@@ -131,6 +131,11 @@ world-action modeling 使用。
 可选参数 ``--actor-bc-weight`` 会在每次在线 actor 更新中加入示教行为克隆损失。
 默认值为 ``0``，因此参考 RLPD 配方仍是无正则基线；非零权重必须登记为独立实验臂。
 
+新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
+``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、
+manifest、环境数和示教合同，并恢复 replay sampling state、normalizer 与收集后的 RNG，
+任一 identity 不一致都会 fail closed。
+
 .. warning::
 
    这些 expert 使用 privileged simulator state。其轨迹是 teacher data，不是可部署
@@ -142,4 +147,5 @@ world-action modeling 使用。
 
 训练期间读取 ``metrics.jsonl``，完成后读取 ``summary.json``。策略按成功、安全、完成度、
 return、时长和动作能耗执行词典序排名。run 还会写出 ``best_policy.pt``、
-``final_policy.pt`` 与 ``checkpoint_latest.pt``。多种子 benchmark 筛选完成前不发布参考成功率。
+``final_policy.pt`` 与 ``checkpoint_latest.pt``。若调度验证已经对应最后一个环境 step，trainer
+会复用它并记录 ``validation_reused``，不再重复相同评测。多种子 benchmark 筛选完成前不发布参考成功率。

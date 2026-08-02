@@ -253,6 +253,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--demo-replay-in",
+        type=Path,
+        help="Validated demo replay cache from a matching source/task/seed identity.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--eval-num-envs", type=int, default=4)
@@ -300,7 +305,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         payload = yaml.safe_load(pre_args.config.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("Dynamic Benchmark config must be a YAML mapping")
-        explicit_only = {"config", "output", "resume", "rlinf_commit", "benchmark_commit"}
+        explicit_only = {
+            "benchmark_commit",
+            "config",
+            "demo_replay_in",
+            "output",
+            "resume",
+            "rlinf_commit",
+        }
         actions = {action.dest: action for action in parser._actions}
         unknown = sorted(set(payload) - set(actions))
         forbidden = sorted(set(payload) & explicit_only)
@@ -415,6 +427,81 @@ def _restore_rng(state: dict[str, Any]) -> None:
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch_cpu"])
     torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _demo_replay_identity(
+    config: TrainConfig,
+    state_schema: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "rlinf-dynamic-benchmark-demo-identity-v0.1",
+        "task": config.task,
+        "rlinf_commit": config.rlinf_commit,
+        "benchmark_commit": config.benchmark_commit,
+        "seed": config.seed,
+        "num_envs": config.num_envs,
+        "demo_episodes": config.demo_episodes,
+        "demo_max_attempts": config.demo_max_attempts,
+        "allow_failed_demos": config.allow_failed_demos,
+        "train_manifest_seed": config.train_manifest_seed,
+        "manifest_size": config.manifest_size,
+        "image_size": config.image_size,
+        "state_schema": state_schema,
+    }
+
+
+def _save_demo_replay_cache(
+    path: Path,
+    identity: dict[str, Any],
+    demo_summary: dict[str, Any],
+    replay: TransitionReplay,
+    normalizer: RunningNormalizer,
+) -> str:
+    payload = {
+        "schema_version": "rlinf-dynamic-benchmark-demo-replay-v0.1",
+        "identity": identity,
+        "demo_summary": demo_summary,
+        "replay": replay.state_dict(),
+        "normalizer": normalizer.state_dict(),
+        "rng_after_collection": _rng_state(),
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+    return _file_sha256(path)
+
+
+def _load_demo_replay_cache(
+    path: Path,
+    expected_identity: dict[str, Any],
+    replay: TransitionReplay,
+    normalizer: RunningNormalizer,
+) -> tuple[dict[str, Any], str]:
+    cache_sha256 = _file_sha256(path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("schema_version") != "rlinf-dynamic-benchmark-demo-replay-v0.1":
+        raise ValueError("demo replay cache schema does not match")
+    if payload.get("identity") != expected_identity:
+        raise ValueError("demo replay cache identity does not match current run")
+    replay.load_state_dict(payload["replay"])
+    normalizer.load_state_dict(payload["normalizer"])
+    _restore_rng(payload["rng_after_collection"])
+    demo_summary = payload["demo_summary"]
+    if int(demo_summary["accepted_episodes"]) != int(
+        expected_identity["demo_episodes"]
+    ):
+        raise ValueError("demo replay cache episode count does not match")
+    if replay.size != int(demo_summary["transitions"]):
+        raise ValueError("demo replay cache transition count does not match")
+    return demo_summary, cache_sha256
 
 
 def _policy_action(
@@ -835,6 +922,10 @@ def main() -> None:
 
     args = _parse_args()
     config = _config(args)
+    if args.demo_replay_in is not None and config.algorithm == "sac":
+        raise ValueError("SAC does not consume a demonstration replay cache")
+    if args.demo_replay_in is not None and args.resume is not None:
+        raise ValueError("resume already contains demonstrations; do not pass demo replay cache")
     if not torch.cuda.is_available():
         raise RuntimeError("Dynamic Benchmark expert training requires CUDA")
     if args.resume is None:
@@ -910,6 +1001,9 @@ def main() -> None:
     next_checkpoint = config.checkpoint_interval
     next_log = config.log_interval
     recent_episodes: list[dict[str, Any]] = []
+    demo_source: dict[str, Any] | None = None
+    last_validation: dict[str, Any] | None = None
+    last_validation_env_steps = -1
     start_time = time.monotonic()
 
     def checkpoint(path: Path) -> None:
@@ -925,6 +1019,7 @@ def main() -> None:
             "alpha_optimizer": alpha_optimizer.state_dict(),
             "normalizer": normalizer.state_dict(),
             "demos": demos.state_dict(),
+            "demo_source": demo_source,
             "online": online.state_dict(),
             "env": env.checkpoint_state(),
             "global_env_steps": global_env_steps,
@@ -934,6 +1029,8 @@ def main() -> None:
             "next_eval": next_eval,
             "next_checkpoint": next_checkpoint,
             "next_log": next_log,
+            "last_validation": last_validation,
+            "last_validation_env_steps": last_validation_env_steps,
             "rng": _rng_state(),
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -952,6 +1049,7 @@ def main() -> None:
         alpha_optimizer.load_state_dict(restored["alpha_optimizer"])
         normalizer.load_state_dict(restored["normalizer"])
         demos.load_state_dict(restored["demos"])
+        demo_source = restored.get("demo_source")
         online.load_state_dict(restored["online"])
         env.load_checkpoint_state(restored["env"])
         obs = env._last_obs
@@ -964,13 +1062,43 @@ def main() -> None:
         next_eval = int(restored["next_eval"])
         next_checkpoint = int(restored["next_checkpoint"])
         next_log = int(restored["next_log"])
+        last_validation = restored.get("last_validation")
+        last_validation_env_steps = int(restored.get("last_validation_env_steps", -1))
         _restore_rng(restored["rng"])
         _append_jsonl(metrics_path, {"event": "resume", "env_steps": global_env_steps})
     else:
         demo_summary = None
         if config.algorithm in {"bc", "rlpd"}:
-            demo_summary = _collect_demos(config, demos, normalizer)
-            _append_jsonl(metrics_path, {"event": "demos", **demo_summary})
+            demo_identity = _demo_replay_identity(config, state_schema)
+            if args.demo_replay_in is None:
+                demo_summary = _collect_demos(config, demos, normalizer)
+                demo_cache_path = args.output / "demo_replay.pt"
+                demo_cache_sha256 = _save_demo_replay_cache(
+                    demo_cache_path,
+                    demo_identity,
+                    demo_summary,
+                    demos,
+                    normalizer,
+                )
+                demo_source = {
+                    "mode": "collected",
+                    "sha256": demo_cache_sha256,
+                }
+            else:
+                demo_summary, demo_cache_sha256 = _load_demo_replay_cache(
+                    args.demo_replay_in,
+                    demo_identity,
+                    demos,
+                    normalizer,
+                )
+                demo_source = {
+                    "mode": "cache",
+                    "sha256": demo_cache_sha256,
+                }
+            _append_jsonl(
+                metrics_path,
+                {"event": "demos", "demo_source": demo_source, **demo_summary},
+            )
         normalizer.update(obs["states"])
         _bc_warm_start(
             config,
@@ -982,6 +1110,8 @@ def main() -> None:
             metrics_path,
         )
         initial_validation = _evaluate(config, model, normalizer, device)
+        last_validation = initial_validation
+        last_validation_env_steps = 0
         best_score = _score(initial_validation)
         best_metrics = initial_validation
         _append_jsonl(
@@ -1003,6 +1133,7 @@ def main() -> None:
                 "status": "complete",
                 "config": asdict(config),
                 "demo_summary": demo_summary,
+                "demo_source": demo_source,
                 "best_validation": best_metrics,
                 "best_score": best_score,
                 "env_steps": 0,
@@ -1126,6 +1257,8 @@ def main() -> None:
 
             if global_env_steps >= next_eval:
                 validation = _evaluate(config, model, normalizer, device)
+                last_validation = validation
+                last_validation_env_steps = global_env_steps
                 score = _score(validation)
                 _append_jsonl(
                     metrics_path,
@@ -1150,7 +1283,20 @@ def main() -> None:
                 checkpoint(args.output / "checkpoint_latest.pt")
 
         checkpoint(args.output / "checkpoint_latest.pt")
-        final_validation = _evaluate(config, model, normalizer, device)
+        if last_validation is not None and last_validation_env_steps == global_env_steps:
+            final_validation = last_validation
+            _append_jsonl(
+                metrics_path,
+                {
+                    "event": "validation_reused",
+                    "env_steps": global_env_steps,
+                    "reason": "scheduled_validation_matches_final_state",
+                },
+            )
+        else:
+            final_validation = _evaluate(config, model, normalizer, device)
+            last_validation = final_validation
+            last_validation_env_steps = global_env_steps
         final_score = _score(final_validation)
         if best_score is None or final_score > tuple(best_score):
             best_score = final_score
@@ -1177,6 +1323,7 @@ def main() -> None:
             "schema_version": "rlinf-dynamic-benchmark-expert-summary-v0.1",
             "status": "stopped" if stop_requested else "complete",
             "config": asdict(config),
+            "demo_source": demo_source,
             "best_validation": best_metrics,
             "best_score": best_score,
             "final_validation": final_validation,

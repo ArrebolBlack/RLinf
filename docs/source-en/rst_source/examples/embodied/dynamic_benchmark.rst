@@ -134,6 +134,12 @@ The optional ``--actor-bc-weight`` adds a demonstration behavior-cloning loss to
 each online actor update. Its default is ``0`` so the reference RLPD recipe remains
 an unregularized baseline; record nonzero values as separate experiment arms.
 
+Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
+with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or
+regularization arms. Loading fails closed unless the source commits, task, state
+schema, seed, manifest, environment count, and demonstration contract match exactly;
+the replay sampling state, normalizer, and post-collection RNG state are restored.
+
 .. warning::
 
    These experts use privileged simulator state. Treat their trajectories as teacher
@@ -146,5 +152,7 @@ Visualization and Results
 Read ``metrics.jsonl`` while training and ``summary.json`` after completion. Rank
 policies lexicographically by success, safety, completion, return, duration, and
 action effort. The run also writes ``best_policy.pt``, ``final_policy.pt``, and
-``checkpoint_latest.pt``. No reference success-rate claim is published until the
+``checkpoint_latest.pt``. When a scheduled validation already represents the final
+environment step, the trainer reuses it and records ``validation_reused`` instead of
+running an identical evaluation twice. No reference success-rate claim is published until the
 multi-seed benchmark screen completes.
