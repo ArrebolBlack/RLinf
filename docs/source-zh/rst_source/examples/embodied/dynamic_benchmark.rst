@@ -188,6 +188,23 @@ identity，保存 reset manifest 和实际动作，并要求每个 episode 的 a
 的策略和超参数选择，之后才能读取 test manifest；冻结前的 evaluator 工程 smoke 使用
 ``--split validation``。
 
+冻结前用相同 paired validation manifest 独立评测 privileged planner，不加载 learned
+policy：
+
+.. code-block:: bash
+
+   python examples/embodiment/evaluate_dynamic_benchmark_planner.py \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --task t1_xyz \
+      --split validation \
+      --manifest-seed 20261150 \
+      --episodes 8 \
+      --output outputs/dynamic_benchmark/t1_xyz_planner/validation_seed1
+
+planner evaluator 同样保存 reset identity、实际动作、exact replay 证据、任务指标和决策
+延迟门；test-ID/OOD 只用于冻结后的单次比较。
+
 可视化与结果
 ------------
 

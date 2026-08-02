@@ -192,6 +192,24 @@ safety, completion, effort, and decision-latency metrics. Keep test manifests un
 until validation-based policy and hyperparameter selection is frozen. Use
 ``--split validation`` for evaluator engineering smoke tests before that freeze.
 
+Evaluate the privileged planner on the same paired validation manifests before the
+freeze, without loading a learned policy:
+
+.. code-block:: bash
+
+   python examples/embodiment/evaluate_dynamic_benchmark_planner.py \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --task t1_xyz \
+      --split validation \
+      --manifest-seed 20261150 \
+      --episodes 8 \
+      --output outputs/dynamic_benchmark/t1_xyz_planner/validation_seed1
+
+The planner evaluator stores the same reset identity, executed actions, exact replay
+evidence, task metrics, and decision-latency gate. Test-ID/OOD remain available only
+for the single post-freeze comparison.
+
 Visualization and Results
 -------------------------
 
