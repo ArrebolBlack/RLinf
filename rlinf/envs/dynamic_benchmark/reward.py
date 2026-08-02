@@ -68,6 +68,24 @@ class DynamicBenchmarkReward:
     def reset(self) -> None:
         self._previous_potential = 0.0
 
+    def state_dict(self) -> dict[str, float | str]:
+        """Return the minimal state required for bit-exact reward resume."""
+
+        return {
+            "schema_version": REWARD_SCHEMA_VERSION,
+            "previous_potential": self._previous_potential,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore reward potential after validating its schema and range."""
+
+        if state.get("schema_version") != REWARD_SCHEMA_VERSION:
+            raise ValueError("unsupported Dynamic Benchmark reward checkpoint schema")
+        previous = float(state["previous_potential"])
+        if not np.isfinite(previous) or not 0.0 <= previous <= 1.0:
+            raise ValueError("reward previous_potential must be finite and in [0, 1]")
+        self._previous_potential = previous
+
     def potential(
         self, *, event_names: Sequence[str], active_stage_progress: float
     ) -> float:

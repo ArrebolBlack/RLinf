@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from collections.abc import Mapping
 from typing import Any, Optional, Union
 
@@ -363,11 +365,14 @@ class DynamicBenchmarkEnv(gym.Env):
         completions = np.zeros(self.num_envs, dtype=np.float32)
         termination_reasons: list[str | None] = [None] * self.num_envs
         component_rows: list[dict[str, float]] = []
+        event_name_rows: list[list[str]] = []
+        active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
         for index, env in enumerate(self.envs):
             if self._needs_reset[index]:
                 terminations[index] = True
                 component_rows.append({"total": 0.0})
+                event_name_rows.append([])
                 continue
             observation = self._raw_observations[index]
             request = self._requests[index]
@@ -380,6 +385,8 @@ class DynamicBenchmarkEnv(gym.Env):
             )
             result = env.step(action)
             event_names = tuple(event.name for event in env._ledger.events)
+            event_name_rows.append(list(event_names))
+            active_stage_progresses[index] = float(result.active_stage_progress)
             reward, components = self.reward_trackers[index].step(
                 action=action.values,
                 event_names=event_names,
@@ -424,6 +431,18 @@ class DynamicBenchmarkEnv(gym.Env):
                     [row.get(name, 0.0) for row in component_rows], dtype=torch.float32
                 )
                 for name in sorted({name for row in component_rows for name in row})
+            },
+            "reward_inputs": {
+                "stepped": torch.as_tensor(stepped, dtype=torch.bool),
+                "action": torch.as_tensor(action_array, dtype=torch.float64),
+                "event_names": event_name_rows,
+                "active_stage_progress": torch.as_tensor(
+                    active_stage_progresses, dtype=torch.float64
+                ),
+                "success": success_tensor.clone(),
+                "terminated": termination_tensor.clone(),
+                "truncated": truncation_tensor.clone(),
+                "termination_reason": list(termination_reasons),
             },
             "episode": {
                 "return": self.returns.clone(),
@@ -519,6 +538,154 @@ class DynamicBenchmarkEnv(gym.Env):
 
     def sample_action_space(self) -> torch.Tensor:
         return torch.as_tensor(self.action_space.sample(), dtype=torch.float32)
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Capture vector env, manifest, reward, and metric state for exact resume."""
+
+        if self._last_obs is None or any(item is None for item in self._requests):
+            raise RuntimeError("Dynamic Benchmark checkpoint requires initialized envs")
+        env_states = [env.save_state() for env in self.envs]
+        request_rows = []
+        for request in self._requests:
+            assert request is not None
+            request_rows.append(
+                {
+                    "episode_id": request.episode_id,
+                    "task_id": request.task_id,
+                    "split": request.split.value,
+                    "seed": request.seed,
+                    "action_mode": request.action_mode.value,
+                    "observation_track": request.observation_track.value,
+                    "object_mode": request.object_mode,
+                    "reset_mode": request.reset_mode,
+                    "factors": dict(request.factors),
+                    "api_version": request.api_version,
+                }
+            )
+        identity = {
+            "task_id": self.task_id,
+            "split": self.split_name,
+            "base_manifest_seed": self.base_manifest_seed,
+            "manifest_size": self.manifest_size,
+            "image_size": self.image_size,
+            "num_envs": self.num_envs,
+            "state_schema": self.state_schema,
+        }
+        identity_sha256 = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.1",
+            "identity": identity,
+            "identity_sha256": identity_sha256,
+            "manifest_generation": self._manifest_generation,
+            "manifest_cursor": self._manifest_cursor,
+            "requests": request_rows,
+            "env_states": env_states,
+            "reward_states": [tracker.state_dict() for tracker in self.reward_trackers],
+            "needs_reset": self._needs_reset.copy(),
+            "elapsed_steps": self._elapsed_steps.clone(),
+            "prev_step_reward": self.prev_step_reward.clone(),
+            "returns": self.returns.clone(),
+            "success_once": self.success_once.clone(),
+            "is_start": self._is_start,
+        }
+
+    def load_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        """Restore a checkpoint produced by :meth:`checkpoint_state`."""
+
+        if state.get("schema_version") != "rlinf-dynamic-benchmark-checkpoint-v0.1":
+            raise ValueError("unsupported Dynamic Benchmark checkpoint schema")
+        identity = dict(state["identity"])
+        expected = {
+            "task_id": self.task_id,
+            "split": self.split_name,
+            "base_manifest_seed": self.base_manifest_seed,
+            "manifest_size": self.manifest_size,
+            "image_size": self.image_size,
+            "num_envs": self.num_envs,
+            "state_schema": self.state_schema,
+        }
+        if identity != expected:
+            raise ValueError("Dynamic Benchmark checkpoint identity does not match env")
+        observed_identity_sha256 = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if observed_identity_sha256 != state["identity_sha256"]:
+            raise ValueError("Dynamic Benchmark checkpoint identity hash mismatch")
+        request_rows = list(state["requests"])
+        env_states = list(state["env_states"])
+        reward_states = list(state["reward_states"])
+        if not (
+            len(request_rows)
+            == len(env_states)
+            == len(reward_states)
+            == self.num_envs
+        ):
+            raise ValueError("Dynamic Benchmark checkpoint vector length mismatch")
+        from se3_wam.benchmark.api import (
+            ActionMode,
+            ObservationTrack,
+            ResetRequest,
+            Split,
+        )
+
+        raw_observations = []
+        requests = []
+        for env, row, env_state in zip(
+            self.envs, request_rows, env_states, strict=True
+        ):
+            request = ResetRequest(
+                episode_id=str(row["episode_id"]),
+                task_id=str(row["task_id"]),
+                split=Split(str(row["split"])),
+                seed=int(row["seed"]),
+                action_mode=ActionMode(str(row["action_mode"])),
+                observation_track=ObservationTrack(str(row["observation_track"])),
+                object_mode=str(row["object_mode"]),
+                reset_mode=str(row["reset_mode"]),
+                factors=dict(row["factors"]),
+                api_version=str(row["api_version"]),
+            )
+            env.reset(request)
+            raw_observations.append(env.load_state(env_state))
+            requests.append(request)
+        self._manifest_generation = int(state["manifest_generation"])
+        self._refresh_manifest()
+        manifest_cursor = int(state["manifest_cursor"])
+        if not 0 <= manifest_cursor <= len(self._manifest_rows):
+            raise ValueError("Dynamic Benchmark checkpoint manifest cursor is invalid")
+        self._manifest_cursor = manifest_cursor
+        self._requests = requests
+        self._raw_observations = raw_observations
+        encoded = np.stack(
+            [
+                self._encode(observation, request)
+                for observation, request in zip(
+                    raw_observations, requests, strict=True
+                )
+            ]
+        )
+        self._last_obs = {"states": torch.as_tensor(encoded, dtype=torch.float32)}
+        for tracker, tracker_state in zip(
+            self.reward_trackers, reward_states, strict=True
+        ):
+            tracker.load_state_dict(tracker_state)
+        self._needs_reset = np.asarray(state["needs_reset"], dtype=bool).copy()
+        if self._needs_reset.shape != (self.num_envs,):
+            raise ValueError("Dynamic Benchmark checkpoint needs_reset shape mismatch")
+        for name, dtype in (
+            ("elapsed_steps", torch.int32),
+            ("prev_step_reward", torch.float32),
+            ("returns", torch.float32),
+            ("success_once", torch.bool),
+        ):
+            value = torch.as_tensor(state[name], dtype=dtype).clone()
+            if value.shape != (self.num_envs,):
+                raise ValueError(f"Dynamic Benchmark checkpoint {name} shape mismatch")
+            target_name = "_elapsed_steps" if name == "elapsed_steps" else name
+            setattr(self, target_name, value)
+        self._is_start = bool(state["is_start"])
 
     def close(self) -> None:
         for env in self.envs:

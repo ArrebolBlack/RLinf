@@ -150,3 +150,27 @@ def test_reward_applies_success_and_safety_as_distinct_terminal_terms() -> None:
     assert success["safety"] == 0.0
     assert safety["success"] == 0.0
     assert safety["safety"] == -10.0
+
+
+def test_reward_state_round_trip_and_validation() -> None:
+    reward = DynamicBenchmarkReward(success_stages=("approach", "grasp"))
+    reward.step(
+        action=np.zeros(7),
+        event_names=("approach",),
+        active_stage_progress=0.25,
+        success=False,
+        terminated=False,
+        truncated=False,
+        termination_reason=None,
+    )
+    state = reward.state_dict()
+    restored = DynamicBenchmarkReward(success_stages=("approach", "grasp"))
+    restored.load_state_dict(state)
+
+    assert restored.state_dict() == state
+    with pytest.raises(ValueError, match="schema"):
+        restored.load_state_dict({"schema_version": "future", "previous_potential": 0.0})
+    with pytest.raises(ValueError, match=r"in \[0, 1\]"):
+        restored.load_state_dict(
+            {"schema_version": state["schema_version"], "previous_potential": 2.0}
+        )
