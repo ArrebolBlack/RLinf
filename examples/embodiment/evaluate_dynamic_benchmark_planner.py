@@ -56,6 +56,15 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _planner_action_values(values: Any) -> tuple[torch.Tensor, np.ndarray]:
+    env_actions = torch.as_tensor(
+        np.clip(np.asarray(values, dtype=np.float32), -1.0, 1.0)[None],
+        dtype=torch.float32,
+    )
+    recorded_values = np.asarray(env_actions[0], dtype=np.float64)
+    return env_actions, recorded_values
+
+
 def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
     from se3_wam.benchmark.evaluation import replay_actions
     from se3_wam.benchmark.metrics import (
@@ -89,13 +98,12 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
         started = time.perf_counter()
         teacher_action = teacher.act(observation)
         latencies_s.append(time.perf_counter() - started)
-        values = np.clip(np.asarray(teacher_action.values, dtype=np.float64), -1.0, 1.0)
+        env_actions, values = _planner_action_values(teacher_action.values)
         action = env._ActionCommand(
             mode=request.action_mode,
             values=values,
             policy_step=observation.policy_step,
         )
-        env_actions = torch.as_tensor(values[None], dtype=torch.float32)
         _, reward, terminated, truncated, infos = env.step(env_actions, auto_reset=False)
         next_observation = env._raw_observations[0]
         if next_observation is None:

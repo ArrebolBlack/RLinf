@@ -14,9 +14,13 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
-from examples.embodiment.evaluate_dynamic_benchmark_planner import _parser
+from examples.embodiment.evaluate_dynamic_benchmark_planner import (
+    _parser,
+    _planner_action_values,
+)
 
 
 def _arguments(split: str) -> list[str]:
@@ -47,3 +51,16 @@ def test_planner_evaluator_accepts_validation_without_test_access() -> None:
 def test_planner_evaluator_rejects_unknown_split() -> None:
     with pytest.raises(SystemExit):
         _parser().parse_args(_arguments("train"))
+
+
+def test_planner_action_record_uses_executed_float32_values() -> None:
+    source = np.asarray([0.123456789012345, -2.0, 0.0, 0.5, -0.5, 1.0, 2.0])
+
+    env_actions, recorded = _planner_action_values(source)
+
+    assert env_actions.dtype.is_floating_point
+    assert np.array_equal(recorded.astype(np.float32), env_actions.numpy()[0])
+    assert recorded.tolist() == env_actions.numpy()[0].astype(np.float64).tolist()
+    assert recorded[0] != source[0]
+    assert recorded[1] == -1.0
+    assert recorded[-1] == 1.0
