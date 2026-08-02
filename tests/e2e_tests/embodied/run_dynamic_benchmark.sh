@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 : "${SE3_WAM_PATH:?Set SE3_WAM_PATH to the research-only SE3-WAM checkout}"
 repo_path="${REPO_PATH:-$(git rev-parse --show-toplevel)}"
-rlinf_commit="$(git -C "$repo_path" rev-parse HEAD)"
-benchmark_commit="$(git -C "$SE3_WAM_PATH" rev-parse HEAD)"
+rlinf_commit="${RLINF_COMMIT:-$(git -C "$repo_path" rev-parse HEAD)}"
+benchmark_commit="${BENCHMARK_COMMIT:-$(git -C "$SE3_WAM_PATH" rev-parse HEAD)}"
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/rlinf-dynamic-benchmark-e2e.XXXXXX")"
 trap 'rm -rf "$run_root"' EXIT
 
