@@ -22,8 +22,6 @@ import hashlib
 import json
 from pathlib import Path
 
-from omegaconf import OmegaConf
-
 from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 
 
@@ -39,19 +37,21 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
-    cfg = OmegaConf.create(
-        {
-            "task_id": args.task,
-            "split": args.split,
-            "manifest_seed": args.manifest_seed,
-            "manifest_size": 2,
-            "image_size": args.image_size,
-            "auto_reset": True,
-            "ignore_terminations": False,
-            "group_size": 1,
-            "task_prompt": f"Solve Dynamic Benchmark task {args.task}.",
-        }
-    )
+    # Keep this low-level runtime probe independent from Hydra/OmegaConf.  The
+    # adapter deliberately accepts plain mappings so that environment and
+    # reward correctness can be checked before the full RLinf scheduler stack
+    # is installed on a compute node.
+    cfg = {
+        "task_id": args.task,
+        "split": args.split,
+        "manifest_seed": args.manifest_seed,
+        "manifest_size": 2,
+        "image_size": args.image_size,
+        "auto_reset": True,
+        "ignore_terminations": False,
+        "group_size": 1,
+        "task_prompt": f"Solve Dynamic Benchmark task {args.task}.",
+    }
     env = DynamicBenchmarkEnv(
         cfg=cfg,
         num_envs=1,
