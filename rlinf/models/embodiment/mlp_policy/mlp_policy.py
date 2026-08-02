@@ -35,6 +35,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         q_head_type="default",
         value_granularity="action_level",
         critic_obs_dim=None,
+        num_q_heads=2,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -49,6 +50,10 @@ class MLPPolicy(nn.Module, BasePolicy):
         action_scale = None
 
         self.value_granularity = value_granularity
+
+        if num_q_heads < 2:
+            raise ValueError("num_q_heads must be at least 2")
+        self.num_q_heads = num_q_heads
 
         assert add_value_head + add_q_head <= 1
         output_dim = (
@@ -71,7 +76,7 @@ class MLPPolicy(nn.Module, BasePolicy):
                 self.q_head = MultiQHead(
                     hidden_size=self.critic_obs_dim,
                     hidden_dims=[256, 256, 256],
-                    num_q_heads=2,
+                    num_q_heads=self.num_q_heads,
                     output_dim=output_dim,
                     action_feature_dim=action_dim * self.num_action_chunks,
                 )
@@ -79,7 +84,7 @@ class MLPPolicy(nn.Module, BasePolicy):
                 self.q_head = MultiCrossQHead(
                     hidden_size=self.critic_obs_dim,
                     hidden_dims=[256, 256, 256],
-                    num_q_heads=2,
+                    num_q_heads=self.num_q_heads,
                     output_dim=output_dim,
                     action_feature_dim=action_dim * self.num_action_chunks,
                 )

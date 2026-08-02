@@ -43,6 +43,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_value_head=cfg.add_value_head,
             add_q_head=cfg.get("add_q_head", False),
             q_head_type=cfg.get("q_head_type", "default"),
+            num_q_heads=cfg.get("num_q_heads", 2),
         )
         model.configure_iql(iql_config)
     else:
@@ -53,6 +54,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_value_head=cfg.add_value_head,
             add_q_head=cfg.get("add_q_head", False),
             q_head_type=cfg.get("q_head_type", "default"),
+            num_q_heads=cfg.get("num_q_heads", 2),
         )
 
     return model
