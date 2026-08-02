@@ -21,17 +21,28 @@ from typing import Any
 
 import numpy as np
 
-REWARD_SCHEMA_VERSION = "rlinf-dynamic-benchmark-reward-v0.1"
+REWARD_SCHEMA_VERSION = "rlinf-dynamic-benchmark-reward-v0.2"
 DEFAULT_SAFETY_FAILURES = frozenset(
     {
         "drop",
+        "driver_blocked",
+        "early_robot_contact",
+        "extra_impact",
+        "extra_striker_impact",
+        "forbidden_wire_contact",
         "invalid_state",
+        "object_goal_collision_unsafe",
+        "release_impulse",
+        "striker_trap",
+        "tray_contact",
+        "trap_or_block",
+        "unsafe_stage_block",
         "unsafe_contact",
+        "unstable_tipping",
+        "wand_drop",
         "workspace_exit",
         "downstream_exit",
-        "wire_contact",
-        "rim_collision",
-        "ramp_collision",
+        "wrong_striker_contact",
     }
 )
 

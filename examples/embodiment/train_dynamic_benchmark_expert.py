@@ -27,21 +27,24 @@ import signal
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
-from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+if TYPE_CHECKING:
+    from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+
 
 
 @dataclass(frozen=True)
 class TrainConfig:
     task: str
     algorithm: str
+    rlinf_commit: str
+    benchmark_commit: str
     seed: int
     num_envs: int
     eval_num_envs: int
@@ -239,6 +242,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True)
     parser.add_argument("--algorithm", choices=("bc", "sac", "rlpd"), default="rlpd")
+    parser.add_argument("--rlinf-commit", required=True)
+    parser.add_argument("--benchmark-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=1)
@@ -279,6 +284,8 @@ def _config(args: argparse.Namespace) -> TrainConfig:
     config = TrainConfig(
         task=args.task,
         algorithm=args.algorithm,
+        rlinf_commit=args.rlinf_commit,
+        benchmark_commit=args.benchmark_commit,
         seed=args.seed,
         num_envs=args.num_envs,
         eval_num_envs=args.eval_num_envs,
@@ -312,6 +319,12 @@ def _config(args: argparse.Namespace) -> TrainConfig:
     )
     if config.num_envs < 1 or config.eval_num_envs < 1:
         raise ValueError("environment counts must be positive")
+    for name, commit in (
+        ("rlinf_commit", config.rlinf_commit),
+        ("benchmark_commit", config.benchmark_commit),
+    ):
+        if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+            raise ValueError(f"{name} must be a full lowercase Git commit")
     if config.q_heads < 2 or not 1 <= config.q_target_subset <= config.q_heads:
         raise ValueError("Q ensemble/subset configuration is invalid")
     if not 0.0 <= config.demo_ratio <= 1.0:
@@ -417,6 +430,8 @@ def _collect_demos(
 ) -> dict[str, Any]:
     from se3_wam.benchmark.teacher_factory import make_privileged_teacher
 
+    from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
+
     count = min(config.num_envs, config.demo_episodes)
     env = DynamicBenchmarkEnv(
         cfg=_env_cfg(
@@ -435,7 +450,9 @@ def _collect_demos(
     successes = 0
     trajectories: list[list[tuple[torch.Tensor, ...]]] = [[] for _ in range(count)]
     try:
-        obs, _ = env.reset()
+        obs = env._last_obs
+        if obs is None:
+            raise RuntimeError("demo environment did not initialize its state")
         teachers = []
         for request in env._requests:
             teacher, _ = make_privileged_teacher(config.task, request=request)
@@ -515,6 +532,8 @@ def _evaluate(
     normalizer: RunningNormalizer,
     device: torch.device,
 ) -> dict[str, Any]:
+    from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
+
     preserved_rng = _rng_state()
     count = min(config.eval_num_envs, config.eval_episodes)
     env = DynamicBenchmarkEnv(
@@ -536,7 +555,9 @@ def _evaluate(
     safety_failures = set(env.reward_schema["safety_failures"])
     model.eval()
     try:
-        obs, _ = env.reset()
+        obs = env._last_obs
+        if obs is None:
+            raise RuntimeError("evaluation environment did not initialize its state")
         while len(records) < config.eval_episodes:
             with torch.inference_mode():
                 actions, _ = _policy_action(
@@ -761,6 +782,9 @@ def _save_policy(
 
 
 def main() -> None:
+    from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
+    from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+
     args = _parser().parse_args()
     config = _config(args)
     if not torch.cuda.is_available():
@@ -793,7 +817,9 @@ def main() -> None:
         total_num_processes=1,
         worker_info=None,
     )
-    obs, _ = env.reset()
+    obs = env._last_obs
+    if obs is None:
+        raise RuntimeError("training environment did not initialize its state")
     state_schema = env.state_schema
     state_dim = int(state_schema["state_dim"])
     normalizer = RunningNormalizer(state_dim, int(state_schema["mask_dim"]))

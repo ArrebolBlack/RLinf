@@ -152,6 +152,32 @@ def test_reward_applies_success_and_safety_as_distinct_terminal_terms() -> None:
     assert safety["safety"] == -10.0
 
 
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "object_goal_collision_unsafe",
+        "forbidden_wire_contact",
+        "release_impulse",
+        "wrong_striker_contact",
+    ),
+)
+def test_reward_recognizes_benchmark_specific_safety_failures(reason: str) -> None:
+    reward = DynamicBenchmarkReward(success_stages=("grasp",))
+
+    _, components = reward.step(
+        action=np.zeros(7),
+        event_names=(),
+        active_stage_progress=0.0,
+        success=False,
+        terminated=True,
+        truncated=False,
+        termination_reason=reason,
+    )
+
+    assert components["safety"] == -10.0
+    assert components["failure"] == 0.0
+
+
 def test_reward_state_round_trip_and_validation() -> None:
     reward = DynamicBenchmarkReward(success_stages=("approach", "grasp"))
     reward.step(
