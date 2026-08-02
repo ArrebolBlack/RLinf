@@ -567,15 +567,7 @@ class DynamicBenchmarkEnv(gym.Env):
                     "api_version": request.api_version,
                 }
             )
-        identity = {
-            "task_id": self.task_id,
-            "split": self.split_name,
-            "base_manifest_seed": self.base_manifest_seed,
-            "manifest_size": self.manifest_size,
-            "image_size": self.image_size,
-            "num_envs": self.num_envs,
-            "state_schema": self.state_schema,
-        }
+        identity = self._checkpoint_identity()
         identity_sha256 = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -596,21 +588,25 @@ class DynamicBenchmarkEnv(gym.Env):
             "is_start": self._is_start,
         }
 
+    def _checkpoint_identity(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "split": self.split_name,
+            "base_manifest_seed": self.base_manifest_seed,
+            "manifest_size": self.manifest_size,
+            "image_size": self.image_size,
+            "camera_observations": self.camera_observations,
+            "num_envs": self.num_envs,
+            "state_schema": self.state_schema,
+        }
+
     def load_checkpoint_state(self, state: Mapping[str, Any]) -> None:
         """Restore a checkpoint produced by :meth:`checkpoint_state`."""
 
         if state.get("schema_version") != "rlinf-dynamic-benchmark-checkpoint-v0.1":
             raise ValueError("unsupported Dynamic Benchmark checkpoint schema")
         identity = dict(state["identity"])
-        expected = {
-            "task_id": self.task_id,
-            "split": self.split_name,
-            "base_manifest_seed": self.base_manifest_seed,
-            "manifest_size": self.manifest_size,
-            "image_size": self.image_size,
-            "num_envs": self.num_envs,
-            "state_schema": self.state_schema,
-        }
+        expected = self._checkpoint_identity()
         if identity != expected:
             raise ValueError("Dynamic Benchmark checkpoint identity does not match env")
         observed_identity_sha256 = hashlib.sha256(
