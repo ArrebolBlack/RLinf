@@ -49,7 +49,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rlinf-commit", required=True)
     parser.add_argument("--benchmark-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--split", choices=("test_id", "test_ood"), required=True)
+    parser.add_argument(
+        "--split",
+        choices=("validation", "test_id", "test_ood"),
+        required=True,
+    )
     parser.add_argument("--manifest-seed", type=int, required=True)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")

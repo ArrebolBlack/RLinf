@@ -189,7 +189,8 @@ The evaluator reconstructs BC/SAC/RLPD, residual-RLPD, and PPO policies, verifie
 checkpoint and source identities, records the reset manifest and executed actions,
 requires exact action replay for every episode, and reports deterministic success,
 safety, completion, effort, and decision-latency metrics. Keep test manifests unread
-until validation-based policy and hyperparameter selection is frozen.
+until validation-based policy and hyperparameter selection is frozen. Use
+``--split validation`` for evaluator engineering smoke tests before that freeze.
 
 Visualization and Results
 -------------------------
