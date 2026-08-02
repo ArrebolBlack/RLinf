@@ -163,6 +163,30 @@ manifest、环境数和示教合同，并恢复 replay sampling state、normaliz
    vision policy 的结果。``--rlinf-commit`` 与 ``--benchmark-commit`` 必须使用完整
    40 位哈希；源码 identity 漂移时 resume 会拒绝运行。
 
+冻结 validation 选择后，可用独立标识的 evaluator commit 在确定性的 test-ID 或
+test-OOD manifest 上评测 best checkpoint：
+
+.. code-block:: bash
+
+   POLICY=outputs/dynamic_benchmark/t2_rlpd_seed1/best_policy.pt
+   POLICY_SHA=$(sha256sum "$POLICY" | cut -d' ' -f1)
+   EVALUATOR_COMMIT=$(git rev-parse HEAD)
+   python examples/embodiment/evaluate_dynamic_benchmark_expert.py \
+      --policy "$POLICY" \
+      --expected-policy-sha256 "$POLICY_SHA" \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --rlinf-commit "$RLINF_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --split test_id \
+      --manifest-seed 20261250 \
+      --episodes 20 \
+      --output outputs/dynamic_benchmark/t2_rlpd_seed1/test_id
+
+evaluator 会重建 BC/SAC/RLPD、residual-RLPD 与 PPO 策略，核验 checkpoint/源码
+identity，保存 reset manifest 和实际动作，并要求每个 episode 的 action replay 精确通过；
+结果包含确定性的成功率、安全失败、完成度、动作能耗与决策延迟。必须先冻结基于 validation
+的策略和超参数选择，之后才能读取 test manifest。
+
 可视化与结果
 ------------
 

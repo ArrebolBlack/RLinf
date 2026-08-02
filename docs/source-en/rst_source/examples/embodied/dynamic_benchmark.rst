@@ -166,6 +166,31 @@ the replay sampling state, normalizer, and post-collection RNG state are restore
    data, not as deployable vision-policy results. Keep ``--rlinf-commit`` and
    ``--benchmark-commit`` at full 40-character hashes; resume rejects identity drift.
 
+Evaluate the frozen best checkpoint on a deterministic test-ID or test-OOD manifest
+with a separately identified evaluator commit:
+
+.. code-block:: bash
+
+   POLICY=outputs/dynamic_benchmark/t2_rlpd_seed1/best_policy.pt
+   POLICY_SHA=$(sha256sum "$POLICY" | cut -d' ' -f1)
+   EVALUATOR_COMMIT=$(git rev-parse HEAD)
+   python examples/embodiment/evaluate_dynamic_benchmark_expert.py \
+      --policy "$POLICY" \
+      --expected-policy-sha256 "$POLICY_SHA" \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --rlinf-commit "$RLINF_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --split test_id \
+      --manifest-seed 20261250 \
+      --episodes 20 \
+      --output outputs/dynamic_benchmark/t2_rlpd_seed1/test_id
+
+The evaluator reconstructs BC/SAC/RLPD, residual-RLPD, and PPO policies, verifies the
+checkpoint and source identities, records the reset manifest and executed actions,
+requires exact action replay for every episode, and reports deterministic success,
+safety, completion, effort, and decision-latency metrics. Keep test manifests unread
+until validation-based policy and hyperparameter selection is frozen.
+
 Visualization and Results
 -------------------------
 
