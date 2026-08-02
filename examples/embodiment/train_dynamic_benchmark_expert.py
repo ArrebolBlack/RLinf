@@ -64,6 +64,7 @@ class TrainConfig:
     gamma: float
     tau: float
     actor_lr: float
+    actor_bc_weight: float
     critic_lr: float
     alpha_lr: float
     initial_alpha: float
@@ -270,6 +271,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--actor-lr", type=float, default=3e-4)
+    parser.add_argument("--actor-bc-weight", type=float, default=0.0)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--initial-alpha", type=float, default=0.01)
@@ -337,6 +339,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         gamma=args.gamma,
         tau=args.tau,
         actor_lr=args.actor_lr,
+        actor_bc_weight=args.actor_bc_weight,
         critic_lr=args.critic_lr,
         alpha_lr=args.alpha_lr,
         initial_alpha=args.initial_alpha,
@@ -362,6 +365,8 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("Q ensemble/subset configuration is invalid")
     if not 0.0 <= config.demo_ratio <= 1.0:
         raise ValueError("demo_ratio must be in [0, 1]")
+    if config.actor_bc_weight < 0.0:
+        raise ValueError("actor_bc_weight must be non-negative")
     if config.algorithm in {"bc", "rlpd"} and config.demo_episodes < 1:
         raise ValueError("BC/RLPD requires at least one demonstration episode")
     if config.batch_size < 2 or config.replay_capacity < config.batch_size:
@@ -761,7 +766,15 @@ def _sac_update(
     )
     policy_q = model.q_head(states, policy_actions).mean(dim=-1, keepdim=True)
     alpha = log_alpha.exp()
-    actor_loss = (alpha.detach() * log_prob - policy_q).mean()
+    actor_sac_loss = (alpha.detach() * log_prob - policy_q).mean()
+    actor_bc_loss = torch.zeros((), dtype=torch.float32, device=device)
+    if config.actor_bc_weight > 0.0 and demos.size > 0:
+        demo_batch = demos.sample(config.batch_size)
+        demo_states = normalizer.normalize(demo_batch["states"], device)
+        demo_actions = demo_batch["actions"].to(device)
+        demo_mean, _ = model._sample_actions(demo_states)
+        actor_bc_loss = F.mse_loss(torch.tanh(demo_mean), demo_actions)
+    actor_loss = actor_sac_loss + config.actor_bc_weight * actor_bc_loss
     actor_optimizer.zero_grad(set_to_none=True)
     actor_loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -784,6 +797,8 @@ def _sac_update(
     return {
         "critic_loss": float(critic_loss.detach()),
         "actor_loss": float(actor_loss.detach()),
+        "actor_sac_loss": float(actor_sac_loss.detach()),
+        "actor_bc_loss": float(actor_bc_loss.detach()),
         "alpha_loss": float(alpha_loss.detach()),
         "alpha": float(log_alpha.exp().detach()),
         "q_data": float(predicted.detach().mean()),

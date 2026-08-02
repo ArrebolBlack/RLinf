@@ -21,6 +21,7 @@ from examples.embodiment.benchmark_dynamic_benchmark_throughput import _full_com
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
     TransitionReplay,
+    _config,
     _parse_args,
     _score,
 )
@@ -125,3 +126,25 @@ def test_recipe_yaml_rejects_run_specific_provenance(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="run-specific"):
         _parse_args(["--config", str(recipe)])
+
+
+def test_actor_bc_regularization_is_explicit_and_non_negative(tmp_path) -> None:
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text(
+        "task: t2_trans\nalgorithm: rlpd\nactor_bc_weight: 2.5\n",
+        encoding="utf-8",
+    )
+    common = [
+        "--config",
+        str(recipe),
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "run"),
+    ]
+
+    assert _config(_parse_args(common)).actor_bc_weight == 2.5
+    with pytest.raises(ValueError, match="non-negative"):
+        _config(_parse_args([*common, "--actor-bc-weight", "-1"]))

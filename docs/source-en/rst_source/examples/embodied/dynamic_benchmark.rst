@@ -130,6 +130,10 @@ Launch the frozen T2 RLPD recipe with explicit source identity and an output dir
 2. Runs BC warm-start followed by RLPD-SAC with an equal demo/online replay mixture.
 3. Evaluates on a frozen validation manifest and checkpoints model, replay, environment, optimizer, normalizer, and RNG state.
 
+The optional ``--actor-bc-weight`` adds a demonstration behavior-cloning loss to
+each online actor update. Its default is ``0`` so the reference RLPD recipe remains
+an unregularized baseline; record nonzero values as separate experiment arms.
+
 .. warning::
 
    These experts use privileged simulator state. Treat their trajectories as teacher

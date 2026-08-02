@@ -128,6 +128,9 @@ world-action modeling 使用。
 2. 先做 BC warm-start，再以等比例 demo/online replay 运行 RLPD-SAC。
 3. 在冻结 validation manifest 上评测，并保存模型、replay、环境、优化器、normalizer 与 RNG 状态。
 
+可选参数 ``--actor-bc-weight`` 会在每次在线 actor 更新中加入示教行为克隆损失。
+默认值为 ``0``，因此参考 RLPD 配方仍是无正则基线；非零权重必须登记为独立实验臂。
+
 .. warning::
 
    这些 expert 使用 privileged simulator state。其轨迹是 teacher data，不是可部署

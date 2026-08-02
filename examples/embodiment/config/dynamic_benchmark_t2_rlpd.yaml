@@ -19,6 +19,7 @@ q_target_subset: 2
 gamma: 0.99
 tau: 0.005
 actor_lr: 0.0003
+actor_bc_weight: 0.0
 critic_lr: 0.0003
 alpha_lr: 0.0003
 initial_alpha: 0.01
