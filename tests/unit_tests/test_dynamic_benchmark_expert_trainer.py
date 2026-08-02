@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from examples.embodiment.benchmark_dynamic_benchmark_throughput import _full_commit
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
     TransitionReplay,
@@ -85,3 +87,11 @@ def test_policy_score_is_success_then_safety_lexicographic() -> None:
 
     assert _score(safer_but_less_complete) > _score(unsafe)
     assert _score(more_success) > _score(baseline)
+
+
+def test_throughput_probe_requires_full_frozen_source_commits() -> None:
+    commit = "a" * 40
+
+    assert _full_commit("source", commit) == commit
+    with pytest.raises(ValueError, match="full lowercase"):
+        _full_commit("source", "abc123")
