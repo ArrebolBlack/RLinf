@@ -5,8 +5,13 @@ set -Eeuo pipefail
 repo_path="${REPO_PATH:-$(git rev-parse --show-toplevel)}"
 rlinf_commit="${RLINF_COMMIT:-$(git -C "$repo_path" rev-parse HEAD)}"
 benchmark_commit="${BENCHMARK_COMMIT:-$(git -C "$SE3_WAM_PATH" rev-parse HEAD)}"
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/rlinf-dynamic-benchmark-e2e.XXXXXX")"
-trap 'rm -rf "$run_root"' EXIT
+if [[ -n "${DYNAMIC_BENCHMARK_E2E_OUTPUT:-}" ]]; then
+    run_root="$DYNAMIC_BENCHMARK_E2E_OUTPUT"
+    mkdir -p "$run_root"
+else
+    run_root="$(mktemp -d "${TMPDIR:-/tmp}/rlinf-dynamic-benchmark-e2e.XXXXXX")"
+    trap 'rm -rf "$run_root"' EXIT
+fi
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
