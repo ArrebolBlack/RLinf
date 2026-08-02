@@ -10,6 +10,7 @@ max_steps_per_rollout_epoch: 160
 manifest_seed: 20261050
 manifest_size: 4096
 image_size: 64
+camera_observations: false
 auto_reset: true
 ignore_terminations: false
 

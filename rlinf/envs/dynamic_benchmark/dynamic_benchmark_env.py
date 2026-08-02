@@ -94,6 +94,7 @@ class DynamicBenchmarkEnv(gym.Env):
         self.image_size = int(_cfg_get(cfg, "image_size", 64))
         if self.image_size < 64:
             raise ValueError("Dynamic Benchmark image_size must be at least 64")
+        self.camera_observations = bool(_cfg_get(cfg, "camera_observations", False))
         self.auto_reset = bool(_cfg_get(cfg, "auto_reset", True))
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
         self.use_rel_reward = False
@@ -116,7 +117,11 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_rows: tuple[Any, ...] = ()
         self._refresh_manifest()
         self.envs = [
-            self._make_mujoco_env(self.task_id, image_size=self.image_size)
+            self._make_mujoco_env(
+                self.task_id,
+                image_size=self.image_size,
+                camera_observations=self.camera_observations,
+            )
             for _ in range(self.num_envs)
         ]
         self.horizon_steps = int(self.envs[0].horizon_steps)
