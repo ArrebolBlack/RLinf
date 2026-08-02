@@ -14,8 +14,8 @@ demonstrations, then exports audited trajectories for downstream world-action mo
 Overview
 --------
 
-Train resumable BC, SAC, or RLPD experts across 14 grasping, placement, interaction,
-and replanning tasks.
+Train resumable BC, SAC, RLPD, planner-residual RLPD, or PPO experts across 14
+grasping, placement, interaction, and replanning tasks.
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -28,7 +28,7 @@ and replanning tasks.
    .. grid-item-card:: Algorithms
       :text-align: center
 
-      BC · SAC · RLPD-SAC
+      BC · SAC · RLPD-SAC · residual RLPD · PPO
 
    .. grid-item-card:: Tasks
       :text-align: center
@@ -133,6 +133,26 @@ Launch the frozen T2 RLPD recipe with explicit source identity and an output dir
 The optional ``--actor-bc-weight`` adds a demonstration behavior-cloning loss to
 each online actor update. Its default is ``0`` so the reference RLPD recipe remains
 an unregularized baseline; record nonzero values as separate experiment arms.
+
+Set ``--algorithm residual_rlpd`` to execute
+``clamp(planner_action + residual_scale * policy_residual, -1, 1)``. Replay and the
+critic stay in residual-action space, planner demonstrations map to the exact zero
+residual, and checkpoints include the stateful planner instances. ``--residual-scale``
+defaults to ``0.25``; treat each scale and actor-BC weight as a separate arm.
+
+The matched on-policy control is a separate resumable trainer:
+
+.. code-block:: bash
+
+   python examples/embodiment/train_dynamic_benchmark_ppo.py \
+      --config examples/embodiment/config/dynamic_benchmark_t1_ppo.yaml \
+      --rlinf-commit "$RLINF_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --output outputs/dynamic_benchmark/t1_ppo_seed1
+
+It uses a squashed-Gaussian 7-D actor, GAE, clipped PPO updates, a value head, frozen
+validation manifests, and update-boundary checkpoint/resume. Time-limit truncations
+bootstrap the value target but stop advantage recursion across the reset boundary.
 
 Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
 with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or

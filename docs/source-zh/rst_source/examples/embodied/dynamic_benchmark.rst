@@ -14,7 +14,8 @@ world-action modeling 使用。
 概览
 ----
 
-在 14 个动态抓取、放置、交互与重规划任务上训练可恢复的 BC、SAC 或 RLPD expert。
+在 14 个动态抓取、放置、交互与重规划任务上训练可恢复的 BC、SAC、RLPD、
+planner-residual RLPD 或 PPO expert。
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -27,7 +28,7 @@ world-action modeling 使用。
    .. grid-item-card:: 算法
       :text-align: center
 
-      BC · SAC · RLPD-SAC
+      BC · SAC · RLPD-SAC · residual RLPD · PPO
 
    .. grid-item-card:: 任务
       :text-align: center
@@ -130,6 +131,26 @@ world-action modeling 使用。
 
 可选参数 ``--actor-bc-weight`` 会在每次在线 actor 更新中加入示教行为克隆损失。
 默认值为 ``0``，因此参考 RLPD 配方仍是无正则基线；非零权重必须登记为独立实验臂。
+
+设置 ``--algorithm residual_rlpd`` 后，实际动作是
+``clamp(planner_action + residual_scale * policy_residual, -1, 1)``。replay 与 critic
+位于 residual action space，planner 示教严格映射到零 residual；checkpoint 还会保存
+有状态的 planner 实例。``--residual-scale`` 默认 ``0.25``，每个 scale 与 actor-BC
+权重组合都必须登记为独立实验臂。
+
+matched on-policy 对照使用独立的可恢复 trainer：
+
+.. code-block:: bash
+
+   python examples/embodiment/train_dynamic_benchmark_ppo.py \
+      --config examples/embodiment/config/dynamic_benchmark_t1_ppo.yaml \
+      --rlinf-commit "$RLINF_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --output outputs/dynamic_benchmark/t1_ppo_seed1
+
+该实现使用 7 维 squashed-Gaussian actor、GAE、clipped PPO、value head、冻结
+validation manifest 与 update-boundary checkpoint/resume。time-limit truncation 会对
+value target 做 bootstrap，但会在 reset 边界停止 advantage 递推。
 
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
 ``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、

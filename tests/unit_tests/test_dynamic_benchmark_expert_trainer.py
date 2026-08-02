@@ -21,6 +21,7 @@ from examples.embodiment.benchmark_dynamic_benchmark_throughput import _full_com
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
     TransitionReplay,
+    _compose_residual_actions,
     _config,
     _demo_replay_identity,
     _load_demo_replay_cache,
@@ -152,6 +153,20 @@ def test_actor_bc_regularization_is_explicit_and_non_negative(tmp_path) -> None:
     assert _config(_parse_args(common)).actor_bc_weight == 2.5
     with pytest.raises(ValueError, match="non-negative"):
         _config(_parse_args([*common, "--actor-bc-weight", "-1"]))
+
+
+def test_residual_action_composition_is_scaled_and_clamped() -> None:
+    planner = torch.tensor([[0.9, -0.9, 0.0, 0.1, -0.1, 0.2, -0.2]])
+    residual = torch.tensor([[1.0, -1.0, 0.4, -0.4, 0.0, 0.8, -0.8]])
+
+    composed = _compose_residual_actions(planner, residual, 0.25)
+
+    assert torch.allclose(
+        composed,
+        torch.tensor([[1.0, -1.0, 0.1, 0.0, -0.1, 0.4, -0.4]]),
+    )
+    with pytest.raises(ValueError, match="residual_scale"):
+        _compose_residual_actions(planner, residual, 0.0)
 
 
 def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:

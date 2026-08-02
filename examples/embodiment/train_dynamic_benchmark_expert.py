@@ -13,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train a resumable privileged-state SAC/RLPD expert on Dynamic Benchmark."""
+"""Train a resumable privileged-state SAC/RLPD expert on Dynamic Benchmark.
+
+The residual-RLPD arm keeps the privileged planner in the executed action path
+and learns a bounded correction.  Its critic and replay operate in residual
+action space, so the zero action is exactly the frozen planner policy.
+"""
 
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ class TrainConfig:
     tau: float
     actor_lr: float
     actor_bc_weight: float
+    residual_scale: float
     critic_lr: float
     alpha_lr: float
     initial_alpha: float
@@ -248,7 +254,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Optional YAML defaults; source commits and output stay explicit CLI arguments.",
     )
     parser.add_argument("--task", required=True)
-    parser.add_argument("--algorithm", choices=("bc", "sac", "rlpd"), default="rlpd")
+    parser.add_argument(
+        "--algorithm",
+        choices=("bc", "sac", "rlpd", "residual_rlpd"),
+        default="rlpd",
+    )
     parser.add_argument("--rlinf-commit", required=True)
     parser.add_argument("--benchmark-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -277,6 +287,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--actor-bc-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--residual-scale",
+        type=float,
+        default=0.25,
+        help="Executed action is clamp(planner + residual_scale * policy_residual).",
+    )
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--initial-alpha", type=float, default=0.01)
@@ -352,6 +368,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         tau=args.tau,
         actor_lr=args.actor_lr,
         actor_bc_weight=args.actor_bc_weight,
+        residual_scale=args.residual_scale,
         critic_lr=args.critic_lr,
         alpha_lr=args.alpha_lr,
         initial_alpha=args.initial_alpha,
@@ -379,7 +396,9 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("demo_ratio must be in [0, 1]")
     if config.actor_bc_weight < 0.0:
         raise ValueError("actor_bc_weight must be non-negative")
-    if config.algorithm in {"bc", "rlpd"} and config.demo_episodes < 1:
+    if not 0.0 < config.residual_scale <= 1.0:
+        raise ValueError("residual_scale must be in (0, 1]")
+    if config.algorithm in {"bc", "rlpd", "residual_rlpd"} and config.demo_episodes < 1:
         raise ValueError("BC/RLPD requires at least one demonstration episode")
     if config.batch_size < 2 or config.replay_capacity < config.batch_size:
         raise ValueError("replay capacity must be at least the batch size")
@@ -519,6 +538,58 @@ def _policy_action(
     action = torch.tanh(raw)
     log_prob = distribution.log_prob(raw) - torch.log(1.0 - action.square() + 1e-6)
     return action, log_prob.sum(dim=-1, keepdim=True)
+
+
+def _make_planner_teachers(task: str, env: Any) -> list[Any]:
+    """Construct one reset planner per live vector environment request."""
+    from se3_wam.benchmark.teacher_factory import make_privileged_teacher
+
+    teachers = []
+    for request in env._requests:
+        teacher, _ = make_privileged_teacher(task, request=request)
+        if hasattr(teacher, "reset"):
+            teacher.reset()
+        teachers.append(teacher)
+    return teachers
+
+
+def _reset_planner_teachers(task: str, env: Any, teachers: list[Any], indices: list[int]) -> None:
+    from se3_wam.benchmark.teacher_factory import make_privileged_teacher
+
+    for index in indices:
+        teacher, _ = make_privileged_teacher(task, request=env._requests[index])
+        if hasattr(teacher, "reset"):
+            teacher.reset()
+        teachers[index] = teacher
+
+
+def _planner_actions(env: Any, teachers: list[Any]) -> torch.Tensor:
+    if len(teachers) != len(env._raw_observations):
+        raise ValueError("planner count does not match vector environment")
+    values = []
+    for index, teacher in enumerate(teachers):
+        observation = env._raw_observations[index]
+        if observation is None:
+            raise RuntimeError("planner-residual environment lost its raw observation")
+        values.append(np.asarray(teacher.act(observation).values, dtype=np.float32))
+    actions = torch.as_tensor(np.stack(values), dtype=torch.float32)
+    if actions.shape != (len(teachers), 7):
+        raise ValueError(f"planner action has unexpected shape {tuple(actions.shape)}")
+    return actions
+
+
+def _compose_residual_actions(
+    planner_actions: torch.Tensor,
+    residual_actions: torch.Tensor,
+    residual_scale: float,
+) -> torch.Tensor:
+    planner = torch.as_tensor(planner_actions, dtype=torch.float32, device="cpu")
+    residual = torch.as_tensor(residual_actions, dtype=torch.float32, device="cpu")
+    if planner.shape != residual.shape or planner.shape[-1] != 7:
+        raise ValueError("planner and residual actions must have matching [..., 7] shapes")
+    if not 0.0 < residual_scale <= 1.0:
+        raise ValueError("residual_scale must be in (0, 1]")
+    return torch.clamp(planner + float(residual_scale) * residual, -1.0, 1.0)
 
 
 def _mixed_batch(
@@ -678,6 +749,7 @@ def _evaluate(
     episode_effort = torch.zeros(count)
     episode_steps = torch.zeros(count, dtype=torch.int64)
     safety_failures = set(env.reward_schema["safety_failures"])
+    teachers = _make_planner_teachers(config.task, env) if config.algorithm == "residual_rlpd" else None
     model.eval()
     try:
         obs = env._last_obs
@@ -692,11 +764,17 @@ def _evaluate(
                     device,
                     stochastic=False,
                 )
-            next_obs, rewards, terminated, truncated, infos = env.step(
-                actions.cpu(), auto_reset=False
-            )
+            policy_actions = actions.cpu()
+            env_actions = policy_actions
+            if teachers is not None:
+                env_actions = _compose_residual_actions(
+                    _planner_actions(env, teachers),
+                    policy_actions,
+                    config.residual_scale,
+                )
+            next_obs, rewards, terminated, truncated, infos = env.step(env_actions, auto_reset=False)
             episode_returns += rewards
-            episode_effort += actions.cpu().square().sum(dim=-1)
+            episode_effort += env_actions.square().sum(dim=-1)
             episode_steps += 1
             dones = torch.logical_or(terminated, truncated)
             done_indices = torch.arange(count)[dones].tolist()
@@ -722,6 +800,8 @@ def _evaluate(
                 break
             if done_indices:
                 next_obs, _ = env.reset(options={"env_idx": done_indices})
+                if teachers is not None:
+                    _reset_planner_teachers(config.task, env, teachers, done_indices)
             obs = next_obs
     finally:
         env.close()
@@ -784,6 +864,8 @@ def _bc_warm_start(
         batch = demos.sample(config.batch_size)
         states = normalizer.normalize(batch["states"], device)
         target = batch["actions"].to(device)
+        if config.algorithm == "residual_rlpd":
+            target = torch.zeros_like(target)
         mean, _ = model._sample_actions(states)
         loss = F.mse_loss(torch.tanh(mean), target)
         actor_optimizer.zero_grad(set_to_none=True)
@@ -859,6 +941,8 @@ def _sac_update(
         demo_batch = demos.sample(config.batch_size)
         demo_states = normalizer.normalize(demo_batch["states"], device)
         demo_actions = demo_batch["actions"].to(device)
+        if config.algorithm == "residual_rlpd":
+            demo_actions = torch.zeros_like(demo_actions)
         demo_mean, _ = model._sample_actions(demo_states)
         actor_bc_loss = F.mse_loss(torch.tanh(demo_mean), demo_actions)
     actor_loss = actor_sac_loss + config.actor_bc_weight * actor_bc_loss
@@ -1004,6 +1088,7 @@ def main() -> None:
     demo_source: dict[str, Any] | None = None
     last_validation: dict[str, Any] | None = None
     last_validation_env_steps = -1
+    training_teachers: list[Any] | None = None
     start_time = time.monotonic()
 
     def checkpoint(path: Path) -> None:
@@ -1031,6 +1116,7 @@ def main() -> None:
             "next_log": next_log,
             "last_validation": last_validation,
             "last_validation_env_steps": last_validation_env_steps,
+            "planner_teachers": training_teachers,
             "rng": _rng_state(),
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1064,11 +1150,17 @@ def main() -> None:
         next_log = int(restored["next_log"])
         last_validation = restored.get("last_validation")
         last_validation_env_steps = int(restored.get("last_validation_env_steps", -1))
+        training_teachers = restored.get("planner_teachers")
+        if config.algorithm == "residual_rlpd":
+            if training_teachers is None or len(training_teachers) != config.num_envs:
+                raise ValueError("residual checkpoint is missing planner teacher state")
+        elif training_teachers is not None:
+            raise ValueError("non-residual checkpoint unexpectedly contains planner state")
         _restore_rng(restored["rng"])
         _append_jsonl(metrics_path, {"event": "resume", "env_steps": global_env_steps})
     else:
         demo_summary = None
-        if config.algorithm in {"bc", "rlpd"}:
+        if config.algorithm in {"bc", "rlpd", "residual_rlpd"}:
             demo_identity = _demo_replay_identity(config, state_schema)
             if args.demo_replay_in is None:
                 demo_summary = _collect_demos(config, demos, normalizer)
@@ -1099,6 +1191,10 @@ def main() -> None:
                 metrics_path,
                 {"event": "demos", "demo_source": demo_source, **demo_summary},
             )
+            if config.algorithm == "residual_rlpd":
+                # The persisted cache stays algorithm-neutral (planner actions), while
+                # the residual MDP treats the same planner transitions as action zero.
+                demos.actions[: demos.size].zero_()
         normalizer.update(obs["states"])
         _bc_warm_start(
             config,
@@ -1153,27 +1249,33 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     episode_returns = torch.zeros(config.num_envs)
     episode_steps = torch.zeros(config.num_envs, dtype=torch.int64)
+    if config.algorithm == "residual_rlpd" and training_teachers is None:
+        training_teachers = _make_planner_teachers(config.task, env)
     try:
         while global_env_steps < config.total_env_steps and not stop_requested:
             if global_env_steps < config.random_env_steps:
-                actions = torch.empty((config.num_envs, 7)).uniform_(-1.0, 1.0)
+                policy_actions = torch.empty((config.num_envs, 7)).uniform_(-1.0, 1.0)
             else:
                 with torch.inference_mode():
-                    actions, _ = _policy_action(
+                    policy_actions, _ = _policy_action(
                         model,
                         normalizer,
                         obs["states"],
                         device,
                         stochastic=True,
                     )
-                    actions = actions.cpu()
-            next_obs, rewards, terminated, truncated, infos = env.step(
-                actions,
-                auto_reset=False,
-            )
+                    policy_actions = policy_actions.cpu()
+            env_actions = policy_actions
+            if training_teachers is not None:
+                env_actions = _compose_residual_actions(
+                    _planner_actions(env, training_teachers),
+                    policy_actions,
+                    config.residual_scale,
+                )
+            next_obs, rewards, terminated, truncated, infos = env.step(env_actions, auto_reset=False)
             online.add(
                 obs["states"],
-                actions,
+                policy_actions,
                 rewards,
                 next_obs["states"],
                 terminated,
@@ -1199,6 +1301,13 @@ def main() -> None:
                 episode_steps[index] = 0
             if done_indices:
                 next_obs, _ = env.reset(options={"env_idx": done_indices})
+                if training_teachers is not None:
+                    _reset_planner_teachers(
+                        config.task,
+                        env,
+                        training_teachers,
+                        done_indices,
+                    )
                 normalizer.update(next_obs["states"].index_select(0, torch.tensor(done_indices)))
             obs = next_obs
             global_env_steps += config.num_envs
