@@ -21,6 +21,7 @@ from examples.embodiment.benchmark_dynamic_benchmark_throughput import _full_com
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
     TransitionReplay,
+    _parse_args,
     _score,
 )
 
@@ -95,3 +96,32 @@ def test_throughput_probe_requires_full_frozen_source_commits() -> None:
     assert _full_commit("source", commit) == commit
     with pytest.raises(ValueError, match="full lowercase"):
         _full_commit("source", "abc123")
+
+
+def test_recipe_yaml_sets_defaults_but_keeps_run_identity_explicit(tmp_path) -> None:
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("task: t2_trans\nalgorithm: rlpd\nnum_envs: 2\n", encoding="utf-8")
+    args = _parse_args(
+        [
+            "--config",
+            str(recipe),
+            "--rlinf-commit",
+            "a" * 40,
+            "--benchmark-commit",
+            "b" * 40,
+            "--output",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert args.task == "t2_trans"
+    assert args.algorithm == "rlpd"
+    assert args.num_envs == 2
+
+
+def test_recipe_yaml_rejects_run_specific_provenance(tmp_path) -> None:
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("task: t2_trans\nrlinf_commit: unsafe\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="run-specific"):
+        _parse_args(["--config", str(recipe)])

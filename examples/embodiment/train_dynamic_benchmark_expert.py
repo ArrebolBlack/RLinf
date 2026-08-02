@@ -24,6 +24,7 @@ import math
 import os
 import random
 import signal
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -240,6 +241,11 @@ class TransitionReplay:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Optional YAML defaults; source commits and output stay explicit CLI arguments.",
+    )
     parser.add_argument("--task", required=True)
     parser.add_argument("--algorithm", choices=("bc", "sac", "rlpd"), default="rlpd")
     parser.add_argument("--rlinf-commit", required=True)
@@ -277,6 +283,33 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-size", type=int, default=4096)
     parser.add_argument("--image-size", type=int, default=64)
     return parser
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Load recipe defaults without hiding run identity or output provenance."""
+    arguments = sys.argv[1:] if argv is None else argv
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=Path)
+    pre_args, _ = pre_parser.parse_known_args(arguments)
+    parser = _parser()
+    if pre_args.config is not None:
+        import yaml
+
+        payload = yaml.safe_load(pre_args.config.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Dynamic Benchmark config must be a YAML mapping")
+        explicit_only = {"config", "output", "resume", "rlinf_commit", "benchmark_commit"}
+        actions = {action.dest: action for action in parser._actions}
+        unknown = sorted(set(payload) - set(actions))
+        forbidden = sorted(set(payload) & explicit_only)
+        if unknown:
+            raise ValueError(f"unknown Dynamic Benchmark config keys: {unknown}")
+        if forbidden:
+            raise ValueError(f"run-specific keys must stay on the CLI: {forbidden}")
+        parser.set_defaults(**payload)
+        for name in payload:
+            actions[name].required = False
+    return parser.parse_args(arguments)
 
 
 def _config(args: argparse.Namespace) -> TrainConfig:
@@ -785,7 +818,7 @@ def main() -> None:
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
-    args = _parser().parse_args()
+    args = _parse_args()
     config = _config(args)
     if not torch.cuda.is_available():
         raise RuntimeError("Dynamic Benchmark expert training requires CUDA")

@@ -36,6 +36,7 @@ FROM base-image-platform-${PLATFORM} AS base-image-embodied-maniskill_libero
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-behavior-openvlaoft
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-behavior-openpi
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-metaworld
+FROM base-image-platform-${PLATFORM} AS base-image-embodied-dynamic_benchmark
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-calvin
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-robocasa
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-isaaclab
@@ -264,6 +265,17 @@ RUN link_assets
 
 # Set default env
 RUN echo "source ${UV_PATH}/openpi/bin/activate" >> ~/.bashrc
+
+
+##################################################################################################
+# Embodied: Dynamic Benchmark (runtime deps; mount the research-only SE3-WAM source at runtime)
+##################################################################################################
+FROM embodied-common-image AS embodied-dynamic_benchmark-image
+
+RUN SE3_WAM_INSTALL_MODE=deps-only bash requirements/install.sh ${INSTALL_MIRROR_OPTION} \
+    --platform ${RLINF_PLATFORM} embodied --venv dynamic-benchmark --env dynamic_benchmark
+
+RUN echo "source ${UV_PATH}/dynamic-benchmark/bin/activate" >> ~/.bashrc
 
 
 ##################################################################################################

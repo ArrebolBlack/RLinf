@@ -134,6 +134,7 @@ RLinf supports SFT, simulation RL, and real-world RL for World Action Models (WA
           <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/roboverse.html">RoboVerse</a> ✅</li>
           <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/behavior.html">BEHAVIOR</a> ✅</li>
           <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/metaworld.html">MetaWorld</a> ✅</li>
+          <li><a href="docs/source-en/rst_source/examples/embodied/dynamic_benchmark.rst">Dynamic Benchmark</a> 🧪</li>
           <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/isaaclab.html">IsaacLab</a> ✅</li>
           <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/calvin.html">CALVIN</a> ✅</li>
           <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/robocasa.html">RoboCasa</a> ✅</li>

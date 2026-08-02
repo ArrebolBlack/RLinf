@@ -22,6 +22,18 @@ Each `BUILD_TARGET` maps to a build stage in [`Dockerfile`](Dockerfile). To see 
 - Per-platform runtime versions: `CUDA_VER`, `ROCM_VER`, `ROCM_ARCHS`, `CANN_VER`, `UBUNTU_VER`. Override any of these to bump versions without changing the rest of the build. For a fully custom base, set `NVIDIA_BASE_IMAGE`, `AMD_BASE_IMAGE`, or `ASCEND_BASE_IMAGE` directly.
 - `NO_MIRROR` — set to `1` to skip the USTC apt/pypi mirror rewrites (recommended outside of mainland China).
 
+The `embodied-dynamic_benchmark` target contains RLinf and the pinned MuJoCo /
+robosuite runtime dependencies. The SE3-WAM benchmark source is research-only and
+is intentionally not copied into the public image. Mount that checkout and install
+it in the image before running a recipe:
+
+```shell
+docker run --rm -it --gpus all \
+    -v /path/to/SE3-WAM:/workspace/SE3-WAM \
+    rlinf:embodied-dynamic_benchmark \
+    bash -lc 'uv pip install -e "/workspace/SE3-WAM[benchmark]" && exec bash'
+```
+
 Example with non-default args:
 
 ```shell
