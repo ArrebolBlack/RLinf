@@ -28,6 +28,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
@@ -127,6 +128,109 @@ def _model_kwargs(config: Mapping[str, Any], state_dim: int) -> dict[str, Any]:
         "critic_obs_dim": state_dim,
         "num_q_heads": q_heads,
     }
+
+
+class _InferenceMLPPolicy(nn.Module):
+    """Actor-only reconstruction of the training MLP for frozen inference.
+
+    Importing ``rlinf.models`` also imports the distributed scheduler and Ray.
+    Evaluation and trajectory export only call ``_sample_actions``, so keep this
+    path independent of the training stack while validating the omitted head
+    weights in :func:`_load_inference_policy`.
+    """
+
+    def __init__(self, state_dim: int, algorithm: str) -> None:
+        super().__init__()
+        self.independent_std = algorithm == "ppo"
+        self.final_tanh = algorithm != "ppo"
+        self.logstd_range = (-5.0, 2.0)
+        self.backbone = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Tanh(),
+        )
+        self.actor_mean = nn.Linear(256, 7)
+        if self.independent_std:
+            self.actor_logstd = nn.Parameter(torch.empty(1, 7))
+        else:
+            self.actor_logstd = nn.Linear(256, 7)
+
+    def _sample_actions(
+        self, states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.backbone(states)
+        mean = self.actor_mean(features)
+        if self.independent_std:
+            log_std = self.actor_logstd.expand_as(mean)
+        else:
+            log_std = self.actor_logstd(features)
+            log_std = torch.tanh(log_std)
+            low, high = self.logstd_range
+            log_std = low + 0.5 * (high - low) * (log_std + 1.0)
+        return mean, log_std
+
+
+def _load_inference_policy(
+    config: Mapping[str, Any],
+    state_dim: int,
+    state_dict: Mapping[str, Any],
+    device: torch.device,
+) -> _InferenceMLPPolicy:
+    """Strictly validate a training checkpoint and load its inference actor."""
+
+    kwargs = _model_kwargs(config, state_dim)
+    algorithm = str(config["algorithm"])
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError("policy model state must be a non-empty mapping")
+    if any(not isinstance(key, str) for key in state_dict):
+        raise ValueError("policy model state keys must be strings")
+    if any(not isinstance(value, torch.Tensor) for value in state_dict.values()):
+        raise ValueError("policy model state values must be tensors")
+
+    model = _InferenceMLPPolicy(state_dim, algorithm)
+    actor_keys = set(model.state_dict())
+    available = set(state_dict)
+    missing = actor_keys - available
+    if missing:
+        raise ValueError(f"policy actor state is missing keys: {sorted(missing)}")
+    auxiliary = available - actor_keys
+
+    if algorithm == "ppo":
+        if not auxiliary or any(not key.startswith("value_head.") for key in auxiliary):
+            raise ValueError("PPO checkpoint must contain only actor and value-head state")
+    else:
+        buffer_keys = {"action_scale", "action_bias"}
+        q_keys = auxiliary - buffer_keys
+        if auxiliary & buffer_keys != buffer_keys or not q_keys:
+            raise ValueError("SAC-family checkpoint is missing Q-head or action buffers")
+        if any(not key.startswith("q_head.qs.") for key in q_keys):
+            raise ValueError("SAC-family checkpoint contains unsupported model state")
+        q_indices: set[int] = set()
+        for key in q_keys:
+            parts = key.split(".")
+            if len(parts) < 4 or not parts[2].isdigit():
+                raise ValueError("SAC-family Q-head key has an invalid structure")
+            q_indices.add(int(parts[2]))
+        if q_indices != set(range(int(kwargs["num_q_heads"]))):
+            raise ValueError("SAC-family checkpoint Q-head count does not match config")
+        for key, expected in (("action_scale", 1.0), ("action_bias", 0.0)):
+            value = state_dict[key]
+            if value.numel() != 1 or not torch.isfinite(value).all():
+                raise ValueError(f"policy {key} buffer must be one finite scalar")
+            if float(value.detach().cpu().reshape(())) != expected:
+                raise ValueError(f"policy {key} buffer has unsupported bounds")
+
+    actor_state = {key: state_dict[key] for key in actor_keys}
+    try:
+        model.load_state_dict(actor_state, strict=True)
+    except RuntimeError as error:
+        raise ValueError("policy actor tensor shapes do not match its schema") from error
+    model.to(device)
+    model.eval()
+    return model
 
 
 def _validate_policy_payload(
@@ -377,8 +481,6 @@ def main() -> None:
     from se3_wam.benchmark.evaluation import manifest_record, summarize_task_records
 
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
-    from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
-
     args = _parser().parse_args()
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite {args.output}")
@@ -401,9 +503,7 @@ def main() -> None:
     )
     device = _device(args.device)
     state_dim = int(state_schema["state_dim"])
-    model = MLPPolicy(**_model_kwargs(config, state_dim)).to(device)
-    model.load_state_dict(payload["model"], strict=True)
-    model.eval()
+    model = _load_inference_policy(config, state_dim, payload["model"], device)
     normalizer = RunningNormalizer(state_dim, int(state_schema["mask_dim"]))
     normalizer.load_state_dict(payload["normalizer"])
 

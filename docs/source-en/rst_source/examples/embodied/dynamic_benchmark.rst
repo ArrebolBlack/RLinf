@@ -210,6 +210,57 @@ The planner evaluator stores the same reset identity, executed actions, exact re
 evidence, task metrics, and decision-latency gate. Test-ID/OOD remain available only
 for the single post-freeze comparison.
 
+Export best-known trajectories
+------------------------------
+
+After validation freezes the candidate pool, put exactly one planner at candidate
+index zero and the hash-pinned policies after it in a
+``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` JSON manifest. Each policy row
+records its path, SHA-256, stochastic flag, exploration seed offset, and optional
+residual-scale override. Exporters use a frozen 8→16→32 escalation budget and select
+the first stable winner under success, safety, completion, return, control steps, and
+action effort:
+
+.. code-block:: bash
+
+   CANDIDATES=outputs/dynamic_benchmark/t2_candidates.json
+   CANDIDATES_SHA=$(sha256sum "$CANDIDATES" | cut -d' ' -f1)
+   python examples/embodiment/export_dynamic_benchmark_optimal_trajectories.py \
+      --candidate-manifest "$CANDIDATES" \
+      --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --rlinf-commit "$RLINF_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --split train --manifest-seed 20261050 \
+      --accepted-episodes 100 --max-resets 200 \
+      --output outputs/dynamic_benchmark/t2_optimal_v1
+
+An interrupted export can repeat the same command with ``--resume``. It verifies the
+immutable source and candidate identities, preserves any uncommitted tail in a
+sibling recovery directory, truncates JSONL files to the last atomically committed
+reset boundary, and reruns that reset. Every attempt keeps a lightweight
+state/action/reward tape and exact replay evidence; each winner additionally keeps
+RGB-D/HDF5 evidence.
+
+Run the independent auditor before consuming the dataset. Pass the final
+``dataset_card.json`` and ``checksums.sha256`` hashes printed by the exporter:
+
+.. code-block:: bash
+
+   python examples/embodiment/audit_dynamic_benchmark_optimal_trajectories.py \
+      --dataset-root outputs/dynamic_benchmark/t2_optimal_v1 \
+      --expected-dataset-card-sha256 "$DATASET_CARD_SHA" \
+      --expected-checksums-sha256 "$CHECKSUMS_SHA" \
+      --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --auditor-commit "$EVALUATOR_COMMIT" \
+      --output outputs/dynamic_benchmark/t2_optimal_v1.audit.json
+
+The auditor independently recomputes checksums, tape shapes and hashes, scores,
+escalation, winner selection, exact benchmark replay, and HDF5/lightweight action
+parity. Only a passing audit writes ``training_eligible=true``. Here ``optimal`` means
+best-known within the immutable candidate/reset/budget contract, not a proof of
+global continuous-control optimality.
+
 Visualization and Results
 -------------------------
 

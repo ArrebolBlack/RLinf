@@ -205,6 +205,51 @@ policy：
 planner evaluator 同样保存 reset identity、实际动作、exact replay 证据、任务指标和决策
 延迟门；test-ID/OOD 只用于冻结后的单次比较。
 
+导出 best-known 轨迹
+-------------------
+
+基于 validation 冻结候选池后，使用
+``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` JSON manifest：candidate index 0
+必须是唯一 planner，其后是 hash-pinned policies。每个 policy 条目记录路径、SHA-256、
+stochastic 标志、exploration seed offset 与可选 residual-scale override。exporter 使用冻结的
+8→16→32 候选升级预算，并按 success、安全、完成度、return、控制步数、动作能耗的稳定
+词典序选择 winner：
+
+.. code-block:: bash
+
+   CANDIDATES=outputs/dynamic_benchmark/t2_candidates.json
+   CANDIDATES_SHA=$(sha256sum "$CANDIDATES" | cut -d' ' -f1)
+   python examples/embodiment/export_dynamic_benchmark_optimal_trajectories.py \
+      --candidate-manifest "$CANDIDATES" \
+      --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --rlinf-commit "$RLINF_COMMIT" \
+      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --split train --manifest-seed 20261050 \
+      --accepted-episodes 100 --max-resets 200 \
+      --output outputs/dynamic_benchmark/t2_optimal_v1
+
+中断后可用相同命令追加 ``--resume``。恢复前会严格核验源码/候选 identity，把未提交尾部保存在
+同级 recovery 目录，将 JSONL 截断到最后一次原子提交的 reset 边界，并重跑该 reset。每次
+attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据；winner 额外保存 RGB-D/HDF5。
+
+消费数据集前必须运行独立 auditor，并传入 exporter 最终打印的 ``dataset_card.json`` 与
+``checksums.sha256`` 哈希：
+
+.. code-block:: bash
+
+   python examples/embodiment/audit_dynamic_benchmark_optimal_trajectories.py \
+      --dataset-root outputs/dynamic_benchmark/t2_optimal_v1 \
+      --expected-dataset-card-sha256 "$DATASET_CARD_SHA" \
+      --expected-checksums-sha256 "$CHECKSUMS_SHA" \
+      --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --auditor-commit "$EVALUATOR_COMMIT" \
+      --output outputs/dynamic_benchmark/t2_optimal_v1.audit.json
+
+auditor 会独立复算根目录 checksum、tape shape/hash、score、升级预算、winner 选择、benchmark
+exact replay 与 HDF5/轻量 action parity。只有全部通过才写入 ``training_eligible=true``。
+这里的 ``optimal`` 指冻结 candidate/reset/budget 合同内的 best-known，不代表连续控制全局最优证明。
+
 可视化与结果
 ------------
 

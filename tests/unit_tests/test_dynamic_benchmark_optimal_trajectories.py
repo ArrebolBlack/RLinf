@@ -1,0 +1,260 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
+    _audit_attempt_tape,
+)
+from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
+    _payload_sha256 as _audit_payload_sha256,
+)
+from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
+    CANDIDATE_SCHEMA,
+    _budget_sequence,
+    _candidate_identity,
+    _eligible,
+    _file_boundary,
+    _progress_payload,
+    _quality_score,
+    _recover_partial_output,
+    _select_winner,
+    _validate_candidate_manifest,
+    _write_attempt_tape,
+)
+
+
+def _record(candidate_index: int, *, value: float = 1.0) -> dict:
+    replay = {"passed": True, "outcomes_exact": True}
+    record = {
+        "success": True,
+        "safety_failure": False,
+        "finite_and_bounded": True,
+        "replay_validation": replay,
+        "trajectory_completion": 1.0,
+        "return": value,
+        "control_steps": 4,
+        "action_l2_sum": 2.0,
+        "candidate_index": candidate_index,
+    }
+    record["quality_score"] = list(_quality_score(record))
+    record["eligible"] = _eligible(record)
+    return record
+
+
+def test_budget_sequence_doubles_to_frozen_maximum() -> None:
+    assert _budget_sequence(8, 32) == (8, 16, 32)
+    assert _budget_sequence(12, 32) == (12, 24, 32)
+    with pytest.raises(ValueError, match="candidate budgets"):
+        _budget_sequence(16, 8)
+
+
+def test_candidate_manifest_is_commit_bound_and_resolves_relative_paths(
+    tmp_path: Path,
+) -> None:
+    candidates = [{"candidate_id": "planner", "kind": "planner"}]
+    candidates.extend(
+        {
+            "candidate_id": f"policy-{index}",
+            "kind": "policy",
+            "policy_path": f"policies/{index}.pt",
+            "policy_sha256": f"{index:x}" * 64,
+            "stochastic": True,
+            "exploration_seed_offset": index,
+        }
+        for index in range(1, 8)
+    )
+    payload = {
+        "schema_version": CANDIDATE_SCHEMA,
+        "task": "t2_trans",
+        "rlinf_commit": "a" * 40,
+        "benchmark_commit": "b" * 40,
+        "candidates": candidates,
+    }
+
+    task, specs = _validate_candidate_manifest(
+        payload,
+        manifest_path=tmp_path / "candidates.json",
+        rlinf_commit="a" * 40,
+        benchmark_commit="b" * 40,
+        max_k=8,
+    )
+
+    assert task == "t2_trans"
+    assert specs[1].policy_path == (tmp_path / "policies/1.pt").resolve()
+    assert _candidate_identity(specs[1])["policy_path"] == str(
+        (tmp_path / "policies/1.pt").resolve()
+    )
+    with pytest.raises(ValueError, match="benchmark commit"):
+        _validate_candidate_manifest(
+            payload,
+            manifest_path=tmp_path / "candidates.json",
+            rlinf_commit="a" * 40,
+            benchmark_commit="c" * 40,
+            max_k=8,
+        )
+    payload["candidates"] = [*payload["candidates"][1:], payload["candidates"][0]]
+    with pytest.raises(ValueError, match="planner at index zero"):
+        _validate_candidate_manifest(
+            payload,
+            manifest_path=tmp_path / "candidates.json",
+            rlinf_commit="a" * 40,
+            benchmark_commit="b" * 40,
+            max_k=8,
+        )
+
+
+def test_winner_selection_is_quality_first_then_stable_candidate_index() -> None:
+    first = _record(0)
+    same_quality_later = _record(1)
+    better_return = _record(2, value=2.0)
+
+    assert _select_winner([same_quality_later, first]) is first
+    assert _select_winner([first, better_return]) is better_return
+    better_return["safety_failure"] = True
+    better_return["eligible"] = _eligible(better_return)
+    assert _select_winner([first, better_return]) is first
+
+
+def test_attempt_tape_round_trip_recomputes_shapes_hashes_and_score(tmp_path: Path) -> None:
+    steps = 3
+    arrays = {
+        "states": np.arange((steps + 1) * 5, dtype=np.float32).reshape(steps + 1, 5),
+        "policy_actions": np.full((steps, 7), 0.25, dtype=np.float32),
+        "actions": np.full((steps, 7), 0.5, dtype=np.float64),
+        "rewards": np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
+        "terminated": np.asarray([False, False, True], dtype=np.bool_),
+        "truncated": np.zeros(steps, dtype=np.bool_),
+    }
+    relative, tape_sha256 = _write_attempt_tape(
+        tmp_path,
+        episode_id="episode-1",
+        candidate_index=0,
+        arrays=arrays,
+    )
+    replay = {"passed": True, "outcomes_exact": True}
+    record = {
+        "schema_version": "rlinf-dynamic-benchmark-optimal-attempt-v0.1",
+        "task_id": "t2_trans",
+        "success": True,
+        "safety_failure": False,
+        "finite_and_bounded": True,
+        "trajectory_completion": 1.0,
+        "return": float(arrays["rewards"].sum(dtype=np.float64)),
+        "control_steps": steps,
+        "action_l2_sum": float(np.square(arrays["actions"]).sum()),
+        "candidate_index": 0,
+        "attempt_tape": relative,
+        "attempt_tape_sha256": tape_sha256,
+        "state_sha256": hashlib.sha256(
+            np.ascontiguousarray(arrays["states"]).tobytes()
+        ).hexdigest(),
+        "policy_action_sha256": hashlib.sha256(
+            np.ascontiguousarray(arrays["policy_actions"]).tobytes()
+        ).hexdigest(),
+        "action_sha256": hashlib.sha256(
+            np.ascontiguousarray(arrays["actions"]).tobytes()
+        ).hexdigest(),
+        "reward_sha256": hashlib.sha256(
+            np.ascontiguousarray(arrays["rewards"]).tobytes()
+        ).hexdigest(),
+        "replay_validation": replay,
+        "replay_validation_sha256": _audit_payload_sha256(replay),
+    }
+    record["quality_score"] = list(_quality_score(record))
+    record["eligible"] = _eligible(record)
+
+    _audit_attempt_tape(tmp_path, record, expected_task="t2_trans")
+
+    record["action_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="content checksum"):
+        _audit_attempt_tape(tmp_path, record, expected_task="t2_trans")
+
+
+def test_resume_preserves_dirty_tail_and_restores_committed_boundary(tmp_path: Path) -> None:
+    output = tmp_path / "export"
+    output.mkdir()
+    paths = {
+        name: output / name
+        for name in ("attempts.jsonl", "reset_results.jsonl", "winner_manifest.jsonl")
+    }
+    committed = {
+        "attempts.jsonl": b'{"attempt":0}\n',
+        "reset_results.jsonl": b'{"reset":0}\n',
+        "winner_manifest.jsonl": b'{"winner":0}\n',
+    }
+    for name, path in paths.items():
+        path.write_bytes(committed[name])
+    progress = _progress_payload(
+        export_state_sha256="a" * 64,
+        started_unix_s=1.0,
+        next_reset_index=1,
+        accepted_count=1,
+        candidate_attempt_count=1,
+        budget_histogram={"8": 1},
+        attempts_path=paths["attempts.jsonl"],
+        reset_results_path=paths["reset_results.jsonl"],
+        winners_path=paths["winner_manifest.jsonl"],
+        resume_count=0,
+        recovery_events=[],
+    )
+    for path in paths.values():
+        with path.open("ab") as stream:
+            stream.write(b'{"dirty":true}\n')
+    dirty_episode = "episode-1"
+    lightweight = output / "lightweight" / dirty_episode
+    published = output / "episodes" / "t2_trans" / "train" / dirty_episode
+    staging = output / ".staging" / "partial"
+    for directory in (lightweight, published, staging):
+        directory.mkdir(parents=True)
+        (directory / "evidence.bin").write_bytes(b"dirty")
+    rows = [
+        SimpleNamespace(request=SimpleNamespace(episode_id="episode-0")),
+        SimpleNamespace(request=SimpleNamespace(episode_id=dirty_episode)),
+    ]
+
+    recovery_name = _recover_partial_output(
+        output=output,
+        progress=progress,
+        reset_rows=rows,
+        task="t2_trans",
+        split="train",
+    )
+
+    assert recovery_name is not None
+    recovery = output.parent / recovery_name
+    assert recovery.is_dir()
+    for name, path in paths.items():
+        assert path.read_bytes() == committed[name]
+        assert _file_boundary(path) == progress["file_boundaries"][name]
+        assert (recovery / name).is_file()
+    assert not lightweight.exists()
+    assert not published.exists()
+    assert not (output / ".staging").exists()
+    assert (recovery / "lightweight" / dirty_episode / "evidence.bin").is_file()
+    assert (
+        recovery
+        / "episodes"
+        / "t2_trans"
+        / "train"
+        / dirty_episode
+        / "evidence.bin"
+    ).is_file()
