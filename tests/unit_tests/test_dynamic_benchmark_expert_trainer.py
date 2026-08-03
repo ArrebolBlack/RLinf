@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -69,10 +71,46 @@ def test_transition_replay_round_trip_preserves_data_cursor_and_sampling_rng() -
 
     assert restored.size == replay.size == 4
     assert restored.cursor == replay.cursor == 2
+    assert torch.equal(
+        replay.states,
+        torch.tensor([[8.0, 9.0], [10.0, 11.0], [4.0, 5.0], [6.0, 7.0]]),
+    )
     original_sample = replay.sample(16)
     restored_sample = restored.sample(16)
     for name in TransitionReplay.FIELDS:
         assert torch.equal(original_sample[name], restored_sample[name])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-backed replay gate")
+@pytest.mark.parametrize("storage", ["pinned_cpu", "gpu"])
+def test_transition_replay_storage_paths_preserve_cpu_sampling(storage: str) -> None:
+    states = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    payload = (
+        states,
+        torch.arange(42, dtype=torch.float32).reshape(6, 7),
+        torch.arange(6, dtype=torch.float32),
+        states + 1.0,
+        torch.tensor([False, False, True, False, False, True]),
+        torch.zeros(6, dtype=torch.bool),
+    )
+    baseline = TransitionReplay(capacity=16, state_dim=4, seed=17)
+    candidate = TransitionReplay(
+        capacity=16,
+        state_dim=4,
+        seed=17,
+        storage=storage,
+        device=torch.device("cuda:0"),
+    )
+    baseline.add(*payload)
+    candidate.add(*payload)
+
+    baseline_sample = baseline.sample(32)
+    candidate_sample = candidate.sample(32)
+
+    for name in TransitionReplay.FIELDS:
+        assert torch.equal(baseline_sample[name], candidate_sample[name].cpu())
+    if storage == "pinned_cpu":
+        assert all(value.is_pinned() for value in candidate_sample.values())
 
 
 def test_policy_score_is_success_then_safety_lexicographic() -> None:
@@ -125,7 +163,9 @@ def test_recipe_yaml_sets_defaults_but_keeps_run_identity_explicit(tmp_path) -> 
     assert args.num_envs == 2
 
 
-@pytest.mark.parametrize("key", ["rlinf_commit", "demo_replay_in"])
+@pytest.mark.parametrize(
+    "key", ["rlinf_commit", "demo_rlinf_commit", "demo_replay_in"]
+)
 def test_recipe_yaml_rejects_run_specific_provenance(tmp_path, key: str) -> None:
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text(f"task: t2_trans\n{key}: unsafe\n", encoding="utf-8")
@@ -176,7 +216,13 @@ def test_safety_penalty_is_explicit_and_reaches_environment_and_cache_identity(
     config = _config(_parse_args(common))
 
     assert config.reward_safety_penalty == -30.0
-    assert _env_cfg(config, split="train", seed=17, num_envs=2)[
+    assert _env_cfg(
+        config,
+        split="train",
+        seed=17,
+        num_envs=2,
+        worker_threads=1,
+    )[
         "reward_safety_penalty"
     ] == -30.0
     assert _demo_replay_identity(
@@ -233,6 +279,13 @@ def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
     config = _config(args)
     state_schema = {"state_dim": 2, "mask_dim": 0, "fields": ["fixture"]}
     identity = _demo_replay_identity(config, state_schema)
+    assert _demo_replay_identity(replace(config, num_envs=32), state_schema) == identity
+    assert (
+        _demo_replay_identity(
+            replace(config, demo_rlinf_commit="c" * 40), state_schema
+        )
+        != identity
+    )
     replay = TransitionReplay(capacity=8, state_dim=2, seed=14)
     states = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     replay.add(

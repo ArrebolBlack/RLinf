@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Union
 
 import gym
@@ -98,6 +99,9 @@ class DynamicBenchmarkEnv(gym.Env):
         self.camera_observations = bool(_cfg_get(cfg, "camera_observations", False))
         self.auto_reset = bool(_cfg_get(cfg, "auto_reset", True))
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
+        self.worker_threads = int(_cfg_get(cfg, "worker_threads", 1))
+        if self.worker_threads < 1:
+            raise ValueError("Dynamic Benchmark worker_threads must be positive")
         self.use_rel_reward = False
         self.group_size = int(_cfg_get(cfg, "group_size", 1))
         self.num_group = max(1, self.num_envs // max(1, self.group_size))
@@ -125,6 +129,14 @@ class DynamicBenchmarkEnv(gym.Env):
             )
             for _ in range(self.num_envs)
         ]
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=min(self.worker_threads, self.num_envs),
+                thread_name_prefix="dynamic-benchmark",
+            )
+            if self.worker_threads > 1 and self.num_envs > 1
+            else None
+        )
         self.horizon_steps = int(self.envs[0].horizon_steps)
         if any(int(env.horizon_steps) != self.horizon_steps for env in self.envs):
             raise RuntimeError("Dynamic Benchmark vector members disagree on horizon")
@@ -303,6 +315,28 @@ class DynamicBenchmarkEnv(gym.Env):
             event_tape_type=self._T5EventTape,
         )
 
+    def _reset_one(self, item: tuple[int, Any]) -> tuple[int, Any]:
+        index, request = item
+        observation = self.envs[index].reset(request)
+        self._arm_hidden_t5_event(self.envs[index], request)
+        return index, observation
+
+    def _step_one(self, item: tuple[int, np.ndarray]) -> tuple[int, Any, Any, tuple[str, ...]]:
+        index, values = item
+        env = self.envs[index]
+        observation = self._raw_observations[index]
+        request = self._requests[index]
+        if observation is None or request is None:
+            raise RuntimeError("Dynamic Benchmark vector member is not initialized")
+        action = self._ActionCommand(
+            mode=request.action_mode,
+            values=values,
+            policy_step=observation.policy_step,
+        )
+        result = env.step(action)
+        event_names = tuple(event.name for event in env._ledger.events)
+        return index, action, result, event_names
+
     def reset(
         self,
         *,
@@ -329,17 +363,21 @@ class DynamicBenchmarkEnv(gym.Env):
             if self._last_obs is None
             else self._last_obs["states"].cpu().numpy().copy()
         )
-        for index in indices:
-            request = self._next_request()
-            observation = self.envs[int(index)].reset(request)
-            self._arm_hidden_t5_event(self.envs[int(index)], request)
+        reset_items = [(int(index), self._next_request()) for index in indices]
+        requests_by_index = dict(reset_items)
+        if self._executor is None or len(reset_items) < 2:
+            reset_results = [self._reset_one(item) for item in reset_items]
+        else:
+            reset_results = list(self._executor.map(self._reset_one, reset_items))
+        for index, observation in reset_results:
+            request = requests_by_index[index]
             state = self._encode(observation, request)
             if states.shape[1] == 0:
                 states = np.zeros((self.num_envs, state.size), dtype=np.float32)
-            states[int(index)] = state
-            self._raw_observations[int(index)] = observation
-            self._requests[int(index)] = request
-            self._needs_reset[int(index)] = False
+            states[index] = state
+            self._raw_observations[index] = observation
+            self._requests[index] = request
+            self._needs_reset[index] = False
         obs = {"states": torch.as_tensor(states, dtype=torch.float32)}
         self._last_obs = obs
         self._is_start = True
@@ -385,28 +423,25 @@ class DynamicBenchmarkEnv(gym.Env):
         successes = np.zeros(self.num_envs, dtype=bool)
         completions = np.zeros(self.num_envs, dtype=np.float32)
         termination_reasons: list[str | None] = [None] * self.num_envs
-        component_rows: list[dict[str, float]] = []
-        event_name_rows: list[list[str]] = []
+        component_rows: list[dict[str, float]] = [{} for _ in range(self.num_envs)]
+        event_name_rows: list[list[str]] = [[] for _ in range(self.num_envs)]
         active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
-        for index, env in enumerate(self.envs):
+        active_items: list[tuple[int, np.ndarray]] = []
+        for index, _env in enumerate(self.envs):
             if self._needs_reset[index]:
                 terminations[index] = True
-                component_rows.append({"total": 0.0})
-                event_name_rows.append([])
+                component_rows[index] = {"total": 0.0}
                 continue
-            observation = self._raw_observations[index]
+            active_items.append((index, action_array[index]))
+        if self._executor is None or len(active_items) < 2:
+            step_results = [self._step_one(item) for item in active_items]
+        else:
+            step_results = list(self._executor.map(self._step_one, active_items))
+        for index, action, result, event_names in step_results:
             request = self._requests[index]
-            if observation is None or request is None:
-                raise RuntimeError("Dynamic Benchmark vector member is not initialized")
-            action = self._ActionCommand(
-                mode=request.action_mode,
-                values=action_array[index],
-                policy_step=observation.policy_step,
-            )
-            result = env.step(action)
-            event_names = tuple(event.name for event in env._ledger.events)
-            event_name_rows.append(list(event_names))
+            assert request is not None
+            event_name_rows[index] = list(event_names)
             active_stage_progresses[index] = float(result.active_stage_progress)
             reward, components = self.reward_trackers[index].step(
                 action=action.values,
@@ -428,7 +463,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 active_stage_progress=result.active_stage_progress,
             )
             termination_reasons[index] = result.termination_reason
-            component_rows.append(components)
+            component_rows[index] = components
             stepped[index] = True
             if result.terminated or result.truncated:
                 self._needs_reset[index] = True
@@ -613,6 +648,7 @@ class DynamicBenchmarkEnv(gym.Env):
             "image_size": self.image_size,
             "camera_observations": self.camera_observations,
             "num_envs": self.num_envs,
+            "worker_threads": self.worker_threads,
             "state_schema": self.state_schema,
         }
 
@@ -705,5 +741,8 @@ class DynamicBenchmarkEnv(gym.Env):
         self._is_start = bool(state["is_start"])
 
     def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         for env in self.envs:
             env.close()
