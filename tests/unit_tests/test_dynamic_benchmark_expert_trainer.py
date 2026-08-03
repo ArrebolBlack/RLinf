@@ -32,6 +32,7 @@ from examples.embodiment.benchmark_dynamic_benchmark_throughput import _full_com
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
     TransitionReplay,
+    _BorrowedEvaluationRuntime,
     _compose_residual_actions,
     _config,
     _demo_replay_identity,
@@ -250,6 +251,7 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     assert env_cfg["process_residual_planner"] is False
     assert config.sampler_learner_overlap is False
     assert config.persistent_eval_workers is False
+    assert config.borrow_training_env_for_eval is False
     overlap_config = _config(_parse_args([*common, "--sampler-learner-overlap"]))
     assert overlap_config.sampler_learner_overlap is True
     with pytest.raises(ValueError, match="threads=1"):
@@ -297,6 +299,37 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
         _config(
             _parse_args([*without_eval_processes, "--persistent-eval-workers"])
         )
+    borrowed_common = [
+        "--task",
+        "t4_sphere",
+        "--algorithm",
+        "residual_rlpd",
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "borrowed"),
+        "--num-envs",
+        "4",
+        "--eval-num-envs",
+        "4",
+        "--env-worker-processes",
+        "4",
+        "--eval-worker-processes",
+        "4",
+        "--borrow-training-env-for-eval",
+    ]
+    borrowed_config = _config(_parse_args(borrowed_common))
+    assert borrowed_config.borrow_training_env_for_eval is True
+    with pytest.raises(ValueError, match="exclusive with persistent"):
+        _config(_parse_args([*borrowed_common, "--persistent-eval-workers"]))
+    with pytest.raises(ValueError, match="matching train/eval vector width"):
+        _config(_parse_args([*borrowed_common, "--eval-num-envs", "8"]))
+    with pytest.raises(ValueError, match="matching train/eval worker topology"):
+        _config(_parse_args([*borrowed_common, "--eval-worker-processes", "2"]))
+    with pytest.raises(ValueError, match="does not support process evaluation planner"):
+        _config(_parse_args([*borrowed_common, "--eval-planner-in-processes"]))
 
 
 def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
@@ -377,6 +410,164 @@ def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
     runtime.close()
     assert env.closed is True
     assert runtime.closed is True
+
+
+def test_borrowed_evaluation_runtime_restores_training_state_and_teachers(
+    tmp_path, monkeypatch
+) -> None:
+    config = _config(
+        _parse_args(
+            [
+                "--task",
+                "t4_sphere",
+                "--algorithm",
+                "residual_rlpd",
+                "--rlinf-commit",
+                "a" * 40,
+                "--benchmark-commit",
+                "b" * 40,
+                "--output",
+                str(tmp_path / "run"),
+                "--num-envs",
+                "2",
+                "--eval-num-envs",
+                "2",
+                "--env-worker-processes",
+                "2",
+                "--eval-worker-processes",
+                "2",
+                "--borrow-training-env-for-eval",
+            ]
+        )
+    )
+
+    class FakeEnv:
+        num_envs = 2
+        seed_offset = 0
+
+        def __init__(self) -> None:
+            self.split_name = "train"
+            self.base_manifest_seed = config.train_manifest_seed
+            self._last_obs = {"states": torch.tensor([[1.0], [2.0]])}
+            self.loaded = 0
+
+        def checkpoint_state(self):
+            return {
+                "identity": {
+                    "split": self.split_name,
+                    "base_manifest_seed": self.base_manifest_seed,
+                },
+                "states": self._last_obs["states"].clone(),
+            }
+
+        def set_manifest_context(self, *, split_name, base_manifest_seed) -> None:
+            self.split_name = split_name
+            self.base_manifest_seed = base_manifest_seed
+
+        def reset(self, *, options):
+            assert options == {"env_idx": [0, 1]}
+            self._last_obs = {"states": torch.tensor([[7.0], [8.0]])}
+            return self._last_obs, {}
+
+        def load_checkpoint_state(self, checkpoint) -> None:
+            self.loaded += 1
+            self._last_obs = {"states": checkpoint["states"].clone()}
+
+    env = FakeEnv()
+    training_teachers = [SimpleNamespace(value=1), SimpleNamespace(value=2)]
+    validation_teachers = [SimpleNamespace(value=7), SimpleNamespace(value=8)]
+    monkeypatch.setattr(
+        expert_trainer,
+        "_make_planner_teachers",
+        lambda task, target_env: validation_teachers,
+    )
+    runtime = _BorrowedEvaluationRuntime(
+        env=env,
+        training_teachers=training_teachers,
+    )
+
+    prepared = runtime.prepare(config)
+    assert prepared[0] is env
+    assert prepared[1] is validation_teachers
+    assert prepared[4] == 0
+    assert prepared[5] == "borrow_training_pool"
+    assert env.split_name == "validation"
+    assert torch.equal(env._last_obs["states"], torch.tensor([[7.0], [8.0]]))
+    training_teachers[0].value = 99
+
+    restore_s = runtime.finish(completed=True)
+    assert restore_s >= 0.0
+    assert runtime.evaluations == 1
+    assert env.loaded == 1
+    assert env.split_name == "train"
+    assert env.base_manifest_seed == config.train_manifest_seed
+    assert torch.equal(env._last_obs["states"], torch.tensor([[1.0], [2.0]]))
+    assert [teacher.value for teacher in training_teachers] == [1, 2]
+    assert runtime.training_checkpoint is None
+
+
+def test_borrowed_evaluation_prepare_failure_restores_training_state(
+    tmp_path, monkeypatch
+) -> None:
+    config = _config(
+        _parse_args(
+            [
+                "--task",
+                "t4_sphere",
+                "--algorithm",
+                "residual_rlpd",
+                "--rlinf-commit",
+                "a" * 40,
+                "--benchmark-commit",
+                "b" * 40,
+                "--output",
+                str(tmp_path / "run"),
+                "--borrow-training-env-for-eval",
+            ]
+        )
+    )
+
+    class FailingEnv:
+        num_envs = 2
+        seed_offset = 0
+
+        def __init__(self) -> None:
+            self.split_name = "train"
+            self.base_manifest_seed = config.train_manifest_seed
+            self._last_obs = {"states": torch.tensor([[1.0], [2.0]])}
+
+        def checkpoint_state(self):
+            return {
+                "identity": {
+                    "split": self.split_name,
+                    "base_manifest_seed": self.base_manifest_seed,
+                },
+                "states": self._last_obs["states"].clone(),
+            }
+
+        def set_manifest_context(self, *, split_name, base_manifest_seed) -> None:
+            self.split_name = split_name
+            self.base_manifest_seed = base_manifest_seed
+
+        def reset(self, *, options):
+            raise RuntimeError("validation reset failed")
+
+        def load_checkpoint_state(self, checkpoint) -> None:
+            self._last_obs = {"states": checkpoint["states"].clone()}
+
+    env = FailingEnv()
+    monkeypatch.setattr(
+        expert_trainer,
+        "_make_planner_teachers",
+        lambda task, target_env: pytest.fail("planner creation must not run"),
+    )
+    runtime = _BorrowedEvaluationRuntime(env=env)
+    with pytest.raises(RuntimeError, match="validation reset failed"):
+        runtime.prepare(config)
+    assert env.split_name == "train"
+    assert env.base_manifest_seed == config.train_manifest_seed
+    assert torch.equal(env._last_obs["states"], torch.tensor([[1.0], [2.0]]))
+    assert runtime.training_checkpoint is None
 
 
 def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state() -> None:

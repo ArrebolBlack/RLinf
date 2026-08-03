@@ -23,6 +23,7 @@ action space, so the zero action is exactly the frozen planner policy.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -64,6 +65,7 @@ class TrainConfig:
     eval_worker_processes: int
     eval_planner_in_processes: bool
     persistent_eval_workers: bool
+    borrow_training_env_for_eval: bool
     process_start_method: str
     sampler_learner_overlap: bool
     total_env_steps: int
@@ -436,6 +438,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--borrow-training-env-for-eval",
+        action="store_true",
+        help=(
+            "Run validation on the training environment/process pool, then restore "
+            "an exact training checkpoint before sampling resumes. Requires identical "
+            "train/eval vector and worker topology."
+        ),
+    )
+    parser.add_argument(
         "--process-start-method",
         choices=("spawn", "forkserver", "fork"),
         default="spawn",
@@ -559,6 +570,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         eval_worker_processes=args.eval_worker_processes,
         eval_planner_in_processes=args.eval_planner_in_processes,
         persistent_eval_workers=args.persistent_eval_workers,
+        borrow_training_env_for_eval=args.borrow_training_env_for_eval,
         process_start_method=args.process_start_method,
         sampler_learner_overlap=args.sampler_learner_overlap,
         total_env_steps=args.total_env_steps,
@@ -613,6 +625,26 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         )
     if config.persistent_eval_workers and not config.eval_worker_processes:
         raise ValueError("persistent evaluation requires evaluation process workers")
+    if config.borrow_training_env_for_eval:
+        if config.persistent_eval_workers:
+            raise ValueError(
+                "borrowed training evaluation is exclusive with persistent evaluation"
+            )
+        if config.eval_planner_in_processes:
+            raise ValueError(
+                "borrowed training evaluation does not support process evaluation planner"
+            )
+        if config.num_envs != config.eval_num_envs:
+            raise ValueError(
+                "borrowed training evaluation requires matching train/eval vector width"
+            )
+        if (
+            config.env_worker_processes != config.eval_worker_processes
+            or config.env_worker_threads != config.eval_worker_threads
+        ):
+            raise ValueError(
+                "borrowed training evaluation requires matching train/eval worker topology"
+            )
     if config.sampler_learner_overlap and not config.env_worker_processes:
         raise ValueError("sampler/learner overlap requires training process workers")
     for name, commit in (
@@ -1315,6 +1347,13 @@ class _EvaluationRuntime:
     def mark_complete(self) -> None:
         self.evaluations += 1
 
+    def finish(self, *, completed: bool) -> float:
+        if completed:
+            self.mark_complete()
+        else:
+            self.close()
+        return 0.0
+
     def close(self) -> None:
         if self.closed:
             return
@@ -1324,12 +1363,111 @@ class _EvaluationRuntime:
         self.closed = True
 
 
+@dataclass
+class _BorrowedEvaluationRuntime:
+    """Temporarily validate on the training pool and restore it bit-exactly."""
+
+    env: Any
+    training_teachers: list[Any] | None = None
+    evaluations: int = 0
+    closed: bool = False
+    checkpoint_s: float = 0.0
+    training_checkpoint: dict[str, Any] | None = None
+    training_observation: torch.Tensor | None = None
+    training_teacher_snapshot: list[Any] | None = None
+    validation_teachers: list[Any] | None = None
+
+    def _restore_training_state(self) -> float:
+        if self.training_checkpoint is None:
+            return 0.0
+        restore_start = time.perf_counter()
+        identity = dict(self.training_checkpoint["identity"])
+        self.env.set_manifest_context(
+            split_name=str(identity["split"]),
+            base_manifest_seed=int(identity["base_manifest_seed"]),
+        )
+        self.env.load_checkpoint_state(self.training_checkpoint)
+        restored = self.env._last_obs
+        if restored is None or self.training_observation is None:
+            raise RuntimeError("borrowed evaluation lost the training observation")
+        if not torch.equal(restored["states"], self.training_observation):
+            raise RuntimeError("borrowed evaluation training observation restore diverged")
+        if self.training_teachers is not None:
+            if self.training_teacher_snapshot is None:
+                raise RuntimeError("borrowed evaluation lost training planner state")
+            self.training_teachers[:] = self.training_teacher_snapshot
+        restore_s = time.perf_counter() - restore_start
+        self.training_checkpoint = None
+        self.training_observation = None
+        self.training_teacher_snapshot = None
+        self.validation_teachers = None
+        return restore_s
+
+    def prepare(
+        self, config: TrainConfig
+    ) -> tuple[Any, list[Any] | None, float, float, int, str]:
+        if self.closed:
+            raise RuntimeError("borrowed evaluation runtime is closed")
+        if self.training_checkpoint is not None:
+            raise RuntimeError("borrowed evaluation runtime is already active")
+        checkpoint_start = time.perf_counter()
+        self.training_checkpoint = self.env.checkpoint_state()
+        current = self.env._last_obs
+        if current is None:
+            self.training_checkpoint = None
+            raise RuntimeError("borrowed evaluation requires initialized training state")
+        self.training_observation = current["states"].clone()
+        self.training_teacher_snapshot = (
+            copy.deepcopy(self.training_teachers)
+            if self.training_teachers is not None
+            else None
+        )
+        self.checkpoint_s = time.perf_counter() - checkpoint_start
+        prepare_start = time.perf_counter()
+        try:
+            validation_seed = (
+                config.validation_manifest_seed + self.env.seed_offset * 1_000_003
+            )
+            self.env.set_manifest_context(
+                split_name="validation",
+                base_manifest_seed=validation_seed,
+            )
+            self.env.reset(options={"env_idx": list(range(self.env.num_envs))})
+            self.validation_teachers = (
+                _make_planner_teachers(config.task, self.env)
+                if config.algorithm == "residual_rlpd"
+                else None
+            )
+        except BaseException:
+            self._restore_training_state()
+            raise
+        return (
+            self.env,
+            self.validation_teachers,
+            0.0,
+            time.perf_counter() - prepare_start,
+            self.evaluations,
+            "borrow_training_pool",
+        )
+
+    def finish(self, *, completed: bool) -> float:
+        restore_s = self._restore_training_state()
+        if completed:
+            self.evaluations += 1
+        return restore_s
+
+    def close(self) -> None:
+        if self.training_checkpoint is not None:
+            self._restore_training_state()
+        self.closed = True
+
+
 def _evaluate(
     config: TrainConfig,
     model: MLPPolicy,
     normalizer: RunningNormalizer,
     device: torch.device,
-    runtime: _EvaluationRuntime | None = None,
+    runtime: _EvaluationRuntime | _BorrowedEvaluationRuntime | None = None,
 ) -> dict[str, Any]:
     preserved_rng = _rng_state()
     evaluation_start = time.monotonic()
@@ -1372,6 +1510,7 @@ def _evaluate(
     safety_failures = set(env.reward_schema["safety_failures"])
     model.eval()
     completed = False
+    training_environment_restore_s = 0.0
     try:
         obs = env._last_obs
         if obs is None:
@@ -1486,12 +1625,10 @@ def _evaluate(
     finally:
         if owns_environment:
             env.close()
-        elif not completed:
-            runtime.close()
+        else:
+            training_environment_restore_s = runtime.finish(completed=completed)
         model.train()
         _restore_rng(preserved_rng)
-    if runtime is not None:
-        runtime.mark_complete()
     records.sort(key=lambda record: record["manifest_episode_index"])
     wall_time_s = time.monotonic() - evaluation_start
     return {
@@ -1516,12 +1653,17 @@ def _evaluate(
         "environment_reset_total_s": environment_reset_s,
         "environment_construction_s": construction_s,
         "environment_restore_s": restore_s,
+        "training_environment_checkpoint_s": float(
+            getattr(runtime, "checkpoint_s", 0.0)
+        ),
+        "training_environment_restore_s": training_environment_restore_s,
         "policy_action_total_s": policy_action_s,
         "planner_action_total_s": planner_action_s,
         "process_planner_action_total_s": process_planner_action_s,
         "process_environment_step_total_s": process_environment_step_s,
         "planner_in_processes": config.eval_planner_in_processes,
-        "persistent_eval_workers": runtime is not None,
+        "persistent_eval_workers": config.persistent_eval_workers,
+        "borrow_training_env_for_eval": config.borrow_training_env_for_eval,
         "persistent_evaluation_index": evaluation_index,
         "evaluation_rewind_mode": evaluation_rewind_mode,
         "action_digest_sha256": action_digest.hexdigest(),
@@ -1851,6 +1993,7 @@ def main() -> None:
             "eval_worker_processes": config.eval_worker_processes,
             "eval_planner_in_processes": config.eval_planner_in_processes,
             "persistent_eval_workers": config.persistent_eval_workers,
+            "borrow_training_env_for_eval": config.borrow_training_env_for_eval,
             "process_start_method": config.process_start_method,
             "sampler_learner_overlap": config.sampler_learner_overlap,
             "sampler_contract": sampler_contract,
@@ -1948,11 +2091,17 @@ def main() -> None:
     training_teachers: list[Any] | None = None
     phase_timings = PhaseTimings()
     start_time = time.monotonic()
-    evaluation_runtime = (
-        _EvaluationRuntime() if config.persistent_eval_workers else None
-    )
+    evaluation_runtime: _EvaluationRuntime | _BorrowedEvaluationRuntime | None
+    if config.persistent_eval_workers:
+        evaluation_runtime = _EvaluationRuntime()
+    elif config.borrow_training_env_for_eval:
+        evaluation_runtime = _BorrowedEvaluationRuntime(env=env)
+    else:
+        evaluation_runtime = None
 
     def evaluate_policy() -> dict[str, Any]:
+        if isinstance(evaluation_runtime, _BorrowedEvaluationRuntime):
+            evaluation_runtime.training_teachers = training_teachers
         return _evaluate(
             config,
             model,

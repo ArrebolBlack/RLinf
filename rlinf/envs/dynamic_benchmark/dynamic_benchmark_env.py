@@ -131,7 +131,7 @@ class _DynamicBenchmarkProcessHandler:
     def _arm_hidden_t5_event(self, env: Any, request: Any) -> None:
         arm_hidden_t5_event(
             task_id=self._task_id,
-            split_name=self._split_name,
+            split_name=str(request.split.value),
             env=env,
             request=request,
             load_task_config=self._load_task_config,
@@ -518,6 +518,26 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_rows = tuple(rows)
         self._manifest_cursor = 0
 
+    def set_manifest_context(self, *, split_name: str, base_manifest_seed: int) -> None:
+        """Switch manifest identity without rebuilding the underlying simulators.
+
+        The caller must either reset every vector member before stepping or load a
+        checkpoint whose identity matches the new context. Keeping this operation
+        separate from reset makes validation borrowing exactly reversible.
+        """
+
+        try:
+            split = self._Split(str(split_name))
+        except ValueError as exc:
+            raise ValueError(
+                f"unsupported Dynamic Benchmark split {split_name!r}"
+            ) from exc
+        self.split_name = str(split_name)
+        self._split = split
+        self.base_manifest_seed = int(base_manifest_seed)
+        self._manifest_generation = 0
+        self._refresh_manifest()
+
     def _next_request(self) -> Any:
         if self._manifest_cursor == len(self._manifest_rows):
             self._manifest_generation += 1
@@ -633,7 +653,7 @@ class DynamicBenchmarkEnv(gym.Env):
     def _arm_hidden_t5_event(self, env: Any, request: Any) -> str | None:
         return arm_hidden_t5_event(
             task_id=self.task_id,
-            split_name=self.split_name,
+            split_name=str(request.split.value),
             env=env,
             request=request,
             load_task_config=self._load_task_config,
