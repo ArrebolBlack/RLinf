@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import random
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import numpy as np
@@ -31,6 +34,7 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     _env_cfg,
     _load_demo_replay_cache,
     _load_demo_replay_cache_for_training,
+    _overlap_sample_and_update,
     _parse_args,
     _rng_state,
     _save_demo_replay_cache,
@@ -238,8 +242,51 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     assert config.process_start_method == "spawn"
     assert env_cfg["worker_processes"] == 8
     assert env_cfg["process_start_method"] == "spawn"
+    assert config.sampler_learner_overlap is False
+    overlap_config = _config(_parse_args([*common, "--sampler-learner-overlap"]))
+    assert overlap_config.sampler_learner_overlap is True
     with pytest.raises(ValueError, match="threads=1"):
         _config(_parse_args([*common, "--env-worker-threads", "2"]))
+    without_processes = [
+        item
+        for index, item in enumerate(common)
+        if not (
+            item == "--env-worker-processes"
+            or (index > 0 and common[index - 1] == "--env-worker-processes")
+        )
+    ]
+    with pytest.raises(ValueError, match="requires training process workers"):
+        _config(_parse_args([*without_processes, "--sampler-learner-overlap"]))
+
+
+def test_sampler_learner_overlap_runs_updates_while_sampling_is_in_flight() -> None:
+    sample_started = threading.Event()
+    release_sample = threading.Event()
+
+    def sample() -> str:
+        sample_started.set()
+        assert release_sample.wait(timeout=2.0)
+        time.sleep(0.01)
+        return "sample"
+
+    def update() -> str:
+        assert sample_started.wait(timeout=2.0)
+        time.sleep(0.01)
+        release_sample.set()
+        time.sleep(0.01)
+        return "update"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        sample_result, update_result, timing = _overlap_sample_and_update(
+            executor, sample, update
+        )
+
+    assert sample_result == "sample"
+    assert update_result == "update"
+    assert timing["environment_step_s"] > 0.0
+    assert timing["sampler_learner_overlap_s"] > 0.0
+    assert timing["overlapped_update_wall_s"] > 0.0
+    assert timing["sampler_wait_after_update_s"] >= 0.0
 
 
 def test_safety_penalty_is_explicit_and_reaches_environment_and_cache_identity(

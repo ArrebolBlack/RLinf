@@ -31,6 +31,8 @@ import random
 import signal
 import sys
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -61,6 +63,7 @@ class TrainConfig:
     env_worker_processes: int
     eval_worker_processes: int
     process_start_method: str
+    sampler_learner_overlap: bool
     total_env_steps: int
     random_env_steps: int
     demo_episodes: int
@@ -420,6 +423,14 @@ def _parser() -> argparse.ArgumentParser:
         default="spawn",
         help="Environment subprocess start method; spawn is CUDA-safe and portable.",
     )
+    parser.add_argument(
+        "--sampler-learner-overlap",
+        action="store_true",
+        help=(
+            "Dispatch one process-backed environment step on a dedicated IPC thread "
+            "while SAC updates consume the preceding replay snapshot."
+        ),
+    )
     parser.add_argument("--total-env-steps", type=int, default=200_000)
     parser.add_argument("--random-env-steps", type=int, default=2_000)
     parser.add_argument("--demo-episodes", type=int, default=32)
@@ -529,6 +540,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         env_worker_processes=args.env_worker_processes,
         eval_worker_processes=args.eval_worker_processes,
         process_start_method=args.process_start_method,
+        sampler_learner_overlap=args.sampler_learner_overlap,
         total_env_steps=args.total_env_steps,
         random_env_steps=args.random_env_steps,
         demo_episodes=args.demo_episodes,
@@ -573,6 +585,8 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("training process workers require env_worker_threads=1")
     if config.eval_worker_processes and config.eval_worker_threads != 1:
         raise ValueError("evaluation process workers require eval_worker_threads=1")
+    if config.sampler_learner_overlap and not config.env_worker_processes:
+        raise ValueError("sampler/learner overlap requires training process workers")
     for name, commit in (
         ("rlinf_commit", config.rlinf_commit),
         ("demo_rlinf_commit", config.demo_rlinf_commit),
@@ -631,6 +645,45 @@ def _env_cfg(
         "process_start_method": process_start_method,
         "reward_safety_penalty": config.reward_safety_penalty,
     }
+
+
+def _timed_call(call: Callable[[], Any]) -> tuple[Any, float, float]:
+    """Run one sampler call and retain monotonic boundaries for overlap accounting."""
+
+    started = time.perf_counter()
+    value = call()
+    finished = time.perf_counter()
+    return value, started, finished
+
+
+def _overlap_sample_and_update(
+    executor: ThreadPoolExecutor,
+    sample: Callable[[], Any],
+    update: Callable[[], Any],
+) -> tuple[Any, Any, dict[str, float]]:
+    """Overlap process-backed sampling with learner work and expose exact wall timings."""
+
+    future = executor.submit(_timed_call, sample)
+    update_started = time.perf_counter()
+    update_result = update()
+    update_finished = time.perf_counter()
+    wait_started = time.perf_counter()
+    sample_result, sample_started, sample_finished = future.result()
+    wait_finished = time.perf_counter()
+    overlap_seconds = max(
+        0.0,
+        min(sample_finished, update_finished) - max(sample_started, update_started),
+    )
+    return (
+        sample_result,
+        update_result,
+        {
+            "environment_step_s": sample_finished - sample_started,
+            "sampler_learner_overlap_s": overlap_seconds,
+            "sampler_wait_after_update_s": wait_finished - wait_started,
+            "overlapped_update_wall_s": update_finished - update_started,
+        },
+    )
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1541,6 +1594,15 @@ def main() -> None:
     config_path = args.output / "config.json"
     _atomic_json(config_path, asdict(config))
     config_sha256 = _file_sha256(config_path)
+    sampler_contract = {
+        "mode": "overlap" if config.sampler_learner_overlap else "synchronous",
+        "max_inflight_vector_steps": 1 if config.sampler_learner_overlap else 0,
+        "policy_lag_vector_steps": 0,
+        "replay_snapshot_lag_vector_steps": (
+            1 if config.sampler_learner_overlap else 0
+        ),
+        "dropped_vector_steps": 0,
+    }
     _append_jsonl(
         metrics_path,
         {
@@ -1554,6 +1616,8 @@ def main() -> None:
             "env_worker_processes": config.env_worker_processes,
             "eval_worker_processes": config.eval_worker_processes,
             "process_start_method": config.process_start_method,
+            "sampler_learner_overlap": config.sampler_learner_overlap,
+            "sampler_contract": sampler_contract,
         },
     )
 
@@ -1830,6 +1894,39 @@ def main() -> None:
     last_log_time = training_start_time
     last_log_env_steps = global_env_steps
     last_log_update_steps = update_steps
+    sampler_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="dynamic-benchmark-sampler")
+        if config.sampler_learner_overlap
+        else None
+    )
+
+    def learner_updates() -> dict[str, Any] | None:
+        nonlocal update_steps
+        update_metrics = None
+        if online.size < max(config.batch_size, config.random_env_steps):
+            return update_metrics
+        for _ in range(config.updates_per_vector_step):
+            update_metrics, update_timing = _sac_update(
+                config,
+                model,
+                target_q,
+                actor_optimizer,
+                critic_optimizer,
+                log_alpha,
+                alpha_optimizer,
+                normalizer,
+                online,
+                demos,
+                device,
+                profile_timing=(
+                    update_steps % config.timing_sample_interval == 0
+                ),
+            )
+            for name, seconds in update_timing.items():
+                phase_timings.add(name, seconds)
+            update_steps += 1
+        return update_metrics
+
     try:
         while global_env_steps < config.total_env_steps and not stop_requested:
             vector_step_start = time.perf_counter()
@@ -1857,14 +1954,35 @@ def main() -> None:
                 "environment_action",
                 time.perf_counter() - action_start,
             )
-            environment_step_start = time.perf_counter()
-            next_obs, rewards, terminated, truncated, infos = env.step(
-                env_actions, auto_reset=False
-            )
-            phase_timings.add(
-                "environment_step",
-                time.perf_counter() - environment_step_start,
-            )
+            updates_overlapped = False
+            update_metrics = None
+            if (
+                sampler_executor is not None
+                and online.size >= max(config.batch_size, config.random_env_steps)
+            ):
+                sample_result, update_metrics, overlap_timing = (
+                    _overlap_sample_and_update(
+                        sampler_executor,
+                        lambda: env.step(env_actions, auto_reset=False),
+                        learner_updates,
+                    )
+                )
+                next_obs, rewards, terminated, truncated, infos = sample_result
+                phase_timings.add(
+                    "environment_step", overlap_timing.pop("environment_step_s")
+                )
+                for name, seconds in overlap_timing.items():
+                    phase_timings.add(name, seconds)
+                updates_overlapped = True
+            else:
+                environment_step_start = time.perf_counter()
+                next_obs, rewards, terminated, truncated, infos = env.step(
+                    env_actions, auto_reset=False
+                )
+                phase_timings.add(
+                    "environment_step",
+                    time.perf_counter() - environment_step_start,
+                )
             replay_add_start = time.perf_counter()
             online.add(
                 obs["states"],
@@ -1922,30 +2040,8 @@ def main() -> None:
             obs = next_obs
             global_env_steps += config.num_envs
 
-            if online.size >= max(config.batch_size, config.random_env_steps):
-                update_metrics = None
-                for _ in range(config.updates_per_vector_step):
-                    update_metrics, update_timing = _sac_update(
-                        config,
-                        model,
-                        target_q,
-                        actor_optimizer,
-                        critic_optimizer,
-                        log_alpha,
-                        alpha_optimizer,
-                        normalizer,
-                        online,
-                        demos,
-                        device,
-                        profile_timing=(
-                            update_steps % config.timing_sample_interval == 0
-                        ),
-                    )
-                    for name, seconds in update_timing.items():
-                        phase_timings.add(name, seconds)
-                    update_steps += 1
-            else:
-                update_metrics = None
+            if not updates_overlapped:
+                update_metrics = learner_updates()
 
             phase_timings.add(
                 "vector_step_wall",
@@ -2103,12 +2199,15 @@ def main() -> None:
             "update_steps_per_second": (update_steps - training_start_update_steps)
             / max(training_end_time - training_start_time, 1e-6),
             "phase_timings": phase_timings.snapshot(reset_interval=False),
+            "sampler_contract": sampler_contract,
             "config_sha256": config_sha256,
         }
         rendered = json.dumps(summary, sort_keys=True, separators=(",", ":"))
         summary["payload_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
         _atomic_json(args.output / "summary.json", summary)
     finally:
+        if sampler_executor is not None:
+            sampler_executor.shutdown(wait=True, cancel_futures=True)
         env.close()
 
 
