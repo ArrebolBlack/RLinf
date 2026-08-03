@@ -24,6 +24,7 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     _compose_residual_actions,
     _config,
     _demo_replay_identity,
+    _env_cfg,
     _load_demo_replay_cache,
     _parse_args,
     _save_demo_replay_cache,
@@ -153,6 +154,39 @@ def test_actor_bc_regularization_is_explicit_and_non_negative(tmp_path) -> None:
     assert _config(_parse_args(common)).actor_bc_weight == 2.5
     with pytest.raises(ValueError, match="non-negative"):
         _config(_parse_args([*common, "--actor-bc-weight", "-1"]))
+
+
+def test_safety_penalty_is_explicit_and_reaches_environment_and_cache_identity(
+    tmp_path,
+) -> None:
+    common = [
+        "--task",
+        "t4_sphere",
+        "--algorithm",
+        "residual_rlpd",
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "run"),
+        "--reward-safety-penalty",
+        "-30",
+    ]
+    config = _config(_parse_args(common))
+
+    assert config.reward_safety_penalty == -30.0
+    assert _env_cfg(config, split="train", seed=17, num_envs=2)[
+        "reward_safety_penalty"
+    ] == -30.0
+    assert _demo_replay_identity(
+        config,
+        {"state_dim": 2, "mask_dim": 0, "fields": ["fixture"]},
+    )["reward_safety_penalty"] == -30.0
+    with pytest.raises(ValueError, match="non-positive"):
+        _config(_parse_args([*common, "--reward-safety-penalty", "1"]))
+    with pytest.raises(ValueError, match="finite"):
+        _config(_parse_args([*common, "--reward-safety-penalty", "nan"]))
 
 
 def test_residual_action_composition_is_scaled_and_clamped() -> None:

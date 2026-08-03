@@ -132,6 +132,11 @@ planner-residual RLPD 或 PPO expert。
 可选参数 ``--actor-bc-weight`` 会在每次在线 actor 更新中加入示教行为克隆损失。
 默认值为 ``0``，因此参考 RLPD 配方仍是无正则基线；非零权重必须登记为独立实验臂。
 
+可选参数 ``--reward-safety-penalty`` 控制训练时安全失败的终止奖励，默认值为 ``-10``。
+该值必须有限且非正，并写入 run 与示教 cache identity；每个非默认值都必须登记为独立、
+仅基于 validation 选择的实验臂。正式评测仍使用 canonical reward 合同，以保证不同策略的
+return 可比较。
+
 设置 ``--algorithm residual_rlpd`` 后，实际动作是
 ``clamp(planner_action + residual_scale * policy_residual, -1, 1)``。replay 与 critic
 位于 residual action space，planner 示教严格映射到零 residual；checkpoint 还会保存

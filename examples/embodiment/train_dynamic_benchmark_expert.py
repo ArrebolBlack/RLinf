@@ -71,6 +71,7 @@ class TrainConfig:
     actor_lr: float
     actor_bc_weight: float
     residual_scale: float
+    reward_safety_penalty: float
     critic_lr: float
     alpha_lr: float
     initial_alpha: float
@@ -293,6 +294,12 @@ def _parser() -> argparse.ArgumentParser:
         default=0.25,
         help="Executed action is clamp(planner + residual_scale * policy_residual).",
     )
+    parser.add_argument(
+        "--reward-safety-penalty",
+        type=float,
+        default=-10.0,
+        help="Terminal reward applied to safety failures during training.",
+    )
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--initial-alpha", type=float, default=0.01)
@@ -369,6 +376,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         actor_lr=args.actor_lr,
         actor_bc_weight=args.actor_bc_weight,
         residual_scale=args.residual_scale,
+        reward_safety_penalty=args.reward_safety_penalty,
         critic_lr=args.critic_lr,
         alpha_lr=args.alpha_lr,
         initial_alpha=args.initial_alpha,
@@ -398,6 +406,8 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("actor_bc_weight must be non-negative")
     if not 0.0 < config.residual_scale <= 1.0:
         raise ValueError("residual_scale must be in (0, 1]")
+    if not math.isfinite(config.reward_safety_penalty) or config.reward_safety_penalty > 0.0:
+        raise ValueError("reward_safety_penalty must be finite and non-positive")
     if config.algorithm in {"bc", "rlpd", "residual_rlpd"} and config.demo_episodes < 1:
         raise ValueError("BC/RLPD requires at least one demonstration episode")
     if config.batch_size < 2 or config.replay_capacity < config.batch_size:
@@ -416,6 +426,7 @@ def _env_cfg(config: TrainConfig, *, split: str, seed: int, num_envs: int) -> di
         "auto_reset": False,
         "ignore_terminations": False,
         "group_size": 1,
+        "reward_safety_penalty": config.reward_safety_penalty,
     }
 
 
@@ -470,6 +481,7 @@ def _demo_replay_identity(
         "demo_episodes": config.demo_episodes,
         "demo_max_attempts": config.demo_max_attempts,
         "allow_failed_demos": config.allow_failed_demos,
+        "reward_safety_penalty": config.reward_safety_penalty,
         "train_manifest_seed": config.train_manifest_seed,
         "manifest_size": config.manifest_size,
         "image_size": config.image_size,

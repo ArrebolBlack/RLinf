@@ -134,6 +134,12 @@ The optional ``--actor-bc-weight`` adds a demonstration behavior-cloning loss to
 each online actor update. Its default is ``0`` so the reference RLPD recipe remains
 an unregularized baseline; record nonzero values as separate experiment arms.
 
+The optional ``--reward-safety-penalty`` controls the terminal safety-failure reward
+used for training and defaults to ``-10``. It must be finite and non-positive, is
+recorded in the run and demonstration-cache identities, and every non-default value
+must be treated as a separate validation-only experiment arm. Evaluation keeps its
+canonical reward contract so return values remain comparable across trained policies.
+
 Set ``--algorithm residual_rlpd`` to execute
 ``clamp(planner_action + residual_scale * policy_residual, -1, 1)``. Replay and the
 critic stay in residual-action space, planner demonstrations map to the exact zero
