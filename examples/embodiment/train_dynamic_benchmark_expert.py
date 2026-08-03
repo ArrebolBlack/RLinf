@@ -23,6 +23,7 @@ action space, so the zero action is exactly the frozen planner policy.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -63,6 +64,7 @@ class TrainConfig:
     env_worker_processes: int
     eval_worker_processes: int
     eval_planner_in_processes: bool
+    persistent_eval_workers: bool
     process_start_method: str
     sampler_learner_overlap: bool
     total_env_steps: int
@@ -427,6 +429,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--persistent-eval-workers",
+        action="store_true",
+        help=(
+            "Keep the validation process pool alive and restore one frozen initial "
+            "environment checkpoint before each evaluation."
+        ),
+    )
+    parser.add_argument(
         "--process-start-method",
         choices=("spawn", "forkserver", "fork"),
         default="spawn",
@@ -549,6 +559,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         env_worker_processes=args.env_worker_processes,
         eval_worker_processes=args.eval_worker_processes,
         eval_planner_in_processes=args.eval_planner_in_processes,
+        persistent_eval_workers=args.persistent_eval_workers,
         process_start_method=args.process_start_method,
         sampler_learner_overlap=args.sampler_learner_overlap,
         total_env_steps=args.total_env_steps,
@@ -601,6 +612,8 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError(
             "process evaluation planner requires residual_rlpd and evaluation process workers"
         )
+    if config.persistent_eval_workers and not config.eval_worker_processes:
+        raise ValueError("persistent evaluation requires evaluation process workers")
     if config.sampler_learner_overlap and not config.env_worker_processes:
         raise ValueError("sampler/learner overlap requires training process workers")
     for name, commit in (
@@ -1164,25 +1177,11 @@ def _collect_demos(
     }
 
 
-def _evaluate(
+def _build_evaluation_environment(
     config: TrainConfig,
-    model: MLPPolicy,
-    normalizer: RunningNormalizer,
-    device: torch.device,
-) -> dict[str, Any]:
+) -> tuple[Any, list[Any] | None]:
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 
-    preserved_rng = _rng_state()
-    evaluation_start = time.monotonic()
-    environment_step_s = 0.0
-    environment_reset_s = 0.0
-    planner_action_s = 0.0
-    process_planner_action_s = 0.0
-    process_environment_step_s = 0.0
-    vector_steps = 0
-    stepped_env_rows = 0
-    action_digest = hashlib.sha256()
-    state_digest = hashlib.sha256()
     count = min(config.eval_num_envs, config.eval_episodes)
     env = DynamicBenchmarkEnv(
         cfg=_env_cfg(
@@ -1200,6 +1199,102 @@ def _evaluate(
         total_num_processes=max(1, min(config.eval_worker_processes, count)),
         worker_info=None,
     )
+    teachers = (
+        _make_planner_teachers(config.task, env)
+        if config.algorithm == "residual_rlpd"
+        and not config.eval_planner_in_processes
+        else None
+    )
+    return env, teachers
+
+
+@dataclass
+class _EvaluationRuntime:
+    """A reusable validation pool restored to one exact initial checkpoint."""
+
+    env: Any | None = None
+    initial_checkpoint: dict[str, Any] | None = None
+    planner_teachers: list[Any] | None = None
+    evaluations: int = 0
+    closed: bool = False
+
+    def prepare(
+        self, config: TrainConfig
+    ) -> tuple[Any, list[Any] | None, float, float, int]:
+        if self.closed:
+            raise RuntimeError("persistent evaluation runtime is closed")
+        construction_s = 0.0
+        restore_s = 0.0
+        if self.env is None:
+            construction_start = time.perf_counter()
+            self.env, self.planner_teachers = _build_evaluation_environment(config)
+            self.initial_checkpoint = self.env.checkpoint_state()
+            construction_s = time.perf_counter() - construction_start
+        else:
+            if self.initial_checkpoint is None:
+                raise RuntimeError("persistent evaluation checkpoint is unavailable")
+            restore_start = time.perf_counter()
+            self.env.load_checkpoint_state(copy.deepcopy(self.initial_checkpoint))
+            if self.planner_teachers is not None:
+                _reset_planner_teachers(
+                    config.task,
+                    self.env,
+                    self.planner_teachers,
+                    list(range(self.env.num_envs)),
+                )
+            restore_s = time.perf_counter() - restore_start
+        return (
+            self.env,
+            self.planner_teachers,
+            construction_s,
+            restore_s,
+            self.evaluations,
+        )
+
+    def mark_complete(self) -> None:
+        self.evaluations += 1
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        if self.env is not None:
+            self.env.close()
+            self.env = None
+        self.closed = True
+
+
+def _evaluate(
+    config: TrainConfig,
+    model: MLPPolicy,
+    normalizer: RunningNormalizer,
+    device: torch.device,
+    runtime: _EvaluationRuntime | None = None,
+) -> dict[str, Any]:
+    preserved_rng = _rng_state()
+    evaluation_start = time.monotonic()
+    construction_s = 0.0
+    restore_s = 0.0
+    evaluation_index = 0
+    owns_environment = runtime is None
+    if runtime is None:
+        construction_start = time.perf_counter()
+        env, teachers = _build_evaluation_environment(config)
+        construction_s = time.perf_counter() - construction_start
+    else:
+        env, teachers, construction_s, restore_s, evaluation_index = runtime.prepare(
+            config
+        )
+    environment_step_s = 0.0
+    environment_reset_s = 0.0
+    planner_action_s = 0.0
+    process_planner_action_s = 0.0
+    process_environment_step_s = 0.0
+    policy_action_s = 0.0
+    vector_steps = 0
+    stepped_env_rows = 0
+    action_digest = hashlib.sha256()
+    state_digest = hashlib.sha256()
+    count = env.num_envs
     process_worker_pids = env.process_worker_pids
     records = []
     episode_returns = torch.zeros(count)
@@ -1208,18 +1303,14 @@ def _evaluate(
     active_episode_ids: list[int | None] = list(range(count))
     next_episode_id = count
     safety_failures = set(env.reward_schema["safety_failures"])
-    teachers = (
-        _make_planner_teachers(config.task, env)
-        if config.algorithm == "residual_rlpd"
-        and not config.eval_planner_in_processes
-        else None
-    )
     model.eval()
+    completed = False
     try:
         obs = env._last_obs
         if obs is None:
             raise RuntimeError("evaluation environment did not initialize its state")
         while len(records) < config.eval_episodes:
+            policy_start = time.perf_counter()
             with torch.inference_mode():
                 actions, _ = _policy_action(
                     model,
@@ -1229,6 +1320,7 @@ def _evaluate(
                     stochastic=False,
                 )
             policy_actions = actions.cpu()
+            policy_action_s += time.perf_counter() - policy_start
             env_actions = policy_actions
             if teachers is not None:
                 planner_start = time.perf_counter()
@@ -1323,10 +1415,16 @@ def _evaluate(
                 if teachers is not None:
                     _reset_planner_teachers(config.task, env, teachers, reset_indices)
             obs = next_obs
+        completed = True
     finally:
-        env.close()
+        if owns_environment:
+            env.close()
+        elif not completed:
+            runtime.close()
         model.train()
         _restore_rng(preserved_rng)
+    if runtime is not None:
+        runtime.mark_complete()
     records.sort(key=lambda record: record["manifest_episode_index"])
     wall_time_s = time.monotonic() - evaluation_start
     return {
@@ -1349,10 +1447,15 @@ def _evaluate(
         "env_steps_per_second": stepped_env_rows / max(wall_time_s, 1e-6),
         "environment_step_mean_ms": 1000.0 * environment_step_s / max(1, vector_steps),
         "environment_reset_total_s": environment_reset_s,
+        "environment_construction_s": construction_s,
+        "environment_restore_s": restore_s,
+        "policy_action_total_s": policy_action_s,
         "planner_action_total_s": planner_action_s,
         "process_planner_action_total_s": process_planner_action_s,
         "process_environment_step_total_s": process_environment_step_s,
         "planner_in_processes": config.eval_planner_in_processes,
+        "persistent_eval_workers": runtime is not None,
+        "persistent_evaluation_index": evaluation_index,
         "action_digest_sha256": action_digest.hexdigest(),
         "state_digest_sha256": state_digest.hexdigest(),
         "worker_processes": len(process_worker_pids),
@@ -1679,6 +1782,7 @@ def main() -> None:
             "env_worker_processes": config.env_worker_processes,
             "eval_worker_processes": config.eval_worker_processes,
             "eval_planner_in_processes": config.eval_planner_in_processes,
+            "persistent_eval_workers": config.persistent_eval_workers,
             "process_start_method": config.process_start_method,
             "sampler_learner_overlap": config.sampler_learner_overlap,
             "sampler_contract": sampler_contract,
@@ -1776,6 +1880,18 @@ def main() -> None:
     training_teachers: list[Any] | None = None
     phase_timings = PhaseTimings()
     start_time = time.monotonic()
+    evaluation_runtime = (
+        _EvaluationRuntime() if config.persistent_eval_workers else None
+    )
+
+    def evaluate_policy() -> dict[str, Any]:
+        return _evaluate(
+            config,
+            model,
+            normalizer,
+            device,
+            runtime=evaluation_runtime,
+        )
 
     def checkpoint(path: Path) -> None:
         state = {
@@ -1905,7 +2021,7 @@ def main() -> None:
             device,
             metrics_path,
         )
-        initial_validation = _evaluate(config, model, normalizer, device)
+        initial_validation = evaluate_policy()
         last_validation = initial_validation
         last_validation_env_steps = 0
         best_score = _score(initial_validation)
@@ -1937,6 +2053,8 @@ def main() -> None:
                 "config_sha256": config_sha256,
             }
             _atomic_json(args.output / "summary.json", summary)
+            if evaluation_runtime is not None:
+                evaluation_runtime.close()
             env.close()
             return
 
@@ -2173,7 +2291,7 @@ def main() -> None:
                 next_log += config.log_interval
 
             if global_env_steps >= next_eval:
-                validation = _evaluate(config, model, normalizer, device)
+                validation = evaluate_policy()
                 last_validation = validation
                 last_validation_env_steps = global_env_steps
                 score = _score(validation)
@@ -2219,7 +2337,7 @@ def main() -> None:
                 },
             )
         else:
-            final_validation = _evaluate(config, model, normalizer, device)
+            final_validation = evaluate_policy()
             last_validation = final_validation
             last_validation_env_steps = global_env_steps
         final_score = _score(final_validation)
@@ -2272,6 +2390,8 @@ def main() -> None:
     finally:
         if sampler_executor is not None:
             sampler_executor.shutdown(wait=True, cancel_futures=True)
+        if evaluation_runtime is not None:
+            evaluation_runtime.close()
         env.close()
 
 

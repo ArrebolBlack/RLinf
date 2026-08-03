@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import torch
 
+import examples.embodiment.train_dynamic_benchmark_expert as expert_trainer
 from examples.embodiment.benchmark_dynamic_benchmark_throughput import _full_commit
 from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
@@ -32,6 +33,7 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     _config,
     _demo_replay_identity,
     _env_cfg,
+    _EvaluationRuntime,
     _load_demo_replay_cache,
     _load_demo_replay_cache_for_training,
     _overlap_sample_and_update,
@@ -244,6 +246,7 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     assert env_cfg["process_start_method"] == "spawn"
     assert env_cfg["process_residual_planner"] is False
     assert config.sampler_learner_overlap is False
+    assert config.persistent_eval_workers is False
     overlap_config = _config(_parse_args([*common, "--sampler-learner-overlap"]))
     assert overlap_config.sampler_learner_overlap is True
     with pytest.raises(ValueError, match="threads=1"):
@@ -283,6 +286,91 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     ]
     with pytest.raises(ValueError, match="process evaluation planner requires"):
         _config(_parse_args([*without_eval_processes, "--eval-planner-in-processes"]))
+    persistent_config = _config(
+        _parse_args([*common, "--persistent-eval-workers"])
+    )
+    assert persistent_config.persistent_eval_workers is True
+    with pytest.raises(ValueError, match="persistent evaluation requires"):
+        _config(
+            _parse_args([*without_eval_processes, "--persistent-eval-workers"])
+        )
+
+
+def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    common = [
+        "--task",
+        "t4_sphere",
+        "--algorithm",
+        "residual_rlpd",
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "run"),
+        "--eval-worker-processes",
+        "2",
+        "--persistent-eval-workers",
+    ]
+    config = _config(_parse_args(common))
+
+    class FakeEnv:
+        num_envs = 2
+
+        def __init__(self) -> None:
+            self.restore_payloads = []
+            self.closed = False
+
+        def checkpoint_state(self):
+            return {"nested": {"values": [1, 2, 3]}}
+
+        def load_checkpoint_state(self, state) -> None:
+            self.restore_payloads.append(state)
+            state["nested"]["values"].append(99)
+
+        def close(self) -> None:
+            self.closed = True
+
+    env = FakeEnv()
+    teachers = [object(), object()]
+    resets = []
+    monkeypatch.setattr(
+        expert_trainer,
+        "_build_evaluation_environment",
+        lambda _config: (env, teachers),
+    )
+    monkeypatch.setattr(
+        expert_trainer,
+        "_reset_planner_teachers",
+        lambda task, target_env, target_teachers, indices: resets.append(
+            (task, target_env, target_teachers, indices)
+        ),
+    )
+
+    runtime = _EvaluationRuntime()
+    first = runtime.prepare(config)
+    assert first[0] is env
+    assert first[1] is teachers
+    assert first[2] > 0.0
+    assert first[3] == 0.0
+    assert first[4] == 0
+    runtime.mark_complete()
+
+    second = runtime.prepare(config)
+    assert second[0] is env
+    assert second[2] == 0.0
+    assert second[3] > 0.0
+    assert second[4] == 1
+    assert env.restore_payloads == [{"nested": {"values": [1, 2, 3, 99]}}]
+    assert runtime.initial_checkpoint == {"nested": {"values": [1, 2, 3]}}
+    assert resets == [("t4_sphere", env, teachers, [0, 1])]
+
+    runtime.close()
+    runtime.close()
+    assert env.closed is True
+    assert runtime.closed is True
 
 
 def test_sampler_learner_overlap_runs_updates_while_sampling_is_in_flight() -> None:
