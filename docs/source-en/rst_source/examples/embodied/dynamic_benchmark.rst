@@ -207,10 +207,11 @@ freeze, without loading a learned policy:
       --output outputs/dynamic_benchmark/t1_xyz_planner/validation_seed1
 
 The planner evaluator stores the same reset identity, executed actions, exact replay
-evidence, task metrics, and decision-latency gate. Every action tape is replayed on an
-independently constructed raw environment, and the replay reset restores task-hidden
-runtime state such as the T5 event tape before exact observation, outcome, and final
-state checks. Test-ID/OOD remain available only for the single post-freeze comparison.
+evidence, task metrics, and decision-latency gate. For every manifest row, both the
+planner rollout and action-tape replay use separately constructed raw environments
+that are reset exactly once. The replay reset also restores task-hidden runtime state
+such as the T5 event tape before exact observation, outcome, and final-state checks.
+Test-ID/OOD remain available only for the single post-freeze comparison.
 
 Export best-known trajectories
 ------------------------------

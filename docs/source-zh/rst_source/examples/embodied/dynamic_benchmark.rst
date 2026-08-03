@@ -203,9 +203,10 @@ policy：
       --output outputs/dynamic_benchmark/t1_xyz_planner/validation_seed1
 
 planner evaluator 同样保存 reset identity、实际动作、exact replay 证据、任务指标和决策
-延迟门。每条 action tape 都在独立新建的 raw environment 上重放；重放 reset 会先恢复
-任务隐藏运行态（例如 T5 event tape），再执行 observation、outcome 与 final state 的
-exact 检查。test-ID/OOD 只用于冻结后的单次比较。
+延迟门。对每个 manifest row，planner rollout 与 action-tape replay 都各自在独立新建且
+只 reset 一次的 raw environment 上运行；重放 reset 还会先恢复任务隐藏运行态（例如
+T5 event tape），再执行 observation、outcome 与 final state 的 exact 检查。test-ID/OOD
+只用于冻结后的单次比较。
 
 导出 best-known 轨迹
 -------------------

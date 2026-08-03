@@ -118,6 +118,52 @@ def _replay_actions_on_fresh_env(
         raw_env.close()
 
 
+def _reset_rollout_on_fresh_env(*, vector_env: Any, request: Any) -> Any:
+    """Start one planner rollout from a newly constructed raw environment.
+
+    The vector adapter normally advances a manifest by repeatedly resetting the
+    same raw simulator. Exact-replay validation instead constructs a new raw
+    simulator. Keeping those lifecycle semantics asymmetric can expose hidden
+    carry-over after later resets, so the planner evaluator replaces its sole raw
+    member for every manifest row and resets that member exactly once.
+    """
+    if int(vector_env.num_envs) != 1:
+        raise ValueError("planner evaluation requires exactly one vector member")
+    if request.task_id != vector_env.task_id:
+        raise ValueError("planner evaluation request task does not match the environment")
+    raw_env = vector_env._make_mujoco_env(
+        vector_env.task_id,
+        image_size=vector_env.image_size,
+        camera_observations=vector_env.camera_observations,
+    )
+    try:
+        if int(raw_env.horizon_steps) != int(vector_env.horizon_steps):
+            raise RuntimeError("fresh planner raw environment changed the horizon")
+        observation = raw_env.reset(request)
+        vector_env._arm_hidden_t5_event(raw_env, request)
+        state = vector_env._encode(observation, request)
+    except BaseException:
+        raw_env.close()
+        raise
+
+    previous_env = vector_env.envs[0]
+    try:
+        previous_env.close()
+    except BaseException:
+        raw_env.close()
+        raise
+    vector_env.envs[0] = raw_env
+    vector_env._reset_metrics(np.asarray([0], dtype=np.int64))
+    vector_env._raw_observations[0] = observation
+    vector_env._requests[0] = request
+    vector_env._needs_reset[0] = False
+    vector_env._last_obs = {
+        "states": torch.as_tensor(state[None], dtype=torch.float32)
+    }
+    vector_env._is_start = True
+    return observation
+
+
 def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
     from se3_wam.benchmark.metrics import (
         completion_time_from_events,
@@ -321,11 +367,10 @@ def main() -> None:
         started = time.time()
         records = []
         latencies_s: list[float] = []
-        for episode_index in range(args.episodes):
-            if episode_index:
-                env.reset(options={"env_idx": [0]})
+        for episode_index, row in enumerate(rows):
+            _reset_rollout_on_fresh_env(vector_env=env, request=row.request)
             record, episode_latencies = _episode(env=env, task_id=args.task)
-            if record["episode_id"] != rows[episode_index].request.episode_id:
+            if record["episode_id"] != row.request.episode_id:
                 raise RuntimeError(
                     "planner rollout order diverged from the frozen reset manifest"
                 )
