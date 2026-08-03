@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
 
@@ -28,7 +30,9 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     _demo_replay_identity,
     _env_cfg,
     _load_demo_replay_cache,
+    _load_demo_replay_cache_for_training,
     _parse_args,
+    _rng_state,
     _save_demo_replay_cache,
     _score,
 )
@@ -165,7 +169,9 @@ def test_recipe_yaml_sets_defaults_but_keeps_run_identity_explicit(tmp_path) -> 
     assert args.num_envs == 2
 
 
-@pytest.mark.parametrize("key", ["rlinf_commit", "demo_rlinf_commit", "demo_replay_in"])
+@pytest.mark.parametrize(
+    "key", ["rlinf_commit", "demo_rlinf_commit", "demo_seed", "demo_replay_in"]
+)
 def test_recipe_yaml_rejects_run_specific_provenance(tmp_path, key: str) -> None:
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text(f"task: t2_trans\n{key}: unsafe\n", encoding="utf-8")
@@ -321,9 +327,12 @@ def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
         ]
     )
     config = _config(args)
+    assert config.demo_seed == config.seed == 3
     state_schema = {"state_dim": 2, "mask_dim": 0, "fields": ["fixture"]}
     identity = _demo_replay_identity(config, state_schema)
     assert _demo_replay_identity(replace(config, num_envs=32), state_schema) == identity
+    assert _demo_replay_identity(replace(config, seed=4), state_schema) == identity
+    assert _demo_replay_identity(replace(config, demo_seed=4), state_schema) != identity
     assert (
         _demo_replay_identity(replace(config, demo_rlinf_commit="c" * 40), state_schema)
         != identity
@@ -407,3 +416,31 @@ def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
             restored_replay,
             restored_normalizer,
         )
+
+    random.seed(41)
+    np.random.seed(41)
+    torch.manual_seed(41)
+    multiseed_replay = TransitionReplay(capacity=8, state_dim=2, seed=52)
+    learner_rng_state = _rng_state()
+    learner_replay_generator_state = multiseed_replay.generator.get_state().clone()
+    multiseed_normalizer = RunningNormalizer(dimension=2, mask_dim=0)
+    _load_demo_replay_cache_for_training(
+        cache_path,
+        identity,
+        multiseed_replay,
+        multiseed_normalizer,
+        training_seed=41,
+        demo_seed=config.demo_seed,
+    )
+    restored_rng_state = _rng_state()
+    assert restored_rng_state["python"] == learner_rng_state["python"]
+    assert np.array_equal(
+        restored_rng_state["numpy"][1], learner_rng_state["numpy"][1]
+    )
+    assert torch.equal(
+        restored_rng_state["torch_cpu"], learner_rng_state["torch_cpu"]
+    )
+    assert torch.equal(
+        multiseed_replay.generator.get_state(), learner_replay_generator_state
+    )
+    assert multiseed_replay.size == replay.size

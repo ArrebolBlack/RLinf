@@ -52,6 +52,7 @@ class TrainConfig:
     demo_rlinf_commit: str
     benchmark_commit: str
     seed: int
+    demo_seed: int
     num_envs: int
     eval_num_envs: int
     demo_num_envs: int
@@ -380,9 +381,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--demo-replay-in",
         type=Path,
-        help="Validated demo replay cache from a matching source/task/seed identity.",
+        help="Validated demo replay cache from a matching producer identity.",
     )
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--demo-seed",
+        type=int,
+        help=(
+            "Seed embedded in --demo-replay-in; defaults to --seed. Set this "
+            "explicitly when multiple learner seeds share one frozen demo cache."
+        ),
+    )
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--eval-num-envs", type=int, default=4)
     parser.add_argument(
@@ -482,6 +491,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         explicit_only = {
             "benchmark_commit",
             "config",
+            "demo_seed",
             "demo_rlinf_commit",
             "demo_replay_in",
             "output",
@@ -510,6 +520,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         demo_rlinf_commit=args.demo_rlinf_commit or args.rlinf_commit,
         benchmark_commit=args.benchmark_commit,
         seed=args.seed,
+        demo_seed=args.seed if args.demo_seed is None else args.demo_seed,
         num_envs=args.num_envs,
         eval_num_envs=args.eval_num_envs,
         demo_num_envs=args.demo_num_envs,
@@ -733,7 +744,7 @@ def _demo_replay_identity(
         "task": config.task,
         "rlinf_commit": config.demo_rlinf_commit,
         "benchmark_commit": config.benchmark_commit,
-        "seed": config.seed,
+        "seed": config.demo_seed,
         # This is the frozen demo producer width, not the learner vector width.
         # Keeping it separate lets utilization candidates consume the exact same
         # cache payload while scanning num_envs.
@@ -803,6 +814,36 @@ def _load_demo_replay_cache(
     if replay.size != int(demo_summary["transitions"]):
         raise ValueError("demo replay cache transition count does not match")
     return demo_summary, cache_sha256
+
+
+def _load_demo_replay_cache_for_training(
+    path: Path,
+    expected_identity: dict[str, Any],
+    replay: TransitionReplay,
+    normalizer: RunningNormalizer,
+    *,
+    training_seed: int,
+    demo_seed: int,
+) -> tuple[dict[str, Any], str]:
+    """Load frozen demo data without collapsing distinct learner RNG streams.
+
+    The same-seed path preserves historical collect-vs-cache exact parity. A
+    learner with a different seed keeps the RNG and replay-sampler states already
+    established from that learner seed while consuming identical cached data.
+    """
+
+    learner_rng_state = _rng_state()
+    learner_replay_generator_state = replay.generator.get_state().clone()
+    summary, cache_sha256 = _load_demo_replay_cache(
+        path,
+        expected_identity,
+        replay,
+        normalizer,
+    )
+    if training_seed != demo_seed:
+        _restore_rng(learner_rng_state)
+        replay.generator.set_state(learner_replay_generator_state)
+    return summary, cache_sha256
 
 
 def _policy_action(
@@ -1688,6 +1729,10 @@ def main() -> None:
         if config.algorithm in {"bc", "rlpd", "residual_rlpd"}:
             demo_identity = _demo_replay_identity(config, state_schema)
             if args.demo_replay_in is None:
+                if config.demo_seed != config.seed:
+                    raise ValueError(
+                        "demo_seed may differ from seed only with --demo-replay-in"
+                    )
                 demo_summary = _collect_demos(config, demos, normalizer)
                 demo_cache_path = args.output / "demo_replay.pt"
                 demo_cache_sha256 = _save_demo_replay_cache(
@@ -1702,11 +1747,13 @@ def main() -> None:
                     "sha256": demo_cache_sha256,
                 }
             else:
-                demo_summary, demo_cache_sha256 = _load_demo_replay_cache(
+                demo_summary, demo_cache_sha256 = _load_demo_replay_cache_for_training(
                     args.demo_replay_in,
                     demo_identity,
                     demos,
                     normalizer,
+                    training_seed=config.seed,
+                    demo_seed=config.demo_seed,
                 )
                 demo_source = {
                     "mode": "cache",
