@@ -498,6 +498,40 @@ def _make_teacher(task: str, request: Any) -> Any:
     return teacher
 
 
+class _ArmedResetReplayEnv:
+    """Expose the canonical raw-env replay API while rearming hidden T5 events."""
+
+    def __init__(self, vector_env: Any, raw_env: Any) -> None:
+        self._vector_env = vector_env
+        self._raw_env = raw_env
+
+    def reset(self, request: Any) -> Any:
+        observation = self._raw_env.reset(request)
+        self._vector_env._arm_hidden_t5_event(self._raw_env, request)
+        return observation
+
+    def step(self, action: Any) -> Any:
+        return self._raw_env.step(action)
+
+    def save_state(self) -> bytes:
+        return self._raw_env.save_state()
+
+
+def _restore_candidate_start(env: Any, state: Mapping[str, Any]) -> None:
+    """Restore wrapper bookkeeping, then rebuild the canonical request reset."""
+
+    env.load_checkpoint_state(state)
+    request = env._requests[0]
+    if request is None:
+        raise RuntimeError("candidate restore lost its reset request")
+    raw_env = env.envs[0]
+    observation = raw_env.reset(request)
+    env._arm_hidden_t5_event(raw_env, request)
+    env._raw_observations[0] = observation
+    encoded = np.asarray(env._encode(observation, request), dtype=np.float32)
+    env._last_obs = {"states": torch.as_tensor(encoded[None, :], dtype=torch.float32)}
+
+
 def _rollout(
     *,
     env: Any,
@@ -651,7 +685,7 @@ def _rollout(
         else None
     )
     replay_validation = replay_actions(
-        raw_env,
+        _ArmedResetReplayEnv(env, raw_env),
         request=request,
         expected_observations=tuple(observations),
         actions=tuple(actions),
@@ -1023,7 +1057,7 @@ def main() -> None:
             budget_used = budgets[-1]
             for budget in budgets:
                 for candidate in candidates[len(reset_attempts) : budget]:
-                    light_env.load_checkpoint_state(initial_state)
+                    _restore_candidate_start(light_env, initial_state)
                     record, arrays, _ = _rollout(
                         env=light_env,
                         candidate=candidate,

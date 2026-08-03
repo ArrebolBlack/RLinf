@@ -29,6 +29,7 @@ from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
 )
 from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     CANDIDATE_SCHEMA,
+    _ArmedResetReplayEnv,
     _budget_sequence,
     _candidate_identity,
     _eligible,
@@ -36,6 +37,7 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _progress_payload,
     _quality_score,
     _recover_partial_output,
+    _restore_candidate_start,
     _select_winner,
     _validate_candidate_manifest,
     _write_attempt_tape,
@@ -258,3 +260,78 @@ def test_resume_preserves_dirty_tail_and_restores_committed_boundary(tmp_path: P
         / dirty_episode
         / "evidence.bin"
     ).is_file()
+
+
+def test_candidate_restore_uses_canonical_request_reset_and_rearms_hidden_event() -> None:
+    request = SimpleNamespace(episode_id="episode-1")
+
+    class RawEnv:
+        def __init__(self) -> None:
+            self.reset_requests = []
+
+        def reset(self, value):
+            self.reset_requests.append(value)
+            return "canonical-observation"
+
+    class VectorEnv:
+        def __init__(self) -> None:
+            self.envs = [RawEnv()]
+            self._requests = [None]
+            self._raw_observations = [None]
+            self._last_obs = None
+            self.armed = []
+
+        def load_checkpoint_state(self, state):
+            assert state == {"checkpoint": True}
+            self._requests[0] = request
+            self._raw_observations[0] = "loaded-state-observation"
+
+        def _arm_hidden_t5_event(self, raw_env, value):
+            self.armed.append((raw_env, value))
+
+        def _encode(self, observation, value):
+            assert observation == "canonical-observation"
+            assert value is request
+            return np.asarray([1.0, 2.0], dtype=np.float32)
+
+    env = VectorEnv()
+    _restore_candidate_start(env, {"checkpoint": True})
+
+    assert env.envs[0].reset_requests == [request]
+    assert env.armed == [(env.envs[0], request)]
+    assert env._raw_observations == ["canonical-observation"]
+    np.testing.assert_array_equal(
+        env._last_obs["states"].numpy(),
+        np.asarray([[1.0, 2.0]], dtype=np.float32),
+    )
+
+
+def test_replay_proxy_rearms_after_canonical_reset() -> None:
+    request = object()
+
+    class RawEnv:
+        def reset(self, value):
+            assert value is request
+            return "observation"
+
+        def step(self, action):
+            return ("step", action)
+
+        def save_state(self):
+            return b"state"
+
+    class VectorEnv:
+        def __init__(self) -> None:
+            self.armed = []
+
+        def _arm_hidden_t5_event(self, raw_env, value):
+            self.armed.append((raw_env, value))
+
+    raw_env = RawEnv()
+    vector_env = VectorEnv()
+    proxy = _ArmedResetReplayEnv(vector_env, raw_env)
+
+    assert proxy.reset(request) == "observation"
+    assert vector_env.armed == [(raw_env, request)]
+    assert proxy.step("action") == ("step", "action")
+    assert proxy.save_state() == b"state"
