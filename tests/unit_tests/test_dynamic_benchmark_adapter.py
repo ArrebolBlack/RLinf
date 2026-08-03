@@ -25,6 +25,10 @@ from rlinf.envs.dynamic_benchmark.state_schema import (
     ALLOWED_PRIVILEGED_KEYS,
     DynamicBenchmarkStateSchema,
 )
+from rlinf.envs.dynamic_benchmark.t5_runtime import (
+    arm_hidden_t5_event,
+    t5_branch_for_episode,
+)
 
 
 def _observation() -> SimpleNamespace:
@@ -42,6 +46,43 @@ def _observation() -> SimpleNamespace:
 
 def test_dynamic_benchmark_env_type_is_registered() -> None:
     assert SupportedEnvType("dynamic_benchmark") is SupportedEnvType.DYNAMIC_BENCHMARK
+
+
+def test_t5_hidden_event_branch_is_deterministic_balanced_and_not_a_reset_factor() -> None:
+    episode_ids = [f"episode-{index:04d}" for index in range(128)]
+    branches = [t5_branch_for_episode(episode_id) for episode_id in episode_ids]
+
+    assert branches == [t5_branch_for_episode(episode_id) for episode_id in episode_ids]
+    assert set(branches) == {"left", "right"}
+    assert 40 <= branches.count("left") <= 88
+    with pytest.raises(ValueError, match="non-empty trimmed"):
+        t5_branch_for_episode(" episode-1")
+
+
+def test_t5_reset_hook_arms_hidden_event_tape_before_the_first_step() -> None:
+    armed: list[SimpleNamespace] = []
+
+    class FakeEnv:
+        def arm_event_tape(self, tape: SimpleNamespace) -> str:
+            armed.append(tape)
+            return "tape-sha"
+
+    result = arm_hidden_t5_event(
+        task_id="t5_replan",
+        split_name="train",
+        env=FakeEnv(),
+        request=SimpleNamespace(episode_id="t5-episode-17", factors={}),
+        load_task_config=lambda _task_id: {
+            "event": {"default_trigger_gate_y_m": 0.42}
+        },
+        event_tape_type=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    assert result == "tape-sha"
+    assert len(armed) == 1
+    assert armed[0].branch in {"left", "right"}
+    assert armed[0].trigger_gate_y_m == 0.42
+    assert "t5-episode-17" in armed[0].event_id
 
 
 def test_state_allowlist_contains_no_future_oracle_fields() -> None:

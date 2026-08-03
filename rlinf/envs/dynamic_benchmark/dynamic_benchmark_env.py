@@ -28,6 +28,7 @@ import torch
 
 from .reward import DynamicBenchmarkReward
 from .state_schema import DynamicBenchmarkStateSchema
+from .t5_runtime import arm_hidden_t5_event
 
 __all__ = ["DynamicBenchmarkEnv"]
 
@@ -156,9 +157,11 @@ class DynamicBenchmarkEnv(gym.Env):
     def _load_benchmark_contracts(self) -> None:
         try:
             from se3_wam.benchmark.api import ActionCommand, Split
+            from se3_wam.benchmark.config import load_task_config
             from se3_wam.benchmark.dataset_manifest import (
                 make_dataset_candidate_manifest,
             )
+            from se3_wam.benchmark.keyed_puck import T5EventTape
             from se3_wam.benchmark.p0_grasp_manifest import (
                 make_p0_grasp_candidate_manifest,
             )
@@ -176,6 +179,8 @@ class DynamicBenchmarkEnv(gym.Env):
         self._Split = Split
         self._make_dataset_candidate_manifest = make_dataset_candidate_manifest
         self._make_p0_grasp_candidate_manifest = make_p0_grasp_candidate_manifest
+        self._load_task_config = load_task_config
+        self._T5EventTape = T5EventTape
         self._active_task_ids = tuple(ACTIVE_TASK_IDS)
         self._task_ids = tuple(RL_EXPERT_TASK_IDS)
         self._get_task_spec = get_task_spec
@@ -288,6 +293,16 @@ class DynamicBenchmarkEnv(gym.Env):
         for index in indices:
             self.reward_trackers[int(index)].reset()
 
+    def _arm_hidden_t5_event(self, env: Any, request: Any) -> str | None:
+        return arm_hidden_t5_event(
+            task_id=self.task_id,
+            split_name=self.split_name,
+            env=env,
+            request=request,
+            load_task_config=self._load_task_config,
+            event_tape_type=self._T5EventTape,
+        )
+
     def reset(
         self,
         *,
@@ -317,6 +332,7 @@ class DynamicBenchmarkEnv(gym.Env):
         for index in indices:
             request = self._next_request()
             observation = self.envs[int(index)].reset(request)
+            self._arm_hidden_t5_event(self.envs[int(index)], request)
             state = self._encode(observation, request)
             if states.shape[1] == 0:
                 states = np.zeros((self.num_envs, state.size), dtype=np.float32)
