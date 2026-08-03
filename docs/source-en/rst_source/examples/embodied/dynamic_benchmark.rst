@@ -146,6 +146,27 @@ critic stay in residual-action space, planner demonstrations map to the exact ze
 residual, and checkpoints include the stateful planner instances. ``--residual-scale``
 defaults to ``0.25``; treat each scale and actor-BC weight as a separate arm.
 
+Environment stepping can use persistent subprocess shards instead of the serial or
+threaded adapter. Set ``--eval-worker-processes 2`` (or ``4``/``8``) to accelerate
+the frozen-manifest validation loop, and ``--env-worker-processes`` to shard training
+reset/step calls. The parent process still assigns manifest rows and restores replies
+by environment index, so seed and episode order do not depend on worker completion
+order. Each subprocess is serial internally; keep the corresponding
+``--*-worker-threads`` value at ``1``. ``--process-start-method spawn`` is the
+portable, CUDA-safe default. Process count is execution provenance and therefore a
+checkpoint must be resumed with the same configuration.
+
+Before a throughput bakeoff, run the process correctness gate against the real
+benchmark checkout. It compares serial/process reset and step digests, verifies an
+exact process-mode checkpoint/resume suffix, and intentionally crashes one worker to
+check bounded cleanup of every shard:
+
+.. code-block:: bash
+
+   python examples/embodiment/verify_dynamic_benchmark_process_runtime.py \
+      --task t4_sphere --num-envs 8 --worker-processes 4 \
+      --output outputs/dynamic_benchmark/process_gate.json
+
 The matched on-policy control is a separate resumable trainer:
 
 .. code-block:: bash

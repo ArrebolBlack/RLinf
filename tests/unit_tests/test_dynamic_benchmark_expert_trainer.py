@@ -144,7 +144,9 @@ def test_throughput_probe_requires_full_frozen_source_commits() -> None:
 
 def test_recipe_yaml_sets_defaults_but_keeps_run_identity_explicit(tmp_path) -> None:
     recipe = tmp_path / "recipe.yaml"
-    recipe.write_text("task: t2_trans\nalgorithm: rlpd\nnum_envs: 2\n", encoding="utf-8")
+    recipe.write_text(
+        "task: t2_trans\nalgorithm: rlpd\nnum_envs: 2\n", encoding="utf-8"
+    )
     args = _parse_args(
         [
             "--config",
@@ -163,9 +165,7 @@ def test_recipe_yaml_sets_defaults_but_keeps_run_identity_explicit(tmp_path) -> 
     assert args.num_envs == 2
 
 
-@pytest.mark.parametrize(
-    "key", ["rlinf_commit", "demo_rlinf_commit", "demo_replay_in"]
-)
+@pytest.mark.parametrize("key", ["rlinf_commit", "demo_rlinf_commit", "demo_replay_in"])
 def test_recipe_yaml_rejects_run_specific_provenance(tmp_path, key: str) -> None:
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text(f"task: t2_trans\n{key}: unsafe\n", encoding="utf-8")
@@ -196,6 +196,46 @@ def test_actor_bc_regularization_is_explicit_and_non_negative(tmp_path) -> None:
         _config(_parse_args([*common, "--actor-bc-weight", "-1"]))
 
 
+def test_process_worker_configuration_is_explicit_and_thread_exclusive(
+    tmp_path,
+) -> None:
+    common = [
+        "--task",
+        "t4_sphere",
+        "--algorithm",
+        "residual_rlpd",
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "run"),
+        "--env-worker-processes",
+        "4",
+        "--eval-worker-processes",
+        "8",
+    ]
+
+    config = _config(_parse_args(common))
+    env_cfg = _env_cfg(
+        config,
+        split="validation",
+        seed=17,
+        num_envs=8,
+        worker_threads=1,
+        worker_processes=config.eval_worker_processes,
+        process_start_method=config.process_start_method,
+    )
+
+    assert config.env_worker_processes == 4
+    assert config.eval_worker_processes == 8
+    assert config.process_start_method == "spawn"
+    assert env_cfg["worker_processes"] == 8
+    assert env_cfg["process_start_method"] == "spawn"
+    with pytest.raises(ValueError, match="threads=1"):
+        _config(_parse_args([*common, "--env-worker-threads", "2"]))
+
+
 def test_safety_penalty_is_explicit_and_reaches_environment_and_cache_identity(
     tmp_path,
 ) -> None:
@@ -216,19 +256,23 @@ def test_safety_penalty_is_explicit_and_reaches_environment_and_cache_identity(
     config = _config(_parse_args(common))
 
     assert config.reward_safety_penalty == -30.0
-    assert _env_cfg(
-        config,
-        split="train",
-        seed=17,
-        num_envs=2,
-        worker_threads=1,
-    )[
-        "reward_safety_penalty"
-    ] == -30.0
-    assert _demo_replay_identity(
-        config,
-        {"state_dim": 2, "mask_dim": 0, "fields": ["fixture"]},
-    )["reward_safety_penalty"] == -30.0
+    assert (
+        _env_cfg(
+            config,
+            split="train",
+            seed=17,
+            num_envs=2,
+            worker_threads=1,
+        )["reward_safety_penalty"]
+        == -30.0
+    )
+    assert (
+        _demo_replay_identity(
+            config,
+            {"state_dim": 2, "mask_dim": 0, "fields": ["fixture"]},
+        )["reward_safety_penalty"]
+        == -30.0
+    )
     with pytest.raises(ValueError, match="non-positive"):
         _config(_parse_args([*common, "--reward-safety-penalty", "1"]))
     with pytest.raises(ValueError, match="finite"):
@@ -281,9 +325,7 @@ def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
     identity = _demo_replay_identity(config, state_schema)
     assert _demo_replay_identity(replace(config, num_envs=32), state_schema) == identity
     assert (
-        _demo_replay_identity(
-            replace(config, demo_rlinf_commit="c" * 40), state_schema
-        )
+        _demo_replay_identity(replace(config, demo_rlinf_commit="c" * 40), state_schema)
         != identity
     )
     replay = TransitionReplay(capacity=8, state_dim=2, seed=14)

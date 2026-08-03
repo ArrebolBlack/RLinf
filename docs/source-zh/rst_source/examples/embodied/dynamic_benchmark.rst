@@ -143,6 +143,24 @@ return 可比较。
 有状态的 planner 实例。``--residual-scale`` 默认 ``0.25``，每个 scale 与 actor-BC
 权重组合都必须登记为独立实验臂。
 
+环境 step 也可使用持久化子进程分片，而非串行或线程 adapter。设置
+``--eval-worker-processes 2``（也可用 ``4``/``8``）可加速冻结 manifest 的 validation，
+``--env-worker-processes`` 则用于分片训练 reset/step。manifest row 仍由主进程分配，
+返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖 worker 完成顺序。每个子进程
+内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``；
+``--process-start-method spawn`` 是跨平台且 CUDA-safe 的默认值。进程数属于执行 provenance，
+checkpoint 恢复时必须使用相同配置。
+
+吞吐 bakeoff 前，应在真实 benchmark checkout 上运行进程正确性 gate。它会比较
+serial/process 的 reset 与 step digest，验证 process 模式 checkpoint/resume 的精确
+后缀，并故意使一个 worker 崩溃，以检查所有分片都能有界清理：
+
+.. code-block:: bash
+
+   python examples/embodiment/verify_dynamic_benchmark_process_runtime.py \
+      --task t4_sphere --num-envs 8 --worker-processes 4 \
+      --output outputs/dynamic_benchmark/process_gate.json
+
 matched on-policy 对照使用独立的可恢复 trainer：
 
 .. code-block:: bash

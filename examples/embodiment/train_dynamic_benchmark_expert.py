@@ -44,7 +44,6 @@ if TYPE_CHECKING:
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
 
-
 @dataclass(frozen=True)
 class TrainConfig:
     task: str
@@ -58,6 +57,9 @@ class TrainConfig:
     demo_num_envs: int
     env_worker_threads: int
     eval_worker_threads: int
+    env_worker_processes: int
+    eval_worker_processes: int
+    process_start_method: str
     total_env_steps: int
     random_env_steps: int
     demo_episodes: int
@@ -183,7 +185,10 @@ class RunningNormalizer:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if int(state["dimension"]) != self.dimension or int(state["mask_dim"]) != self.mask_dim:
+        if (
+            int(state["dimension"]) != self.dimension
+            or int(state["mask_dim"]) != self.mask_dim
+        ):
             raise ValueError("normalizer shape does not match checkpoint")
         self.epsilon = float(state["epsilon"])
         self.count = int(state["count"])
@@ -230,10 +235,14 @@ class TransitionReplay:
         self.size = 0
         self.generator = torch.Generator(device="cpu")
         self.generator.manual_seed(seed)
-        self.states = torch.empty((capacity, state_dim), dtype=torch.float32, **allocation)
+        self.states = torch.empty(
+            (capacity, state_dim), dtype=torch.float32, **allocation
+        )
         self.actions = torch.empty((capacity, 7), dtype=torch.float32, **allocation)
         self.rewards = torch.empty((capacity, 1), dtype=torch.float32, **allocation)
-        self.next_states = torch.empty((capacity, state_dim), dtype=torch.float32, **allocation)
+        self.next_states = torch.empty(
+            (capacity, state_dim), dtype=torch.float32, **allocation
+        )
         self.terminated = torch.empty((capacity, 1), dtype=torch.bool, **allocation)
         self.truncated = torch.empty((capacity, 1), dtype=torch.bool, **allocation)
 
@@ -250,8 +259,12 @@ class TransitionReplay:
         if rows < 1:
             return
         payload = {
-            "states": torch.as_tensor(states, dtype=torch.float32).to(self.storage_device),
-            "actions": torch.as_tensor(actions, dtype=torch.float32).to(self.storage_device),
+            "states": torch.as_tensor(states, dtype=torch.float32).to(
+                self.storage_device
+            ),
+            "actions": torch.as_tensor(actions, dtype=torch.float32).to(
+                self.storage_device
+            ),
             "rewards": torch.as_tensor(rewards, dtype=torch.float32)
             .reshape(-1, 1)
             .to(self.storage_device),
@@ -380,6 +393,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--env-worker-threads", type=int, default=1)
     parser.add_argument("--eval-worker-threads", type=int, default=1)
+    parser.add_argument(
+        "--env-worker-processes",
+        type=int,
+        default=0,
+        help="Persistent subprocess shards for training environment reset/step (0 is serial).",
+    )
+    parser.add_argument(
+        "--eval-worker-processes",
+        type=int,
+        default=0,
+        help="Persistent subprocess shards for validation environment reset/step (0 is serial).",
+    )
+    parser.add_argument(
+        "--process-start-method",
+        choices=("spawn", "forkserver", "fork"),
+        default="spawn",
+        help="Environment subprocess start method; spawn is CUDA-safe and portable.",
+    )
     parser.add_argument("--total-env-steps", type=int, default=200_000)
     parser.add_argument("--random-env-steps", type=int, default=2_000)
     parser.add_argument("--demo-episodes", type=int, default=32)
@@ -484,6 +515,9 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         demo_num_envs=args.demo_num_envs,
         env_worker_threads=args.env_worker_threads,
         eval_worker_threads=args.eval_worker_threads,
+        env_worker_processes=args.env_worker_processes,
+        eval_worker_processes=args.eval_worker_processes,
+        process_start_method=args.process_start_method,
         total_env_steps=args.total_env_steps,
         random_env_steps=args.random_env_steps,
         demo_episodes=args.demo_episodes,
@@ -522,12 +556,20 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("environment counts must be positive")
     if config.env_worker_threads < 1 or config.eval_worker_threads < 1:
         raise ValueError("environment worker thread counts must be positive")
+    if config.env_worker_processes < 0 or config.eval_worker_processes < 0:
+        raise ValueError("environment worker process counts must be non-negative")
+    if config.env_worker_processes and config.env_worker_threads != 1:
+        raise ValueError("training process workers require env_worker_threads=1")
+    if config.eval_worker_processes and config.eval_worker_threads != 1:
+        raise ValueError("evaluation process workers require eval_worker_threads=1")
     for name, commit in (
         ("rlinf_commit", config.rlinf_commit),
         ("demo_rlinf_commit", config.demo_rlinf_commit),
         ("benchmark_commit", config.benchmark_commit),
     ):
-        if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        if len(commit) != 40 or any(
+            character not in "0123456789abcdef" for character in commit
+        ):
             raise ValueError(f"{name} must be a full lowercase Git commit")
     if config.q_heads < 2 or not 1 <= config.q_target_subset <= config.q_heads:
         raise ValueError("Q ensemble/subset configuration is invalid")
@@ -537,7 +579,10 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("actor_bc_weight must be non-negative")
     if not 0.0 < config.residual_scale <= 1.0:
         raise ValueError("residual_scale must be in (0, 1]")
-    if not math.isfinite(config.reward_safety_penalty) or config.reward_safety_penalty > 0.0:
+    if (
+        not math.isfinite(config.reward_safety_penalty)
+        or config.reward_safety_penalty > 0.0
+    ):
         raise ValueError("reward_safety_penalty must be finite and non-positive")
     if config.algorithm in {"bc", "rlpd", "residual_rlpd"} and config.demo_episodes < 1:
         raise ValueError("BC/RLPD requires at least one demonstration episode")
@@ -557,6 +602,8 @@ def _env_cfg(
     seed: int,
     num_envs: int,
     worker_threads: int,
+    worker_processes: int = 0,
+    process_start_method: str = "spawn",
 ) -> dict[str, Any]:
     return {
         "task_id": config.task,
@@ -569,13 +616,17 @@ def _env_cfg(
         "ignore_terminations": False,
         "group_size": 1,
         "worker_threads": worker_threads,
+        "worker_processes": worker_processes,
+        "process_start_method": process_start_method,
         "reward_safety_penalty": config.reward_safety_penalty,
     }
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -624,7 +675,9 @@ class PhaseTimings:
             raise ValueError("phase timing observations must be non-negative")
         self.total_seconds[name] = self.total_seconds.get(name, 0.0) + float(seconds)
         self.total_counts[name] = self.total_counts.get(name, 0) + int(count)
-        self.interval_seconds[name] = self.interval_seconds.get(name, 0.0) + float(seconds)
+        self.interval_seconds[name] = self.interval_seconds.get(name, 0.0) + float(
+            seconds
+        )
         self.interval_counts[name] = self.interval_counts.get(name, 0) + int(count)
 
     @staticmethod
@@ -728,7 +781,10 @@ def _load_demo_replay_cache(
     if payload.get("schema_version") != "rlinf-dynamic-benchmark-demo-replay-v0.1":
         raise ValueError("demo replay cache schema does not match")
     cached_identity = payload.get("identity")
-    if isinstance(cached_identity, dict) and "reward_safety_penalty" not in cached_identity:
+    if (
+        isinstance(cached_identity, dict)
+        and "reward_safety_penalty" not in cached_identity
+    ):
         # Caches produced before reward-safety provenance was added used the
         # canonical -10 penalty but otherwise share the same v0.1 identity.
         # Upgrade only that exact legacy omission; non-canonical penalties and
@@ -788,7 +844,9 @@ def _make_planner_teachers(task: str, env: Any) -> list[Any]:
     return teachers
 
 
-def _reset_planner_teachers(task: str, env: Any, teachers: list[Any], indices: list[int]) -> None:
+def _reset_planner_teachers(
+    task: str, env: Any, teachers: list[Any], indices: list[int]
+) -> None:
     from se3_wam.benchmark.teacher_factory import make_privileged_teacher
 
     for index in indices:
@@ -821,7 +879,9 @@ def _compose_residual_actions(
     planner = torch.as_tensor(planner_actions, dtype=torch.float32, device="cpu")
     residual = torch.as_tensor(residual_actions, dtype=torch.float32, device="cpu")
     if planner.shape != residual.shape or planner.shape[-1] != 7:
-        raise ValueError("planner and residual actions must have matching [..., 7] shapes")
+        raise ValueError(
+            "planner and residual actions must have matching [..., 7] shapes"
+        )
     if not 0.0 < residual_scale <= 1.0:
         raise ValueError("residual_scale must be in (0, 1]")
     return torch.clamp(planner + float(residual_scale) * residual, -1.0, 1.0)
@@ -929,7 +989,9 @@ def _collect_demos(
                 observation = env._raw_observations[index]
                 if observation is None:
                     raise RuntimeError("demo environment lost its raw observation")
-                action_values.append(np.asarray(teacher.act(observation).values, dtype=np.float32))
+                action_values.append(
+                    np.asarray(teacher.act(observation).values, dtype=np.float32)
+                )
             actions = torch.as_tensor(np.stack(action_values), dtype=torch.float32)
             next_obs, rewards, terminated, truncated, infos = env.step(
                 actions,
@@ -1012,12 +1074,15 @@ def _evaluate(
             seed=config.validation_manifest_seed,
             num_envs=count,
             worker_threads=config.eval_worker_threads,
+            worker_processes=config.eval_worker_processes,
+            process_start_method=config.process_start_method,
         ),
         num_envs=count,
         seed_offset=0,
-        total_num_processes=1,
+        total_num_processes=max(1, min(config.eval_worker_processes, count)),
         worker_info=None,
     )
+    process_worker_pids = env.process_worker_pids
     records = []
     episode_returns = torch.zeros(count)
     episode_effort = torch.zeros(count)
@@ -1025,7 +1090,11 @@ def _evaluate(
     active_episode_ids: list[int | None] = list(range(count))
     next_episode_id = count
     safety_failures = set(env.reward_schema["safety_failures"])
-    teachers = _make_planner_teachers(config.task, env) if config.algorithm == "residual_rlpd" else None
+    teachers = (
+        _make_planner_teachers(config.task, env)
+        if config.algorithm == "residual_rlpd"
+        else None
+    )
     model.eval()
     try:
         obs = env._last_obs
@@ -1049,10 +1118,14 @@ def _evaluate(
                     config.residual_scale,
                 )
             step_start = time.perf_counter()
-            next_obs, rewards, terminated, truncated, infos = env.step(env_actions, auto_reset=False)
+            next_obs, rewards, terminated, truncated, infos = env.step(
+                env_actions, auto_reset=False
+            )
             environment_step_s += time.perf_counter() - step_start
             vector_steps += 1
-            stepped_env_rows += sum(episode_id is not None for episode_id in active_episode_ids)
+            stepped_env_rows += sum(
+                episode_id is not None for episode_id in active_episode_ids
+            )
             episode_returns += rewards
             episode_effort += env_actions.square().sum(dim=-1)
             episode_steps += 1
@@ -1123,10 +1196,10 @@ def _evaluate(
         ),
         "wall_time_s": wall_time_s,
         "env_steps_per_second": stepped_env_rows / max(wall_time_s, 1e-6),
-        "environment_step_mean_ms": 1000.0
-        * environment_step_s
-        / max(1, vector_steps),
+        "environment_step_mean_ms": 1000.0 * environment_step_s / max(1, vector_steps),
         "environment_reset_total_s": environment_reset_s,
+        "worker_processes": len(process_worker_pids),
+        "worker_pids": process_worker_pids,
         "records": records,
     }
 
@@ -1142,10 +1215,14 @@ def _score(metrics: dict[str, Any]) -> tuple[float, ...]:
     )
 
 
-def _parameter_groups(model: MLPPolicy) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+def _parameter_groups(
+    model: MLPPolicy,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     critic = list(model.q_head.parameters())
     critic_ids = {id(parameter) for parameter in critic}
-    actor = [parameter for parameter in model.parameters() if id(parameter) not in critic_ids]
+    actor = [
+        parameter for parameter in model.parameters() if id(parameter) not in critic_ids
+    ]
     if not actor or not critic or {id(parameter) for parameter in actor} & critic_ids:
         raise RuntimeError("actor/critic parameter partition is invalid")
     return actor, critic
@@ -1181,7 +1258,11 @@ def _bc_warm_start(
         actor_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            [parameter for group in actor_optimizer.param_groups for parameter in group["params"]],
+            [
+                parameter
+                for group in actor_optimizer.param_groups
+                for parameter in group["params"]
+            ],
             10.0,
         )
         actor_optimizer.step()
@@ -1257,9 +1338,9 @@ def _sac_update(
     )
     actions = device_batch["actions"]
     rewards = device_batch["rewards"]
-    dones = torch.logical_or(
-        device_batch["terminated"], device_batch["truncated"]
-    ).to(dtype=torch.float32)
+    dones = torch.logical_or(device_batch["terminated"], device_batch["truncated"]).to(
+        dtype=torch.float32
+    )
     with torch.no_grad():
         next_actions, next_log_prob = _policy_action_normalized(
             model,
@@ -1268,7 +1349,9 @@ def _sac_update(
         )
         target_values = target_q(next_states, next_actions)
         subset = torch.randperm(config.q_heads, device=device)[: config.q_target_subset]
-        target_min = target_values.index_select(-1, subset).min(dim=-1, keepdim=True).values
+        target_min = (
+            target_values.index_select(-1, subset).min(dim=-1, keepdim=True).values
+        )
         alpha = log_alpha.exp()
         bootstrap = target_min - alpha * next_log_prob
         target = rewards + config.gamma * (1.0 - dones) * bootstrap
@@ -1305,7 +1388,11 @@ def _sac_update(
     actor_optimizer.zero_grad(set_to_none=True)
     actor_loss.backward()
     torch.nn.utils.clip_grad_norm_(
-        [parameter for group in actor_optimizer.param_groups for parameter in group["params"]],
+        [
+            parameter
+            for group in actor_optimizer.param_groups
+            for parameter in group["params"]
+        ],
         10.0,
     )
     actor_optimizer.step()
@@ -1389,7 +1476,9 @@ def main() -> None:
     if args.demo_replay_in is not None and config.algorithm == "sac":
         raise ValueError("SAC does not consume a demonstration replay cache")
     if args.demo_replay_in is not None and args.resume is not None:
-        raise ValueError("resume already contains demonstrations; do not pass demo replay cache")
+        raise ValueError(
+            "resume already contains demonstrations; do not pass demo replay cache"
+        )
     if (
         args.resume is None
         and args.demo_replay_in is None
@@ -1421,6 +1510,9 @@ def main() -> None:
             "non_blocking_copy": config.non_blocking_copy,
             "env_worker_threads": config.env_worker_threads,
             "eval_worker_threads": config.eval_worker_threads,
+            "env_worker_processes": config.env_worker_processes,
+            "eval_worker_processes": config.eval_worker_processes,
+            "process_start_method": config.process_start_method,
         },
     )
 
@@ -1436,11 +1528,21 @@ def main() -> None:
             seed=config.train_manifest_seed,
             num_envs=config.num_envs,
             worker_threads=config.env_worker_threads,
+            worker_processes=config.env_worker_processes,
+            process_start_method=config.process_start_method,
         ),
         num_envs=config.num_envs,
         seed_offset=0,
-        total_num_processes=1,
+        total_num_processes=max(1, min(config.env_worker_processes, config.num_envs)),
         worker_info=None,
+    )
+    _append_jsonl(
+        metrics_path,
+        {
+            "event": "environment_workers",
+            "env_worker_processes": config.env_worker_processes,
+            "worker_pids": env.process_worker_pids,
+        },
     )
     obs = env._last_obs
     if obs is None:
@@ -1541,7 +1643,10 @@ def main() -> None:
 
     if args.resume is not None:
         restored = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if restored["config"] != asdict(config) or restored["state_schema"] != state_schema:
+        if (
+            restored["config"] != asdict(config)
+            or restored["state_schema"] != state_schema
+        ):
             raise ValueError("resume config/state schema does not match current run")
         model.load_state_dict(restored["model"])
         target_q.load_state_dict(restored["target_q"])
@@ -1573,7 +1678,9 @@ def main() -> None:
             if training_teachers is None or len(training_teachers) != config.num_envs:
                 raise ValueError("residual checkpoint is missing planner teacher state")
         elif training_teachers is not None:
-            raise ValueError("non-residual checkpoint unexpectedly contains planner state")
+            raise ValueError(
+                "non-residual checkpoint unexpectedly contains planner state"
+            )
         _restore_rng(restored["rng"])
         _append_jsonl(metrics_path, {"event": "resume", "env_steps": global_env_steps})
     else:
@@ -1704,7 +1811,9 @@ def main() -> None:
                 time.perf_counter() - action_start,
             )
             environment_step_start = time.perf_counter()
-            next_obs, rewards, terminated, truncated, infos = env.step(env_actions, auto_reset=False)
+            next_obs, rewards, terminated, truncated, infos = env.step(
+                env_actions, auto_reset=False
+            )
             phase_timings.add(
                 "environment_step",
                 time.perf_counter() - environment_step_start,
@@ -1755,7 +1864,9 @@ def main() -> None:
                         training_teachers,
                         done_indices,
                     )
-                normalizer.update(next_obs["states"].index_select(0, torch.tensor(done_indices)))
+                normalizer.update(
+                    next_obs["states"].index_select(0, torch.tensor(done_indices))
+                )
                 phase_timings.add(
                     "environment_reset",
                     time.perf_counter() - reset_start,
@@ -1834,7 +1945,10 @@ def main() -> None:
                         ),
                         recent_mean_completion=float(
                             np.mean(
-                                [item["trajectory_completion"] for item in recent_episodes]
+                                [
+                                    item["trajectory_completion"]
+                                    for item in recent_episodes
+                                ]
                             )
                         ),
                         recent_mean_return=float(
@@ -1858,7 +1972,11 @@ def main() -> None:
                 score = _score(validation)
                 _append_jsonl(
                     metrics_path,
-                    {"event": "validation", "env_steps": global_env_steps, **validation},
+                    {
+                        "event": "validation",
+                        "env_steps": global_env_steps,
+                        **validation,
+                    },
                 )
                 if best_score is None or score > tuple(best_score):
                     best_score = score
@@ -1880,7 +1998,10 @@ def main() -> None:
 
         training_end_time = time.monotonic()
         checkpoint(args.output / "checkpoint_latest.pt")
-        if last_validation is not None and last_validation_env_steps == global_env_steps:
+        if (
+            last_validation is not None
+            and last_validation_env_steps == global_env_steps
+        ):
             final_validation = last_validation
             _append_jsonl(
                 metrics_path,
@@ -1932,9 +2053,7 @@ def main() -> None:
                 global_env_steps - training_start_env_steps
             )
             / max(training_end_time - training_start_time, 1e-6),
-            "update_steps_per_second": (
-                update_steps - training_start_update_steps
-            )
+            "update_steps_per_second": (update_steps - training_start_update_steps)
             / max(training_end_time - training_start_time, 1e-6),
             "phase_timings": phase_timings.snapshot(reset_interval=False),
             "config_sha256": config_sha256,

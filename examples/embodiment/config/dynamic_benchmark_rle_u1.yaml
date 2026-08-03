@@ -9,6 +9,9 @@ eval_num_envs: 2
 demo_num_envs: 2
 env_worker_threads: 1
 eval_worker_threads: 1
+env_worker_processes: 0
+eval_worker_processes: 0
+process_start_method: spawn
 total_env_steps: 20000
 random_env_steps: 5000
 demo_episodes: 64

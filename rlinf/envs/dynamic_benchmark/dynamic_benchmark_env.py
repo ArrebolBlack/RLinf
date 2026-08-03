@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Union
@@ -52,6 +53,134 @@ def _torch_clone(value: Any) -> Any:
     if isinstance(value, list):
         return [_torch_clone(item) for item in value]
     return copy.deepcopy(value)
+
+
+def _pack_process_observation(observation: Any) -> dict[str, Any]:
+    """Convert immutable mapping proxies into a pickle-safe observation payload."""
+
+    return {
+        "episode_id": observation.episode_id,
+        "task_id": observation.task_id,
+        "physics_step": observation.physics_step,
+        "control_step": observation.control_step,
+        "policy_step": observation.policy_step,
+        "time_s": observation.time_s,
+        "rgb": dict(observation.rgb),
+        "depth_m": dict(observation.depth_m),
+        "segmentation": dict(observation.segmentation),
+        "proprio": dict(observation.proprio),
+        "privileged": dict(observation.privileged),
+        "events_since_last_observation": [
+            {
+                "name": event.name,
+                "physics_step": event.physics_step,
+                "time_s": event.time_s,
+                "details": dict(event.details),
+            }
+            for event in observation.events_since_last_observation
+        ],
+        "api_version": observation.api_version,
+    }
+
+
+class _DynamicBenchmarkProcessHandler:
+    """Own a fixed shard of canonical MuJoCo environments in one subprocess."""
+
+    def __init__(self, payload: Mapping[str, Any], indices: tuple[int, ...]) -> None:
+        from se3_wam.benchmark.api import ActionCommand, ActionMode
+        from se3_wam.benchmark.config import load_task_config
+        from se3_wam.benchmark.keyed_puck import T5EventTape
+        from se3_wam.benchmark.suite import make_mujoco_env
+
+        self._ActionCommand = ActionCommand
+        self._ActionMode = ActionMode
+        self._load_task_config = load_task_config
+        self._T5EventTape = T5EventTape
+        self._task_id = str(payload["task_id"])
+        self._split_name = str(payload["split_name"])
+        self._indices = indices
+        self._envs = {
+            index: make_mujoco_env(
+                self._task_id,
+                image_size=int(payload["image_size"]),
+                camera_observations=bool(payload["camera_observations"]),
+            )
+            for index in indices
+        }
+
+    def ready_metadata(self) -> dict[str, Any]:
+        return {
+            "pid": os.getpid(),
+            "indices": self._indices,
+            "horizons": {
+                index: int(self._envs[index].horizon_steps) for index in self._indices
+            },
+        }
+
+    def _arm_hidden_t5_event(self, env: Any, request: Any) -> None:
+        arm_hidden_t5_event(
+            task_id=self._task_id,
+            split_name=self._split_name,
+            env=env,
+            request=request,
+            load_task_config=self._load_task_config,
+            event_tape_type=self._T5EventTape,
+        )
+
+    def handle(
+        self,
+        command: str,
+        items: list[tuple[int, Any]],
+    ) -> list[tuple[int, Any]]:
+        results = []
+        for index, payload in items:
+            env = self._envs[index]
+            if command == "reset":
+                request = payload
+                observation = env.reset(request)
+                self._arm_hidden_t5_event(env, request)
+                result = _pack_process_observation(observation)
+            elif command == "step":
+                action = self._ActionCommand(
+                    mode=self._ActionMode(str(payload["action_mode"])),
+                    values=payload["values"],
+                    policy_step=int(payload["policy_step"]),
+                )
+                step_result = env.step(action)
+                result = {
+                    "observation": _pack_process_observation(step_result.observation),
+                    "terminated": step_result.terminated,
+                    "truncated": step_result.truncated,
+                    "success": step_result.success,
+                    "termination_reason": step_result.termination_reason,
+                    "active_stage_progress": step_result.active_stage_progress,
+                    "event_names": tuple(event.name for event in env._ledger.events),
+                }
+            elif command == "save":
+                result = env.save_state()
+            elif command == "restore":
+                request, env_state = payload
+                env.reset(request)
+                self._arm_hidden_t5_event(env, request)
+                result = _pack_process_observation(env.load_state(env_state))
+            else:
+                raise ValueError(
+                    f"unsupported Dynamic Benchmark process command {command!r}"
+                )
+            results.append((index, result))
+        return results
+
+    def close(self) -> None:
+        for env in self._envs.values():
+            env.close()
+        self._envs.clear()
+
+
+def _make_dynamic_benchmark_process_handler(
+    payload: Mapping[str, Any],
+    indices: tuple[int, ...],
+) -> _DynamicBenchmarkProcessHandler:
+    return _DynamicBenchmarkProcessHandler(payload, indices)
 
 
 class DynamicBenchmarkEnv(gym.Env):
@@ -102,6 +231,17 @@ class DynamicBenchmarkEnv(gym.Env):
         self.worker_threads = int(_cfg_get(cfg, "worker_threads", 1))
         if self.worker_threads < 1:
             raise ValueError("Dynamic Benchmark worker_threads must be positive")
+        self.worker_processes = int(_cfg_get(cfg, "worker_processes", 0))
+        if self.worker_processes < 0:
+            raise ValueError("Dynamic Benchmark worker_processes must be non-negative")
+        self.process_start_method = str(_cfg_get(cfg, "process_start_method", "spawn"))
+        self.process_timeout_s = float(_cfg_get(cfg, "process_timeout_s", 120.0))
+        if self.process_timeout_s <= 0.0:
+            raise ValueError("Dynamic Benchmark process_timeout_s must be positive")
+        if self.worker_processes and self.worker_threads != 1:
+            raise ValueError(
+                "Dynamic Benchmark process workers require worker_threads=1 per process"
+            )
         self.use_rel_reward = False
         self.group_size = int(_cfg_get(cfg, "group_size", 1))
         self.num_group = max(1, self.num_envs // max(1, self.group_size))
@@ -121,25 +261,61 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_cursor = 0
         self._manifest_rows: tuple[Any, ...] = ()
         self._refresh_manifest()
-        self.envs = [
-            self._make_mujoco_env(
-                self.task_id,
-                image_size=self.image_size,
-                camera_observations=self.camera_observations,
+        self._process_vector = None
+        if self.worker_processes:
+            from .process_vector import OrderedProcessVector
+
+            self.envs = []
+            self._executor = None
+            self._process_vector = OrderedProcessVector(
+                num_envs=self.num_envs,
+                num_workers=self.worker_processes,
+                handler_factory=_make_dynamic_benchmark_process_handler,
+                handler_payload={
+                    "task_id": self.task_id,
+                    "split_name": self.split_name,
+                    "image_size": self.image_size,
+                    "camera_observations": self.camera_observations,
+                },
+                start_method=self.process_start_method,
+                timeout_s=self.process_timeout_s,
             )
-            for _ in range(self.num_envs)
-        ]
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=min(self.worker_threads, self.num_envs),
-                thread_name_prefix="dynamic-benchmark",
+            horizons = {
+                int(index): int(horizon)
+                for metadata in self._process_vector.ready_metadata
+                for index, horizon in metadata["horizons"].items()
+            }
+            if set(horizons) != set(range(self.num_envs)):
+                raise RuntimeError(
+                    "Dynamic Benchmark process workers lost environment indices"
+                )
+            self.horizon_steps = horizons[0]
+            if any(horizon != self.horizon_steps for horizon in horizons.values()):
+                raise RuntimeError(
+                    "Dynamic Benchmark vector members disagree on horizon"
+                )
+        else:
+            self.envs = [
+                self._make_mujoco_env(
+                    self.task_id,
+                    image_size=self.image_size,
+                    camera_observations=self.camera_observations,
+                )
+                for _ in range(self.num_envs)
+            ]
+            self._executor = (
+                ThreadPoolExecutor(
+                    max_workers=min(self.worker_threads, self.num_envs),
+                    thread_name_prefix="dynamic-benchmark",
+                )
+                if self.worker_threads > 1 and self.num_envs > 1
+                else None
             )
-            if self.worker_threads > 1 and self.num_envs > 1
-            else None
-        )
-        self.horizon_steps = int(self.envs[0].horizon_steps)
-        if any(int(env.horizon_steps) != self.horizon_steps for env in self.envs):
-            raise RuntimeError("Dynamic Benchmark vector members disagree on horizon")
+            self.horizon_steps = int(self.envs[0].horizon_steps)
+            if any(int(env.horizon_steps) != self.horizon_steps for env in self.envs):
+                raise RuntimeError(
+                    "Dynamic Benchmark vector members disagree on horizon"
+                )
         self._raw_observations: list[Any | None] = [None] * self.num_envs
         self._requests: list[Any | None] = [None] * self.num_envs
         self._state_schema: DynamicBenchmarkStateSchema | None = None
@@ -168,8 +344,14 @@ class DynamicBenchmarkEnv(gym.Env):
 
     def _load_benchmark_contracts(self) -> None:
         try:
-            from se3_wam.benchmark.api import ActionCommand, Split
+            from se3_wam.benchmark.api import (
+                ActionCommand,
+                ObservationBundle,
+                Split,
+                StepResult,
+            )
             from se3_wam.benchmark.config import load_task_config
+            from se3_wam.benchmark.contracts import EventRecord
             from se3_wam.benchmark.dataset_manifest import (
                 make_dataset_candidate_manifest,
             )
@@ -188,7 +370,10 @@ class DynamicBenchmarkEnv(gym.Env):
                 "DynamicBenchmarkEnv requires the SE3-WAM benchmark source on PYTHONPATH"
             ) from exc
         self._ActionCommand = ActionCommand
+        self._ObservationBundle = ObservationBundle
         self._Split = Split
+        self._StepResult = StepResult
+        self._EventRecord = EventRecord
         self._make_dataset_candidate_manifest = make_dataset_candidate_manifest
         self._make_p0_grasp_candidate_manifest = make_p0_grasp_candidate_manifest
         self._load_task_config = load_task_config
@@ -282,6 +467,14 @@ class DynamicBenchmarkEnv(gym.Env):
     def reward_schema(self) -> Mapping[str, Any]:
         return self.reward_trackers[0].to_dict()
 
+    @property
+    def process_worker_pids(self) -> tuple[int, ...]:
+        """Return stable child PIDs, or an empty tuple for the in-process backend."""
+
+        if self._process_vector is None:
+            return ()
+        return self._process_vector.worker_pids
+
     def _encode(self, observation: Any, request: Any) -> np.ndarray:
         if self._state_schema is None:
             self._state_schema = DynamicBenchmarkStateSchema.from_observation(
@@ -294,6 +487,32 @@ class DynamicBenchmarkEnv(gym.Env):
             observation=observation,
             factors=request.factors,
             horizon_steps=self.horizon_steps,
+        )
+
+    def _unpack_process_observation(self, payload: Mapping[str, Any]) -> Any:
+        events = tuple(
+            self._EventRecord(
+                name=str(event["name"]),
+                physics_step=int(event["physics_step"]),
+                time_s=float(event["time_s"]),
+                details=dict(event["details"]),
+            )
+            for event in payload["events_since_last_observation"]
+        )
+        return self._ObservationBundle(
+            episode_id=str(payload["episode_id"]),
+            task_id=str(payload["task_id"]),
+            physics_step=int(payload["physics_step"]),
+            control_step=int(payload["control_step"]),
+            policy_step=int(payload["policy_step"]),
+            time_s=float(payload["time_s"]),
+            rgb=dict(payload["rgb"]),
+            depth_m=dict(payload["depth_m"]),
+            segmentation=dict(payload["segmentation"]),
+            proprio=dict(payload["proprio"]),
+            privileged=dict(payload["privileged"]),
+            events_since_last_observation=events,
+            api_version=str(payload["api_version"]),
         )
 
     def _reset_metrics(self, indices: np.ndarray) -> None:
@@ -321,7 +540,9 @@ class DynamicBenchmarkEnv(gym.Env):
         self._arm_hidden_t5_event(self.envs[index], request)
         return index, observation
 
-    def _step_one(self, item: tuple[int, np.ndarray]) -> tuple[int, Any, Any, tuple[str, ...]]:
+    def _step_one(
+        self, item: tuple[int, np.ndarray]
+    ) -> tuple[int, Any, Any, tuple[str, ...]]:
         index, values = item
         env = self.envs[index]
         observation = self._raw_observations[index]
@@ -365,7 +586,12 @@ class DynamicBenchmarkEnv(gym.Env):
         )
         reset_items = [(int(index), self._next_request()) for index in indices]
         requests_by_index = dict(reset_items)
-        if self._executor is None or len(reset_items) < 2:
+        if self._process_vector is not None:
+            reset_results = [
+                (index, self._unpack_process_observation(payload))
+                for index, payload in self._process_vector.run("reset", reset_items)
+            ]
+        elif self._executor is None or len(reset_items) < 2:
             reset_results = [self._reset_one(item) for item in reset_items]
         else:
             reset_results = list(self._executor.map(self._reset_one, reset_items))
@@ -428,13 +654,56 @@ class DynamicBenchmarkEnv(gym.Env):
         active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
         active_items: list[tuple[int, np.ndarray]] = []
-        for index, _env in enumerate(self.envs):
+        for index in range(self.num_envs):
             if self._needs_reset[index]:
                 terminations[index] = True
                 component_rows[index] = {"total": 0.0}
                 continue
             active_items.append((index, action_array[index]))
-        if self._executor is None or len(active_items) < 2:
+        if self._process_vector is not None:
+            process_items = []
+            for index, values in active_items:
+                observation = self._raw_observations[index]
+                request = self._requests[index]
+                if observation is None or request is None:
+                    raise RuntimeError(
+                        "Dynamic Benchmark vector member is not initialized"
+                    )
+                process_items.append(
+                    (
+                        index,
+                        {
+                            "values": values,
+                            "action_mode": request.action_mode.value,
+                            "policy_step": observation.policy_step,
+                        },
+                    )
+                )
+            process_results = self._process_vector.run("step", process_items)
+            step_results = []
+            for index, payload in process_results:
+                observation = self._raw_observations[index]
+                request = self._requests[index]
+                assert observation is not None and request is not None
+                action = self._ActionCommand(
+                    mode=request.action_mode,
+                    values=action_array[index],
+                    policy_step=observation.policy_step,
+                )
+                result = self._StepResult(
+                    observation=self._unpack_process_observation(
+                        payload["observation"]
+                    ),
+                    terminated=bool(payload["terminated"]),
+                    truncated=bool(payload["truncated"]),
+                    success=bool(payload["success"]),
+                    termination_reason=payload["termination_reason"],
+                    active_stage_progress=float(payload["active_stage_progress"]),
+                )
+                step_results.append(
+                    (index, action, result, payload["event_names"])
+                )
+        elif self._executor is None or len(active_items) < 2:
             step_results = [self._step_one(item) for item in active_items]
         else:
             step_results = list(self._executor.map(self._step_one, active_items))
@@ -600,7 +869,15 @@ class DynamicBenchmarkEnv(gym.Env):
 
         if self._last_obs is None or any(item is None for item in self._requests):
             raise RuntimeError("Dynamic Benchmark checkpoint requires initialized envs")
-        env_states = [env.save_state() for env in self.envs]
+        if self._process_vector is None:
+            env_states = [env.save_state() for env in self.envs]
+        else:
+            env_states = [
+                value
+                for _, value in self._process_vector.run(
+                    "save", ((index, None) for index in range(self.num_envs))
+                )
+            ]
         request_rows = []
         for request in self._requests:
             assert request is not None
@@ -649,6 +926,8 @@ class DynamicBenchmarkEnv(gym.Env):
             "camera_observations": self.camera_observations,
             "num_envs": self.num_envs,
             "worker_threads": self.worker_threads,
+            "worker_processes": self.worker_processes,
+            "process_start_method": self.process_start_method,
             "state_schema": self.state_schema,
         }
 
@@ -670,10 +949,7 @@ class DynamicBenchmarkEnv(gym.Env):
         env_states = list(state["env_states"])
         reward_states = list(state["reward_states"])
         if not (
-            len(request_rows)
-            == len(env_states)
-            == len(reward_states)
-            == self.num_envs
+            len(request_rows) == len(env_states) == len(reward_states) == self.num_envs
         ):
             raise ValueError("Dynamic Benchmark checkpoint vector length mismatch")
         from se3_wam.benchmark.api import (
@@ -685,8 +961,9 @@ class DynamicBenchmarkEnv(gym.Env):
 
         raw_observations = []
         requests = []
-        for env, row, env_state in zip(
-            self.envs, request_rows, env_states, strict=True
+        restore_items = []
+        for index, (row, env_state) in enumerate(
+            zip(request_rows, env_states, strict=True)
         ):
             request = ResetRequest(
                 episode_id=str(row["episode_id"]),
@@ -700,9 +977,18 @@ class DynamicBenchmarkEnv(gym.Env):
                 factors=dict(row["factors"]),
                 api_version=str(row["api_version"]),
             )
-            env.reset(request)
-            raw_observations.append(env.load_state(env_state))
             requests.append(request)
+            if self._process_vector is None:
+                env = self.envs[index]
+                env.reset(request)
+                raw_observations.append(env.load_state(env_state))
+            else:
+                restore_items.append((index, (request, env_state)))
+        if self._process_vector is not None:
+            raw_observations = [
+                self._unpack_process_observation(payload)
+                for _, payload in self._process_vector.run("restore", restore_items)
+            ]
         self._manifest_generation = int(state["manifest_generation"])
         self._refresh_manifest()
         manifest_cursor = int(state["manifest_cursor"])
@@ -714,9 +1000,7 @@ class DynamicBenchmarkEnv(gym.Env):
         encoded = np.stack(
             [
                 self._encode(observation, request)
-                for observation, request in zip(
-                    raw_observations, requests, strict=True
-                )
+                for observation, request in zip(raw_observations, requests, strict=True)
             ]
         )
         self._last_obs = {"states": torch.as_tensor(encoded, dtype=torch.float32)}
@@ -741,6 +1025,9 @@ class DynamicBenchmarkEnv(gym.Env):
         self._is_start = bool(state["is_start"])
 
     def close(self) -> None:
+        if self._process_vector is not None:
+            self._process_vector.close()
+            self._process_vector = None
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
