@@ -290,6 +290,98 @@ def _manifest_row(env: Any, episode_id: str) -> Any:
     return matches[0]
 
 
+class _ArmedResetReplayEnv:
+    """Expose raw replay while restoring Dynamic Benchmark hidden reset state."""
+
+    def __init__(self, vector_env: Any, raw_env: Any) -> None:
+        self._vector_env = vector_env
+        self._raw_env = raw_env
+
+    def reset(self, request: Any) -> Any:
+        observation = self._raw_env.reset(request)
+        self._vector_env._arm_hidden_t5_event(self._raw_env, request)
+        return observation
+
+    def step(self, action: Any) -> Any:
+        return self._raw_env.step(action)
+
+    def save_state(self) -> bytes:
+        return self._raw_env.save_state()
+
+
+def _replay_actions_on_fresh_env(
+    *,
+    vector_env: Any,
+    task_id: str,
+    request: Any,
+    expected_observations: tuple[Any, ...],
+    actions: tuple[Any, ...],
+    expected_outcomes: tuple[Any, ...],
+    expected_final_state: bytes,
+    replay_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Replay one expert action tape on an independent canonical raw environment."""
+    if replay_fn is None:
+        from se3_wam.benchmark.evaluation import replay_actions
+
+        replay_fn = replay_actions
+    raw_env = vector_env._make_mujoco_env(
+        task_id,
+        image_size=vector_env.image_size,
+        camera_observations=vector_env.camera_observations,
+    )
+    try:
+        return replay_fn(
+            _ArmedResetReplayEnv(vector_env, raw_env),
+            request=request,
+            expected_observations=expected_observations,
+            actions=actions,
+            expected_outcomes=expected_outcomes,
+            expected_final_state=expected_final_state,
+        )
+    finally:
+        raw_env.close()
+
+
+def _reset_rollout_on_fresh_env(*, vector_env: Any, request: Any) -> Any:
+    """Start one expert rollout from a newly constructed raw environment."""
+    if int(vector_env.num_envs) != 1:
+        raise ValueError("expert evaluation requires exactly one vector member")
+    if request.task_id != vector_env.task_id:
+        raise ValueError("expert evaluation request task does not match the environment")
+    raw_env = vector_env._make_mujoco_env(
+        vector_env.task_id,
+        image_size=vector_env.image_size,
+        camera_observations=vector_env.camera_observations,
+    )
+    try:
+        if int(raw_env.horizon_steps) != int(vector_env.horizon_steps):
+            raise RuntimeError("fresh expert raw environment changed the horizon")
+        observation = raw_env.reset(request)
+        vector_env._arm_hidden_t5_event(raw_env, request)
+        state = vector_env._encode(observation, request)
+    except BaseException:
+        raw_env.close()
+        raise
+
+    previous_env = vector_env.envs[0]
+    try:
+        previous_env.close()
+    except BaseException:
+        raw_env.close()
+        raise
+    vector_env.envs[0] = raw_env
+    vector_env._reset_metrics(np.asarray([0], dtype=np.int64))
+    vector_env._raw_observations[0] = observation
+    vector_env._requests[0] = request
+    vector_env._needs_reset[0] = False
+    vector_env._last_obs = {
+        "states": torch.as_tensor(state[None], dtype=torch.float32)
+    }
+    vector_env._is_start = True
+    return observation
+
+
 def _make_teacher(task: str, request: Any) -> Any:
     from se3_wam.benchmark.teacher_factory import make_privileged_teacher
 
@@ -307,7 +399,6 @@ def _episode(
     config: Mapping[str, Any],
     device: torch.device,
 ) -> tuple[dict[str, Any], list[float]]:
-    from se3_wam.benchmark.evaluation import replay_actions
     from se3_wam.benchmark.metrics import (
         completion_time_from_events,
         hierarchical_task_completion,
@@ -421,8 +512,9 @@ def _episode(
         if result_info["success"]
         else None
     )
-    replay_validation = replay_actions(
-        raw_env,
+    replay_validation = _replay_actions_on_fresh_env(
+        vector_env=env,
+        task_id=task_id,
         request=request,
         expected_observations=tuple(observations),
         actions=tuple(actions),
@@ -542,9 +634,8 @@ def main() -> None:
         started = time.time()
         records = []
         latencies_s: list[float] = []
-        for episode_index in range(args.episodes):
-            if episode_index:
-                env.reset(options={"env_idx": [0]})
+        for episode_index, row in enumerate(rows):
+            _reset_rollout_on_fresh_env(vector_env=env, request=row.request)
             record, episode_latencies = _episode(
                 env=env,
                 model=model,
@@ -552,7 +643,7 @@ def main() -> None:
                 config=config,
                 device=device,
             )
-            if record["episode_id"] != rows[episode_index].request.episode_id:
+            if record["episode_id"] != row.request.episode_id:
                 raise RuntimeError("rollout order diverged from the frozen reset manifest")
             records.append(record)
             latencies_s.extend(episode_latencies)

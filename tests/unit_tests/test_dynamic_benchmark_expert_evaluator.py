@@ -14,14 +14,18 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
 from examples.embodiment.evaluate_dynamic_benchmark_expert import (
+    _ArmedResetReplayEnv,
     _expected_sha256,
     _latency_summary,
     _load_inference_policy,
     _model_kwargs,
+    _replay_actions_on_fresh_env,
+    _reset_rollout_on_fresh_env,
     _validate_policy_payload,
 )
 
@@ -142,3 +146,106 @@ def test_inference_policy_rejects_unknown_or_incomplete_heads() -> None:
     del state["q_head.qs.9.net.0.weight"]
     with pytest.raises(ValueError, match="Q-head count"):
         _load_inference_policy(config, 173, state, torch.device("cpu"))
+
+
+def test_expert_rollout_and_replay_use_separate_fresh_raw_envs() -> None:
+    class Request:
+        task_id = "t5_replan"
+
+    request = Request()
+
+    class RawEnv:
+        horizon_steps = 120
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.closed = False
+            self.reset_calls = []
+
+        def reset(self, value):
+            self.reset_calls.append(value)
+            return f"{self.name}-observation"
+
+        def step(self, action):
+            return (self.name, action)
+
+        def save_state(self):
+            return self.name.encode()
+
+        def close(self):
+            self.closed = True
+
+    class VectorEnv:
+        num_envs = 1
+        task_id = "t5_replan"
+        image_size = 64
+        camera_observations = False
+        horizon_steps = 120
+
+        def __init__(self) -> None:
+            self.previous = RawEnv("previous")
+            self.rollout = RawEnv("rollout")
+            self.replay = RawEnv("replay")
+            self.envs = [self.previous]
+            self._raw_observations = ["stale"]
+            self._requests = [object()]
+            self._needs_reset = np.asarray([True])
+            self._last_obs = None
+            self._is_start = False
+            self.make_calls = []
+            self.arm_calls = []
+            self.reset_metric_calls = []
+
+        def _make_mujoco_env(self, task_id, **kwargs):
+            self.make_calls.append((task_id, kwargs))
+            return self.rollout if len(self.make_calls) == 1 else self.replay
+
+        def _arm_hidden_t5_event(self, raw_env, value):
+            self.arm_calls.append((raw_env, value))
+
+        def _encode(self, observation, value):
+            assert observation == "rollout-observation"
+            assert value is request
+            return np.asarray([1.0, 2.0], dtype=np.float32)
+
+        def _reset_metrics(self, indices):
+            self.reset_metric_calls.append(indices.copy())
+
+    vector_env = VectorEnv()
+    observation = _reset_rollout_on_fresh_env(
+        vector_env=vector_env,
+        request=request,
+    )
+
+    assert observation == "rollout-observation"
+    assert vector_env.previous.closed
+    assert vector_env.envs == [vector_env.rollout]
+    assert vector_env.rollout.reset_calls == [request]
+    assert not vector_env._needs_reset[0]
+    assert vector_env._last_obs["states"].tolist() == [[1.0, 2.0]]
+
+    def replay_fn(proxy, **kwargs):
+        assert isinstance(proxy, _ArmedResetReplayEnv)
+        assert proxy.reset(request) == "replay-observation"
+        assert proxy.step("action") == ("replay", "action")
+        assert proxy.save_state() == b"replay"
+        assert kwargs["request"] is request
+        return {"passed": True}
+
+    result = _replay_actions_on_fresh_env(
+        vector_env=vector_env,
+        task_id="t5_replan",
+        request=request,
+        expected_observations=("expected",),
+        actions=("action",),
+        expected_outcomes=("outcome",),
+        expected_final_state=b"expected",
+        replay_fn=replay_fn,
+    )
+
+    assert result == {"passed": True}
+    assert vector_env.replay.closed
+    assert vector_env.arm_calls == [
+        (vector_env.rollout, request),
+        (vector_env.replay, request),
+    ]

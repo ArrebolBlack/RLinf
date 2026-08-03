@@ -183,7 +183,8 @@ test-OOD manifest 上评测 best checkpoint：
       --output outputs/dynamic_benchmark/t2_rlpd_seed1/test_id
 
 evaluator 会重建 BC/SAC/RLPD、residual-RLPD 与 PPO 策略，核验 checkpoint/源码
-identity，保存 reset manifest 和实际动作，并要求每个 episode 的 action replay 精确通过；
+identity，保存 reset manifest 和实际动作；每个 rollout 和 replay 都使用独立新建且只
+reset 一次的 raw environment，并要求每个 episode 的 action replay 精确通过；
 结果包含确定性的成功率、安全失败、完成度、动作能耗与决策延迟。必须先冻结基于 validation
 的策略和超参数选择，之后才能读取 test manifest；冻结前的 evaluator 工程 smoke 使用
 ``--split validation``。
