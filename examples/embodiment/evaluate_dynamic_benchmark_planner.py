@@ -65,8 +65,60 @@ def _planner_action_values(values: Any) -> tuple[torch.Tensor, np.ndarray]:
     return env_actions, recorded_values
 
 
+class _ArmedResetReplayEnv:
+    """Expose raw replay while restoring Dynamic Benchmark hidden reset state."""
+
+    def __init__(self, vector_env: Any, raw_env: Any) -> None:
+        self._vector_env = vector_env
+        self._raw_env = raw_env
+
+    def reset(self, request: Any) -> Any:
+        observation = self._raw_env.reset(request)
+        self._vector_env._arm_hidden_t5_event(self._raw_env, request)
+        return observation
+
+    def step(self, action: Any) -> Any:
+        return self._raw_env.step(action)
+
+    def save_state(self) -> bytes:
+        return self._raw_env.save_state()
+
+
+def _replay_actions_on_fresh_env(
+    *,
+    vector_env: Any,
+    task_id: str,
+    request: Any,
+    expected_observations: tuple[Any, ...],
+    actions: tuple[Any, ...],
+    expected_outcomes: tuple[Any, ...],
+    expected_final_state: bytes,
+    replay_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Replay one action tape on an independent canonical raw environment."""
+    if replay_fn is None:
+        from se3_wam.benchmark.evaluation import replay_actions
+
+        replay_fn = replay_actions
+    raw_env = vector_env._make_mujoco_env(
+        task_id,
+        image_size=vector_env.image_size,
+        camera_observations=vector_env.camera_observations,
+    )
+    try:
+        return replay_fn(
+            _ArmedResetReplayEnv(vector_env, raw_env),
+            request=request,
+            expected_observations=expected_observations,
+            actions=actions,
+            expected_outcomes=expected_outcomes,
+            expected_final_state=expected_final_state,
+        )
+    finally:
+        raw_env.close()
+
+
 def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
-    from se3_wam.benchmark.evaluation import replay_actions
     from se3_wam.benchmark.metrics import (
         completion_time_from_events,
         hierarchical_task_completion,
@@ -78,9 +130,15 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
     observation = env._raw_observations[0]
     if request is None or observation is None:
         raise RuntimeError("planner evaluation environment is not initialized")
-    matches = [row for row in env._manifest_rows if row.request.episode_id == request.episode_id]
+    matches = [
+        row
+        for row in env._manifest_rows
+        if row.request.episode_id == request.episode_id
+    ]
     if len(matches) != 1:
-        raise RuntimeError(f"manifest does not uniquely contain episode {request.episode_id!r}")
+        raise RuntimeError(
+            f"manifest does not uniquely contain episode {request.episode_id!r}"
+        )
     row = matches[0]
     teacher, preparation = make_privileged_teacher(task_id, request=request)
     if hasattr(teacher, "reset"):
@@ -104,10 +162,14 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
             values=values,
             policy_step=observation.policy_step,
         )
-        _, reward, terminated, truncated, infos = env.step(env_actions, auto_reset=False)
+        _, reward, terminated, truncated, infos = env.step(
+            env_actions, auto_reset=False
+        )
         next_observation = env._raw_observations[0]
         if next_observation is None:
-            raise RuntimeError("planner evaluation environment lost its raw observation")
+            raise RuntimeError(
+                "planner evaluation environment lost its raw observation"
+            )
         terminated_value = bool(terminated[0])
         truncated_value = bool(truncated[0])
         reason = infos["termination_reason"][0]
@@ -153,8 +215,9 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
         if result_info["success"]
         else None
     )
-    replay_validation = replay_actions(
-        raw_env,
+    replay_validation = _replay_actions_on_fresh_env(
+        vector_env=env,
+        task_id=task_id,
         request=request,
         expected_observations=tuple(observations),
         actions=tuple(actions),
@@ -263,7 +326,9 @@ def main() -> None:
                 env.reset(options={"env_idx": [0]})
             record, episode_latencies = _episode(env=env, task_id=args.task)
             if record["episode_id"] != rows[episode_index].request.episode_id:
-                raise RuntimeError("planner rollout order diverged from the frozen reset manifest")
+                raise RuntimeError(
+                    "planner rollout order diverged from the frozen reset manifest"
+                )
             records.append(record)
             latencies_s.extend(episode_latencies)
             print(
