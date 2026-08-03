@@ -293,6 +293,14 @@ def _log_anomalies(paths: list[Path]) -> list[str]:
     return sorted(found)
 
 
+def _combined_anomalies(paths: list[Path], watchdog_triggered: bool) -> list[str]:
+    """Combine log classifications with supervisor-detected failures."""
+    found = set(_log_anomalies(paths))
+    if watchdog_triggered:
+        found.add("hang")
+    return sorted(found)
+
+
 def main() -> None:
     args = _parser().parse_args()
     command = list(args.trainer_command)
@@ -554,18 +562,14 @@ def main() -> None:
             {row["numa_mem_nodes"] for row in cpu_samples if row["numa_mem_nodes"]}
         ),
         "sampling_errors": sampling_errors,
-        "anomalies": sorted(
-            set(
-                _log_anomalies(
-                    [
-                        monitor_root / "trainer.stdout.log",
-                        monitor_root / "trainer.stderr.log",
-                        monitor_root / "nvidia_smi_dmon.log",
-                        monitor_root / "nvidia_smi_pmon.log",
-                    ]
-                )
-                | ({"hang"} if watchdog_triggered else set())
-            )
+        "anomalies": _combined_anomalies(
+            [
+                monitor_root / "trainer.stdout.log",
+                monitor_root / "trainer.stderr.log",
+                monitor_root / "nvidia_smi_dmon.log",
+                monitor_root / "nvidia_smi_pmon.log",
+            ],
+            watchdog_triggered,
         ),
         "monitor_sha256": monitor_hashes,
         "nvidia_monitor_return_codes": {

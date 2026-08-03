@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from examples.embodiment.monitor_dynamic_benchmark_utilization import (
+    _combined_anomalies,
     _distribution,
     _log_anomalies,
     _trainer_output,
@@ -58,3 +59,13 @@ def test_log_anomalies_classifies_known_failure_modes(tmp_path: Path) -> None:
         "oom",
         "worker_crash",
     ]
+
+
+def test_combined_anomalies_adds_watchdog_hang_without_type_error(
+    tmp_path: Path,
+) -> None:
+    stderr = tmp_path / "stderr.log"
+    stderr.write_text("CUDA out of memory\n", encoding="utf-8")
+
+    assert _combined_anomalies([stderr], watchdog_triggered=True) == ["hang", "oom"]
+    assert _combined_anomalies([stderr], watchdog_triggered=False) == ["oom"]
