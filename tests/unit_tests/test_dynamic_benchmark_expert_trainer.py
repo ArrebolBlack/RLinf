@@ -332,6 +332,31 @@ def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
             replay.state_dict()["data"][name],
         )
     assert restored_normalizer.state_dict()["count"] == 2
+
+    legacy_identity = dict(identity)
+    legacy_identity.pop("reward_safety_penalty")
+    legacy_path = tmp_path / "legacy_demo_replay.pt"
+    _save_demo_replay_cache(
+        legacy_path,
+        legacy_identity,
+        summary,
+        replay,
+        normalizer,
+    )
+    _load_demo_replay_cache(
+        legacy_path,
+        identity,
+        restored_replay,
+        restored_normalizer,
+    )
+    with pytest.raises(ValueError, match="identity"):
+        _load_demo_replay_cache(
+            legacy_path,
+            dict(identity, reward_safety_penalty=-20.0),
+            restored_replay,
+            restored_normalizer,
+        )
+
     mismatched_identity = dict(identity, seed=4)
     with pytest.raises(ValueError, match="identity"):
         _load_demo_replay_cache(

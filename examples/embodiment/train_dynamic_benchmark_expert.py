@@ -727,7 +727,14 @@ def _load_demo_replay_cache(
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("schema_version") != "rlinf-dynamic-benchmark-demo-replay-v0.1":
         raise ValueError("demo replay cache schema does not match")
-    if payload.get("identity") != expected_identity:
+    cached_identity = payload.get("identity")
+    if isinstance(cached_identity, dict) and "reward_safety_penalty" not in cached_identity:
+        # Caches produced before reward-safety provenance was added used the
+        # canonical -10 penalty but otherwise share the same v0.1 identity.
+        # Upgrade only that exact legacy omission; non-canonical penalties and
+        # every other identity mismatch remain fail-closed.
+        cached_identity = dict(cached_identity, reward_safety_penalty=-10.0)
+    if cached_identity != expected_identity:
         raise ValueError("demo replay cache identity does not match current run")
     replay.load_state_dict(payload["replay"])
     normalizer.load_state_dict(payload["normalizer"])
