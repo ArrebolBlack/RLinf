@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import os
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Union
@@ -98,6 +99,14 @@ class _DynamicBenchmarkProcessHandler:
         self._T5EventTape = T5EventTape
         self._task_id = str(payload["task_id"])
         self._split_name = str(payload["split_name"])
+        self._process_residual_planner = bool(
+            payload.get("process_residual_planner", False)
+        )
+        self._make_privileged_teacher = None
+        if self._process_residual_planner:
+            from se3_wam.benchmark.teacher_factory import make_privileged_teacher
+
+            self._make_privileged_teacher = make_privileged_teacher
         self._indices = indices
         self._envs = {
             index: make_mujoco_env(
@@ -107,6 +116,8 @@ class _DynamicBenchmarkProcessHandler:
             )
             for index in indices
         }
+        self._observations: dict[int, Any] = {}
+        self._teachers: dict[int, Any] = {}
 
     def ready_metadata(self) -> dict[str, Any]:
         return {
@@ -127,6 +138,58 @@ class _DynamicBenchmarkProcessHandler:
             event_tape_type=self._T5EventTape,
         )
 
+    def _reset_residual_planner(self, index: int, request: Any) -> None:
+        if not self._process_residual_planner:
+            return
+        if self._make_privileged_teacher is None:
+            raise RuntimeError("process residual planner factory is unavailable")
+        teacher, _ = self._make_privileged_teacher(self._task_id, request=request)
+        if hasattr(teacher, "reset"):
+            teacher.reset()
+        self._teachers[index] = teacher
+
+    @staticmethod
+    def _compose_residual_action(
+        planner_values: Any,
+        residual_values: Any,
+        residual_scale: float,
+    ) -> np.ndarray:
+        planner = torch.as_tensor(planner_values, dtype=torch.float32, device="cpu")
+        residual = torch.as_tensor(residual_values, dtype=torch.float32, device="cpu")
+        if planner.shape != (7,) or residual.shape != (7,):
+            raise ValueError("process planner and residual actions must have shape (7,)")
+        if not 0.0 < residual_scale <= 1.0:
+            raise ValueError("process residual_scale must be in (0, 1]")
+        return (
+            torch.clamp(planner + float(residual_scale) * residual, -1.0, 1.0)
+            .numpy()
+            .copy()
+        )
+
+    @staticmethod
+    def _pack_step_result(
+        env: Any,
+        step_result: Any,
+        *,
+        action_values: Any | None = None,
+        planner_action_s: float = 0.0,
+        environment_step_s: float = 0.0,
+    ) -> dict[str, Any]:
+        payload = {
+            "observation": _pack_process_observation(step_result.observation),
+            "terminated": step_result.terminated,
+            "truncated": step_result.truncated,
+            "success": step_result.success,
+            "termination_reason": step_result.termination_reason,
+            "active_stage_progress": step_result.active_stage_progress,
+            "event_names": tuple(event.name for event in env._ledger.events),
+            "planner_action_s": float(planner_action_s),
+            "environment_step_s": float(environment_step_s),
+        }
+        if action_values is not None:
+            payload["action_values"] = np.asarray(action_values, dtype=np.float32)
+        return payload
+
     def handle(
         self,
         command: str,
@@ -139,6 +202,8 @@ class _DynamicBenchmarkProcessHandler:
                 request = payload
                 observation = env.reset(request)
                 self._arm_hidden_t5_event(env, request)
+                self._observations[index] = observation
+                self._reset_residual_planner(index, request)
                 result = _pack_process_observation(observation)
             elif command == "step":
                 action = self._ActionCommand(
@@ -146,23 +211,56 @@ class _DynamicBenchmarkProcessHandler:
                     values=payload["values"],
                     policy_step=int(payload["policy_step"]),
                 )
+                environment_step_start = time.perf_counter()
                 step_result = env.step(action)
-                result = {
-                    "observation": _pack_process_observation(step_result.observation),
-                    "terminated": step_result.terminated,
-                    "truncated": step_result.truncated,
-                    "success": step_result.success,
-                    "termination_reason": step_result.termination_reason,
-                    "active_stage_progress": step_result.active_stage_progress,
-                    "event_names": tuple(event.name for event in env._ledger.events),
-                }
+                environment_step_s = time.perf_counter() - environment_step_start
+                self._observations[index] = step_result.observation
+                result = self._pack_step_result(
+                    env,
+                    step_result,
+                    environment_step_s=environment_step_s,
+                )
+            elif command == "step_residual_planner":
+                if not self._process_residual_planner:
+                    raise RuntimeError("process residual planner is not configured")
+                observation = self._observations.get(index)
+                teacher = self._teachers.get(index)
+                if observation is None or teacher is None:
+                    raise RuntimeError("process residual planner is not initialized")
+                planner_start = time.perf_counter()
+                planner_values = teacher.act(observation).values
+                action_values = self._compose_residual_action(
+                    planner_values,
+                    payload["values"],
+                    float(payload["residual_scale"]),
+                )
+                planner_action_s = time.perf_counter() - planner_start
+                action = self._ActionCommand(
+                    mode=self._ActionMode(str(payload["action_mode"])),
+                    values=action_values,
+                    policy_step=int(payload["policy_step"]),
+                )
+                environment_step_start = time.perf_counter()
+                step_result = env.step(action)
+                environment_step_s = time.perf_counter() - environment_step_start
+                self._observations[index] = step_result.observation
+                result = self._pack_step_result(
+                    env,
+                    step_result,
+                    action_values=action_values,
+                    planner_action_s=planner_action_s,
+                    environment_step_s=environment_step_s,
+                )
             elif command == "save":
                 result = env.save_state()
             elif command == "restore":
                 request, env_state = payload
                 env.reset(request)
                 self._arm_hidden_t5_event(env, request)
-                result = _pack_process_observation(env.load_state(env_state))
+                observation = env.load_state(env_state)
+                self._observations[index] = observation
+                self._reset_residual_planner(index, request)
+                result = _pack_process_observation(observation)
             else:
                 raise ValueError(
                     f"unsupported Dynamic Benchmark process command {command!r}"
@@ -174,6 +272,8 @@ class _DynamicBenchmarkProcessHandler:
         for env in self._envs.values():
             env.close()
         self._envs.clear()
+        self._observations.clear()
+        self._teachers.clear()
 
 
 def _make_dynamic_benchmark_process_handler(
@@ -242,6 +342,11 @@ class DynamicBenchmarkEnv(gym.Env):
             raise ValueError(
                 "Dynamic Benchmark process workers require worker_threads=1 per process"
             )
+        self.process_residual_planner = bool(
+            _cfg_get(cfg, "process_residual_planner", False)
+        )
+        if self.process_residual_planner and not self.worker_processes:
+            raise ValueError("process residual planner requires process workers")
         self.use_rel_reward = False
         self.group_size = int(_cfg_get(cfg, "group_size", 1))
         self.num_group = max(1, self.num_envs // max(1, self.group_size))
@@ -276,6 +381,7 @@ class DynamicBenchmarkEnv(gym.Env):
                     "split_name": self.split_name,
                     "image_size": self.image_size,
                     "camera_observations": self.camera_observations,
+                    "process_residual_planner": self.process_residual_planner,
                 },
                 start_method=self.process_start_method,
                 timeout_s=self.process_timeout_s,
@@ -631,6 +737,8 @@ class DynamicBenchmarkEnv(gym.Env):
         self,
         actions: Union[np.ndarray, torch.Tensor],
         auto_reset: bool = True,
+        *,
+        process_residual_planner_scale: float | None = None,
     ) -> tuple[
         dict[str, torch.Tensor],
         torch.Tensor,
@@ -639,6 +747,14 @@ class DynamicBenchmarkEnv(gym.Env):
         dict[str, Any],
     ]:
         action_array = self._normalize_actions(actions)
+        if process_residual_planner_scale is not None:
+            if self._process_vector is None or not self.process_residual_planner:
+                raise ValueError(
+                    "process_residual_planner_scale requires configured process workers"
+                )
+            if not 0.0 < process_residual_planner_scale <= 1.0:
+                raise ValueError("process residual planner scale must be in (0, 1]")
+        applied_action_array = action_array.copy()
         if self._last_obs is None:
             self.reset()
         assert self._last_obs is not None
@@ -652,6 +768,8 @@ class DynamicBenchmarkEnv(gym.Env):
         component_rows: list[dict[str, float]] = [{} for _ in range(self.num_envs)]
         event_name_rows: list[list[str]] = [[] for _ in range(self.num_envs)]
         active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
+        process_planner_action_s = np.zeros(self.num_envs, dtype=np.float64)
+        process_environment_step_s = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
         active_items: list[tuple[int, np.ndarray]] = []
         for index in range(self.num_envs):
@@ -679,15 +797,33 @@ class DynamicBenchmarkEnv(gym.Env):
                         },
                     )
                 )
-            process_results = self._process_vector.run("step", process_items)
+            process_command = (
+                "step_residual_planner"
+                if process_residual_planner_scale is not None
+                else "step"
+            )
+            if process_residual_planner_scale is not None:
+                for _, process_payload in process_items:
+                    process_payload["residual_scale"] = float(
+                        process_residual_planner_scale
+                    )
+            process_results = self._process_vector.run(process_command, process_items)
             step_results = []
             for index, payload in process_results:
                 observation = self._raw_observations[index]
                 request = self._requests[index]
                 assert observation is not None and request is not None
+                applied_values = payload.get("action_values", action_array[index])
+                applied_action_array[index] = np.asarray(applied_values, dtype=np.float64)
+                process_planner_action_s[index] = float(
+                    payload.get("planner_action_s", 0.0)
+                )
+                process_environment_step_s[index] = float(
+                    payload.get("environment_step_s", 0.0)
+                )
                 action = self._ActionCommand(
                     mode=request.action_mode,
-                    values=action_array[index],
+                    values=applied_values,
                     policy_step=observation.policy_step,
                 )
                 result = self._StepResult(
@@ -759,7 +895,7 @@ class DynamicBenchmarkEnv(gym.Env):
             },
             "reward_inputs": {
                 "stepped": torch.as_tensor(stepped, dtype=torch.bool),
-                "action": torch.as_tensor(action_array, dtype=torch.float64),
+                "action": torch.as_tensor(applied_action_array, dtype=torch.float64),
                 "event_names": event_name_rows,
                 "active_stage_progress": torch.as_tensor(
                     active_stage_progresses, dtype=torch.float64
@@ -768,6 +904,14 @@ class DynamicBenchmarkEnv(gym.Env):
                 "terminated": termination_tensor.clone(),
                 "truncated": truncation_tensor.clone(),
                 "termination_reason": list(termination_reasons),
+            },
+            "process_timings": {
+                "planner_action_s": torch.as_tensor(
+                    process_planner_action_s, dtype=torch.float64
+                ),
+                "environment_step_s": torch.as_tensor(
+                    process_environment_step_s, dtype=torch.float64
+                ),
             },
             "episode": {
                 "return": self.returns.clone(),

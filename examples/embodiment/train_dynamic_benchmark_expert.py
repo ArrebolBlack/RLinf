@@ -62,6 +62,7 @@ class TrainConfig:
     eval_worker_threads: int
     env_worker_processes: int
     eval_worker_processes: int
+    eval_planner_in_processes: bool
     process_start_method: str
     sampler_learner_overlap: bool
     total_env_steps: int
@@ -418,6 +419,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Persistent subprocess shards for validation environment reset/step (0 is serial).",
     )
     parser.add_argument(
+        "--eval-planner-in-processes",
+        action="store_true",
+        help=(
+            "For residual RLPD validation, compute each privileged planner action "
+            "inside its owning environment subprocess."
+        ),
+    )
+    parser.add_argument(
         "--process-start-method",
         choices=("spawn", "forkserver", "fork"),
         default="spawn",
@@ -539,6 +548,7 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         eval_worker_threads=args.eval_worker_threads,
         env_worker_processes=args.env_worker_processes,
         eval_worker_processes=args.eval_worker_processes,
+        eval_planner_in_processes=args.eval_planner_in_processes,
         process_start_method=args.process_start_method,
         sampler_learner_overlap=args.sampler_learner_overlap,
         total_env_steps=args.total_env_steps,
@@ -585,6 +595,12 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         raise ValueError("training process workers require env_worker_threads=1")
     if config.eval_worker_processes and config.eval_worker_threads != 1:
         raise ValueError("evaluation process workers require eval_worker_threads=1")
+    if config.eval_planner_in_processes and (
+        config.algorithm != "residual_rlpd" or not config.eval_worker_processes
+    ):
+        raise ValueError(
+            "process evaluation planner requires residual_rlpd and evaluation process workers"
+        )
     if config.sampler_learner_overlap and not config.env_worker_processes:
         raise ValueError("sampler/learner overlap requires training process workers")
     for name, commit in (
@@ -629,6 +645,7 @@ def _env_cfg(
     worker_threads: int,
     worker_processes: int = 0,
     process_start_method: str = "spawn",
+    process_residual_planner: bool = False,
 ) -> dict[str, Any]:
     return {
         "task_id": config.task,
@@ -643,6 +660,7 @@ def _env_cfg(
         "worker_threads": worker_threads,
         "worker_processes": worker_processes,
         "process_start_method": process_start_method,
+        "process_residual_planner": process_residual_planner,
         "reward_safety_penalty": config.reward_safety_penalty,
     }
 
@@ -1158,8 +1176,13 @@ def _evaluate(
     evaluation_start = time.monotonic()
     environment_step_s = 0.0
     environment_reset_s = 0.0
+    planner_action_s = 0.0
+    process_planner_action_s = 0.0
+    process_environment_step_s = 0.0
     vector_steps = 0
     stepped_env_rows = 0
+    action_digest = hashlib.sha256()
+    state_digest = hashlib.sha256()
     count = min(config.eval_num_envs, config.eval_episodes)
     env = DynamicBenchmarkEnv(
         cfg=_env_cfg(
@@ -1170,6 +1193,7 @@ def _evaluate(
             worker_threads=config.eval_worker_threads,
             worker_processes=config.eval_worker_processes,
             process_start_method=config.process_start_method,
+            process_residual_planner=config.eval_planner_in_processes,
         ),
         num_envs=count,
         seed_offset=0,
@@ -1187,6 +1211,7 @@ def _evaluate(
     teachers = (
         _make_planner_teachers(config.task, env)
         if config.algorithm == "residual_rlpd"
+        and not config.eval_planner_in_processes
         else None
     )
     model.eval()
@@ -1206,19 +1231,51 @@ def _evaluate(
             policy_actions = actions.cpu()
             env_actions = policy_actions
             if teachers is not None:
+                planner_start = time.perf_counter()
                 env_actions = _compose_residual_actions(
                     _planner_actions(env, teachers),
                     policy_actions,
                     config.residual_scale,
                 )
+                planner_action_s += time.perf_counter() - planner_start
             step_start = time.perf_counter()
-            next_obs, rewards, terminated, truncated, infos = env.step(
-                env_actions, auto_reset=False
-            )
+            if config.eval_planner_in_processes:
+                next_obs, rewards, terminated, truncated, infos = env.step(
+                    policy_actions,
+                    auto_reset=False,
+                    process_residual_planner_scale=config.residual_scale,
+                )
+                env_actions = infos["reward_inputs"]["action"].to(torch.float32)
+                process_timings = infos["process_timings"]
+                process_planner_action_s += float(
+                    process_timings["planner_action_s"].sum()
+                )
+                process_environment_step_s += float(
+                    process_timings["environment_step_s"].sum()
+                )
+            else:
+                next_obs, rewards, terminated, truncated, infos = env.step(
+                    env_actions, auto_reset=False
+                )
             environment_step_s += time.perf_counter() - step_start
             vector_steps += 1
-            stepped_env_rows += sum(
-                episode_id is not None for episode_id in active_episode_ids
+            stepped_mask = infos["reward_inputs"]["stepped"].to(torch.bool)
+            stepped_env_rows += int(stepped_mask.sum())
+            applied_actions = infos["reward_inputs"]["action"][stepped_mask]
+            stepped_states = next_obs["states"][stepped_mask]
+            action_digest.update(
+                applied_actions.detach()
+                .cpu()
+                .numpy()
+                .astype("<f8", copy=False)
+                .tobytes(order="C")
+            )
+            state_digest.update(
+                stepped_states.detach()
+                .cpu()
+                .numpy()
+                .astype("<f4", copy=False)
+                .tobytes(order="C")
             )
             episode_returns += rewards
             episode_effort += env_actions.square().sum(dim=-1)
@@ -1292,6 +1349,12 @@ def _evaluate(
         "env_steps_per_second": stepped_env_rows / max(wall_time_s, 1e-6),
         "environment_step_mean_ms": 1000.0 * environment_step_s / max(1, vector_steps),
         "environment_reset_total_s": environment_reset_s,
+        "planner_action_total_s": planner_action_s,
+        "process_planner_action_total_s": process_planner_action_s,
+        "process_environment_step_total_s": process_environment_step_s,
+        "planner_in_processes": config.eval_planner_in_processes,
+        "action_digest_sha256": action_digest.hexdigest(),
+        "state_digest_sha256": state_digest.hexdigest(),
         "worker_processes": len(process_worker_pids),
         "worker_pids": process_worker_pids,
         "records": records,
@@ -1615,6 +1678,7 @@ def main() -> None:
             "eval_worker_threads": config.eval_worker_threads,
             "env_worker_processes": config.env_worker_processes,
             "eval_worker_processes": config.eval_worker_processes,
+            "eval_planner_in_processes": config.eval_planner_in_processes,
             "process_start_method": config.process_start_method,
             "sampler_learner_overlap": config.sampler_learner_overlap,
             "sampler_contract": sampler_contract,

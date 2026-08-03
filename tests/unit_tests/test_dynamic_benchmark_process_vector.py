@@ -22,10 +22,12 @@ import time
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 
 from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
     DynamicBenchmarkEnv,
+    _DynamicBenchmarkProcessHandler,
     _pack_process_observation,
 )
 from rlinf.envs.dynamic_benchmark.process_vector import OrderedProcessVector
@@ -117,6 +119,21 @@ def test_process_observation_transport_removes_mapping_proxies() -> None:
     assert restored.episode_id == observation.episode_id
     assert restored.proprio == {"joint": [1.0]}
     assert restored.events_since_last_observation[0].details == {"force": 1.5}
+
+
+def test_process_residual_composition_matches_frozen_float32_contract() -> None:
+    planner = np.asarray([0.9, -0.9, 0.0, 0.1, -0.1, 0.2, -0.2], dtype=np.float32)
+    residual = np.asarray([1.0, -1.0, 0.4, -0.4, 0.0, 0.8, -0.8], dtype=np.float64)
+
+    observed = _DynamicBenchmarkProcessHandler._compose_residual_action(
+        planner, residual, 0.25
+    )
+
+    assert observed.dtype == np.float32
+    assert np.array_equal(
+        observed,
+        np.asarray([1.0, -1.0, 0.1, 0.0, -0.1, 0.4, -0.4], dtype=np.float32),
+    )
 
 
 def test_process_vector_matches_serial_and_restores_reset_order() -> None:

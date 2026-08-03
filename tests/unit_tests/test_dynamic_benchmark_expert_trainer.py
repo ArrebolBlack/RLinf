@@ -242,6 +242,7 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     assert config.process_start_method == "spawn"
     assert env_cfg["worker_processes"] == 8
     assert env_cfg["process_start_method"] == "spawn"
+    assert env_cfg["process_residual_planner"] is False
     assert config.sampler_learner_overlap is False
     overlap_config = _config(_parse_args([*common, "--sampler-learner-overlap"]))
     assert overlap_config.sampler_learner_overlap is True
@@ -257,6 +258,31 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     ]
     with pytest.raises(ValueError, match="requires training process workers"):
         _config(_parse_args([*without_processes, "--sampler-learner-overlap"]))
+    planner_config = _config(
+        _parse_args([*common, "--eval-planner-in-processes"])
+    )
+    planner_env_cfg = _env_cfg(
+        planner_config,
+        split="validation",
+        seed=17,
+        num_envs=8,
+        worker_threads=1,
+        worker_processes=planner_config.eval_worker_processes,
+        process_start_method=planner_config.process_start_method,
+        process_residual_planner=planner_config.eval_planner_in_processes,
+    )
+    assert planner_config.eval_planner_in_processes is True
+    assert planner_env_cfg["process_residual_planner"] is True
+    without_eval_processes = [
+        item
+        for index, item in enumerate(common)
+        if not (
+            item == "--eval-worker-processes"
+            or (index > 0 and common[index - 1] == "--eval-worker-processes")
+        )
+    ]
+    with pytest.raises(ValueError, match="process evaluation planner requires"):
+        _config(_parse_args([*without_eval_processes, "--eval-planner-in-processes"]))
 
 
 def test_sampler_learner_overlap_runs_updates_while_sampling_is_in_flight() -> None:

@@ -11,6 +11,7 @@ env_worker_threads: 1
 eval_worker_threads: 1
 env_worker_processes: 0
 eval_worker_processes: 0
+eval_planner_in_processes: false
 process_start_method: spawn
 sampler_learner_overlap: false
 total_env_steps: 20000
