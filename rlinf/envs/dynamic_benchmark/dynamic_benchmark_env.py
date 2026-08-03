@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import os
+import pickle
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -66,17 +67,17 @@ def _pack_process_observation(observation: Any) -> dict[str, Any]:
         "control_step": observation.control_step,
         "policy_step": observation.policy_step,
         "time_s": observation.time_s,
-        "rgb": dict(observation.rgb),
-        "depth_m": dict(observation.depth_m),
-        "segmentation": dict(observation.segmentation),
-        "proprio": dict(observation.proprio),
-        "privileged": dict(observation.privileged),
+        "rgb": copy.deepcopy(dict(observation.rgb)),
+        "depth_m": copy.deepcopy(dict(observation.depth_m)),
+        "segmentation": copy.deepcopy(dict(observation.segmentation)),
+        "proprio": copy.deepcopy(dict(observation.proprio)),
+        "privileged": copy.deepcopy(dict(observation.privileged)),
         "events_since_last_observation": [
             {
                 "name": event.name,
                 "physics_step": event.physics_step,
                 "time_s": event.time_s,
-                "details": dict(event.details),
+                "details": copy.deepcopy(dict(event.details)),
             }
             for event in observation.events_since_last_observation
         ],
@@ -84,17 +85,81 @@ def _pack_process_observation(observation: Any) -> dict[str, Any]:
     }
 
 
+def _observation_payload_sha256(payload: Mapping[str, Any]) -> str:
+    """Fingerprint the pickle-safe observation snapshot stored in a checkpoint."""
+
+    return hashlib.sha256(pickle.dumps(dict(payload), protocol=5)).hexdigest()
+
+
+def _state_tensor_sha256(states: Any) -> str:
+    tensor = torch.as_tensor(states).detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("utf-8"))
+    digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("utf-8"))
+    digest.update(tensor.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _unpack_observation_payload(
+    payload: Mapping[str, Any],
+    *,
+    observation_type: Any,
+    event_type: Any,
+) -> Any:
+    events = tuple(
+        event_type(
+            name=str(event["name"]),
+            physics_step=int(event["physics_step"]),
+            time_s=float(event["time_s"]),
+            details=copy.deepcopy(dict(event["details"])),
+        )
+        for event in payload["events_since_last_observation"]
+    )
+    return observation_type(
+        episode_id=str(payload["episode_id"]),
+        task_id=str(payload["task_id"]),
+        physics_step=int(payload["physics_step"]),
+        control_step=int(payload["control_step"]),
+        policy_step=int(payload["policy_step"]),
+        time_s=float(payload["time_s"]),
+        rgb=copy.deepcopy(dict(payload["rgb"])),
+        depth_m=copy.deepcopy(dict(payload["depth_m"])),
+        segmentation=copy.deepcopy(dict(payload["segmentation"])),
+        proprio=copy.deepcopy(dict(payload["proprio"])),
+        privileged=copy.deepcopy(dict(payload["privileged"])),
+        events_since_last_observation=events,
+        api_version=str(payload["api_version"]),
+    )
+
+
+def _assert_restore_observation_identity(observed: Any, expected: Any) -> None:
+    for name in (
+        "episode_id",
+        "task_id",
+        "physics_step",
+        "control_step",
+        "policy_step",
+    ):
+        if getattr(observed, name) != getattr(expected, name):
+            raise RuntimeError(
+                f"Dynamic Benchmark restored observation {name} does not match checkpoint"
+            )
+
+
 class _DynamicBenchmarkProcessHandler:
     """Own a fixed shard of canonical MuJoCo environments in one subprocess."""
 
     def __init__(self, payload: Mapping[str, Any], indices: tuple[int, ...]) -> None:
-        from se3_wam.benchmark.api import ActionCommand, ActionMode
+        from se3_wam.benchmark.api import ActionCommand, ActionMode, ObservationBundle
         from se3_wam.benchmark.config import load_task_config
+        from se3_wam.benchmark.contracts import EventRecord
         from se3_wam.benchmark.keyed_puck import T5EventTape
         from se3_wam.benchmark.suite import make_mujoco_env
 
         self._ActionCommand = ActionCommand
         self._ActionMode = ActionMode
+        self._ObservationBundle = ObservationBundle
+        self._EventRecord = EventRecord
         self._load_task_config = load_task_config
         self._T5EventTape = T5EventTape
         self._task_id = str(payload["task_id"])
@@ -252,12 +317,24 @@ class _DynamicBenchmarkProcessHandler:
                     environment_step_s=environment_step_s,
                 )
             elif command == "save":
-                result = env.save_state()
+                observation = self._observations.get(index)
+                if observation is None:
+                    raise RuntimeError("process checkpoint requires an initialized observation")
+                result = {
+                    "env_state": env.save_state(),
+                    "observation": _pack_process_observation(observation),
+                }
             elif command == "restore":
-                request, env_state = payload
+                request, env_state, observation_payload = payload
                 env.reset(request)
                 self._arm_hidden_t5_event(env, request)
-                observation = env.load_state(env_state)
+                observed = env.load_state(env_state)
+                observation = _unpack_observation_payload(
+                    observation_payload,
+                    observation_type=self._ObservationBundle,
+                    event_type=self._EventRecord,
+                )
+                _assert_restore_observation_identity(observed, observation)
                 self._observations[index] = observation
                 self._reset_residual_planner(index, request)
                 result = _pack_process_observation(observation)
@@ -664,29 +741,10 @@ class DynamicBenchmarkEnv(gym.Env):
         )
 
     def _unpack_process_observation(self, payload: Mapping[str, Any]) -> Any:
-        events = tuple(
-            self._EventRecord(
-                name=str(event["name"]),
-                physics_step=int(event["physics_step"]),
-                time_s=float(event["time_s"]),
-                details=dict(event["details"]),
-            )
-            for event in payload["events_since_last_observation"]
-        )
-        return self._ObservationBundle(
-            episode_id=str(payload["episode_id"]),
-            task_id=str(payload["task_id"]),
-            physics_step=int(payload["physics_step"]),
-            control_step=int(payload["control_step"]),
-            policy_step=int(payload["policy_step"]),
-            time_s=float(payload["time_s"]),
-            rgb=dict(payload["rgb"]),
-            depth_m=dict(payload["depth_m"]),
-            segmentation=dict(payload["segmentation"]),
-            proprio=dict(payload["proprio"]),
-            privileged=dict(payload["privileged"]),
-            events_since_last_observation=events,
-            api_version=str(payload["api_version"]),
+        return _unpack_observation_payload(
+            payload,
+            observation_type=self._ObservationBundle,
+            event_type=self._EventRecord,
         )
 
     def _reset_metrics(self, indices: np.ndarray) -> None:
@@ -1079,17 +1137,39 @@ class DynamicBenchmarkEnv(gym.Env):
     def checkpoint_state(self) -> dict[str, Any]:
         """Capture vector env, manifest, reward, and metric state for exact resume."""
 
-        if self._last_obs is None or any(item is None for item in self._requests):
+        if (
+            self._last_obs is None
+            or any(item is None for item in self._requests)
+            or any(item is None for item in self._raw_observations)
+        ):
             raise RuntimeError("Dynamic Benchmark checkpoint requires initialized envs")
         if self._process_vector is None:
-            env_states = [env.save_state() for env in self.envs]
+            snapshots = []
+            for env, observation in zip(
+                self.envs, self._raw_observations, strict=True
+            ):
+                assert observation is not None
+                snapshots.append(
+                    {
+                        "env_state": env.save_state(),
+                        "observation": _pack_process_observation(observation),
+                    }
+                )
         else:
-            env_states = [
+            snapshots = [
                 value
                 for _, value in self._process_vector.run(
                     "save", ((index, None) for index in range(self.num_envs))
                 )
             ]
+        env_states = [snapshot["env_state"] for snapshot in snapshots]
+        raw_observations = [snapshot["observation"] for snapshot in snapshots]
+        raw_observation_sha256 = [
+            _observation_payload_sha256(observation)
+            for observation in raw_observations
+        ]
+        last_obs = _torch_clone(self._last_obs)
+        last_obs_sha256 = _state_tensor_sha256(last_obs["states"])
         request_rows = []
         for request in self._requests:
             assert request is not None
@@ -1112,13 +1192,17 @@ class DynamicBenchmarkEnv(gym.Env):
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         return {
-            "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.1",
+            "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.2",
             "identity": identity,
             "identity_sha256": identity_sha256,
             "manifest_generation": self._manifest_generation,
             "manifest_cursor": self._manifest_cursor,
             "requests": request_rows,
             "env_states": env_states,
+            "raw_observations": raw_observations,
+            "raw_observation_sha256": raw_observation_sha256,
+            "last_obs": last_obs,
+            "last_obs_sha256": last_obs_sha256,
             "reward_states": [tracker.state_dict() for tracker in self.reward_trackers],
             "needs_reset": self._needs_reset.copy(),
             "elapsed_steps": self._elapsed_steps.clone(),
@@ -1151,7 +1235,7 @@ class DynamicBenchmarkEnv(gym.Env):
     ) -> None:
         """Restore a checkpoint produced by :meth:`checkpoint_state`."""
 
-        if state.get("schema_version") != "rlinf-dynamic-benchmark-checkpoint-v0.1":
+        if state.get("schema_version") != "rlinf-dynamic-benchmark-checkpoint-v0.2":
             raise ValueError("unsupported Dynamic Benchmark checkpoint schema")
         identity = dict(state["identity"])
         expected = self._checkpoint_identity()
@@ -1172,11 +1256,23 @@ class DynamicBenchmarkEnv(gym.Env):
             )
         request_rows = list(state["requests"])
         env_states = list(state["env_states"])
+        raw_observation_payloads = list(state["raw_observations"])
+        raw_observation_sha256 = list(state["raw_observation_sha256"])
         reward_states = list(state["reward_states"])
         if not (
-            len(request_rows) == len(env_states) == len(reward_states) == self.num_envs
+            len(request_rows)
+            == len(env_states)
+            == len(raw_observation_payloads)
+            == len(raw_observation_sha256)
+            == len(reward_states)
+            == self.num_envs
         ):
             raise ValueError("Dynamic Benchmark checkpoint vector length mismatch")
+        for payload, expected_sha256 in zip(
+            raw_observation_payloads, raw_observation_sha256, strict=True
+        ):
+            if _observation_payload_sha256(payload) != expected_sha256:
+                raise ValueError("Dynamic Benchmark checkpoint observation hash mismatch")
         from se3_wam.benchmark.api import (
             ActionMode,
             ObservationTrack,
@@ -1187,8 +1283,17 @@ class DynamicBenchmarkEnv(gym.Env):
         raw_observations = []
         requests = []
         restore_items = []
-        for index, (row, env_state) in enumerate(
-            zip(request_rows, env_states, strict=True)
+        authoritative_observations = [
+            self._unpack_process_observation(payload)
+            for payload in raw_observation_payloads
+        ]
+        for index, (row, env_state, authoritative_observation) in enumerate(
+            zip(
+                request_rows,
+                env_states,
+                authoritative_observations,
+                strict=True,
+            )
         ):
             request = ResetRequest(
                 episode_id=str(row["episode_id"]),
@@ -1203,12 +1308,28 @@ class DynamicBenchmarkEnv(gym.Env):
                 api_version=str(row["api_version"]),
             )
             requests.append(request)
+            if (
+                authoritative_observation.episode_id != request.episode_id
+                or authoritative_observation.task_id != request.task_id
+            ):
+                raise ValueError(
+                    "Dynamic Benchmark checkpoint observation identity does not match request"
+                )
             if self._process_vector is None:
                 env = self.envs[index]
                 env.reset(request)
-                raw_observations.append(env.load_state(env_state))
+                observed = env.load_state(env_state)
+                _assert_restore_observation_identity(
+                    observed, authoritative_observation
+                )
+                raw_observations.append(authoritative_observation)
             else:
-                restore_items.append((index, (request, env_state)))
+                restore_items.append(
+                    (
+                        index,
+                        (request, env_state, raw_observation_payloads[index]),
+                    )
+                )
         if self._process_vector is not None:
             raw_observations = [
                 self._unpack_process_observation(payload)
@@ -1229,7 +1350,20 @@ class DynamicBenchmarkEnv(gym.Env):
                 for observation, request in zip(raw_observations, requests, strict=True)
             ]
         )
-        self._last_obs = {"states": torch.as_tensor(encoded, dtype=torch.float32)}
+        encoded_states = torch.as_tensor(encoded, dtype=torch.float32)
+        saved_last_obs = state["last_obs"]
+        if not isinstance(saved_last_obs, Mapping) or set(saved_last_obs) != {"states"}:
+            raise ValueError("Dynamic Benchmark checkpoint last observation is invalid")
+        saved_states = torch.as_tensor(saved_last_obs["states"]).clone()
+        if saved_states.dtype != torch.float32 or saved_states.shape != encoded_states.shape:
+            raise ValueError("Dynamic Benchmark checkpoint last observation shape mismatch")
+        if _state_tensor_sha256(saved_states) != state["last_obs_sha256"]:
+            raise ValueError("Dynamic Benchmark checkpoint last observation hash mismatch")
+        if not torch.equal(encoded_states, saved_states):
+            raise RuntimeError(
+                "Dynamic Benchmark checkpoint raw/vector observations are inconsistent"
+            )
+        self._last_obs = {"states": saved_states}
         for tracker, tracker_state in zip(
             self.reward_trackers, reward_states, strict=True
         ):

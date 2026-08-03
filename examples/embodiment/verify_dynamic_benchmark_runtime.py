@@ -135,6 +135,9 @@ def _checkpoint_sha256(state: dict[str, Any]) -> str:
     digest.update(state["identity_sha256"].encode())
     for env_state in state["env_states"]:
         digest.update(env_state)
+    for observation_sha256 in state["raw_observation_sha256"]:
+        digest.update(observation_sha256.encode())
+    digest.update(state["last_obs_sha256"].encode())
     for key in ("manifest_generation", "manifest_cursor"):
         digest.update(str(state[key]).encode())
     return digest.hexdigest()

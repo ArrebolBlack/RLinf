@@ -663,7 +663,7 @@ def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state() ->
             self._manifest_cursor = self.num_envs
 
     checkpoint = {
-        "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.1",
+        "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.2",
         "identity": identity,
         "identity_sha256": hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

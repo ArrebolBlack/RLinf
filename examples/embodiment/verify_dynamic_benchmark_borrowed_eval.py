@@ -23,6 +23,8 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     _evaluate,
     _make_planner_teachers,
     _parse_args,
+    _planner_actions,
+    _reset_planner_teachers,
 )
 from examples.embodiment.verify_dynamic_benchmark_runtime import (
     _checkpoint_sha256,
@@ -62,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-manifest-seed", type=int, default=20262050)
     parser.add_argument("--validation-manifest-seed", type=int, default=20262150)
     parser.add_argument("--manifest-size", type=int, default=64)
+    parser.add_argument("--training-vector-steps", type=int, default=64)
     parser.add_argument("--process-start-method", default="spawn")
     parser.add_argument("--cleanup-timeout-s", type=float, default=10.0)
     parser.add_argument("--output", type=Path, required=True)
@@ -111,13 +114,40 @@ def _live_pids(pids: tuple[int, ...]) -> list[int]:
     return live
 
 
+def _advance_training(
+    *,
+    task: str,
+    env: Any,
+    teachers: list[Any],
+    vector_steps: int,
+) -> tuple[list[str], int]:
+    digests = []
+    reset_count = 0
+    for _ in range(vector_steps):
+        actions = _planner_actions(env, teachers)
+        result = env.step(actions, auto_reset=False)
+        digests.append(_step_digest(result))
+        dones = torch.logical_or(result[2], result[3])
+        done_indices = torch.arange(env.num_envs)[dones].tolist()
+        if done_indices:
+            env.reset(options={"env_idx": done_indices})
+            _reset_planner_teachers(task, env, teachers, done_indices)
+            reset_count += len(done_indices)
+    return digests, reset_count
+
+
 def main() -> None:
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 
     args = _parser().parse_args()
     if args.output.exists():
         raise FileExistsError(f"refusing existing output {args.output}")
-    if min(args.worker_processes, args.num_envs, args.eval_episodes) < 1:
+    if min(
+        args.worker_processes,
+        args.num_envs,
+        args.eval_episodes,
+        args.training_vector_steps,
+    ) < 1:
         raise ValueError("worker, vector, and episode counts must be positive")
     if args.worker_processes > args.num_envs:
         raise ValueError("worker_processes may not exceed num_envs")
@@ -189,15 +219,55 @@ def main() -> None:
             training_teachers=training_teachers,
         )
         training_checkpoint = env.checkpoint_state()
+        training_manifest_cache = env.manifest_cache_state()
         checkpoint_sha256 = _checkpoint_sha256(training_checkpoint)
 
         recreated = _evaluate(config, policy, normalizer, device)
         first = _evaluate(config, policy, normalizer, device, runtime=runtime)
         after_first = env.checkpoint_state()
         _assert_nested_equal(training_checkpoint, after_first)
+
+        reference = DynamicBenchmarkEnv(
+            cfg=_env_cfg(
+                config,
+                split="train",
+                seed=args.train_manifest_seed,
+                num_envs=args.num_envs,
+                worker_threads=1,
+                worker_processes=args.worker_processes,
+                process_start_method=args.process_start_method,
+            ),
+            num_envs=args.num_envs,
+            seed_offset=0,
+            total_num_processes=args.worker_processes,
+            worker_info=None,
+        )
+        reference.load_manifest_cache_state(training_manifest_cache)
+        reference.load_checkpoint_state(training_checkpoint, refresh_manifest=False)
+        reference_teachers = _make_planner_teachers(config.task, reference)
+        advanced_digests, advanced_resets = _advance_training(
+            task=config.task,
+            env=env,
+            teachers=training_teachers,
+            vector_steps=args.training_vector_steps,
+        )
+        reference_digests, reference_resets = _advance_training(
+            task=config.task,
+            env=reference,
+            teachers=reference_teachers,
+            vector_steps=args.training_vector_steps,
+        )
+        if advanced_digests != reference_digests or advanced_resets != reference_resets:
+            raise RuntimeError("post-first-evaluation training advance diverged")
+        if advanced_resets < 1:
+            raise RuntimeError("training advance did not cross a done/reset boundary")
+        advanced_checkpoint = env.checkpoint_state()
+        _assert_nested_equal(advanced_checkpoint, reference.checkpoint_state())
+        advanced_checkpoint_sha256 = _checkpoint_sha256(advanced_checkpoint)
+
         second = _evaluate(config, policy, normalizer, device, runtime=runtime)
         after_second = env.checkpoint_state()
-        _assert_nested_equal(training_checkpoint, after_second)
+        _assert_nested_equal(advanced_checkpoint, after_second)
 
         exact_keys = (
             "episodes",
@@ -244,35 +314,24 @@ def main() -> None:
         except RuntimeError as exc:
             if str(exc) != "intentional borrowed evaluation failure":
                 raise
-            _assert_nested_equal(training_checkpoint, env.checkpoint_state())
+            _assert_nested_equal(advanced_checkpoint, env.checkpoint_state())
             failure_restore_passed = not runtime.closed
         if not failure_restore_passed:
             raise RuntimeError("borrowed evaluation failure did not restore training state")
 
-        reference = DynamicBenchmarkEnv(
-            cfg=_env_cfg(
-                config,
-                split="train",
-                seed=args.train_manifest_seed,
-                num_envs=args.num_envs,
-                worker_threads=1,
-                worker_processes=args.worker_processes,
-                process_start_method=args.process_start_method,
-            ),
-            num_envs=args.num_envs,
-            seed_offset=0,
-            total_num_processes=args.worker_processes,
-            worker_info=None,
-        )
-        reference.load_checkpoint_state(training_checkpoint)
-        actions = torch.zeros((args.num_envs, 7), dtype=torch.float32)
+        actions = _planner_actions(env, training_teachers)
+        reference_actions = _planner_actions(reference, reference_teachers)
+        if not torch.equal(actions, reference_actions):
+            raise RuntimeError("post-evaluation planner action diverged")
         continued_digest = _step_digest(env.step(actions, auto_reset=False))
-        reference_digest = _step_digest(reference.step(actions, auto_reset=False))
+        reference_digest = _step_digest(
+            reference.step(reference_actions, auto_reset=False)
+        )
         if continued_digest != reference_digest:
             raise RuntimeError("post-evaluation training continuation diverged")
 
         result = {
-            "schema_version": "rle-u1-borrowed-eval-gate-v0.1",
+            "schema_version": "rle-u1-borrowed-eval-gate-v0.2",
             "task_id": args.task,
             "rlinf_commit": args.rlinf_commit,
             "benchmark_commit": args.benchmark_commit,
@@ -282,11 +341,16 @@ def main() -> None:
             "eval_episodes": args.eval_episodes,
             "worker_pids": worker_pids,
             "checkpoint_sha256": checkpoint_sha256,
+            "advanced_checkpoint_sha256": advanced_checkpoint_sha256,
+            "training_vector_steps": args.training_vector_steps,
+            "training_reset_count": advanced_resets,
+            "training_advance_exact": True,
             "recreated_borrowed_exact": True,
             "repeated_evaluation_exact": True,
             "checkpoint_restore_exact": True,
             "failure_restore_passed": True,
             "continuation_exact": True,
+            "planner_continuation_exact": True,
             "continued_step_digest": continued_digest,
             "recreated": recreated,
             "borrowed_first": first,

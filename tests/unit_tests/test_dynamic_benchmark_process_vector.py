@@ -28,6 +28,7 @@ import pytest
 from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
     DynamicBenchmarkEnv,
     _DynamicBenchmarkProcessHandler,
+    _observation_payload_sha256,
     _pack_process_observation,
 )
 from rlinf.envs.dynamic_benchmark.process_vector import OrderedProcessVector
@@ -119,6 +120,77 @@ def test_process_observation_transport_removes_mapping_proxies() -> None:
     assert restored.episode_id == observation.episode_id
     assert restored.proprio == {"joint": [1.0]}
     assert restored.events_since_last_observation[0].details == {"force": 1.5}
+
+    original_sha256 = _observation_payload_sha256(packed)
+    assert _observation_payload_sha256(transport) == original_sha256
+    transport["privileged"]["object"][0] = 3.0
+    assert _observation_payload_sha256(transport) != original_sha256
+
+
+def test_process_restore_installs_checkpoint_observation_in_worker_cache() -> None:
+    def observation(*, value: float, with_event: bool) -> SimpleNamespace:
+        events = (
+            SimpleNamespace(
+                name="contact",
+                physics_step=7,
+                time_s=0.07,
+                details={"force": 2.5},
+            ),
+        ) if with_event else ()
+        return SimpleNamespace(
+            episode_id="episode-restore",
+            task_id="t4_sphere",
+            physics_step=7,
+            control_step=3,
+            policy_step=3,
+            time_s=0.07,
+            rgb={},
+            depth_m={},
+            segmentation={},
+            proprio={"joint": np.asarray([1.0], dtype=np.float32)},
+            privileged={"object": np.asarray([value], dtype=np.float32)},
+            events_since_last_observation=events,
+            api_version="db-api-v0.1",
+        )
+
+    authoritative = observation(value=2.0, with_event=True)
+    reencoded = observation(value=999.0, with_event=False)
+
+    class FakeCanonicalEnv:
+        def reset(self, request) -> None:
+            self.request = request
+
+        def load_state(self, env_state):
+            assert env_state == b"env-state"
+            return reencoded
+
+        def save_state(self):
+            return b"saved-state"
+
+    handler = object.__new__(_DynamicBenchmarkProcessHandler)
+    handler._envs = {0: FakeCanonicalEnv()}
+    handler._observations = {}
+    handler._ObservationBundle = lambda **kwargs: SimpleNamespace(**kwargs)
+    handler._EventRecord = lambda **kwargs: SimpleNamespace(**kwargs)
+    handler._arm_hidden_t5_event = lambda env, request: None
+    handler._reset_residual_planner = lambda index, request: None
+    request = SimpleNamespace(episode_id="episode-restore", task_id="t4_sphere")
+
+    restored = handler.handle(
+        "restore",
+        [(0, (request, b"env-state", _pack_process_observation(authoritative)))],
+    )
+    cached = handler._observations[0]
+    assert np.array_equal(cached.privileged["object"], np.asarray([2.0], dtype=np.float32))
+    assert cached.events_since_last_observation[0].name == "contact"
+    assert restored[0][1]["events_since_last_observation"][0]["name"] == "contact"
+
+    saved = handler.handle("save", [(0, None)])[0][1]
+    assert saved["env_state"] == b"saved-state"
+    assert np.array_equal(
+        saved["observation"]["privileged"]["object"],
+        np.asarray([2.0], dtype=np.float32),
+    )
 
 
 def test_process_residual_composition_matches_frozen_float32_contract() -> None:

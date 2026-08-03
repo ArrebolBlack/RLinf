@@ -1260,7 +1260,7 @@ def _rewind_evaluation_environment(
     """Reset a frozen evaluation manifest without replaying expensive sim state."""
 
     if initial_checkpoint.get("schema_version") != (
-        "rlinf-dynamic-benchmark-checkpoint-v0.1"
+        "rlinf-dynamic-benchmark-checkpoint-v0.2"
     ):
         raise ValueError("unsupported evaluation rewind checkpoint schema")
     expected_identity = env._checkpoint_identity()
