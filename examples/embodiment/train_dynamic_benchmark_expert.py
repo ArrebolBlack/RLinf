@@ -1375,18 +1375,28 @@ class _BorrowedEvaluationRuntime:
     training_checkpoint: dict[str, Any] | None = None
     training_observation: torch.Tensor | None = None
     training_teacher_snapshot: list[Any] | None = None
+    training_manifest_cache: dict[str, Any] | None = None
+    validation_manifest_cache: dict[str, Any] | None = None
     validation_teachers: list[Any] | None = None
+    validation_manifest_cache_hit: bool = False
+    validation_manifest_context_s: float = 0.0
+    training_manifest_context_restore_s: float = 0.0
 
     def _restore_training_state(self) -> float:
         if self.training_checkpoint is None:
             return 0.0
         restore_start = time.perf_counter()
-        identity = dict(self.training_checkpoint["identity"])
-        self.env.set_manifest_context(
-            split_name=str(identity["split"]),
-            base_manifest_seed=int(identity["base_manifest_seed"]),
+        if self.training_manifest_cache is None:
+            raise RuntimeError("borrowed evaluation lost the training manifest cache")
+        manifest_restore_start = time.perf_counter()
+        self.env.load_manifest_cache_state(self.training_manifest_cache)
+        self.training_manifest_context_restore_s = (
+            time.perf_counter() - manifest_restore_start
         )
-        self.env.load_checkpoint_state(self.training_checkpoint)
+        self.env.load_checkpoint_state(
+            self.training_checkpoint,
+            refresh_manifest=False,
+        )
         restored = self.env._last_obs
         if restored is None or self.training_observation is None:
             raise RuntimeError("borrowed evaluation lost the training observation")
@@ -1400,6 +1410,7 @@ class _BorrowedEvaluationRuntime:
         self.training_checkpoint = None
         self.training_observation = None
         self.training_teacher_snapshot = None
+        self.training_manifest_cache = None
         self.validation_teachers = None
         return restore_s
 
@@ -1412,9 +1423,11 @@ class _BorrowedEvaluationRuntime:
             raise RuntimeError("borrowed evaluation runtime is already active")
         checkpoint_start = time.perf_counter()
         self.training_checkpoint = self.env.checkpoint_state()
+        self.training_manifest_cache = self.env.manifest_cache_state()
         current = self.env._last_obs
         if current is None:
             self.training_checkpoint = None
+            self.training_manifest_cache = None
             raise RuntimeError("borrowed evaluation requires initialized training state")
         self.training_observation = current["states"].clone()
         self.training_teacher_snapshot = (
@@ -1428,9 +1441,26 @@ class _BorrowedEvaluationRuntime:
             validation_seed = (
                 config.validation_manifest_seed + self.env.seed_offset * 1_000_003
             )
-            self.env.set_manifest_context(
-                split_name="validation",
-                base_manifest_seed=validation_seed,
+            manifest_context_start = time.perf_counter()
+            self.validation_manifest_cache_hit = self.validation_manifest_cache is not None
+            if self.validation_manifest_cache is None:
+                self.env.set_manifest_context(
+                    split_name="validation",
+                    base_manifest_seed=validation_seed,
+                )
+                self.validation_manifest_cache = self.env.manifest_cache_state()
+            else:
+                if (
+                    self.validation_manifest_cache["split_name"] != "validation"
+                    or int(self.validation_manifest_cache["base_manifest_seed"])
+                    != validation_seed
+                ):
+                    raise RuntimeError(
+                        "borrowed evaluation validation manifest cache identity diverged"
+                    )
+                self.env.load_manifest_cache_state(self.validation_manifest_cache)
+            self.validation_manifest_context_s = (
+                time.perf_counter() - manifest_context_start
             )
             self.env.reset(options={"env_idx": list(range(self.env.num_envs))})
             self.validation_teachers = (
@@ -1657,6 +1687,15 @@ def _evaluate(
             getattr(runtime, "checkpoint_s", 0.0)
         ),
         "training_environment_restore_s": training_environment_restore_s,
+        "validation_manifest_cache_hit": bool(
+            getattr(runtime, "validation_manifest_cache_hit", False)
+        ),
+        "validation_manifest_context_s": float(
+            getattr(runtime, "validation_manifest_context_s", 0.0)
+        ),
+        "training_manifest_context_restore_s": float(
+            getattr(runtime, "training_manifest_context_restore_s", 0.0)
+        ),
         "policy_action_total_s": policy_action_s,
         "planner_action_total_s": planner_action_s,
         "process_planner_action_total_s": process_planner_action_s,

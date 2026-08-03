@@ -538,6 +538,54 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_generation = 0
         self._refresh_manifest()
 
+    def manifest_cache_state(self) -> dict[str, Any]:
+        """Return an in-memory cache for the current frozen manifest generation."""
+
+        return {
+            "schema_version": "rlinf-dynamic-benchmark-manifest-cache-v0.1",
+            "task_id": self.task_id,
+            "split_name": self.split_name,
+            "base_manifest_seed": self.base_manifest_seed,
+            "manifest_size": self.manifest_size,
+            "manifest_generation": self._manifest_generation,
+            "manifest_rows": self._manifest_rows,
+        }
+
+    def load_manifest_cache_state(self, state: Mapping[str, Any]) -> None:
+        """Install a validated in-memory manifest cache without regenerating it."""
+
+        if state.get("schema_version") != "rlinf-dynamic-benchmark-manifest-cache-v0.1":
+            raise ValueError("unsupported Dynamic Benchmark manifest cache schema")
+        if str(state.get("task_id")) != self.task_id:
+            raise ValueError("Dynamic Benchmark manifest cache task does not match env")
+        if int(state.get("manifest_size", -1)) != self.manifest_size:
+            raise ValueError("Dynamic Benchmark manifest cache size does not match env")
+        split_name = str(state["split_name"])
+        try:
+            split = self._Split(split_name)
+        except ValueError as exc:
+            raise ValueError(
+                f"unsupported Dynamic Benchmark split {split_name!r}"
+            ) from exc
+        generation = int(state["manifest_generation"])
+        if generation < 0:
+            raise ValueError("Dynamic Benchmark manifest cache generation must be non-negative")
+        rows = tuple(state["manifest_rows"])
+        if len(rows) != self.manifest_size:
+            raise ValueError("Dynamic Benchmark manifest cache row count does not match env")
+        if any(
+            row.request.task_id != self.task_id
+            or str(row.request.split.value) != split_name
+            for row in rows
+        ):
+            raise ValueError("Dynamic Benchmark manifest cache row identity does not match env")
+        self.split_name = split_name
+        self._split = split
+        self.base_manifest_seed = int(state["base_manifest_seed"])
+        self._manifest_generation = generation
+        self._manifest_rows = rows
+        self._manifest_cursor = 0
+
     def _next_request(self) -> Any:
         if self._manifest_cursor == len(self._manifest_rows):
             self._manifest_generation += 1
@@ -1095,7 +1143,12 @@ class DynamicBenchmarkEnv(gym.Env):
             "state_schema": self.state_schema,
         }
 
-    def load_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+    def load_checkpoint_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        refresh_manifest: bool = True,
+    ) -> None:
         """Restore a checkpoint produced by :meth:`checkpoint_state`."""
 
         if state.get("schema_version") != "rlinf-dynamic-benchmark-checkpoint-v0.1":
@@ -1109,6 +1162,14 @@ class DynamicBenchmarkEnv(gym.Env):
         ).hexdigest()
         if observed_identity_sha256 != state["identity_sha256"]:
             raise ValueError("Dynamic Benchmark checkpoint identity hash mismatch")
+        manifest_generation = int(state["manifest_generation"])
+        if not refresh_manifest and (
+            self._manifest_generation != manifest_generation
+            or len(self._manifest_rows) != self.manifest_size
+        ):
+            raise ValueError(
+                "Dynamic Benchmark cached manifest generation does not match checkpoint"
+            )
         request_rows = list(state["requests"])
         env_states = list(state["env_states"])
         reward_states = list(state["reward_states"])
@@ -1153,8 +1214,9 @@ class DynamicBenchmarkEnv(gym.Env):
                 self._unpack_process_observation(payload)
                 for _, payload in self._process_vector.run("restore", restore_items)
             ]
-        self._manifest_generation = int(state["manifest_generation"])
-        self._refresh_manifest()
+        self._manifest_generation = manifest_generation
+        if refresh_manifest:
+            self._refresh_manifest()
         manifest_cursor = int(state["manifest_cursor"])
         if not 0 <= manifest_cursor <= len(self._manifest_rows):
             raise ValueError("Dynamic Benchmark checkpoint manifest cursor is invalid")

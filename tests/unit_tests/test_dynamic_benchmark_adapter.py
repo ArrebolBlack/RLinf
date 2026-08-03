@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from rlinf.envs import SupportedEnvType
+from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 from rlinf.envs.dynamic_benchmark.reward import DynamicBenchmarkReward
 from rlinf.envs.dynamic_benchmark.state_schema import (
     ALLOWED_PRIVILEGED_KEYS,
@@ -46,6 +47,53 @@ def _observation() -> SimpleNamespace:
 
 def test_dynamic_benchmark_env_type_is_registered() -> None:
     assert SupportedEnvType("dynamic_benchmark") is SupportedEnvType.DYNAMIC_BENCHMARK
+
+
+def test_manifest_cache_round_trip_validates_identity_without_regeneration() -> None:
+    class FakeSplit:
+        def __init__(self, value: str) -> None:
+            if value not in {"train", "validation"}:
+                raise ValueError(value)
+            self.value = value
+
+    env = object.__new__(DynamicBenchmarkEnv)
+    env.task_id = "t4_sphere"
+    env.split_name = "train"
+    env._split = FakeSplit("train")
+    env._Split = FakeSplit
+    env.base_manifest_seed = 17
+    env.manifest_size = 2
+    env._manifest_generation = 3
+    env._manifest_cursor = 1
+    rows = tuple(
+        SimpleNamespace(
+            request=SimpleNamespace(
+                task_id="t4_sphere",
+                split=SimpleNamespace(value="train"),
+            )
+        )
+        for _ in range(2)
+    )
+    env._manifest_rows = rows
+
+    cache = env.manifest_cache_state()
+    env.split_name = "validation"
+    env._split = FakeSplit("validation")
+    env.base_manifest_seed = 23
+    env._manifest_generation = 0
+    env._manifest_rows = ()
+    env._manifest_cursor = 99
+    env.load_manifest_cache_state(cache)
+
+    assert env.split_name == "train"
+    assert env.base_manifest_seed == 17
+    assert env._manifest_generation == 3
+    assert env._manifest_rows is rows
+    assert env._manifest_cursor == 0
+    with pytest.raises(ValueError, match="generation"):
+        env.load_manifest_cache_state(dict(cache, manifest_generation=-1))
+    with pytest.raises(ValueError, match="task"):
+        env.load_manifest_cache_state(dict(cache, task_id="t2_trans"))
 
 
 def test_t5_hidden_event_branch_is_deterministic_balanced_and_not_a_reset_factor() -> None:

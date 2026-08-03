@@ -233,6 +233,10 @@ def main() -> None:
             raise RuntimeError("borrowed evaluation did not use the training worker PIDs")
         if first["evaluation_rewind_mode"] != "borrow_training_pool":
             raise RuntimeError("borrowed evaluation mode was not reported")
+        if first["validation_manifest_cache_hit"]:
+            raise RuntimeError("first borrowed evaluation unexpectedly hit manifest cache")
+        if not second["validation_manifest_cache_hit"]:
+            raise RuntimeError("repeated borrowed evaluation missed manifest cache")
 
         failure_restore_passed = False
         try:

@@ -450,6 +450,9 @@ def test_borrowed_evaluation_runtime_restores_training_state_and_teachers(
             self.base_manifest_seed = config.train_manifest_seed
             self._last_obs = {"states": torch.tensor([[1.0], [2.0]])}
             self.loaded = 0
+            self.loaded_without_refresh = 0
+            self.manifest_context_builds = 0
+            self.manifest_cache_loads = 0
 
         def checkpoint_state(self):
             return {
@@ -463,14 +466,27 @@ def test_borrowed_evaluation_runtime_restores_training_state_and_teachers(
         def set_manifest_context(self, *, split_name, base_manifest_seed) -> None:
             self.split_name = split_name
             self.base_manifest_seed = base_manifest_seed
+            self.manifest_context_builds += 1
+
+        def manifest_cache_state(self):
+            return {
+                "split_name": self.split_name,
+                "base_manifest_seed": self.base_manifest_seed,
+            }
+
+        def load_manifest_cache_state(self, state) -> None:
+            self.split_name = state["split_name"]
+            self.base_manifest_seed = state["base_manifest_seed"]
+            self.manifest_cache_loads += 1
 
         def reset(self, *, options):
             assert options == {"env_idx": [0, 1]}
             self._last_obs = {"states": torch.tensor([[7.0], [8.0]])}
             return self._last_obs, {}
 
-        def load_checkpoint_state(self, checkpoint) -> None:
+        def load_checkpoint_state(self, checkpoint, *, refresh_manifest=True) -> None:
             self.loaded += 1
+            self.loaded_without_refresh += int(not refresh_manifest)
             self._last_obs = {"states": checkpoint["states"].clone()}
 
     env = FakeEnv()
@@ -491,6 +507,7 @@ def test_borrowed_evaluation_runtime_restores_training_state_and_teachers(
     assert prepared[1] is validation_teachers
     assert prepared[4] == 0
     assert prepared[5] == "borrow_training_pool"
+    assert runtime.validation_manifest_cache_hit is False
     assert env.split_name == "validation"
     assert torch.equal(env._last_obs["states"], torch.tensor([[7.0], [8.0]]))
     training_teachers[0].value = 99
@@ -499,11 +516,23 @@ def test_borrowed_evaluation_runtime_restores_training_state_and_teachers(
     assert restore_s >= 0.0
     assert runtime.evaluations == 1
     assert env.loaded == 1
+    assert env.loaded_without_refresh == 1
+    assert env.manifest_context_builds == 1
+    assert env.manifest_cache_loads == 1
     assert env.split_name == "train"
     assert env.base_manifest_seed == config.train_manifest_seed
     assert torch.equal(env._last_obs["states"], torch.tensor([[1.0], [2.0]]))
     assert [teacher.value for teacher in training_teachers] == [1, 2]
     assert runtime.training_checkpoint is None
+
+    repeated = runtime.prepare(config)
+    assert repeated[5] == "borrow_training_pool"
+    assert runtime.validation_manifest_cache_hit is True
+    assert env.manifest_context_builds == 1
+    assert env.manifest_cache_loads == 2
+    runtime.finish(completed=True)
+    assert env.loaded_without_refresh == 2
+    assert env.manifest_cache_loads == 3
 
 
 def test_borrowed_evaluation_prepare_failure_restores_training_state(
@@ -549,10 +578,21 @@ def test_borrowed_evaluation_prepare_failure_restores_training_state(
             self.split_name = split_name
             self.base_manifest_seed = base_manifest_seed
 
+        def manifest_cache_state(self):
+            return {
+                "split_name": self.split_name,
+                "base_manifest_seed": self.base_manifest_seed,
+            }
+
+        def load_manifest_cache_state(self, state) -> None:
+            self.split_name = state["split_name"]
+            self.base_manifest_seed = state["base_manifest_seed"]
+
         def reset(self, *, options):
             raise RuntimeError("validation reset failed")
 
-        def load_checkpoint_state(self, checkpoint) -> None:
+        def load_checkpoint_state(self, checkpoint, *, refresh_manifest=True) -> None:
+            assert refresh_manifest is False
             self._last_obs = {"states": checkpoint["states"].clone()}
 
     env = FailingEnv()
