@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -320,15 +323,11 @@ def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
         num_envs = 2
 
         def __init__(self) -> None:
-            self.restore_payloads = []
+            self.rewind_payloads = []
             self.closed = False
 
         def checkpoint_state(self):
             return {"nested": {"values": [1, 2, 3]}}
-
-        def load_checkpoint_state(self, state) -> None:
-            self.restore_payloads.append(state)
-            state["nested"]["values"].append(99)
 
         def close(self) -> None:
             self.closed = True
@@ -340,6 +339,11 @@ def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
         expert_trainer,
         "_build_evaluation_environment",
         lambda _config: (env, teachers),
+    )
+    monkeypatch.setattr(
+        expert_trainer,
+        "_rewind_evaluation_environment",
+        lambda target_env, state: target_env.rewind_payloads.append(state),
     )
     monkeypatch.setattr(
         expert_trainer,
@@ -356,6 +360,7 @@ def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
     assert first[2] > 0.0
     assert first[3] == 0.0
     assert first[4] == 0
+    assert first[5] == "initial_construction"
     runtime.mark_complete()
 
     second = runtime.prepare(config)
@@ -363,7 +368,8 @@ def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
     assert second[2] == 0.0
     assert second[3] > 0.0
     assert second[4] == 1
-    assert env.restore_payloads == [{"nested": {"values": [1, 2, 3, 99]}}]
+    assert second[5] == "manifest_reset"
+    assert env.rewind_payloads == [{"nested": {"values": [1, 2, 3]}}]
     assert runtime.initial_checkpoint == {"nested": {"values": [1, 2, 3]}}
     assert resets == [("t4_sphere", env, teachers, [0, 1])]
 
@@ -371,6 +377,81 @@ def test_persistent_evaluation_runtime_restores_one_frozen_checkpoint(
     runtime.close()
     assert env.closed is True
     assert runtime.closed is True
+
+
+def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state() -> None:
+    identity = {"task_id": "t4_sphere", "num_envs": 2}
+    request_rows = [
+        {
+            "episode_id": f"episode-{index}",
+            "task_id": "t4_sphere",
+            "split": "validation",
+            "seed": 100 + index,
+            "action_mode": "joint_delta",
+            "observation_track": "state",
+            "object_mode": "default",
+            "reset_mode": "canonical",
+            "factors": {"index": index},
+            "api_version": "v1",
+        }
+        for index in range(2)
+    ]
+
+    def request(row):
+        return SimpleNamespace(
+            episode_id=row["episode_id"],
+            task_id=row["task_id"],
+            split=SimpleNamespace(value=row["split"]),
+            seed=row["seed"],
+            action_mode=SimpleNamespace(value=row["action_mode"]),
+            observation_track=SimpleNamespace(value=row["observation_track"]),
+            object_mode=row["object_mode"],
+            reset_mode=row["reset_mode"],
+            factors=row["factors"],
+            api_version=row["api_version"],
+        )
+
+    class FakeEnv:
+        num_envs = 2
+
+        def __init__(self) -> None:
+            self._manifest_generation = 99
+            self._manifest_cursor = 99
+            self._requests = []
+            self.reset_options = None
+
+        def _checkpoint_identity(self):
+            return identity
+
+        def _refresh_manifest(self):
+            self._manifest_cursor = 0
+
+        def reset(self, *, options):
+            self.reset_options = options
+            self._requests = [request(row) for row in request_rows]
+            self._manifest_cursor = self.num_envs
+
+    checkpoint = {
+        "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.1",
+        "identity": identity,
+        "identity_sha256": hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "manifest_generation": 3,
+        "manifest_cursor": 2,
+        "requests": request_rows,
+        "needs_reset": np.zeros(2, dtype=bool),
+        "elapsed_steps": torch.zeros(2, dtype=torch.int32),
+        "prev_step_reward": torch.zeros(2),
+        "returns": torch.zeros(2),
+        "success_once": torch.zeros(2, dtype=torch.bool),
+        "is_start": True,
+    }
+    env = FakeEnv()
+    expert_trainer._rewind_evaluation_environment(env, checkpoint)
+    assert env._manifest_generation == 3
+    assert env._manifest_cursor == 2
+    assert env.reset_options == {"env_idx": [0, 1]}
 
 
 def test_sampler_learner_overlap_runs_updates_while_sampling_is_in_flight() -> None:

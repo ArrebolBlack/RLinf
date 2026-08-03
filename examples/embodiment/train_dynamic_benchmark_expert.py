@@ -23,7 +23,6 @@ action space, so the zero action is exactly the frozen planner policy.
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import math
@@ -32,7 +31,7 @@ import random
 import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1208,6 +1207,65 @@ def _build_evaluation_environment(
     return env, teachers
 
 
+def _request_checkpoint_row(request: Any) -> dict[str, Any]:
+    return {
+        "episode_id": request.episode_id,
+        "task_id": request.task_id,
+        "split": request.split.value,
+        "seed": request.seed,
+        "action_mode": request.action_mode.value,
+        "observation_track": request.observation_track.value,
+        "object_mode": request.object_mode,
+        "reset_mode": request.reset_mode,
+        "factors": dict(request.factors),
+        "api_version": request.api_version,
+    }
+
+
+def _rewind_evaluation_environment(
+    env: Any, initial_checkpoint: Mapping[str, Any]
+) -> None:
+    """Reset a frozen evaluation manifest without replaying expensive sim state."""
+
+    if initial_checkpoint.get("schema_version") != (
+        "rlinf-dynamic-benchmark-checkpoint-v0.1"
+    ):
+        raise ValueError("unsupported evaluation rewind checkpoint schema")
+    expected_identity = env._checkpoint_identity()
+    checkpoint_identity = dict(initial_checkpoint["identity"])
+    if checkpoint_identity != expected_identity:
+        raise ValueError("evaluation rewind checkpoint identity does not match env")
+    identity_sha256 = hashlib.sha256(
+        json.dumps(
+            checkpoint_identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if identity_sha256 != initial_checkpoint["identity_sha256"]:
+        raise ValueError("evaluation rewind checkpoint identity hash mismatch")
+    if int(initial_checkpoint["manifest_cursor"]) != env.num_envs:
+        raise ValueError("evaluation rewind checkpoint is not at the manifest start")
+    if not bool(initial_checkpoint["is_start"]):
+        raise ValueError("evaluation rewind checkpoint is not a reset boundary")
+    for name in ("needs_reset", "elapsed_steps", "prev_step_reward", "returns"):
+        values = np.asarray(initial_checkpoint[name])
+        if np.any(values):
+            raise ValueError(f"evaluation rewind checkpoint has nonzero {name}")
+    if np.any(np.asarray(initial_checkpoint["success_once"], dtype=bool)):
+        raise ValueError("evaluation rewind checkpoint has prior successes")
+
+    expected_requests = [dict(row) for row in initial_checkpoint["requests"]]
+    if len(expected_requests) != env.num_envs:
+        raise ValueError("evaluation rewind checkpoint vector length mismatch")
+    env._manifest_generation = int(initial_checkpoint["manifest_generation"])
+    env._refresh_manifest()
+    env.reset(options={"env_idx": list(range(env.num_envs))})
+    if env._manifest_cursor != int(initial_checkpoint["manifest_cursor"]):
+        raise RuntimeError("evaluation rewind manifest cursor diverged")
+    observed_requests = [_request_checkpoint_row(request) for request in env._requests]
+    if observed_requests != expected_requests:
+        raise RuntimeError("evaluation rewind request order diverged")
+
+
 @dataclass
 class _EvaluationRuntime:
     """A reusable validation pool restored to one exact initial checkpoint."""
@@ -1220,7 +1278,7 @@ class _EvaluationRuntime:
 
     def prepare(
         self, config: TrainConfig
-    ) -> tuple[Any, list[Any] | None, float, float, int]:
+    ) -> tuple[Any, list[Any] | None, float, float, int, str]:
         if self.closed:
             raise RuntimeError("persistent evaluation runtime is closed")
         construction_s = 0.0
@@ -1230,11 +1288,12 @@ class _EvaluationRuntime:
             self.env, self.planner_teachers = _build_evaluation_environment(config)
             self.initial_checkpoint = self.env.checkpoint_state()
             construction_s = time.perf_counter() - construction_start
+            rewind_mode = "initial_construction"
         else:
             if self.initial_checkpoint is None:
                 raise RuntimeError("persistent evaluation checkpoint is unavailable")
             restore_start = time.perf_counter()
-            self.env.load_checkpoint_state(copy.deepcopy(self.initial_checkpoint))
+            _rewind_evaluation_environment(self.env, self.initial_checkpoint)
             if self.planner_teachers is not None:
                 _reset_planner_teachers(
                     config.task,
@@ -1243,12 +1302,14 @@ class _EvaluationRuntime:
                     list(range(self.env.num_envs)),
                 )
             restore_s = time.perf_counter() - restore_start
+            rewind_mode = "manifest_reset"
         return (
             self.env,
             self.planner_teachers,
             construction_s,
             restore_s,
             self.evaluations,
+            rewind_mode,
         )
 
     def mark_complete(self) -> None:
@@ -1275,15 +1336,21 @@ def _evaluate(
     construction_s = 0.0
     restore_s = 0.0
     evaluation_index = 0
+    evaluation_rewind_mode = "recreate"
     owns_environment = runtime is None
     if runtime is None:
         construction_start = time.perf_counter()
         env, teachers = _build_evaluation_environment(config)
         construction_s = time.perf_counter() - construction_start
     else:
-        env, teachers, construction_s, restore_s, evaluation_index = runtime.prepare(
-            config
-        )
+        (
+            env,
+            teachers,
+            construction_s,
+            restore_s,
+            evaluation_index,
+            evaluation_rewind_mode,
+        ) = runtime.prepare(config)
     environment_step_s = 0.0
     environment_reset_s = 0.0
     planner_action_s = 0.0
@@ -1456,6 +1523,7 @@ def _evaluate(
         "planner_in_processes": config.eval_planner_in_processes,
         "persistent_eval_workers": runtime is not None,
         "persistent_evaluation_index": evaluation_index,
+        "evaluation_rewind_mode": evaluation_rewind_mode,
         "action_digest_sha256": action_digest.hexdigest(),
         "state_digest_sha256": state_digest.hexdigest(),
         "worker_processes": len(process_worker_pids),

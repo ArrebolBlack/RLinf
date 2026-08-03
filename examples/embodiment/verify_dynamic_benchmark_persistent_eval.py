@@ -191,6 +191,8 @@ def main() -> None:
         or first["environment_restore_s"] != 0.0
         or second["environment_construction_s"] != 0.0
         or second["environment_restore_s"] <= 0.0
+        or first["evaluation_rewind_mode"] != "initial_construction"
+        or second["evaluation_rewind_mode"] != "manifest_reset"
     ):
         runtime.close()
         raise RuntimeError("persistent evaluation lifecycle timings are inconsistent")
