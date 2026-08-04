@@ -541,7 +541,7 @@ def _rollout(
     device: torch.device,
     capture_trace: bool,
     trace_metadata: Mapping[str, Any] | None = None,
-    replay_actions: np.ndarray | None = None,
+    replay_actions_array: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray], Any | None]:
     from se3_wam.benchmark.api import StepResult
     from se3_wam.benchmark.dataset import EpisodeTrace
@@ -594,12 +594,12 @@ def _rollout(
     terminated_value = False
     truncated_value = False
     while not (terminated_value or truncated_value):
-        if replay_actions is not None:
+        if replay_actions_array is not None:
             action_index = len(actions)
-            if action_index >= replay_actions.shape[0]:
+            if action_index >= replay_actions_array.shape[0]:
                 raise RuntimeError("replayed action sequence is shorter than the rollout")
             env_actions = torch.as_tensor(
-                replay_actions[action_index], dtype=torch.float32
+                replay_actions_array[action_index], dtype=torch.float32
             ).unsqueeze(0)
             policy_action = env_actions.clone()
         elif candidate.spec.kind == "planner":
@@ -1133,7 +1133,7 @@ def main() -> None:
                     candidate=candidate,
                     device=device,
                     capture_trace=True,
-                    replay_actions=replay_actions_array,
+                    replay_actions_array=replay_actions_array,
                     trace_metadata={
                         "candidate_manifest_sha256": candidate_manifest_sha256,
                         "budget_used": budget_used,
