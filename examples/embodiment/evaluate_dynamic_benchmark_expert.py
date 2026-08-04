@@ -613,6 +613,15 @@ def main() -> None:
             "auto_reset": False,
             "ignore_terminations": False,
             "group_size": 1,
+            "reward_lift_shaping_weight": float(
+                config.get("reward_lift_shaping_weight", 0.0)
+            ),
+            "reward_orientation_shaping_weight": float(
+                config.get("reward_orientation_shaping_weight", 0.0)
+            ),
+            "state_derived_features": list(
+                config.get("state_derived_features", [])
+            ),
         },
         num_envs=1,
         seed_offset=0,
