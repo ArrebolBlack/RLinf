@@ -120,6 +120,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="resume an interrupted export at its last committed reset boundary",
     )
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     return parser
 
 
@@ -831,9 +833,15 @@ def main() -> None:
     from se3_wam.benchmark.evaluation import manifest_record
 
     args = _parser().parse_args()
-    if args.output.exists() and not args.resume:
+    if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise ValueError("shard-index must be in [0, shard-count)")
+    sharded = args.shard_count > 1
+    shard_output = (
+        args.output / f"shard-{args.shard_index:02d}" if sharded else args.output
+    )
+    if shard_output.exists() and not args.resume:
         raise FileExistsError(f"refusing to overwrite {args.output}")
-    if args.resume and not args.output.is_dir():
+    if args.resume and not shard_output.is_dir():
         raise FileNotFoundError("--resume requires an existing export directory")
     if args.accepted_episodes < 1 or args.max_resets < args.accepted_episodes:
         raise ValueError("max_resets must be at least accepted_episodes > 0")
@@ -898,6 +906,18 @@ def main() -> None:
         if reference_schemas and canonical_json(light_env.state_schema) not in reference_schemas:
             raise ValueError("export environment state schema does not match policies")
         rows = list(light_env._manifest_rows[: args.max_resets])
+        if sharded:
+            step = (len(rows) + args.shard_count - 1) // args.shard_count
+            start = args.shard_index * step
+            shard_rows = rows[start : start + step]
+            run_output = shard_output
+            for _ in range(start):
+                light_env.reset(options={"env_idx": [0]})
+                render_env.reset(options={"env_idx": [0]})
+        else:
+            start = 0
+            shard_rows = rows
+            run_output = args.output
         reset_manifest_text = "".join(
             canonical_json(manifest_record(row)) + "\n" for row in rows
         )
@@ -929,18 +949,18 @@ def main() -> None:
             "candidates": [_candidate_identity(candidate.spec) for candidate in candidates],
         }
         export_state["payload_sha256"] = _payload_sha256(export_state)
-        attempts_path = args.output / "attempts.jsonl"
-        winners_path = args.output / "winner_manifest.jsonl"
-        reset_results_path = args.output / "reset_results.jsonl"
-        reset_manifest_path = args.output / "reset_manifest.jsonl"
-        export_state_path = args.output / "export_state.json"
-        progress_path = args.output / "progress.json"
+        attempts_path = run_output / "attempts.jsonl"
+        winners_path = run_output / "winner_manifest.jsonl"
+        reset_results_path = run_output / "reset_results.jsonl"
+        reset_manifest_path = run_output / "reset_manifest.jsonl"
+        export_state_path = run_output / "export_state.json"
+        progress_path = run_output / "progress.json"
         if args.resume:
-            if (args.output / "dataset_card.json").exists() or (
-                args.output / "SHA256SUMS"
+            if (run_output / "dataset_card.json").exists() or (
+                run_output / "SHA256SUMS"
             ).exists():
                 raise ValueError("refusing to resume a sealed export")
-            if _sha256(args.output / "candidate_manifest.json") != candidate_manifest_sha256:
+            if _sha256(run_output / "candidate_manifest.json") != candidate_manifest_sha256:
                 raise ValueError("resume candidate-manifest copy checksum mismatch")
             if reset_manifest_path.read_text(encoding="utf-8") != reset_manifest_text:
                 raise ValueError("resume reset manifest does not match the requested run")
@@ -958,9 +978,9 @@ def main() -> None:
             if progress.get("export_state_sha256") != export_state_sha256:
                 raise ValueError("resume progress references a different export state")
             recovery_event = _recover_partial_output(
-                output=args.output,
+                output=run_output,
                 progress=progress,
-                reset_rows=rows,
+                reset_rows=shard_rows,
                 task=task,
                 split=args.split,
             )
@@ -1004,8 +1024,8 @@ def main() -> None:
                 ),
             )
         else:
-            args.output.mkdir(parents=True)
-            shutil.copyfile(args.candidate_manifest, args.output / "candidate_manifest.json")
+            run_output.mkdir(parents=True)
+            shutil.copyfile(args.candidate_manifest, run_output / "candidate_manifest.json")
             reset_manifest_path.write_text(reset_manifest_text, encoding="utf-8")
             for path in (attempts_path, winners_path, reset_results_path):
                 path.write_text("", encoding="utf-8")
@@ -1034,11 +1054,12 @@ def main() -> None:
                     recovery_events=[],
                 ),
             )
-        for reset_index, row in enumerate(rows):
+        for local_index, row in enumerate(shard_rows):
+            reset_index = start + local_index
             if accepted >= args.accepted_episodes:
                 break
-            if reset_index < attempted_resets:
-                if reset_index + 1 < len(rows):
+            if local_index < attempted_resets:
+                if local_index + 1 < len(shard_rows):
                     light_env.reset(options={"env_idx": [0]})
                     render_env.reset(options={"env_idx": [0]})
                 continue
@@ -1156,7 +1177,7 @@ def main() -> None:
                 _progress_payload(
                     export_state_sha256=export_state_sha256,
                     started_unix_s=started,
-                    next_reset_index=reset_index + 1,
+                    next_reset_index=local_index + 1,
                     accepted_count=accepted,
                     candidate_attempt_count=attempt_count,
                     budget_histogram=budget_histogram,
@@ -1167,7 +1188,7 @@ def main() -> None:
                     recovery_events=recovery_events,
                 ),
             )
-            if reset_index + 1 < len(rows):
+            if local_index + 1 < len(shard_rows):
                 light_env.reset(options={"env_idx": [0]})
                 render_env.reset(options={"env_idx": [0]})
 
@@ -1182,6 +1203,33 @@ def main() -> None:
                 raise RuntimeError(
                     f"candidate policy changed during export: {candidate.spec.candidate_id}"
                 )
+        if sharded:
+            _atomic_json(
+                run_output / "shard_complete.json",
+                {
+                    "schema_version": "rlinf-dynamic-benchmark-optimal-shard-v0.1",
+                    "shard_index": args.shard_index,
+                    "shard_count": args.shard_count,
+                    "accepted_count": accepted,
+                    "attempted_reset_count": attempted_resets,
+                    "candidate_attempt_count": attempt_count,
+                    "budget_histogram": dict(budget_histogram),
+                },
+            )
+            print(
+                json.dumps(
+                    {
+                        "shard": args.shard_index,
+                        "accepted": accepted,
+                        "attempted_resets": attempted_resets,
+                        "candidate_attempts": attempt_count,
+                        "budget_histogram": budget_histogram,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return
         status = "complete" if accepted == args.accepted_episodes else "incomplete"
         card = {
             "schema_version": EXPORT_SCHEMA,
