@@ -70,6 +70,13 @@ def _episode_number(episode_id: str) -> int:
     return int(match.group(1))
 
 
+def _winner_episode_id(row: dict[str, Any]) -> str:
+    request = row.get("request")
+    if not isinstance(request, dict) or not isinstance(request.get("episode_id"), str):
+        raise KeyError("winner row is missing request.episode_id")
+    return request["episode_id"]
+
+
 def main() -> None:
     args = _parser().parse_args()
     root = args.root.resolve()
@@ -102,18 +109,18 @@ def main() -> None:
     reset_index_by_episode: dict[str, int] = {
         row["episode_id"]: int(row["reset_index"]) for row in all_results
     }
-    all_winners.sort(key=lambda row: reset_index_by_episode[row["episode_id"]])
+    all_winners.sort(key=lambda row: reset_index_by_episode[_winner_episode_id(row)])
     kept_winners = all_winners[: args.accepted_episodes]
     if len(kept_winners) < args.accepted_episodes:
         raise RuntimeError(
             f"only {len(kept_winners)}/{args.accepted_episodes} winners across shards"
         )
-    max_reset = reset_index_by_episode[kept_winners[-1]["episode_id"]]
+    max_reset = reset_index_by_episode[_winner_episode_id(kept_winners[-1])]
     kept_results = [row for row in all_results if int(row["reset_index"]) <= max_reset]
     kept_episodes = {row["episode_id"] for row in kept_results}
     kept_attempts = [row for row in all_attempts if row["episode_id"] in kept_episodes]
     kept_attempts.sort(key=lambda row: (_episode_number(row["episode_id"]), row["candidate_index"]))
-    kept_winners.sort(key=lambda row: reset_index_by_episode[row["episode_id"]])
+    kept_winners.sort(key=lambda row: reset_index_by_episode[_winner_episode_id(row)])
 
     budget_histogram: dict[str, int] = {}
     for row in kept_results:
@@ -144,11 +151,17 @@ def main() -> None:
     _write_jsonl(output / "winner_manifest.jsonl", kept_winners)
 
     for winner in kept_winners:
-        episode_id = winner["episode_id"]
+        episode_id = _winner_episode_id(winner)
+        relative = winner.get("relative_episode_dir")
+        target_rel = relative if isinstance(relative, str) else (
+            f"episodes/{task}/{split}/{episode_id}"
+        )
         for shard in shard_dirs:
-            source = shard / "episodes" / task / split / episode_id
+            source = shard / target_rel if isinstance(relative, str) else (
+                shard / "episodes" / task / split / episode_id
+            )
             if source.exists():
-                shutil.copytree(source, output / "episodes" / task / split / episode_id)
+                shutil.copytree(source, output / target_rel)
                 break
         else:
             raise FileNotFoundError(f"winner episode {episode_id} not found in any shard")
