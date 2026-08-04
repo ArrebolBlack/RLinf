@@ -34,7 +34,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -101,6 +101,8 @@ class TrainConfig:
     validation_manifest_seed: int
     manifest_size: int
     image_size: int
+    features: dict[str, Any] = field(default_factory=dict)
+    reward_components: dict[str, Any] = field(default_factory=dict)
 
 
 class RunningNormalizer:
@@ -539,16 +541,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "rlinf_commit",
         }
         actions = {action.dest: action for action in parser._actions}
-        unknown = sorted(set(payload) - set(actions))
+        nested_keys = {"features", "reward_components"}
+        unknown = sorted(set(payload) - set(actions) - nested_keys)
         forbidden = sorted(set(payload) & explicit_only)
         if unknown:
             raise ValueError(f"unknown Dynamic Benchmark config keys: {unknown}")
         if forbidden:
             raise ValueError(f"run-specific keys must stay on the CLI: {forbidden}")
+        nested_defaults = {
+            key: payload.pop(key) for key in nested_keys if key in payload
+        }
         parser.set_defaults(**payload)
         for name in payload:
             actions[name].required = False
-    return parser.parse_args(arguments)
+    else:
+        nested_defaults = {}
+    args = parser.parse_args(arguments)
+    for key, value in nested_defaults.items():
+        setattr(args, key, value)
+    return args
 
 
 def _config(args: argparse.Namespace) -> TrainConfig:
@@ -606,7 +617,14 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         validation_manifest_seed=args.validation_manifest_seed,
         manifest_size=args.manifest_size,
         image_size=args.image_size,
+        features=dict(getattr(args, "features", {}) or {}),
+        reward_components=dict(getattr(args, "reward_components", {}) or {}),
     )
+    from rlinf.envs.dynamic_benchmark.feature_registry import FeatureRegistry
+    from rlinf.envs.dynamic_benchmark.reward_registry import RewardRegistry
+
+    FeatureRegistry.from_config(config.features)
+    RewardRegistry.from_config(config.reward_components)
     if min(config.num_envs, config.eval_num_envs, config.demo_num_envs) < 1:
         raise ValueError("environment counts must be positive")
     if config.env_worker_threads < 1 or config.eval_worker_threads < 1:
@@ -706,6 +724,8 @@ def _env_cfg(
         "process_start_method": process_start_method,
         "process_residual_planner": process_residual_planner,
         "reward_safety_penalty": config.reward_safety_penalty,
+        "features": dict(getattr(config, "features", {}) or {}),
+        "reward_components": dict(getattr(config, "reward_components", {}) or {}),
     }
 
 
@@ -854,7 +874,7 @@ def _demo_replay_identity(
     config: TrainConfig,
     state_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    identity = {
         "schema_version": "rlinf-dynamic-benchmark-demo-identity-v0.1",
         "task": config.task,
         "rlinf_commit": config.demo_rlinf_commit,
@@ -873,6 +893,44 @@ def _demo_replay_identity(
         "image_size": config.image_size,
         "state_schema": state_schema,
     }
+    infra = _infra_identity(config)
+    if infra is not None:
+        identity["infra_identity"] = infra
+    return identity
+
+
+def _infra_identity(config: TrainConfig) -> dict[str, Any] | None:
+    """Canonical feature/reward identity, or None for the frozen default run.
+
+    Returning None (and omitting the key) keeps legacy demo caches and resumes
+    byte-compatible when the shared registries are disabled.
+    """
+
+    if not config.features and not config.reward_components:
+        return None
+    from rlinf.envs.dynamic_benchmark.feature_registry import FeatureRegistry
+    from rlinf.envs.dynamic_benchmark.reward_registry import RewardRegistry
+
+    features = FeatureRegistry.from_config(config.features)
+    rewards = RewardRegistry.from_config(config.reward_components)
+    return {
+        "features": features.to_dict(),
+        "features_sha256": features.identity_sha256(),
+        "reward_components": rewards.to_dict(),
+        "reward_components_sha256": rewards.identity_sha256(),
+    }
+
+
+def _configs_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Tolerant config comparison for legacy checkpoints without infra keys."""
+
+    left_normalized = dict(left)
+    right_normalized = dict(right)
+    left_normalized.setdefault("features", {})
+    left_normalized.setdefault("reward_components", {})
+    right_normalized.setdefault("features", {})
+    right_normalized.setdefault("reward_components", {})
+    return left_normalized == right_normalized
 
 
 def _save_demo_replay_cache(
@@ -1968,6 +2026,7 @@ def _save_policy(
         "model": model.state_dict(),
         "normalizer": normalizer.state_dict(),
         "state_schema": state_schema,
+        "infra_identity": _infra_identity(config),
         "validation": metrics,
         "env_steps": env_steps,
     }
@@ -2165,6 +2224,7 @@ def main() -> None:
             "demo_source": demo_source,
             "online": online.state_dict(),
             "env": env.checkpoint_state(),
+            "infra_identity": _infra_identity(config),
             "global_env_steps": global_env_steps,
             "update_steps": update_steps,
             "best_score": best_score,
@@ -2184,10 +2244,9 @@ def main() -> None:
 
     if args.resume is not None:
         restored = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if (
-            restored["config"] != asdict(config)
-            or restored["state_schema"] != state_schema
-        ):
+        if not _configs_equal(restored["config"], asdict(config)) or restored[
+            "state_schema"
+        ] != state_schema:
             raise ValueError("resume config/state schema does not match current run")
         model.load_state_dict(restored["model"])
         target_q.load_state_dict(restored["target_q"])
@@ -2300,6 +2359,7 @@ def main() -> None:
                 "schema_version": "rlinf-dynamic-benchmark-expert-summary-v0.1",
                 "status": "complete",
                 "config": asdict(config),
+                "infra_identity": _infra_identity(config),
                 "demo_summary": demo_summary,
                 "demo_source": demo_source,
                 "best_validation": best_metrics,
@@ -2622,6 +2682,7 @@ def main() -> None:
             "schema_version": "rlinf-dynamic-benchmark-expert-summary-v0.1",
             "status": "stopped" if stop_requested else "complete",
             "config": asdict(config),
+            "infra_identity": _infra_identity(config),
             "demo_source": demo_source,
             "best_validation": best_metrics,
             "best_score": best_score,

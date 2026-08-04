@@ -30,7 +30,14 @@ import gym
 import numpy as np
 import torch
 
+from .feature_registry import FeatureRegistry
+from .geometry import (
+    eef_velocity_world,
+    object_in_eef_pose_wxyz,
+    quaternion_geodesic_wxyz,
+)
 from .reward import DynamicBenchmarkReward
+from .reward_registry import RewardRegistry
 from .state_schema import DynamicBenchmarkStateSchema
 from .t5_runtime import arm_hidden_t5_event
 
@@ -510,6 +517,18 @@ class DynamicBenchmarkEnv(gym.Env):
         self.returns = torch.zeros(self.num_envs, dtype=torch.float32)
         self.success_once = torch.zeros(self.num_envs, dtype=torch.bool)
         self.reward_trackers = [self._make_reward() for _ in range(self.num_envs)]
+        self.feature_registry = FeatureRegistry.from_config(_cfg_get(cfg, "features", {}))
+        self.reward_registries = [
+            RewardRegistry.from_config(_cfg_get(cfg, "reward_components", {}))
+            for _ in range(self.num_envs)
+        ]
+        self._action_histories: list[list[np.ndarray]] = [[] for _ in range(self.num_envs)]
+        self._previous_eef_poses: list[np.ndarray | None] = [None] * self.num_envs
+        self._ee_velocities: list[np.ndarray | None] = [None] * self.num_envs
+        self._time_to_goals: list[float | None] = [None] * self.num_envs
+        self._distances: list[float | None] = [None] * self.num_envs
+        self._relative_velocity_norms: list[float | None] = [None] * self.num_envs
+        self._stage_progresses: list[float | None] = [None] * self.num_envs
         self.info_logging_keys = ["success", "trajectory_completion"]
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(7,), dtype=np.float32)
         self.reset()
@@ -519,7 +538,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 "states": gym.spaces.Box(
                     -np.inf,
                     np.inf,
-                    shape=(self.num_envs, self._state_schema.state_dim),
+                    shape=(self.num_envs, int(self.state_schema["state_dim"])),
                     dtype=np.float32,
                 )
             }
@@ -712,11 +731,44 @@ class DynamicBenchmarkEnv(gym.Env):
     def state_schema(self) -> dict[str, Any]:
         if self._state_schema is None:
             raise RuntimeError("state schema is unavailable before the first reset")
-        return self._state_schema.to_dict()
+        base = self._state_schema.to_dict()
+        if self.feature_registry.is_empty:
+            return base
+        composed = dict(base)
+        composed["schema_version"] = str(base["schema_version"]) + "+features"
+        composed["feature_registry"] = self.feature_registry.to_dict()
+        composed["value_dim"] = int(base["value_dim"]) + self.feature_registry.value_dim
+        composed["mask_dim"] = int(base["mask_dim"]) + self.feature_registry.mask_dim
+        composed["state_dim"] = (
+            int(base["value_dim"])
+            + int(base["mask_dim"])
+            + self.feature_registry.value_dim
+            + self.feature_registry.mask_dim
+        )
+        return composed
 
     @property
     def reward_schema(self) -> Mapping[str, Any]:
         return self.reward_trackers[0].to_dict()
+
+    @property
+    def infra_identity(self) -> dict[str, Any]:
+        """Feature-set and reward-component identity recorded in checkpoints."""
+
+        reward_config = self.reward_registries[0].to_dict()
+        return {
+            "features": self.feature_registry.to_dict(),
+            "features_sha256": self.feature_registry.identity_sha256(),
+            "reward_components": reward_config,
+            "reward_components_sha256": self.reward_registries[0].identity_sha256(),
+        }
+
+    @property
+    def infra_is_default(self) -> bool:
+        return (
+            self.feature_registry.is_empty
+            and all(registry.is_empty for registry in self.reward_registries)
+        )
 
     @property
     def process_worker_pids(self) -> tuple[int, ...]:
@@ -726,7 +778,13 @@ class DynamicBenchmarkEnv(gym.Env):
             return ()
         return self._process_vector.worker_pids
 
-    def _encode(self, observation: Any, request: Any) -> np.ndarray:
+    def _encode(
+        self,
+        observation: Any,
+        request: Any,
+        *,
+        env_index: int | None = None,
+    ) -> np.ndarray:
         if self._state_schema is None:
             self._state_schema = DynamicBenchmarkStateSchema.from_observation(
                 task_id=self.task_id,
@@ -734,11 +792,119 @@ class DynamicBenchmarkEnv(gym.Env):
                 observation=observation,
                 factors=request.factors,
             )
-        return self._state_schema.encode(
+        base = self._state_schema.encode(
             observation=observation,
             factors=request.factors,
             horizon_steps=self.horizon_steps,
         )
+        if self.feature_registry.is_empty:
+            return base
+        extra: dict[str, Any] = {
+            "ee_velocity": None,
+            "time_to_goal_s": None,
+            "stage_progress": None,
+            "action_history": [],
+        }
+        if env_index is not None:
+            extra["ee_velocity"] = self._ee_velocities[env_index]
+            extra["time_to_goal_s"] = self._time_to_goals[env_index]
+            extra["stage_progress"] = self._stage_progresses[env_index]
+            extra["action_history"] = list(self._action_histories[env_index])
+        values, masks = self.feature_registry.encode(
+            observation=observation, extra=extra
+        )
+        composed = np.concatenate([base, values, masks])
+        if composed.shape != (self.state_schema["state_dim"],) or not np.all(
+            np.isfinite(composed)
+        ):
+            raise RuntimeError(
+                f"composed state violates feature registry: "
+                f"shape={composed.shape}, expected={self.state_schema['state_dim']}"
+            )
+        return composed
+
+    def _current_geometry(self, observation: Any) -> dict[str, Any]:
+        privileged = getattr(observation, "privileged", {})
+        geometry: dict[str, Any] = {}
+        if "object_pose_wxyz" in privileged and "eef_pose_xyzw" in privileged:
+            relative = object_in_eef_pose_wxyz(
+                privileged["object_pose_wxyz"], privileged["eef_pose_xyzw"]
+            )
+            geometry["relative_pose"] = relative
+            geometry["relative_translation_error_m"] = float(
+                np.linalg.norm(relative[:3])
+            )
+            geometry["relative_rotation_error_rad"] = quaternion_geodesic_wxyz(
+                relative[3:], np.asarray([1.0, 0.0, 0.0, 0.0])
+            )
+            geometry["distance_m"] = float(
+                np.linalg.norm(
+                    np.asarray(privileged["object_pose_wxyz"], dtype=np.float64)[:3]
+                    - np.asarray(privileged["eef_pose_xyzw"], dtype=np.float64)[:3]
+                )
+            )
+        if "object_pose_wxyz" in privileged and "goal_pose_wxyz" in privileged:
+            object_pose = np.asarray(privileged["object_pose_wxyz"], dtype=np.float64)
+            goal_pose = np.asarray(privileged["goal_pose_wxyz"], dtype=np.float64)
+            geometry["geodesic_error_rad"] = quaternion_geodesic_wxyz(
+                object_pose[3:], goal_pose[3:]
+            )
+            geometry["goal_error_m"] = float(
+                np.linalg.norm(object_pose[:3] - goal_pose[:3])
+            )
+        if "object_twist_world" in privileged:
+            geometry["object_vel"] = np.asarray(
+                privileged["object_twist_world"], dtype=np.float64
+            ).reshape(-1)
+        return geometry
+
+    def _update_eef_velocity(
+        self, index: int, observation: Any
+    ) -> np.ndarray | None:
+        privileged = getattr(observation, "privileged", {})
+        if "eef_pose_xyzw" not in privileged:
+            return None
+        current = np.asarray(privileged["eef_pose_xyzw"], dtype=np.float64)
+        previous = self._previous_eef_poses[index]
+        velocity = (
+            None
+            if previous is None
+            else eef_velocity_world(previous, current, dt_s=0.05)
+        )
+        self._previous_eef_poses[index] = current
+        self._ee_velocities[index] = velocity
+        return velocity
+
+    def _time_to_goal(
+        self, index: int, observation: Any, ee_velocity: np.ndarray | None
+    ) -> tuple[float | None, float | None]:
+        privileged = getattr(observation, "privileged", {})
+        required = ("object_pose_wxyz", "eef_pose_xyzw", "object_twist_world")
+        if ee_velocity is None or any(key not in privileged for key in required):
+            return None, None
+        object_pose = np.asarray(privileged["object_pose_wxyz"], dtype=np.float64)
+        eef_pose = np.asarray(privileged["eef_pose_xyzw"], dtype=np.float64)
+        object_twist = np.asarray(privileged["object_twist_world"], dtype=np.float64)
+        offset = object_pose[:3] - eef_pose[:3]
+        distance = float(np.linalg.norm(offset))
+        relative_velocity = np.asarray(ee_velocity, dtype=np.float64)[:3] - object_twist[:3]
+        closing_speed = (
+            -float(np.dot(offset / max(distance, 1e-9), relative_velocity))
+            if distance > 1e-9
+            else 0.0
+        )
+        time_to_goal = (
+            None
+            if distance <= 1e-9
+            else float(np.clip(distance / max(closing_speed, 0.01), 0.0, 60.0))
+        )
+        self._relative_velocity_norms[index] = float(
+            np.linalg.norm(
+                np.asarray(ee_velocity, dtype=np.float64) - object_twist
+            )
+        )
+        self._distances[index] = distance
+        return time_to_goal, distance
 
     def _unpack_process_observation(self, payload: Mapping[str, Any]) -> Any:
         return _unpack_observation_payload(
@@ -754,7 +920,16 @@ class DynamicBenchmarkEnv(gym.Env):
         self.returns[tensor_indices] = 0.0
         self.success_once[tensor_indices] = False
         for index in indices:
-            self.reward_trackers[int(index)].reset()
+            member = int(index)
+            self.reward_trackers[member].reset()
+            self.reward_registries[member].reset()
+            self._action_histories[member] = []
+            self._previous_eef_poses[member] = None
+            self._ee_velocities[member] = None
+            self._time_to_goals[member] = None
+            self._distances[member] = None
+            self._relative_velocity_norms[member] = None
+            self._stage_progresses[member] = None
 
     def _arm_hidden_t5_event(self, env: Any, request: Any) -> str | None:
         return arm_hidden_t5_event(
@@ -829,7 +1004,7 @@ class DynamicBenchmarkEnv(gym.Env):
             reset_results = list(self._executor.map(self._reset_one, reset_items))
         for index, observation in reset_results:
             request = requests_by_index[index]
-            state = self._encode(observation, request)
+            state = self._encode(observation, request, env_index=int(index))
             if states.shape[1] == 0:
                 states = np.zeros((self.num_envs, state.size), dtype=np.float32)
             states[index] = state
@@ -894,6 +1069,7 @@ class DynamicBenchmarkEnv(gym.Env):
         component_rows: list[dict[str, float]] = [{} for _ in range(self.num_envs)]
         event_name_rows: list[list[str]] = [[] for _ in range(self.num_envs)]
         active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
+        registry_input_rows: list[dict[str, Any]] = [{} for _ in range(self.num_envs)]
         process_planner_action_s = np.zeros(self.num_envs, dtype=np.float64)
         process_environment_step_s = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
@@ -974,6 +1150,11 @@ class DynamicBenchmarkEnv(gym.Env):
             assert request is not None
             event_name_rows[index] = list(event_names)
             active_stage_progresses[index] = float(result.active_stage_progress)
+            geometry = self._current_geometry(result.observation)
+            ee_velocity = self._update_eef_velocity(index, result.observation)
+            time_to_goal, _ = self._time_to_goal(index, result.observation, ee_velocity)
+            self._time_to_goals[index] = time_to_goal
+            self._stage_progresses[index] = float(result.active_stage_progress)
             reward, components = self.reward_trackers[index].step(
                 action=action.values,
                 event_names=event_names,
@@ -983,9 +1164,36 @@ class DynamicBenchmarkEnv(gym.Env):
                 truncated=bool(result.truncated),
                 termination_reason=result.termination_reason,
             )
-            states[index] = self._encode(result.observation, request)
+            registry_inputs = {
+                "action_l2": float(np.square(action.values).sum()),
+                "completion": self.reward_trackers[index].potential(
+                    event_names=event_names,
+                    active_stage_progress=result.active_stage_progress,
+                ),
+                "stage_progress": float(result.active_stage_progress),
+                "geodesic_error_rad": geometry.get("geodesic_error_rad"),
+                "relative_translation_error_m": geometry.get(
+                    "relative_translation_error_m"
+                ),
+                "relative_rotation_error_rad": geometry.get(
+                    "relative_rotation_error_rad"
+                ),
+                "relative_velocity_norm_m_s": self._relative_velocity_norms[index],
+                "distance_m": self._distances[index],
+                "time_to_goal_s": self._time_to_goals[index],
+            }
+            registry_reward, registry_values, registry_recorded = self.reward_registries[
+                index
+            ].step(registry_inputs)
+            registry_input_rows[index] = registry_recorded
+            self._action_histories[index].append(
+                np.asarray(action.values, dtype=np.float32)
+            )
+            states[index] = self._encode(
+                result.observation, request, env_index=index
+            )
             self._raw_observations[index] = result.observation
-            rewards[index] = reward
+            rewards[index] = float(reward) + float(registry_reward)
             terminations[index] = bool(result.terminated)
             truncations[index] = bool(result.truncated)
             successes[index] = bool(result.success)
@@ -994,7 +1202,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 active_stage_progress=result.active_stage_progress,
             )
             termination_reasons[index] = result.termination_reason
-            component_rows[index] = components
+            component_rows[index] = {**components, **registry_values}
             stepped[index] = True
             if result.terminated or result.truncated:
                 self._needs_reset[index] = True
@@ -1030,6 +1238,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 "terminated": termination_tensor.clone(),
                 "truncated": truncation_tensor.clone(),
                 "termination_reason": list(termination_reasons),
+                "registry": registry_input_rows,
             },
             "process_timings": {
                 "planner_action_s": torch.as_tensor(
@@ -1192,7 +1401,7 @@ class DynamicBenchmarkEnv(gym.Env):
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         return {
-            "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.2",
+            "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.3",
             "identity": identity,
             "identity_sha256": identity_sha256,
             "manifest_generation": self._manifest_generation,
@@ -1204,6 +1413,16 @@ class DynamicBenchmarkEnv(gym.Env):
             "last_obs": last_obs,
             "last_obs_sha256": last_obs_sha256,
             "reward_states": [tracker.state_dict() for tracker in self.reward_trackers],
+            "reward_registry_states": [
+                tracker.state_dict() for tracker in self.reward_registries
+            ],
+            "action_histories": [
+                [np.asarray(action, dtype=np.float32) for action in history]
+                for history in self._action_histories
+            ],
+            "previous_eef_poses": list(self._previous_eef_poses),
+            "ee_velocities": list(self._ee_velocities),
+            "stage_progresses": list(self._stage_progresses),
             "needs_reset": self._needs_reset.copy(),
             "elapsed_steps": self._elapsed_steps.clone(),
             "prev_step_reward": self.prev_step_reward.clone(),
@@ -1213,7 +1432,7 @@ class DynamicBenchmarkEnv(gym.Env):
         }
 
     def _checkpoint_identity(self) -> dict[str, Any]:
-        return {
+        identity = {
             "task_id": self.task_id,
             "split": self.split_name,
             "base_manifest_seed": self.base_manifest_seed,
@@ -1226,6 +1445,9 @@ class DynamicBenchmarkEnv(gym.Env):
             "process_start_method": self.process_start_method,
             "state_schema": self.state_schema,
         }
+        if not self.infra_is_default:
+            identity["infra_identity"] = self.infra_identity
+        return identity
 
     def load_checkpoint_state(
         self,
@@ -1235,8 +1457,17 @@ class DynamicBenchmarkEnv(gym.Env):
     ) -> None:
         """Restore a checkpoint produced by :meth:`checkpoint_state`."""
 
-        if state.get("schema_version") != "rlinf-dynamic-benchmark-checkpoint-v0.2":
+        if state.get("schema_version") not in {
+            "rlinf-dynamic-benchmark-checkpoint-v0.2",
+            "rlinf-dynamic-benchmark-checkpoint-v0.3",
+        }:
             raise ValueError("unsupported Dynamic Benchmark checkpoint schema")
+        if state.get("schema_version") == "rlinf-dynamic-benchmark-checkpoint-v0.2":
+            if not self.infra_is_default:
+                raise ValueError(
+                    "legacy v0.2 checkpoint cannot resume a run with enabled "
+                    "features or reward components"
+                )
         identity = dict(state["identity"])
         expected = self._checkpoint_identity()
         if identity != expected:
@@ -1259,6 +1490,11 @@ class DynamicBenchmarkEnv(gym.Env):
         raw_observation_payloads = list(state["raw_observations"])
         raw_observation_sha256 = list(state["raw_observation_sha256"])
         reward_states = list(state["reward_states"])
+        reward_registry_states = list(state.get("reward_registry_states", []))
+        action_histories = list(state.get("action_histories", []))
+        previous_eef_poses = list(state.get("previous_eef_poses", []))
+        ee_velocities = list(state.get("ee_velocities", []))
+        stage_progresses = list(state.get("stage_progresses", []))
         if not (
             len(request_rows)
             == len(env_states)
@@ -1268,6 +1504,20 @@ class DynamicBenchmarkEnv(gym.Env):
             == self.num_envs
         ):
             raise ValueError("Dynamic Benchmark checkpoint vector length mismatch")
+        if reward_registry_states and len(reward_registry_states) != self.num_envs:
+            raise ValueError(
+                "Dynamic Benchmark checkpoint reward registry length mismatch"
+            )
+        for name, values in (
+            ("action_histories", action_histories),
+            ("previous_eef_poses", previous_eef_poses),
+            ("ee_velocities", ee_velocities),
+            ("stage_progresses", stage_progresses),
+        ):
+            if values and len(values) != self.num_envs:
+                raise ValueError(
+                    f"Dynamic Benchmark checkpoint {name} length mismatch"
+                )
         for payload, expected_sha256 in zip(
             raw_observation_payloads, raw_observation_sha256, strict=True
         ):
@@ -1344,10 +1594,42 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_cursor = manifest_cursor
         self._requests = requests
         self._raw_observations = raw_observations
+        if reward_registry_states:
+            for tracker, tracker_state in zip(
+                self.reward_registries, reward_registry_states, strict=True
+            ):
+                tracker.load_state_dict(tracker_state)
+        if action_histories:
+            self._action_histories = [
+                [np.asarray(action, dtype=np.float32) for action in history]
+                for history in action_histories
+            ]
+        if previous_eef_poses:
+            self._previous_eef_poses = [
+                None if pose is None else np.asarray(pose, dtype=np.float64)
+                for pose in previous_eef_poses
+            ]
+        if ee_velocities:
+            self._ee_velocities = [
+                None if velocity is None else np.asarray(velocity, dtype=np.float64)
+                for velocity in ee_velocities
+            ]
+        if stage_progresses:
+            self._stage_progresses = [
+                None if progress is None else float(progress)
+                for progress in stage_progresses
+            ]
+        for index, observation in enumerate(raw_observations):
+            time_to_goal, _ = self._time_to_goal(
+                index, observation, self._ee_velocities[index]
+            )
+            self._time_to_goals[index] = time_to_goal
         encoded = np.stack(
             [
-                self._encode(observation, request)
-                for observation, request in zip(raw_observations, requests, strict=True)
+                self._encode(observation, request, env_index=index)
+                for index, (observation, request) in enumerate(
+                    zip(raw_observations, requests, strict=True)
+                )
             ]
         )
         encoded_states = torch.as_tensor(encoded, dtype=torch.float32)

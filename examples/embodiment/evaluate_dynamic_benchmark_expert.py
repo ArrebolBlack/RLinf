@@ -613,6 +613,8 @@ def main() -> None:
             "auto_reset": False,
             "ignore_terminations": False,
             "group_size": 1,
+            "features": config.get("features", {}),
+            "reward_components": config.get("reward_components", {}),
         },
         num_envs=1,
         seed_offset=0,

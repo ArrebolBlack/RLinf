@@ -1,0 +1,63 @@
+# RLOPT shared-infra speed template: borrowed-training-pool evaluation.
+# Reuses the RLE-U1 borrowed-eval implementation (267e1140): validation runs on
+# the training process pool with a manifest switch/restore, giving roughly 9x
+# faster 20K validation wall time in the RLE-U1 measurements.  The frozen
+# evaluation episode set is unchanged: same manifest rows, same order.
+#
+# Constraints enforced by the trainer: borrowed evaluation requires
+# num_envs == eval_num_envs, env_worker_processes == eval_worker_processes,
+# persistent_eval_workers == false, and eval_planner_in_processes == false.
+#
+# Keep --rlinf-commit, --benchmark-commit, --output, and optional --resume on
+# the CLI.
+task: null
+algorithm: residual_rlpd
+seed: 1
+num_envs: 8
+eval_num_envs: 8
+demo_num_envs: 8
+env_worker_threads: 1
+eval_worker_threads: 1
+env_worker_processes: 8
+eval_worker_processes: 8
+eval_planner_in_processes: false
+persistent_eval_workers: false
+borrow_training_env_for_eval: true
+sampler_learner_overlap: true
+process_start_method: spawn
+total_env_steps: 20000
+random_env_steps: 2000
+demo_episodes: 16
+demo_max_attempts: 160
+demo_ratio: 0.5
+bc_steps: 2000
+batch_size: 512
+replay_capacity: 250000
+replay_storage: pageable_cpu
+non_blocking_copy: false
+updates_per_vector_step: 1
+timing_sample_interval: 50
+q_heads: 10
+q_target_subset: 2
+gamma: 0.99
+tau: 0.005
+actor_lr: 0.0003
+actor_bc_weight: 100.0
+residual_scale: 0.25
+reward_safety_penalty: -10.0
+critic_lr: 0.0003
+alpha_lr: 0.0003
+initial_alpha: 0.01
+target_entropy: -7.0
+eval_interval: 10000
+eval_episodes: 8
+checkpoint_interval: 10000
+log_interval: 1000
+train_manifest_seed: 20261050
+validation_manifest_seed: 20261150
+manifest_size: 4096
+image_size: 64
+
+# Optional shared-infra sections; omit for a pure speed baseline.
+features: {}
+reward_components: {}
