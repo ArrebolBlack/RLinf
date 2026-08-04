@@ -153,6 +153,24 @@ def _payload_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _drop_last_jsonl(path: Path) -> None:
+    """Atomically drop the last committed row of a JSONL file."""
+
+    if not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return
+    body = "\n".join(lines[:-1])
+    temporary = path.with_suffix(path.suffix + ".drop.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        if body:
+            stream.write(body + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
 def _quality_score(record: Mapping[str, Any]) -> tuple[float, ...]:
     """Return the frozen quality score, excluding deterministic identity tie-break."""
 
@@ -1128,62 +1146,72 @@ def main() -> None:
                 candidate = candidates[int(winner["candidate_index"])]
                 tape_path = run_output / winner["attempt_tape"]
                 replay_actions_array = np.load(tape_path)["actions"]
-                render_record, _, trace = _rollout(
-                    env=render_env,
-                    candidate=candidate,
-                    device=device,
-                    capture_trace=True,
-                    replay_actions_array=replay_actions_array,
-                    trace_metadata={
-                        "candidate_manifest_sha256": candidate_manifest_sha256,
-                        "budget_used": budget_used,
-                        "winner_quality_score": list(_quality_score(winner)),
-                        "lightweight_action_sha256": winner["action_sha256"],
-                        "source_identity": source_identity,
-                    },
-                )
-                if trace is None:
-                    raise RuntimeError("winner render did not return an episode trace")
-                for key in (
-                    "episode_id",
-                    "success",
-                    "safety_failure",
-                    "termination_reason",
-                    "trajectory_completion",
-                    "completion_time_s",
-                    "return",
-                    "control_steps",
-                    "action_l2_sum",
-                    "action_sha256",
-                ):
-                    if render_record[key] != winner[key]:
-                        raise RuntimeError(f"winner render parity failed for {key}")
-                episode_record = write_episode_atomic(run_output, trace)
-                winner_row = {
-                    **episode_record,
-                    "candidate_id": candidate.spec.candidate_id,
-                    "candidate_index": candidate.index,
-                    "candidate_count": len(reset_attempts),
-                    "budget_used": budget_used,
-                    "selection_contract": SELECTION_CONTRACT,
-                    "quality_score": list(_quality_score(winner)),
-                    "lightweight_attempt_tape": winner["attempt_tape"],
-                    "lightweight_attempt_tape_sha256": winner["attempt_tape_sha256"],
-                }
-                _append_jsonl(winners_path, winner_row)
-                accepted += 1
-                print(
-                    json.dumps(
-                        {
-                            "accepted": accepted,
-                            "episode_id": winner["episode_id"],
-                            "candidate_id": winner["candidate_id"],
+                try:
+                    render_record, _, trace = _rollout(
+                        env=render_env,
+                        candidate=candidate,
+                        device=device,
+                        capture_trace=True,
+                        replay_actions_array=replay_actions_array,
+                        trace_metadata={
+                            "candidate_manifest_sha256": candidate_manifest_sha256,
                             "budget_used": budget_used,
+                            "winner_quality_score": list(_quality_score(winner)),
+                            "lightweight_action_sha256": winner["action_sha256"],
+                            "source_identity": source_identity,
                         },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
+                    )
+                    if trace is None:
+                        raise RuntimeError("winner render did not return an episode trace")
+                    for key in (
+                        "episode_id",
+                        "success",
+                        "safety_failure",
+                        "termination_reason",
+                        "trajectory_completion",
+                        "completion_time_s",
+                        "return",
+                        "control_steps",
+                        "action_l2_sum",
+                        "action_sha256",
+                    ):
+                        if render_record[key] != winner[key]:
+                            raise RuntimeError(f"winner render parity failed for {key}")
+                    episode_record = write_episode_atomic(run_output, trace)
+                    winner_row = {
+                        **episode_record,
+                        "candidate_id": candidate.spec.candidate_id,
+                        "candidate_index": candidate.index,
+                        "candidate_count": len(reset_attempts),
+                        "budget_used": budget_used,
+                        "selection_contract": SELECTION_CONTRACT,
+                        "quality_score": list(_quality_score(winner)),
+                        "lightweight_attempt_tape": winner["attempt_tape"],
+                        "lightweight_attempt_tape_sha256": winner["attempt_tape_sha256"],
+                    }
+                    _append_jsonl(winners_path, winner_row)
+                    accepted += 1
+                    print(
+                        json.dumps(
+                            {
+                                "accepted": accepted,
+                                "episode_id": winner["episode_id"],
+                                "candidate_id": winner["candidate_id"],
+                                "budget_used": budget_used,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                except RuntimeError as exc:
+                    if "parity failed" not in str(exc):
+                        raise
+                    _drop_last_jsonl(reset_results_path)
+                    winner = None
+                    recovery_events.append(
+                        f"render_parity_skip:reset:{reset_index}:"
+                        f"{row.request.episode_id}:{str(exc)}"
+                    )
             _atomic_json(
                 progress_path,
                 _progress_payload(
