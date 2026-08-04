@@ -1086,7 +1086,7 @@ def main() -> None:
                         capture_trace=False,
                     )
                     relative, tape_sha256 = _write_attempt_tape(
-                        args.output,
+                        run_output,
                         episode_id=record["episode_id"],
                         candidate_index=candidate.index,
                         arrays=arrays,
@@ -1146,7 +1146,7 @@ def main() -> None:
                 ):
                     if render_record[key] != winner[key]:
                         raise RuntimeError(f"winner render parity failed for {key}")
-                episode_record = write_episode_atomic(args.output, trace)
+                episode_record = write_episode_atomic(run_output, trace)
                 winner_row = {
                     **episode_record,
                     "candidate_id": candidate.spec.candidate_id,
