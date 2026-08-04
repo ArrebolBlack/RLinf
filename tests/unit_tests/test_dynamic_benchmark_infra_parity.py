@@ -133,6 +133,45 @@ def test_checkpoint_identity_records_infra_only_when_enabled() -> None:
     assert enabled_env._checkpoint_identity() != other_env._checkpoint_identity()
 
 
+def test_enabled_feature_reencode_is_deterministic_after_restore() -> None:
+    """Simulate load_checkpoint_state's re-encode after restoring derived state."""
+
+    env = _bare_env()
+    env.feature_registry = FeatureRegistry.from_config(
+        {
+            "relative_pose": True,
+            "time_to_goal": True,
+            "stage": True,
+            "action_history": {"k": 2},
+        }
+    )
+    observation = _observation()
+    factors = {"speed_class": "normal"}
+    request = SimpleNamespace(factors=factors)
+    env._ee_velocities[0] = np.asarray([0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env._time_to_goals[0] = 2.5
+    env._distances[0] = 0.3
+    env._relative_velocity_norms[0] = 0.1
+    env._stage_progresses[0] = 0.7
+    env._action_histories[0] = [np.zeros(7), np.ones(7)]
+    original = env._encode(observation, request, env_index=0)
+
+    # The checkpoint loader restores derived fields, then re-encodes from the
+    # raw observation; the result must be byte-identical.
+    env._ee_velocities = [None]
+    env._time_to_goals = [None]
+    env._distances = [None]
+    env._relative_velocity_norms = [None]
+    env._stage_progresses = [None]
+    env._action_histories = [[]]
+    env._ee_velocities[0] = np.asarray([0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env._time_to_goals[0] = 2.5
+    env._stage_progresses[0] = 0.7
+    env._action_histories[0] = [np.zeros(7), np.ones(7)]
+    restored = env._encode(observation, request, env_index=0)
+    assert np.array_equal(original, restored)
+
+
 def test_legacy_v0_2_checkpoint_is_rejected_for_non_default_infra() -> None:
     env = _bare_env()
     env.feature_registry = FeatureRegistry.from_config({"relative_pose": True})
