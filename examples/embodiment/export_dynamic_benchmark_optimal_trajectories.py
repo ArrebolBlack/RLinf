@@ -153,19 +153,19 @@ def _payload_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _drop_last_jsonl(path: Path) -> None:
-    """Atomically drop the last committed row of a JSONL file."""
+def _rewrite_last_jsonl(path: Path, row: Mapping[str, Any]) -> None:
+    """Atomically replace the last committed row of a JSONL file."""
 
     if not path.exists():
-        return
+        raise FileNotFoundError(path)
     lines = path.read_text(encoding="utf-8").splitlines()
     if not lines:
-        return
-    body = "\n".join(lines[:-1])
+        raise ValueError(f"{path} has no rows to rewrite")
+    lines[-1] = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+    body = "\n".join(lines) + "\n"
     temporary = path.with_suffix(path.suffix + ".drop.tmp")
     with temporary.open("w", encoding="utf-8") as stream:
-        if body:
-            stream.write(body + "\n")
+        stream.write(body)
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
@@ -1209,7 +1209,15 @@ def main() -> None:
                         and "canonical replay contract" not in str(exc)
                     ):
                         raise
-                    _drop_last_jsonl(reset_results_path)
+                    _rewrite_last_jsonl(
+                        reset_results_path,
+                        {
+                            **reset_result,
+                            "accepted": False,
+                            "winner_candidate_id": None,
+                            "winner_candidate_index": None,
+                        },
+                    )
                     winner = None
                     recovery_events.append(
                         f"render_parity_skip:reset:{reset_index}:"
