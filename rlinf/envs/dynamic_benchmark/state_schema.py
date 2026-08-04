@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = "rlinf-dynamic-benchmark-state-v0.1"
+SCHEMA_VERSION = "rlinf-dynamic-benchmark-state-v0.2"
 
 # Explicit allowlisting makes future-oracle additions fail closed: a newly
 # added privileged field is not silently exposed to an expert policy.
@@ -74,6 +74,137 @@ ALLOWED_PRIVILEGED_KEYS = (
 )
 DEFAULT_CATEGORICAL_FACTORS = {"speed_class": ("normal", "high")}
 
+# Current-state derived features.  Each entry maps a feature name to a
+# (shape, callable) pair; the callable takes the current observation and
+# returns a finite np.ndarray of that shape.  Features whose prerequisites
+# are missing are encoded as zeros with a zero mask entry (the same masking
+# contract as optional privileged fields).
+def _eef_to_object_pose(observation: Any) -> np.ndarray:
+    from .geometry import object_in_eef_pose_wxyz
+
+    return object_in_eef_pose_wxyz(
+        observation.privileged["object_pose_wxyz"],
+        observation.privileged["eef_pose_xyzw"],
+    )
+
+
+def _eef_to_object_distance(observation: Any) -> np.ndarray:
+    pose = _eef_to_object_pose(observation)
+    return np.asarray([float(np.linalg.norm(pose[:3]))], dtype=np.float64)
+
+
+def _fingerpad_midpoint_world(observation: Any) -> np.ndarray:
+    left = np.asarray(
+        observation.privileged["left_fingerpad_center_world"], dtype=np.float64
+    ).reshape(-1)
+    right = np.asarray(
+        observation.privileged["right_fingerpad_center_world"], dtype=np.float64
+    ).reshape(-1)
+    if left.shape != (3,) or right.shape != (3,):
+        raise ValueError("fingerpad centers must be length 3")
+    return 0.5 * (left + right)
+
+
+def _grasp_point_offset_world(observation: Any) -> np.ndarray:
+    object_pose = np.asarray(
+        observation.privileged["object_pose_wxyz"], dtype=np.float64
+    )
+    return np.asarray(object_pose[:3], dtype=np.float64) - _fingerpad_midpoint_world(
+        observation
+    )
+
+
+def _closing_axis_object_alignment(observation: Any) -> np.ndarray:
+    from .geometry import closing_axis_object_alignment_rad
+
+    return np.asarray(
+        [
+            closing_axis_object_alignment_rad(
+                observation.privileged["object_pose_wxyz"],
+                observation.privileged["fingerpad_closing_axis_world"],
+            )
+        ],
+        dtype=np.float64,
+    )
+
+
+def _object_vertical_position(observation: Any) -> np.ndarray:
+    return np.asarray(
+        [float(np.asarray(observation.privileged["object_pose_wxyz"])[2])],
+        dtype=np.float64,
+    )
+
+
+def _eef_vertical_position(observation: Any) -> np.ndarray:
+    return np.asarray(
+        [float(np.asarray(observation.privileged["eef_pose_xyzw"])[2])],
+        dtype=np.float64,
+    )
+
+
+def _object_yaw_rad(observation: Any) -> np.ndarray:
+    from .geometry import quaternion_yaw_wxyz
+
+    return np.asarray(
+        [quaternion_yaw_wxyz(np.asarray(observation.privileged["object_pose_wxyz"])[3:])],
+        dtype=np.float64,
+    )
+
+
+def _object_xy_velocity(observation: Any) -> np.ndarray:
+    twist = np.asarray(
+        observation.privileged["object_twist_world"], dtype=np.float64
+    ).reshape(-1)
+    if twist.shape != (6,):
+        raise ValueError("object_twist_world must be length 6")
+    return np.asarray(twist[:2], dtype=np.float64)
+
+
+def _object_angular_velocity_z(observation: Any) -> np.ndarray:
+    twist = np.asarray(
+        observation.privileged["object_twist_world"], dtype=np.float64
+    ).reshape(-1)
+    if twist.shape != (6,):
+        raise ValueError("object_twist_world must be length 6")
+    return np.asarray([twist[5]], dtype=np.float64)
+
+
+DERIVED_FEATURES: dict[str, tuple[tuple[int, ...], Any]] = {
+    "eef_to_object_pose_wxyz": ((7,), _eef_to_object_pose),
+    "eef_to_object_distance_m": ((1,), _eef_to_object_distance),
+    "fingerpad_midpoint_world": ((3,), _fingerpad_midpoint_world),
+    "grasp_point_offset_world_m": ((3,), _grasp_point_offset_world),
+    "closing_axis_object_alignment_rad": ((1,), _closing_axis_object_alignment),
+    "object_vertical_position_m": ((1,), _object_vertical_position),
+    "eef_vertical_position_m": ((1,), _eef_vertical_position),
+    "object_yaw_rad": ((1,), _object_yaw_rad),
+    "object_xy_velocity_m_s": ((2,), _object_xy_velocity),
+    "object_angular_velocity_z_rad_s": ((1,), _object_angular_velocity_z),
+}
+
+DERIVED_PREREQUISITES: dict[str, tuple[str, ...]] = {
+    "eef_to_object_pose_wxyz": ("object_pose_wxyz", "eef_pose_xyzw"),
+    "eef_to_object_distance_m": ("object_pose_wxyz", "eef_pose_xyzw"),
+    "fingerpad_midpoint_world": (
+        "left_fingerpad_center_world",
+        "right_fingerpad_center_world",
+    ),
+    "grasp_point_offset_world_m": (
+        "object_pose_wxyz",
+        "left_fingerpad_center_world",
+        "right_fingerpad_center_world",
+    ),
+    "closing_axis_object_alignment_rad": (
+        "object_pose_wxyz",
+        "fingerpad_closing_axis_world",
+    ),
+    "object_vertical_position_m": ("object_pose_wxyz",),
+    "eef_vertical_position_m": ("eef_pose_xyzw",),
+    "object_yaw_rad": ("object_pose_wxyz",),
+    "object_xy_velocity_m_s": ("object_twist_world",),
+    "object_angular_velocity_z_rad_s": ("object_twist_world",),
+}
+
 
 @dataclass(frozen=True)
 class StateField:
@@ -116,6 +247,7 @@ class DynamicBenchmarkStateSchema:
         task_id: str,
         task_ids: Sequence[str],
         fields: Sequence[StateField],
+        derived_fields: Sequence[StateField] = (),
         factor_fields: Sequence[StateField],
         categorical_factors: Mapping[str, Sequence[str]],
     ) -> None:
@@ -128,12 +260,19 @@ class DynamicBenchmarkStateSchema:
         if len(set(self.task_ids)) != len(self.task_ids):
             raise ValueError("task_ids must be unique")
         self.fields = tuple(fields)
+        for field in derived_fields:
+            if field.source != "derived":
+                raise ValueError(
+                    f"derived field {field.name!r} must use source 'derived'"
+                )
+        self.derived_fields = tuple(derived_fields)
         self.factor_fields = tuple(factor_fields)
         self.categorical_factors = {
             name: tuple(values) for name, values in sorted(categorical_factors.items())
         }
         names = [
-            (field.source, field.name) for field in (*self.fields, *self.factor_fields)
+            (field.source, field.name)
+            for field in (*self.fields, *self.derived_fields, *self.factor_fields)
         ]
         if len(set(names)) != len(names):
             raise ValueError("state schema fields must be unique")
@@ -141,9 +280,12 @@ class DynamicBenchmarkStateSchema:
             len(self.task_ids)
             + 2
             + sum(field.size for field in self.fields)
+            + sum(field.size for field in self.derived_fields)
             + sum(field.size for field in self.factor_fields)
         )
-        self.mask_dim = len(self.fields) + len(self.factor_fields)
+        self.mask_dim = (
+            len(self.fields) + len(self.derived_fields) + len(self.factor_fields)
+        )
         self.state_dim = self.value_dim + self.mask_dim
 
     @classmethod
@@ -155,6 +297,7 @@ class DynamicBenchmarkStateSchema:
         observation: Any,
         factors: Mapping[str, Any],
         categorical_factors: Mapping[str, Sequence[str]] | None = None,
+        derived_features: Sequence[str] = (),
     ) -> DynamicBenchmarkStateSchema:
         categories = dict(DEFAULT_CATEGORICAL_FACTORS)
         if categorical_factors is not None:
@@ -183,6 +326,13 @@ class DynamicBenchmarkStateSchema:
                 f"observation is missing required state fields: {sorted(required - present)}"
             )
 
+        derived_fields = []
+        for name in derived_features:
+            if name not in DERIVED_FEATURES:
+                raise ValueError(f"unknown derived state feature {name!r}")
+            shape, _ = DERIVED_FEATURES[name]
+            derived_fields.append(StateField("derived", name, shape, int(np.prod(shape))))
+
         factor_fields = []
         for name, value in sorted(factors.items()):
             if isinstance(value, str):
@@ -203,6 +353,7 @@ class DynamicBenchmarkStateSchema:
             task_id=task_id,
             task_ids=task_ids,
             fields=fields,
+            derived_fields=derived_fields,
             factor_fields=factor_fields,
             categorical_factors=categories,
         )
@@ -226,6 +377,26 @@ class DynamicBenchmarkStateSchema:
             encoded[vocabulary.index(value)] = 1.0
             return encoded
         return self._encode_field(field, value)
+
+    def _encode_derived(
+        self, field: StateField, observation: Any
+    ) -> tuple[np.ndarray, bool]:
+        prerequisites = DERIVED_PREREQUISITES.get(field.name, ())
+        privileged = getattr(observation, "privileged", {})
+        if any(name not in privileged for name in prerequisites):
+            return np.zeros(field.size, dtype=np.float64), False
+        try:
+            _, function = DERIVED_FEATURES[field.name]
+            value = _numeric_array(
+                function(observation), context=f"derived.{field.name}"
+            )
+        except (KeyError, ValueError, TypeError):
+            return np.zeros(field.size, dtype=np.float64), False
+        if value.shape != field.shape:
+            raise ValueError(
+                f"derived.{field.name} shape changed from {field.shape} to {value.shape}"
+            )
+        return value.reshape(-1), True
 
     def encode(
         self,
@@ -257,6 +428,10 @@ class DynamicBenchmarkStateSchema:
             else:
                 parts.append(np.zeros(field.size, dtype=np.float64))
                 masks.append(0.0)
+        for field in self.derived_fields:
+            value, available = self._encode_derived(field, observation)
+            parts.append(value)
+            masks.append(1.0 if available else 0.0)
         for field in self.factor_fields:
             if field.name in factors:
                 parts.append(self._encode_factor(field, factors[field.name]))
@@ -278,6 +453,7 @@ class DynamicBenchmarkStateSchema:
             "task_id": self.task_id,
             "task_ids": list(self.task_ids),
             "fields": [asdict(field) for field in self.fields],
+            "derived_fields": [asdict(field) for field in self.derived_fields],
             "factor_fields": [asdict(field) for field in self.factor_fields],
             "categorical_factors": {
                 name: list(values) for name, values in self.categorical_factors.items()
@@ -292,6 +468,8 @@ __all__ = [
     "ALLOWED_PRIVILEGED_KEYS",
     "ALLOWED_PROPRIO_KEYS",
     "DEFAULT_CATEGORICAL_FACTORS",
+    "DERIVED_FEATURES",
+    "DERIVED_PREREQUISITES",
     "DynamicBenchmarkStateSchema",
     "SCHEMA_VERSION",
     "StateField",

@@ -234,6 +234,13 @@ class DynamicBenchmarkEnv(gym.Env):
             timeout_penalty=float(_cfg_get(self.cfg, "reward_timeout_penalty", -1.0)),
             step_penalty=float(_cfg_get(self.cfg, "reward_step_penalty", -0.01)),
             action_l2_scale=float(_cfg_get(self.cfg, "reward_action_l2_scale", -0.001)),
+            lift_shaping_weight=float(
+                _cfg_get(self.cfg, "reward_lift_shaping_weight", 0.0)
+            ),
+            orientation_shaping_weight=float(
+                _cfg_get(self.cfg, "reward_orientation_shaping_weight", 0.0)
+            ),
+            lift_target_m=float(_cfg_get(self.cfg, "reward_lift_target_m", 0.08)),
         )
 
     @property
@@ -277,6 +284,9 @@ class DynamicBenchmarkEnv(gym.Env):
                 task_ids=self._task_ids,
                 observation=observation,
                 factors=request.factors,
+                derived_features=tuple(
+                    _cfg_get(self.cfg, "state_derived_features", [])
+                ),
             )
         return self._state_schema.encode(
             observation=observation,
@@ -389,6 +399,8 @@ class DynamicBenchmarkEnv(gym.Env):
         event_name_rows: list[list[str]] = []
         active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
+        object_z_rows = np.zeros(self.num_envs, dtype=np.float64)
+        alignment_error_rows = np.zeros(self.num_envs, dtype=np.float64)
         for index, env in enumerate(self.envs):
             if self._needs_reset[index]:
                 terminations[index] = True
@@ -405,6 +417,22 @@ class DynamicBenchmarkEnv(gym.Env):
                 policy_step=observation.policy_step,
             )
             result = env.step(action)
+            from .geometry import closing_axis_object_alignment_rad
+
+            object_z_rows[index] = float(
+                np.asarray(result.observation.privileged["object_pose_wxyz"])[2]
+            )
+            try:
+                alignment_error_rows[index] = float(
+                    closing_axis_object_alignment_rad(
+                        result.observation.privileged["object_pose_wxyz"],
+                        result.observation.privileged[
+                            "fingerpad_closing_axis_world"
+                        ],
+                    )
+                )
+            except (KeyError, ValueError, TypeError):
+                alignment_error_rows[index] = 0.0
             event_names = tuple(event.name for event in env._ledger.events)
             event_name_rows.append(list(event_names))
             active_stage_progresses[index] = float(result.active_stage_progress)
@@ -416,6 +444,8 @@ class DynamicBenchmarkEnv(gym.Env):
                 terminated=bool(result.terminated),
                 truncated=bool(result.truncated),
                 termination_reason=result.termination_reason,
+                object_z_m=float(object_z_rows[index]),
+                alignment_error_rad=float(alignment_error_rows[index]),
             )
             states[index] = self._encode(result.observation, request)
             self._raw_observations[index] = result.observation
@@ -459,6 +489,10 @@ class DynamicBenchmarkEnv(gym.Env):
                 "event_names": event_name_rows,
                 "active_stage_progress": torch.as_tensor(
                     active_stage_progresses, dtype=torch.float64
+                ),
+                "object_z_m": torch.as_tensor(object_z_rows, dtype=torch.float64),
+                "alignment_error_rad": torch.as_tensor(
+                    alignment_error_rows, dtype=torch.float64
                 ),
                 "success": success_tensor.clone(),
                 "terminated": termination_tensor.clone(),
@@ -613,6 +647,15 @@ class DynamicBenchmarkEnv(gym.Env):
             "image_size": self.image_size,
             "camera_observations": self.camera_observations,
             "num_envs": self.num_envs,
+            "reward_lift_shaping_weight": float(
+                _cfg_get(self.cfg, "reward_lift_shaping_weight", 0.0)
+            ),
+            "reward_orientation_shaping_weight": float(
+                _cfg_get(self.cfg, "reward_orientation_shaping_weight", 0.0)
+            ),
+            "state_derived_features": tuple(
+                _cfg_get(self.cfg, "state_derived_features", [])
+            ),
             "state_schema": self.state_schema,
         }
 

@@ -241,3 +241,204 @@ def test_reward_state_round_trip_and_validation() -> None:
         restored.load_state_dict(
             {"schema_version": state["schema_version"], "previous_potential": 2.0}
         )
+
+
+def _derived_observation() -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id="t1_so3",
+        policy_step=5,
+        proprio={"robot0_proprio_state": np.asarray([0.1, -0.2])},
+        privileged={
+            "object_pose_wxyz": np.asarray([1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0]),
+            "object_twist_world": np.asarray([0.5, -0.25, 0.0, 0.0, 0.0, 0.75]),
+            "eef_pose_xyzw": np.asarray([4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 1.0]),
+            "left_fingerpad_center_world": np.asarray([4.0, 4.9, 6.0]),
+            "right_fingerpad_center_world": np.asarray([4.0, 5.1, 6.0]),
+            "fingerpad_closing_axis_world": np.asarray([0.0, 1.0, 0.0]),
+        },
+    )
+
+
+def test_derived_state_features_are_current_state_and_masked() -> None:
+    observation = _derived_observation()
+    features = (
+        "eef_to_object_pose_wxyz",
+        "eef_to_object_distance_m",
+        "fingerpad_midpoint_world",
+        "grasp_point_offset_world_m",
+        "closing_axis_object_alignment_rad",
+        "object_vertical_position_m",
+        "eef_vertical_position_m",
+        "object_yaw_rad",
+        "object_xy_velocity_m_s",
+        "object_angular_velocity_z_rad_s",
+    )
+    schema = DynamicBenchmarkStateSchema.from_observation(
+        task_id="t1_so3",
+        task_ids=("t1_xyz", "t1_so3"),
+        observation=observation,
+        factors={"speed_class": "normal"},
+        derived_features=features,
+    )
+
+    state = schema.encode(
+        observation=observation, factors={"speed_class": "normal"}, horizon_steps=10
+    )
+
+    assert state.shape == (schema.state_dim,)
+    assert np.all(np.isfinite(state))
+    assert {field.name for field in schema.derived_fields} == set(features)
+    assert len(schema.derived_fields) == len(features)
+    # Derived masks follow the regular field masks and precede factor masks.
+    derived_mask = state[-schema.mask_dim :][
+        len(schema.fields) : len(schema.fields) + len(features)
+    ]
+    assert np.all(derived_mask == 1.0)
+    # eef_to_object pose: object at (1,2,3) relative to eef at (4,5,6) with
+    # identity orientation is (-3,-3,-3) and a canonical wxyz quaternion.
+    base = (
+        len(schema.task_ids)
+        + 2
+        + sum(field.size for field in schema.fields)
+    )
+    assert np.allclose(state[base : base + 7], [-3.0, -3.0, -3.0, 1.0, 0.0, 0.0, 0.0])
+    assert state[base + 7 : base + 8] == pytest.approx(np.sqrt(27.0))
+
+
+def test_derived_features_missing_prerequisites_are_zero_masked() -> None:
+    observation = _derived_observation()
+    del observation.privileged["fingerpad_closing_axis_world"]
+    schema = DynamicBenchmarkStateSchema.from_observation(
+        task_id="t1_so3",
+        task_ids=("t1_so3",),
+        observation=observation,
+        factors={},
+        derived_features=("closing_axis_object_alignment_rad",),
+    )
+
+    state = schema.encode(
+        observation=observation, factors={}, horizon_steps=10
+    )
+
+    mask = state[-schema.mask_dim :]
+    assert mask[-1] == 0.0
+    assert state[schema.value_dim - 1] == 0.0
+
+
+def test_dense_lift_shaping_reward_increases_after_bilateral_hold() -> None:
+    reward = DynamicBenchmarkReward(
+        success_stages=("approach", "bilateral_hold", "clearance", "stable_dwell"),
+        lift_shaping_weight=2.0,
+        lift_target_m=0.1,
+    )
+    kwargs = {
+        "action": np.zeros(7),
+        "active_stage_progress": 0.0,
+        "success": False,
+        "terminated": False,
+        "truncated": False,
+        "termination_reason": None,
+    }
+    _, before = reward.step(
+        **kwargs,
+        event_names=("approach", "bilateral_hold"),
+        object_z_m=0.10,
+    )
+    _, after = reward.step(
+        **kwargs,
+        event_names=("approach", "bilateral_hold"),
+        object_z_m=0.15,
+    )
+
+    assert before["lift_shaping"] == pytest.approx(0.0)
+    assert after["lift_shaping"] == pytest.approx(2.0 * 0.5)
+    # Second step has no progress delta, so total = step penalty + lift shaping.
+    assert after["total"] == pytest.approx(after["step"] + after["lift_shaping"])
+
+
+def test_dense_orientation_shaping_reward_tracks_alignment() -> None:
+    reward = DynamicBenchmarkReward(
+        success_stages=("approach", "bilateral_hold", "clearance", "stable_dwell"),
+        orientation_shaping_weight=3.0,
+    )
+    kwargs = {
+        "action": np.zeros(7),
+        "event_names": (),
+        "active_stage_progress": 0.0,
+        "success": False,
+        "terminated": False,
+        "truncated": False,
+        "termination_reason": None,
+    }
+    _, first = reward.step(**kwargs, alignment_error_rad=1.2)
+    _, second = reward.step(**kwargs, alignment_error_rad=0.2)
+
+    first_potential = 1.0 - 1.2 / (np.pi / 2.0)
+    second_potential = 1.0 - 0.2 / (np.pi / 2.0)
+    assert first["orientation_shaping"] == pytest.approx(
+        3.0 * first_potential
+    )
+    assert second["orientation_shaping"] == pytest.approx(
+        3.0 * (second_potential - first_potential)
+    )
+
+
+def test_dense_reward_defaults_preserve_baseline_components() -> None:
+    kwargs = {
+        "action": np.zeros(7),
+        "event_names": ("task_start", "approach"),
+        "active_stage_progress": 0.5,
+        "success": False,
+        "terminated": False,
+        "truncated": False,
+        "termination_reason": None,
+    }
+    plain = DynamicBenchmarkReward(success_stages=("approach", "grasp", "success_stage"))
+    shaped = DynamicBenchmarkReward(success_stages=("approach", "grasp", "success_stage"))
+
+    plain_total, plain_components = plain.step(**kwargs)
+    shaped_total, shaped_components = shaped.step(**kwargs, object_z_m=1.0, alignment_error_rad=0.1)
+
+    assert shaped_components["lift_shaping"] == 0.0
+    assert shaped_components["orientation_shaping"] == 0.0
+    assert shaped_total == plain_total
+    for name, value in plain_components.items():
+        assert shaped_components[name] == value
+
+
+def test_dense_reward_state_round_trip_with_shaping() -> None:
+    reward = DynamicBenchmarkReward(
+        success_stages=("approach", "bilateral_hold", "clearance", "stable_dwell"),
+        lift_shaping_weight=1.0,
+        orientation_shaping_weight=2.0,
+    )
+    reward.step(
+        action=np.zeros(7),
+        event_names=("approach", "bilateral_hold"),
+        active_stage_progress=0.0,
+        success=False,
+        terminated=False,
+        truncated=False,
+        termination_reason=None,
+        object_z_m=0.12,
+    )
+    reward.step(
+        action=np.zeros(7),
+        event_names=("approach", "bilateral_hold"),
+        active_stage_progress=0.0,
+        success=False,
+        terminated=False,
+        truncated=False,
+        termination_reason=None,
+        object_z_m=0.14,
+        alignment_error_rad=0.3,
+    )
+    state = reward.state_dict()
+    restored = DynamicBenchmarkReward(
+        success_stages=("approach", "bilateral_hold", "clearance", "stable_dwell"),
+        lift_shaping_weight=1.0,
+        orientation_shaping_weight=2.0,
+    )
+    restored.load_state_dict(state)
+
+    assert restored.state_dict() == state
