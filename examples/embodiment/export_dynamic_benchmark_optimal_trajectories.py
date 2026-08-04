@@ -954,7 +954,7 @@ def main() -> None:
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "reset_manifest_sha256": reset_manifest_sha256,
             "source_identity": source_identity,
-            "state_schema": light_env.state_schema,
+            "state_schema": json.loads(json.dumps(light_env.state_schema, allow_nan=False)),
             "candidates": [_candidate_identity(candidate.spec) for candidate in candidates],
         }
         export_state["payload_sha256"] = _payload_sha256(export_state)
