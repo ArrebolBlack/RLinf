@@ -1126,7 +1126,7 @@ def main() -> None:
             _append_jsonl(reset_results_path, reset_result)
             if winner is not None:
                 candidate = candidates[int(winner["candidate_index"])]
-                tape_path = run_output / winner["lightweight_attempt_tape"]
+                tape_path = run_output / winner["attempt_tape"]
                 replay_actions_array = np.load(tape_path)["actions"]
                 render_record, _, trace = _rollout(
                     env=render_env,
