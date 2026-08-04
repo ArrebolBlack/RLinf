@@ -1203,8 +1203,11 @@ def main() -> None:
                         ),
                         flush=True,
                     )
-                except RuntimeError as exc:
-                    if "parity failed" not in str(exc):
+                except (RuntimeError, ValueError) as exc:
+                    if (
+                        "parity failed" not in str(exc)
+                        and "canonical replay contract" not in str(exc)
+                    ):
                         raise
                     _drop_last_jsonl(reset_results_path)
                     winner = None
