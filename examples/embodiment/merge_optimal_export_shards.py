@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Merge sharded best-known trajectory exports into one sealed dataset root.
 
 Each shard produced by ``export_dynamic_benchmark_optimal_trajectories.py
@@ -77,6 +91,30 @@ def _winner_episode_id(row: dict[str, Any]) -> str:
     return request["episode_id"]
 
 
+def _kept_recovery_events(events: list[str], *, max_reset: int) -> list[str]:
+    """Keep source recovery provenance that can affect the merged prefix."""
+
+    kept = []
+    for event in events:
+        if not isinstance(event, str):
+            raise ValueError("shard recovery events must be strings")
+        if not event.startswith("render_parity_skip:"):
+            kept.append(event)
+            continue
+        parts = event.split(":", maxsplit=4)
+        if len(parts) != 5 or parts[:2] != ["render_parity_skip", "reset"]:
+            raise ValueError("shard render-parity recovery event is malformed")
+        try:
+            reset_index = int(parts[2])
+        except ValueError as error:
+            raise ValueError("shard render-parity reset index is malformed") from error
+        if reset_index < 0:
+            raise ValueError("shard render-parity reset index is negative")
+        if reset_index <= max_reset:
+            kept.append(event)
+    return kept
+
+
 def main() -> None:
     args = _parser().parse_args()
     root = args.root.resolve()
@@ -91,6 +129,8 @@ def main() -> None:
     all_results: list[dict[str, Any]] = []
     all_attempts: list[dict[str, Any]] = []
     all_winners: list[dict[str, Any]] = []
+    all_recovery_events: list[str] = []
+    resume_count = 0
     started_unix_s: float | None = None
     for shard in shard_dirs:
         complete = shard / "shard_complete.json"
@@ -100,6 +140,11 @@ def main() -> None:
         all_attempts.extend(_read_jsonl(shard / "attempts.jsonl"))
         all_winners.extend(_read_jsonl(shard / "winner_manifest.jsonl"))
         progress = json.loads((shard / "progress.json").read_text(encoding="utf-8"))
+        recovery_events = progress.get("recovery_events")
+        if not isinstance(recovery_events, list):
+            raise ValueError(f"{shard} progress has no recovery-event list")
+        all_recovery_events.extend(recovery_events)
+        resume_count += int(progress.get("resume_count", 0))
         if started_unix_s is None or progress.get("started_unix_s", float("inf")) < started_unix_s:
             started_unix_s = progress.get("started_unix_s")
     if started_unix_s is None:
@@ -117,6 +162,7 @@ def main() -> None:
         )
     max_reset = reset_index_by_episode[_winner_episode_id(kept_winners[-1])]
     kept_results = [row for row in all_results if int(row["reset_index"]) <= max_reset]
+    recovery_events = _kept_recovery_events(all_recovery_events, max_reset=max_reset)
     kept_episodes = {row["episode_id"] for row in kept_results}
     kept_attempts = [row for row in all_attempts if row["episode_id"] in kept_episodes]
     kept_attempts.sort(key=lambda row: (_episode_number(row["episode_id"]), row["candidate_index"]))
@@ -188,8 +234,8 @@ def main() -> None:
         "accepted_count": len(kept_winners),
         "candidate_attempt_count": len(kept_attempts),
         "budget_histogram": budget_histogram,
-        "resume_count": 0,
-        "recovery_events": [],
+        "resume_count": resume_count,
+        "recovery_events": recovery_events,
         "file_boundaries": {
             "attempts.jsonl": _file_boundary(attempts_path),
             "reset_results.jsonl": _file_boundary(results_path),
@@ -221,8 +267,8 @@ def main() -> None:
         "reset_manifest_sha256": hashlib.sha256(reset_manifest_path.read_bytes()).hexdigest(),
         "export_state_sha256": progress["export_state_sha256"],
         "progress_sha256": hashlib.sha256(progress_path.read_bytes()).hexdigest(),
-        "resume_count": 0,
-        "recovery_events": [],
+        "resume_count": resume_count,
+        "recovery_events": recovery_events,
         "source_identity": source_identity,
         "image_size": image_size,
         "device": device,
@@ -239,6 +285,7 @@ def main() -> None:
                 "accepted": len(kept_winners),
                 "attempted_resets": len(kept_results),
                 "candidate_attempts": len(kept_attempts),
+                "recovery_events": len(recovery_events),
                 "checksum_entries": checksum_count,
                 "dataset_card_payload_sha256": card["payload_sha256"],
             },

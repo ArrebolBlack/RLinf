@@ -55,6 +55,7 @@ EXPORT_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-v0.1"
 ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.1"
 STATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-state-v0.1"
 PROGRESS_SCHEMA = "rlinf-dynamic-benchmark-optimal-progress-v0.1"
+RENDER_PARITY_SKIP_SCHEMA = "rlinf-dynamic-benchmark-render-parity-skip-v0.1"
 SELECTION_CONTRACT = (
     "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
 )
@@ -205,6 +206,37 @@ def _select_winner(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         eligible,
         key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
     )
+
+
+def _render_parity_failure_reason(error: BaseException | str) -> str | None:
+    message = str(error)
+    if "parity failed" in message:
+        return "render_parity_failed"
+    if "canonical replay contract" in message:
+        return "canonical_replay_contract_failed"
+    return None
+
+
+def _render_parity_skip(
+    winner: Mapping[str, Any],
+    error: BaseException,
+) -> dict[str, Any]:
+    """Bind a failed render replay to the independently selected light attempt."""
+
+    reason = _render_parity_failure_reason(error)
+    if reason is None:
+        raise ValueError("render-parity skip requires a recognized replay failure")
+    return {
+        "schema_version": RENDER_PARITY_SKIP_SCHEMA,
+        "reason": reason,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "candidate_id": winner["candidate_id"],
+        "candidate_index": int(winner["candidate_index"]),
+        "attempt_tape": winner["attempt_tape"],
+        "attempt_tape_sha256": winner["attempt_tape_sha256"],
+        "action_sha256": winner["action_sha256"],
+    }
 
 
 def _budget_sequence(initial_k: int, max_k: int) -> tuple[int, ...]:
@@ -1204,11 +1236,9 @@ def main() -> None:
                         flush=True,
                     )
                 except (RuntimeError, ValueError) as exc:
-                    if (
-                        "parity failed" not in str(exc)
-                        and "canonical replay contract" not in str(exc)
-                    ):
+                    if _render_parity_failure_reason(exc) is None:
                         raise
+                    render_parity_skip = _render_parity_skip(winner, exc)
                     _rewrite_last_jsonl(
                         reset_results_path,
                         {
@@ -1216,6 +1246,7 @@ def main() -> None:
                             "accepted": False,
                             "winner_candidate_id": None,
                             "winner_candidate_index": None,
+                            "render_parity_skip": render_parity_skip,
                         },
                     )
                     winner = None

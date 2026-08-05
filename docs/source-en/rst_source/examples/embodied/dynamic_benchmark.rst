@@ -242,6 +242,15 @@ reset boundary, and reruns that reset. Every attempt keeps a lightweight
 state/action/reward tape and exact replay evidence; each winner additionally keeps
 RGB-D/HDF5 evidence.
 
+If the independently selected lightweight winner fails canonical render replay, the
+reset is rejected instead of being published. New exports bind a structured
+``render_parity_skip`` record to the selected attempt, while the sealed recovery log
+retains the failure event. Sharded exports must be sealed with
+``merge_optimal_export_shards.py`` so those events survive prefix truncation. The
+auditor accepts a skipped reset only when it independently selects the same attempt,
+finds no published winner, and validates the matching recovery evidence; skipped
+resets never count toward the accepted quota.
+
 Run the independent auditor before consuming the dataset. Pass the final
 ``dataset_card.json`` and ``checksums.sha256`` hashes printed by the exporter:
 
