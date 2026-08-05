@@ -55,6 +55,7 @@ EXPORT_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-v0.1"
 ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.1"
 STATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-state-v0.1"
 PROGRESS_SCHEMA = "rlinf-dynamic-benchmark-optimal-progress-v0.1"
+RENDER_PARITY_SKIP_SCHEMA = "rlinf-dynamic-benchmark-render-parity-skip-v0.1"
 SELECTION_CONTRACT = (
     "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
 )
@@ -120,6 +121,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="resume an interrupted export at its last committed reset boundary",
     )
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     return parser
 
 
@@ -149,6 +152,24 @@ def _payload_sha256(payload: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _rewrite_last_jsonl(path: Path, row: Mapping[str, Any]) -> None:
+    """Atomically replace the last committed row of a JSONL file."""
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise ValueError(f"{path} has no rows to rewrite")
+    lines[-1] = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+    body = "\n".join(lines) + "\n"
+    temporary = path.with_suffix(path.suffix + ".drop.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def _quality_score(record: Mapping[str, Any]) -> tuple[float, ...]:
@@ -185,6 +206,37 @@ def _select_winner(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         eligible,
         key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
     )
+
+
+def _render_parity_failure_reason(error: BaseException | str) -> str | None:
+    message = str(error)
+    if "parity failed" in message:
+        return "render_parity_failed"
+    if "canonical replay contract" in message:
+        return "canonical_replay_contract_failed"
+    return None
+
+
+def _render_parity_skip(
+    winner: Mapping[str, Any],
+    error: BaseException,
+) -> dict[str, Any]:
+    """Bind a failed render replay to the independently selected light attempt."""
+
+    reason = _render_parity_failure_reason(error)
+    if reason is None:
+        raise ValueError("render-parity skip requires a recognized replay failure")
+    return {
+        "schema_version": RENDER_PARITY_SKIP_SCHEMA,
+        "reason": reason,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "candidate_id": winner["candidate_id"],
+        "candidate_index": int(winner["candidate_index"]),
+        "attempt_tape": winner["attempt_tape"],
+        "attempt_tape_sha256": winner["attempt_tape_sha256"],
+        "action_sha256": winner["action_sha256"],
+    }
 
 
 def _budget_sequence(initial_k: int, max_k: int) -> tuple[int, ...]:
@@ -539,6 +591,7 @@ def _rollout(
     device: torch.device,
     capture_trace: bool,
     trace_metadata: Mapping[str, Any] | None = None,
+    replay_actions_array: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray], Any | None]:
     from se3_wam.benchmark.api import StepResult
     from se3_wam.benchmark.dataset import EpisodeTrace
@@ -591,7 +644,15 @@ def _rollout(
     terminated_value = False
     truncated_value = False
     while not (terminated_value or truncated_value):
-        if candidate.spec.kind == "planner":
+        if replay_actions_array is not None:
+            action_index = len(actions)
+            if action_index >= replay_actions_array.shape[0]:
+                raise RuntimeError("replayed action sequence is shorter than the rollout")
+            env_actions = torch.as_tensor(
+                replay_actions_array[action_index], dtype=torch.float32
+            ).unsqueeze(0)
+            policy_action = env_actions.clone()
+        elif candidate.spec.kind == "planner":
             env_actions = _planner_actions(env, [teacher])
             policy_action = env_actions.clone()
         else:
@@ -831,9 +892,15 @@ def main() -> None:
     from se3_wam.benchmark.evaluation import manifest_record
 
     args = _parser().parse_args()
-    if args.output.exists() and not args.resume:
+    if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise ValueError("shard-index must be in [0, shard-count)")
+    sharded = args.shard_count > 1
+    shard_output = (
+        args.output / f"shard-{args.shard_index:02d}" if sharded else args.output
+    )
+    if shard_output.exists() and not args.resume:
         raise FileExistsError(f"refusing to overwrite {args.output}")
-    if args.resume and not args.output.is_dir():
+    if args.resume and not shard_output.is_dir():
         raise FileNotFoundError("--resume requires an existing export directory")
     if args.accepted_episodes < 1 or args.max_resets < args.accepted_episodes:
         raise ValueError("max_resets must be at least accepted_episodes > 0")
@@ -898,6 +965,18 @@ def main() -> None:
         if reference_schemas and canonical_json(light_env.state_schema) not in reference_schemas:
             raise ValueError("export environment state schema does not match policies")
         rows = list(light_env._manifest_rows[: args.max_resets])
+        if sharded:
+            step = (len(rows) + args.shard_count - 1) // args.shard_count
+            start = args.shard_index * step
+            shard_rows = rows[start : start + step]
+            run_output = shard_output
+            for _ in range(start):
+                light_env.reset(options={"env_idx": [0]})
+                render_env.reset(options={"env_idx": [0]})
+        else:
+            start = 0
+            shard_rows = rows
+            run_output = args.output
         reset_manifest_text = "".join(
             canonical_json(manifest_record(row)) + "\n" for row in rows
         )
@@ -925,22 +1004,22 @@ def main() -> None:
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "reset_manifest_sha256": reset_manifest_sha256,
             "source_identity": source_identity,
-            "state_schema": light_env.state_schema,
+            "state_schema": json.loads(json.dumps(light_env.state_schema, allow_nan=False)),
             "candidates": [_candidate_identity(candidate.spec) for candidate in candidates],
         }
         export_state["payload_sha256"] = _payload_sha256(export_state)
-        attempts_path = args.output / "attempts.jsonl"
-        winners_path = args.output / "winner_manifest.jsonl"
-        reset_results_path = args.output / "reset_results.jsonl"
-        reset_manifest_path = args.output / "reset_manifest.jsonl"
-        export_state_path = args.output / "export_state.json"
-        progress_path = args.output / "progress.json"
+        attempts_path = run_output / "attempts.jsonl"
+        winners_path = run_output / "winner_manifest.jsonl"
+        reset_results_path = run_output / "reset_results.jsonl"
+        reset_manifest_path = run_output / "reset_manifest.jsonl"
+        export_state_path = run_output / "export_state.json"
+        progress_path = run_output / "progress.json"
         if args.resume:
-            if (args.output / "dataset_card.json").exists() or (
-                args.output / "SHA256SUMS"
+            if (run_output / "dataset_card.json").exists() or (
+                run_output / "SHA256SUMS"
             ).exists():
                 raise ValueError("refusing to resume a sealed export")
-            if _sha256(args.output / "candidate_manifest.json") != candidate_manifest_sha256:
+            if _sha256(run_output / "candidate_manifest.json") != candidate_manifest_sha256:
                 raise ValueError("resume candidate-manifest copy checksum mismatch")
             if reset_manifest_path.read_text(encoding="utf-8") != reset_manifest_text:
                 raise ValueError("resume reset manifest does not match the requested run")
@@ -958,9 +1037,9 @@ def main() -> None:
             if progress.get("export_state_sha256") != export_state_sha256:
                 raise ValueError("resume progress references a different export state")
             recovery_event = _recover_partial_output(
-                output=args.output,
+                output=run_output,
                 progress=progress,
-                reset_rows=rows,
+                reset_rows=shard_rows,
                 task=task,
                 split=args.split,
             )
@@ -1004,8 +1083,8 @@ def main() -> None:
                 ),
             )
         else:
-            args.output.mkdir(parents=True)
-            shutil.copyfile(args.candidate_manifest, args.output / "candidate_manifest.json")
+            run_output.mkdir(parents=True)
+            shutil.copyfile(args.candidate_manifest, run_output / "candidate_manifest.json")
             reset_manifest_path.write_text(reset_manifest_text, encoding="utf-8")
             for path in (attempts_path, winners_path, reset_results_path):
                 path.write_text("", encoding="utf-8")
@@ -1034,11 +1113,12 @@ def main() -> None:
                     recovery_events=[],
                 ),
             )
-        for reset_index, row in enumerate(rows):
+        for local_index, row in enumerate(shard_rows):
+            reset_index = start + local_index
             if accepted >= args.accepted_episodes:
                 break
-            if reset_index < attempted_resets:
-                if reset_index + 1 < len(rows):
+            if local_index < attempted_resets:
+                if local_index + 1 < len(shard_rows):
                     light_env.reset(options={"env_idx": [0]})
                     render_env.reset(options={"env_idx": [0]})
                 continue
@@ -1065,7 +1145,7 @@ def main() -> None:
                         capture_trace=False,
                     )
                     relative, tape_sha256 = _write_attempt_tape(
-                        args.output,
+                        run_output,
                         episode_id=record["episode_id"],
                         candidate_index=candidate.index,
                         arrays=arrays,
@@ -1096,67 +1176,90 @@ def main() -> None:
             _append_jsonl(reset_results_path, reset_result)
             if winner is not None:
                 candidate = candidates[int(winner["candidate_index"])]
-                render_record, _, trace = _rollout(
-                    env=render_env,
-                    candidate=candidate,
-                    device=device,
-                    capture_trace=True,
-                    trace_metadata={
-                        "candidate_manifest_sha256": candidate_manifest_sha256,
-                        "budget_used": budget_used,
-                        "winner_quality_score": list(_quality_score(winner)),
-                        "lightweight_action_sha256": winner["action_sha256"],
-                        "source_identity": source_identity,
-                    },
-                )
-                if trace is None:
-                    raise RuntimeError("winner render did not return an episode trace")
-                for key in (
-                    "episode_id",
-                    "success",
-                    "safety_failure",
-                    "termination_reason",
-                    "trajectory_completion",
-                    "completion_time_s",
-                    "return",
-                    "control_steps",
-                    "action_l2_sum",
-                    "action_sha256",
-                ):
-                    if render_record[key] != winner[key]:
-                        raise RuntimeError(f"winner render parity failed for {key}")
-                episode_record = write_episode_atomic(args.output, trace)
-                winner_row = {
-                    **episode_record,
-                    "candidate_id": candidate.spec.candidate_id,
-                    "candidate_index": candidate.index,
-                    "candidate_count": len(reset_attempts),
-                    "budget_used": budget_used,
-                    "selection_contract": SELECTION_CONTRACT,
-                    "quality_score": list(_quality_score(winner)),
-                    "lightweight_attempt_tape": winner["attempt_tape"],
-                    "lightweight_attempt_tape_sha256": winner["attempt_tape_sha256"],
-                }
-                _append_jsonl(winners_path, winner_row)
-                accepted += 1
-                print(
-                    json.dumps(
-                        {
-                            "accepted": accepted,
-                            "episode_id": winner["episode_id"],
-                            "candidate_id": winner["candidate_id"],
+                tape_path = run_output / winner["attempt_tape"]
+                replay_actions_array = np.load(tape_path)["actions"]
+                try:
+                    render_record, _, trace = _rollout(
+                        env=render_env,
+                        candidate=candidate,
+                        device=device,
+                        capture_trace=True,
+                        replay_actions_array=replay_actions_array,
+                        trace_metadata={
+                            "candidate_manifest_sha256": candidate_manifest_sha256,
                             "budget_used": budget_used,
+                            "winner_quality_score": list(_quality_score(winner)),
+                            "lightweight_action_sha256": winner["action_sha256"],
+                            "source_identity": source_identity,
                         },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
+                    )
+                    if trace is None:
+                        raise RuntimeError("winner render did not return an episode trace")
+                    for key in (
+                        "episode_id",
+                        "success",
+                        "safety_failure",
+                        "termination_reason",
+                        "trajectory_completion",
+                        "completion_time_s",
+                        "return",
+                        "control_steps",
+                        "action_l2_sum",
+                        "action_sha256",
+                    ):
+                        if render_record[key] != winner[key]:
+                            raise RuntimeError(f"winner render parity failed for {key}")
+                    episode_record = write_episode_atomic(run_output, trace)
+                    winner_row = {
+                        **episode_record,
+                        "candidate_id": candidate.spec.candidate_id,
+                        "candidate_index": candidate.index,
+                        "candidate_count": len(reset_attempts),
+                        "budget_used": budget_used,
+                        "selection_contract": SELECTION_CONTRACT,
+                        "quality_score": list(_quality_score(winner)),
+                        "lightweight_attempt_tape": winner["attempt_tape"],
+                        "lightweight_attempt_tape_sha256": winner["attempt_tape_sha256"],
+                    }
+                    _append_jsonl(winners_path, winner_row)
+                    accepted += 1
+                    print(
+                        json.dumps(
+                            {
+                                "accepted": accepted,
+                                "episode_id": winner["episode_id"],
+                                "candidate_id": winner["candidate_id"],
+                                "budget_used": budget_used,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    if _render_parity_failure_reason(exc) is None:
+                        raise
+                    render_parity_skip = _render_parity_skip(winner, exc)
+                    _rewrite_last_jsonl(
+                        reset_results_path,
+                        {
+                            **reset_result,
+                            "accepted": False,
+                            "winner_candidate_id": None,
+                            "winner_candidate_index": None,
+                            "render_parity_skip": render_parity_skip,
+                        },
+                    )
+                    winner = None
+                    recovery_events.append(
+                        f"render_parity_skip:reset:{reset_index}:"
+                        f"{row.request.episode_id}:{str(exc)}"
+                    )
             _atomic_json(
                 progress_path,
                 _progress_payload(
                     export_state_sha256=export_state_sha256,
                     started_unix_s=started,
-                    next_reset_index=reset_index + 1,
+                    next_reset_index=local_index + 1,
                     accepted_count=accepted,
                     candidate_attempt_count=attempt_count,
                     budget_histogram=budget_histogram,
@@ -1167,7 +1270,7 @@ def main() -> None:
                     recovery_events=recovery_events,
                 ),
             )
-            if reset_index + 1 < len(rows):
+            if local_index + 1 < len(shard_rows):
                 light_env.reset(options={"env_idx": [0]})
                 render_env.reset(options={"env_idx": [0]})
 
@@ -1182,6 +1285,33 @@ def main() -> None:
                 raise RuntimeError(
                     f"candidate policy changed during export: {candidate.spec.candidate_id}"
                 )
+        if sharded:
+            _atomic_json(
+                run_output / "shard_complete.json",
+                {
+                    "schema_version": "rlinf-dynamic-benchmark-optimal-shard-v0.1",
+                    "shard_index": args.shard_index,
+                    "shard_count": args.shard_count,
+                    "accepted_count": accepted,
+                    "attempted_reset_count": attempted_resets,
+                    "candidate_attempt_count": attempt_count,
+                    "budget_histogram": dict(budget_histogram),
+                },
+            )
+            print(
+                json.dumps(
+                    {
+                        "shard": args.shard_index,
+                        "accepted": accepted,
+                        "attempted_resets": attempted_resets,
+                        "candidate_attempts": attempt_count,
+                        "budget_histogram": budget_histogram,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return
         status = "complete" if accepted == args.accepted_episodes else "incomplete"
         card = {
             "schema_version": EXPORT_SCHEMA,

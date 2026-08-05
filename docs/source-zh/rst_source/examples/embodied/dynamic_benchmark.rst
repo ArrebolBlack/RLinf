@@ -260,6 +260,12 @@ stochastic 标志、exploration seed offset 与可选 residual-scale override。
 同级 recovery 目录，将 JSONL 截断到最后一次原子提交的 reset 边界，并重跑该 reset。每次
 attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据；winner 额外保存 RGB-D/HDF5。
 
+如果独立选出的轻量 winner 未通过 canonical render replay，该 reset 会被拒绝而不是发布。新导出
+会把结构化 ``render_parity_skip`` 证据绑定到被选 attempt，并在 sealed recovery log 中保留
+失败事件。分片导出必须使用 ``merge_optimal_export_shards.py`` 封存，保证这些事件在前缀截断后
+仍被保留。auditor 只有在独立选出同一 attempt、确认没有发布 winner、并校验匹配的 recovery
+证据后才接受 skip；skip reset 永远不计入 accepted 配额。
+
 消费数据集前必须运行独立 auditor，并传入 exporter 最终打印的 ``dataset_card.json`` 与
 ``checksums.sha256`` 哈希：
 

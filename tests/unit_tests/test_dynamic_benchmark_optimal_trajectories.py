@@ -23,6 +23,8 @@ import pytest
 
 from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
     _audit_attempt_tape,
+    _audit_render_parity_skip,
+    _render_parity_skip_events,
 )
 from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
     _payload_sha256 as _audit_payload_sha256,
@@ -37,11 +39,13 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _progress_payload,
     _quality_score,
     _recover_partial_output,
+    _render_parity_skip,
     _restore_candidate_start,
     _select_winner,
     _validate_candidate_manifest,
     _write_attempt_tape,
 )
+from examples.embodiment.merge_optimal_export_shards import _kept_recovery_events
 
 
 def _record(candidate_index: int, *, value: float = 1.0) -> dict:
@@ -134,6 +138,70 @@ def test_winner_selection_is_quality_first_then_stable_candidate_index() -> None
     better_return["safety_failure"] = True
     better_return["eligible"] = _eligible(better_return)
     assert _select_winner([first, better_return]) is first
+
+
+def test_render_parity_skip_binds_the_selected_attempt_and_recovery_event() -> None:
+    selected = {
+        **_record(3),
+        "candidate_id": "policy-3",
+        "attempt_tape": "lightweight/episode-1/candidate-03.npz",
+        "attempt_tape_sha256": "a" * 64,
+        "action_sha256": "b" * 64,
+    }
+    error = RuntimeError("winner render parity failed for return")
+    result = {
+        "reset_index": 7,
+        "episode_id": "episode-1",
+        "accepted": False,
+        "winner_candidate_id": None,
+        "winner_candidate_index": None,
+        "render_parity_skip": _render_parity_skip(selected, error),
+    }
+    events = _render_parity_skip_events(
+        ["render_parity_skip:reset:7:episode-1:winner render parity failed for return"]
+    )
+
+    assert _audit_render_parity_skip(result, selected, events[7]) == "structured-v0.1"
+    result["render_parity_skip"]["candidate_id"] = "policy-tampered"
+    with pytest.raises(ValueError, match="selected attempt"):
+        _audit_render_parity_skip(result, selected, events[7])
+
+
+def test_legacy_render_parity_skip_requires_one_recognized_recovery_event() -> None:
+    selected = {
+        **_record(0),
+        "candidate_id": "planner",
+        "attempt_tape": "lightweight/episode-1/candidate-00.npz",
+        "attempt_tape_sha256": "a" * 64,
+        "action_sha256": "b" * 64,
+    }
+    result = {"reset_index": 1, "episode_id": "episode-1", "accepted": False}
+    events = _render_parity_skip_events(
+        [
+            "resume.recovery-1",
+            "render_parity_skip:reset:1:episode-1:canonical replay contract mismatch",
+        ]
+    )
+
+    assert _audit_render_parity_skip(result, selected, events[1]) == "legacy-v0.1"
+    with pytest.raises(ValueError, match="no matching recovery event"):
+        _audit_render_parity_skip(result, selected, None)
+    with pytest.raises(ValueError, match="invalid"):
+        _render_parity_skip_events(
+            ["render_parity_skip:reset:1:episode-1:unrecognized failure"]
+        )
+
+
+def test_shard_merge_keeps_only_render_skip_events_in_the_sealed_prefix() -> None:
+    events = [
+        "shard-00.recovery-1",
+        "render_parity_skip:reset:3:episode-3:winner render parity failed for return",
+        "render_parity_skip:reset:9:episode-9:winner render parity failed for return",
+    ]
+
+    assert _kept_recovery_events(events, max_reset=5) == events[:2]
+    with pytest.raises(ValueError, match="malformed"):
+        _kept_recovery_events(["render_parity_skip:bad"], max_reset=5)
 
 
 def test_attempt_tape_round_trip_recomputes_shapes_hashes_and_score(tmp_path: Path) -> None:

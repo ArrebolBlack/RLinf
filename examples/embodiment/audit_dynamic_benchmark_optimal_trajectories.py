@@ -37,6 +37,7 @@ ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.1"
 AUDIT_SCHEMA = "rlinf-dynamic-benchmark-optimal-audit-v0.1"
 STATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-state-v0.1"
 PROGRESS_SCHEMA = "rlinf-dynamic-benchmark-optimal-progress-v0.1"
+RENDER_PARITY_SKIP_SCHEMA = "rlinf-dynamic-benchmark-render-parity-skip-v0.1"
 SELECTION_CONTRACT = (
     "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
 )
@@ -244,6 +245,99 @@ def _selected(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         eligible,
         key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
     )
+
+
+def _render_parity_failure_reason(error: str) -> str | None:
+    if "parity failed" in error:
+        return "render_parity_failed"
+    if "canonical replay contract" in error:
+        return "canonical_replay_contract_failed"
+    return None
+
+
+def _render_parity_skip_events(recovery_events: Any) -> dict[int, dict[str, str]]:
+    """Parse the frozen v0.1 string event used by already exported shards."""
+
+    if not isinstance(recovery_events, list) or not all(
+        isinstance(event, str) for event in recovery_events
+    ):
+        raise ValueError("recovery events must be a list of strings")
+    skips: dict[int, dict[str, str]] = {}
+    for event in recovery_events:
+        if not event.startswith("render_parity_skip:"):
+            continue
+        parts = event.split(":", maxsplit=4)
+        if len(parts) != 5 or parts[:2] != ["render_parity_skip", "reset"]:
+            raise ValueError("render-parity recovery event is malformed")
+        try:
+            reset_index = int(parts[2])
+        except ValueError as error:
+            raise ValueError("render-parity recovery reset index is malformed") from error
+        episode_id, message = parts[3], parts[4]
+        reason = _render_parity_failure_reason(message)
+        if reset_index < 0 or not episode_id or reason is None:
+            raise ValueError("render-parity recovery event is invalid")
+        if reset_index in skips:
+            raise ValueError("multiple render-parity recovery events name one reset")
+        skips[reset_index] = {
+            "episode_id": episode_id,
+            "error": message,
+            "reason": reason,
+        }
+    return skips
+
+
+def _audit_render_parity_skip(
+    result: Mapping[str, Any],
+    selected: Mapping[str, Any],
+    event: Mapping[str, str] | None,
+) -> str:
+    """Validate a rejected publication whose light winner failed render replay."""
+
+    if event is None:
+        raise ValueError("render-parity skip has no matching recovery event")
+    if event.get("episode_id") != result.get("episode_id"):
+        raise ValueError("render-parity recovery event episode identity mismatch")
+    skip = result.get("render_parity_skip")
+    if skip is None:
+        return "legacy-v0.1"
+    if not isinstance(skip, dict):
+        raise ValueError("render-parity skip evidence is not a mapping")
+    expected_keys = {
+        "schema_version",
+        "reason",
+        "error_type",
+        "error",
+        "candidate_id",
+        "candidate_index",
+        "attempt_tape",
+        "attempt_tape_sha256",
+        "action_sha256",
+    }
+    if set(skip) != expected_keys:
+        raise ValueError("render-parity skip evidence inventory mismatch")
+    if skip.get("schema_version") != RENDER_PARITY_SKIP_SCHEMA:
+        raise ValueError("render-parity skip evidence schema mismatch")
+    if skip.get("error_type") not in {"RuntimeError", "ValueError"}:
+        raise ValueError("render-parity skip error type is invalid")
+    message = skip.get("error")
+    if not isinstance(message, str):
+        raise ValueError("render-parity skip error is missing")
+    reason = _render_parity_failure_reason(message)
+    if reason is None or skip.get("reason") != reason:
+        raise ValueError("render-parity skip reason does not recompute")
+    if event.get("error") != message or event.get("reason") != reason:
+        raise ValueError("render-parity skip disagrees with its recovery event")
+    selected_values = {
+        "candidate_id": selected["candidate_id"],
+        "candidate_index": int(selected["candidate_index"]),
+        "attempt_tape": selected["attempt_tape"],
+        "attempt_tape_sha256": selected["attempt_tape_sha256"],
+        "action_sha256": selected["action_sha256"],
+    }
+    if any(skip.get(key) != value for key, value in selected_values.items()):
+        raise ValueError("render-parity skip is not bound to the selected attempt")
+    return "structured-v0.1"
 
 
 def _audit_attempt_tape(
@@ -620,6 +714,9 @@ def _audit_dataset(
         winner_by_episode[episode_id] = winner
 
     accepted = 0
+    render_parity_skips: Counter[str] = Counter()
+    skip_events = _render_parity_skip_events(card.get("recovery_events"))
+    consumed_skip_events: set[int] = set()
     budget_histogram: Counter[str] = Counter()
     for reset_index, result in enumerate(reset_results):
         reset = reset_rows[reset_index]
@@ -643,12 +740,13 @@ def _audit_dataset(
             if _selected(records[:previous_budget]) is not None:
                 raise ValueError("candidate search escalated after already finding an eligible winner")
         selected = _selected(records)
-        is_accepted = selected is not None
-        if bool(result.get("accepted")) != is_accepted:
-            raise ValueError("reset-result acceptance does not recompute")
         budget_histogram[str(budget_used)] += 1
         winner = winner_by_episode.get(episode_id)
         if selected is None:
+            if bool(result.get("accepted")) or result.get("render_parity_skip") is not None:
+                raise ValueError("reset-result acceptance does not recompute")
+            if reset_index in skip_events:
+                raise ValueError("render-parity recovery event has no selected attempt")
             if budget_used != budgets[-1] or winner is not None:
                 raise ValueError("rejected reset did not exhaust max_k or unexpectedly has a winner")
             if result.get("winner_candidate_id") is not None or result.get(
@@ -656,6 +754,23 @@ def _audit_dataset(
             ) is not None:
                 raise ValueError("rejected reset names a winner")
             continue
+        if not bool(result.get("accepted")):
+            if winner is not None:
+                raise ValueError("render-parity skipped reset unexpectedly has a winner")
+            if result.get("winner_candidate_id") is not None or result.get(
+                "winner_candidate_index"
+            ) is not None:
+                raise ValueError("render-parity skipped reset names a winner")
+            protocol = _audit_render_parity_skip(
+                result,
+                selected,
+                skip_events.get(reset_index),
+            )
+            render_parity_skips[protocol] += 1
+            consumed_skip_events.add(reset_index)
+            continue
+        if result.get("render_parity_skip") is not None or reset_index in skip_events:
+            raise ValueError("accepted reset unexpectedly carries render-parity skip evidence")
         if (
             result.get("winner_candidate_id") != selected["candidate_id"]
             or int(result.get("winner_candidate_index", -1)) != int(selected["candidate_index"])
@@ -673,6 +788,8 @@ def _audit_dataset(
             raise ValueError("published winner does not match independently selected attempt")
         _audit_winner_episode(root, winner, selected, reset, card)
         accepted += 1
+    if consumed_skip_events != set(skip_events):
+        raise ValueError("render-parity recovery event inventory mismatch")
     if accepted != len(winner_rows) or set(winner_by_episode) != {
         row["episode_id"] for row in reset_results if row["accepted"]
     }:
@@ -704,6 +821,8 @@ def _audit_dataset(
         "candidate_pool_size": len(candidates),
         "checksum_entry_count": checksum_entries,
         "budget_histogram": dict(budget_histogram),
+        "render_parity_skip_count": sum(render_parity_skips.values()),
+        "render_parity_skip_protocols": dict(render_parity_skips),
     }
 
 
