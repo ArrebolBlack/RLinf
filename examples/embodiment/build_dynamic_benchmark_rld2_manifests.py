@@ -57,11 +57,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.1"
-INPUT_SPEC_SCHEMA = "rlinf-dynamic-benchmark-rld2-input-spec-v0.1"
+LEGACY_CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.1"
+CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.2"
+INPUT_SPEC_SCHEMA = "rlinf-dynamic-benchmark-rld2-input-spec-v0.2"
 PROVENANCE_SCHEMA = "rlinf-dynamic-benchmark-candidate-provenance-v0.1"
 INVENTORY_SCHEMA = "rlinf-dynamic-benchmark-rld2-input-inventory-v0.1"
-RELEASE_SCHEMA = "rlinf-dynamic-benchmark-rld2-candidate-release-v0.1"
+RELEASE_SCHEMA = "rlinf-dynamic-benchmark-rld2-candidate-release-v0.2"
+EVALUATOR_IDENTITY_SCHEMA = "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
+EVALUATOR_IDENTITY_KEYS = {
+    "schema_version",
+    "evaluator_rlinf_commit",
+    "evaluator_benchmark_commit",
+    "backend_id",
+    "policy_benchmark_relations",
+}
+POLICY_BENCHMARK_RELATION_KEYS = {
+    "policy_benchmark_commit",
+    "relation",
+    "evidence_path",
+    "evidence_sha256",
+}
+POLICY_BENCHMARK_RELATIONS = {"identical", "checkpoint-compatible"}
 
 EXACT_TASKS = (
     "p0_grasp",
@@ -142,6 +158,8 @@ class BuildContext:
     path_maps: tuple[PathMap, ...]
     file_hash_cache: dict[str, str]
     input_files: dict[tuple[str, str], dict[str, Any]]
+    evaluator_evidence_sources: dict[str, str]
+    calibration_evidence_sources: dict[str, tuple[str, str]]
     inventory_rows: list[dict[str, Any]]
     deduplicated: list[dict[str, Any]]
 
@@ -178,6 +196,133 @@ def _require_commit(value: Any, label: str) -> str:
     if not isinstance(value, str) or HEX_40.fullmatch(value) is None:
         raise ManifestBuildError(f"{label} must be a full lowercase Git commit")
     return value
+
+
+def _validate_evaluator_identity(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Validate the quality evaluator independently of policy provenance."""
+
+    if not isinstance(value, Mapping) or set(value) != EVALUATOR_IDENTITY_KEYS:
+        raise ManifestBuildError(f"{label} evaluator_identity field inventory mismatch")
+    if value.get("schema_version") != EVALUATOR_IDENTITY_SCHEMA:
+        raise ManifestBuildError(f"{label} evaluator_identity schema mismatch")
+    evaluator_rlinf_commit = _require_commit(
+        value.get("evaluator_rlinf_commit"),
+        f"{label} evaluator RLinf commit",
+    )
+    evaluator_benchmark_commit = _require_commit(
+        value.get("evaluator_benchmark_commit"),
+        f"{label} evaluator benchmark commit",
+    )
+    backend_id = value.get("backend_id")
+    if (
+        not isinstance(backend_id, str)
+        or not backend_id
+        or backend_id.strip() != backend_id
+    ):
+        raise ManifestBuildError(f"{label} evaluator backend_id is missing")
+    raw_relations = value.get("policy_benchmark_relations")
+    if not isinstance(raw_relations, list) or not raw_relations:
+        raise ManifestBuildError(
+            f"{label} policy_benchmark_relations must be non-empty"
+        )
+    relations = []
+    for index, raw_relation in enumerate(raw_relations):
+        if not isinstance(raw_relation, Mapping) or set(raw_relation) != (
+            POLICY_BENCHMARK_RELATION_KEYS
+        ):
+            raise ManifestBuildError(
+                f"{label} benchmark relation {index} field inventory mismatch"
+            )
+        policy_commit = _require_commit(
+            raw_relation.get("policy_benchmark_commit"),
+            f"{label} benchmark relation {index} policy commit",
+        )
+        relation = raw_relation.get("relation")
+        if relation not in POLICY_BENCHMARK_RELATIONS:
+            raise ManifestBuildError(
+                f"{label} benchmark relation {index} is unsupported"
+            )
+        evidence_path = raw_relation.get("evidence_path")
+        evidence_sha256 = raw_relation.get("evidence_sha256")
+        if relation == "identical":
+            if evaluator_benchmark_commit != policy_commit:
+                raise ManifestBuildError(
+                    f"{label} identical benchmark relation has different commits"
+                )
+            if evidence_path is not None or evidence_sha256 is not None:
+                raise ManifestBuildError(
+                    f"{label} identical benchmark relation must not declare evidence"
+                )
+        else:
+            if evaluator_benchmark_commit == policy_commit:
+                raise ManifestBuildError(
+                    f"{label} checkpoint-compatible relation requires different commits"
+                )
+            if not isinstance(evidence_path, str) or not evidence_path.strip():
+                raise ManifestBuildError(
+                    f"{label} checkpoint-compatible relation evidence_path is missing"
+                )
+            evidence_sha256 = _require_sha256(
+                evidence_sha256,
+                f"{label} benchmark relation {index} evidence",
+            )
+        relations.append(
+            {
+                "policy_benchmark_commit": policy_commit,
+                "relation": relation,
+                "evidence_path": evidence_path,
+                "evidence_sha256": evidence_sha256,
+            }
+        )
+    commits = [row["policy_benchmark_commit"] for row in relations]
+    if commits != sorted(commits) or len(commits) != len(set(commits)):
+        raise ManifestBuildError(
+            f"{label} policy_benchmark_relations must be sorted and unique by commit"
+        )
+    normalized = {
+        "schema_version": EVALUATOR_IDENTITY_SCHEMA,
+        "evaluator_rlinf_commit": evaluator_rlinf_commit,
+        "evaluator_benchmark_commit": evaluator_benchmark_commit,
+        "backend_id": backend_id,
+        "policy_benchmark_relations": relations,
+    }
+    _canonical_json(normalized)
+    return normalized
+
+
+def _evaluator_identity_semantics(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare identities independently of their portable relative evidence paths."""
+
+    normalized = copy.deepcopy(dict(value))
+    for relation in normalized["policy_benchmark_relations"]:
+        if relation["relation"] == "checkpoint-compatible":
+            relation["evidence_path"] = None
+    return normalized
+
+
+def _portable_evidence_path(sha256: str) -> str:
+    return f"evidence/benchmark-compatibility/{sha256}.json"
+
+
+def _portable_evaluator_identity(
+    value: Mapping[str, Any],
+    *,
+    from_task_manifest: bool,
+) -> dict[str, Any]:
+    """Rewrite verified input evidence to its canonical release-relative path."""
+
+    result = copy.deepcopy(dict(value))
+    prefix = "../" if from_task_manifest else ""
+    for relation in result["policy_benchmark_relations"]:
+        if relation["relation"] == "checkpoint-compatible":
+            relation["evidence_path"] = prefix + _portable_evidence_path(
+                relation["evidence_sha256"]
+            )
+    return result
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -282,6 +427,126 @@ def _hash_input_file(
     return actual
 
 
+def _prepare_input_evaluator_identity(
+    value: Any,
+    *,
+    spec_path: Path,
+    context: BuildContext,
+) -> dict[str, Any]:
+    """Verify compatibility evidence and retain its resolved input source."""
+
+    normalized = _validate_evaluator_identity(value, label="RLD2 input spec")
+    for relation in normalized["policy_benchmark_relations"]:
+        if relation["relation"] == "identical":
+            continue
+        evidence_path = _resolved_policy_path(
+            relation["evidence_path"],
+            manifest_path=spec_path,
+            path_maps=context.path_maps,
+        )
+        evidence_sha256 = relation["evidence_sha256"]
+        _hash_input_file(
+            evidence_path,
+            expected_sha256=evidence_sha256,
+            role="benchmark-compatibility-evidence",
+            logical_id=relation["policy_benchmark_commit"],
+            context=context,
+        )
+        try:
+            json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ManifestBuildError(
+                f"benchmark compatibility evidence must be valid UTF-8 JSON: {evidence_path}"
+            ) from error
+        existing = context.evaluator_evidence_sources.get(evidence_sha256)
+        if existing is not None and existing != evidence_path:
+            if _sha256(Path(existing)) != _sha256(Path(evidence_path)):
+                raise ManifestBuildError(
+                    "evaluator evidence SHA identity maps to different content"
+                )
+        else:
+            context.evaluator_evidence_sources[evidence_sha256] = evidence_path
+        relation["evidence_path"] = evidence_path
+    return normalized
+
+
+def _portable_calibration_path(task: str, sha256: str) -> str:
+    return f"evidence/calibration/{task}-{sha256}.json"
+
+
+def _prepare_planner_dominance_contract(
+    value: Any,
+    *,
+    task: str,
+    backend_id: str,
+    spec_path: Path,
+    context: BuildContext,
+) -> dict[str, Any]:
+    """Verify and bind one task's planner-dominance calibration evidence."""
+
+    if not isinstance(value, Mapping) or not value:
+        raise ManifestBuildError(f"planner_dominance contract for {task} is empty")
+    contract = copy.deepcopy(dict(value))
+    if contract.get("task") != task:
+        raise ManifestBuildError(f"planner_dominance task identity mismatch for {task}")
+    if contract.get("backend_id") != backend_id:
+        raise ManifestBuildError(f"planner_dominance backend_id mismatch for {task}")
+    calibration = contract.get("calibration")
+    expected_keys = {
+        "replay_count",
+        "reset_episode_id",
+        "reset_manifest_sha256",
+        "evidence_path",
+        "evidence_sha256",
+    }
+    if not isinstance(calibration, Mapping) or set(calibration) != expected_keys:
+        raise ManifestBuildError(
+            f"planner_dominance calibration inventory mismatch for {task}"
+        )
+    evidence_sha256 = _require_sha256(
+        calibration.get("evidence_sha256"),
+        f"{task} planner-dominance calibration evidence",
+    )
+    evidence_path = _resolved_policy_path(
+        calibration.get("evidence_path"),
+        manifest_path=spec_path,
+        path_maps=context.path_maps,
+    )
+    _hash_input_file(
+        evidence_path,
+        expected_sha256=evidence_sha256,
+        role="planner-dominance-calibration-evidence",
+        logical_id=task,
+        context=context,
+    )
+    try:
+        json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ManifestBuildError(
+            f"planner-dominance calibration evidence must be UTF-8 JSON: {task}"
+        ) from error
+    context.calibration_evidence_sources[task] = (evidence_sha256, evidence_path)
+    contract["calibration"] = dict(calibration)
+    contract["calibration"]["evidence_path"] = evidence_path
+    _canonical_json(contract)
+    return contract
+
+
+def _portable_planner_dominance(
+    value: Mapping[str, Any] | None,
+    *,
+    task: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    contract = copy.deepcopy(dict(value))
+    calibration = contract["calibration"]
+    calibration["evidence_path"] = "../" + _portable_calibration_path(
+        task, calibration["evidence_sha256"]
+    )
+    return contract
+
+
 def _expansion(mode: str, offset: int) -> dict[str, Any]:
     if mode not in {"planner", "deterministic", "stochastic"}:
         raise ManifestBuildError(f"unsupported candidate expansion mode {mode!r}")
@@ -370,7 +635,7 @@ def _validate_provenance(
     *,
     candidate: Mapping[str, Any],
     task: str,
-    benchmark_commit: str,
+    allowed_benchmark_commits: set[str],
     production: bool,
 ) -> dict[str, Any]:
     if not isinstance(provenance, Mapping) or set(provenance) != PROVENANCE_KEYS:
@@ -459,14 +724,23 @@ def _validate_provenance(
         item = value[section][key]
         if item is not None:
             _require_commit(item, f"provenance {section}.{key}")
-    if value["benchmark"]["commit"] not in {None, benchmark_commit}:
+    if value["benchmark"]["commit"] is not None and (
+        value["benchmark"]["commit"] not in allowed_benchmark_commits
+    ):
         raise ManifestBuildError(
-            f"{task} candidate provenance benchmark commit mismatch"
+            f"{task} candidate provenance benchmark commit is not covered by evaluator_identity"
         )
     expected_expansion = _candidate_expansion(candidate)
     if value["expansion"] != expected_expansion:
         raise ManifestBuildError(f"{task} candidate provenance expansion mismatch")
     if candidate.get("kind") == "policy":
+        if (
+            value["source"]["rlinf_commit"] is None
+            or value["benchmark"]["commit"] is None
+        ):
+            raise ManifestBuildError(
+                f"{task} policy candidate requires per-candidate RLinf and benchmark authority"
+            )
         policy_path = candidate.get("policy_path")
         policy_sha256 = candidate.get("policy_sha256")
         if value["checkpoint"]["path"] not in {None, policy_path}:
@@ -567,6 +841,8 @@ def _validate_old_candidate(
     manifest_sha256: str,
     manifest_rlinf_commit: str,
     manifest_benchmark_commit: str,
+    evaluator_identity: Mapping[str, Any],
+    allowed_benchmark_commits: set[str],
     override: Mapping[str, Any] | None,
     context: BuildContext,
     production: bool,
@@ -630,11 +906,23 @@ def _validate_old_candidate(
     if kind == "policy":
         provenance["checkpoint"]["path"] = candidate["policy_path"]
         provenance["checkpoint"]["sha256"] = candidate["policy_sha256"]
+        provenance["source"]["rlinf_commit"] = manifest_rlinf_commit
+        provenance["benchmark"]["commit"] = manifest_benchmark_commit
+    else:
+        provenance["source"]["rlinf_commit"] = evaluator_identity[
+            "evaluator_rlinf_commit"
+        ]
+        provenance["runtime"]["evaluator_rlinf_commit"] = evaluator_identity[
+            "evaluator_rlinf_commit"
+        ]
+        provenance["benchmark"]["commit"] = evaluator_identity[
+            "evaluator_benchmark_commit"
+        ]
     candidate["provenance"] = _validate_provenance(
         provenance,
         candidate=candidate,
         task=task,
-        benchmark_commit=manifest_benchmark_commit,
+        allowed_benchmark_commits=allowed_benchmark_commits,
         production=production,
     )
     _candidate_semantics(candidate)
@@ -685,13 +973,18 @@ def _validate_expansion_spec(value: Any) -> tuple[int, ...]:
     return tuple(offsets)
 
 
-def _validate_spec(payload: Mapping[str, Any], *, production: bool) -> dict[str, Any]:
+def _validate_spec(
+    payload: Mapping[str, Any],
+    *,
+    spec_path: Path,
+    context: BuildContext,
+    production: bool,
+) -> dict[str, Any]:
     allowed = {
         "schema_version",
         "release_id",
         "candidate_schema_version",
-        "rlinf_commit",
-        "benchmark_commit",
+        "evaluator_identity",
         "stochastic_expansion",
         "additions",
         "provenance_overrides",
@@ -705,12 +998,6 @@ def _validate_spec(payload: Mapping[str, Any], *, production: bool) -> dict[str,
         raise ManifestBuildError("RLD2 input spec release_id mismatch")
     if payload.get("candidate_schema_version") != CANDIDATE_SCHEMA:
         raise ManifestBuildError("RLD2 candidate schema version mismatch")
-    rlinf_commit = _require_commit(
-        payload.get("rlinf_commit"), "RLD2 evaluator RLinf commit"
-    )
-    benchmark_commit = _require_commit(
-        payload.get("benchmark_commit"), "RLD2 benchmark commit"
-    )
     offsets = _validate_expansion_spec(payload.get("stochastic_expansion"))
     additions = payload.get("additions")
     if not isinstance(additions, list):
@@ -781,22 +1068,36 @@ def _validate_spec(payload: Mapping[str, Any], *, production: bool) -> dict[str,
         raise ManifestBuildError("planner_dominance must be a task mapping")
     if set(dominance) - set(EXACT_TASKS):
         raise ManifestBuildError("planner_dominance includes an unknown task")
-    for task, contract in dominance.items():
-        if not isinstance(contract, Mapping) or not contract:
-            raise ManifestBuildError(f"planner_dominance contract for {task} is empty")
-        _canonical_json(contract)
+    evaluator_identity = _prepare_input_evaluator_identity(
+        payload.get("evaluator_identity"),
+        spec_path=spec_path,
+        context=context,
+    )
+    normalized_dominance = {
+        task: _prepare_planner_dominance_contract(
+            contract,
+            task=task,
+            backend_id=evaluator_identity["backend_id"],
+            spec_path=spec_path,
+            context=context,
+        )
+        for task, contract in dominance.items()
+    }
     if production and set(dominance) != set(EXACT_TASKS):
         missing = sorted(set(EXACT_TASKS) - set(dominance))
         raise ManifestBuildError(
             f"production RLD2 requires planner_dominance for exact14: {missing}"
         )
     return {
-        "rlinf_commit": rlinf_commit,
-        "benchmark_commit": benchmark_commit,
+        "evaluator_identity": evaluator_identity,
+        "policy_benchmark_commits": [
+            relation["policy_benchmark_commit"]
+            for relation in evaluator_identity["policy_benchmark_relations"]
+        ],
         "offsets": offsets,
         "addition_by_task": addition_by_task,
         "overrides": normalized_overrides,
-        "planner_dominance": dict(dominance),
+        "planner_dominance": normalized_dominance,
     }
 
 
@@ -835,7 +1136,6 @@ def _validate_addition_policy(
     *,
     task: str,
     spec_path: Path,
-    benchmark_commit: str,
     context: BuildContext,
 ) -> dict[str, Any]:
     allowed = {"policy_path", "policy_sha256", "residual_scale", "provenance"}
@@ -897,7 +1197,7 @@ def _addition_candidates(
     task: str,
     offsets: Sequence[int],
     spec_path: Path,
-    benchmark_commit: str,
+    allowed_benchmark_commits: set[str],
     context: BuildContext,
     production: bool,
 ) -> list[dict[str, Any]]:
@@ -906,7 +1206,6 @@ def _addition_candidates(
             row,
             task=task,
             spec_path=spec_path,
-            benchmark_commit=benchmark_commit,
             context=context,
         )
         for row in source["policies"]
@@ -945,13 +1244,12 @@ def _addition_candidates(
             )
             provenance["checkpoint"]["path"] = item["policy_path"]
             provenance["checkpoint"]["sha256"] = item["policy_sha256"]
-            provenance["benchmark"]["commit"] = benchmark_commit
             provenance["expansion"] = _expansion(mode, offset)
             candidate["provenance"] = _validate_provenance(
                 provenance,
                 candidate=candidate,
                 task=task,
-                benchmark_commit=benchmark_commit,
+                allowed_benchmark_commits=allowed_benchmark_commits,
                 production=production,
             )
             candidates.append(candidate)
@@ -1032,9 +1330,17 @@ def _build_in_memory(
     context: BuildContext,
     production: bool,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    normalized = _validate_spec(spec, production=production)
-    rlinf_commit = normalized["rlinf_commit"]
-    benchmark_commit = normalized["benchmark_commit"]
+    normalized = _validate_spec(
+        spec,
+        spec_path=spec_path,
+        context=context,
+        production=production,
+    )
+    evaluator_identity = normalized["evaluator_identity"]
+    policy_benchmark_commits = set(normalized["policy_benchmark_commits"])
+    allowed_benchmark_commits = policy_benchmark_commits | {
+        evaluator_identity["evaluator_benchmark_commit"]
+    }
     overrides = normalized["overrides"]
     used_overrides: set[int] = set()
     manifests: dict[str, dict[str, Any]] = {}
@@ -1048,7 +1354,7 @@ def _build_in_memory(
         path = old_manifests[task]
         payload = old_payloads[task]
         if (
-            payload.get("schema_version") != CANDIDATE_SCHEMA
+            payload.get("schema_version") != LEGACY_CANDIDATE_SCHEMA
             or payload.get("task") != task
         ):
             raise ManifestBuildError(
@@ -1060,8 +1366,10 @@ def _build_in_memory(
         old_benchmark_commit = _require_commit(
             payload.get("benchmark_commit"), f"{task} old benchmark commit"
         )
-        if old_benchmark_commit != benchmark_commit:
-            raise ManifestBuildError(f"{task} old benchmark commit differs from RLD2")
+        if old_benchmark_commit not in policy_benchmark_commits:
+            raise ManifestBuildError(
+                f"{task} old policy benchmark is absent from evaluator_identity relations"
+            )
         rows = payload.get("candidates")
         if not isinstance(rows, list) or not rows:
             raise ManifestBuildError(f"old candidate manifest for {task} is empty")
@@ -1088,7 +1396,9 @@ def _build_in_memory(
                 manifest_path=path,
                 manifest_sha256=manifest_sha256,
                 manifest_rlinf_commit=old_rlinf_commit,
-                manifest_benchmark_commit=benchmark_commit,
+                manifest_benchmark_commit=old_benchmark_commit,
+                evaluator_identity=evaluator_identity,
+                allowed_benchmark_commits=allowed_benchmark_commits,
                 override=override,
                 context=context,
                 production=production,
@@ -1106,8 +1416,6 @@ def _build_in_memory(
         manifests[task] = {
             "schema_version": CANDIDATE_SCHEMA,
             "task": task,
-            "rlinf_commit": rlinf_commit,
-            "benchmark_commit": benchmark_commit,
             "candidates": candidates,
         }
 
@@ -1121,19 +1429,25 @@ def _build_in_memory(
     planner_provenance = _blank_provenance(_expansion("planner", 0))
     if planner_override is not None:
         planner_provenance = _deep_merge(planner_provenance, planner_override)
-    planner_provenance["benchmark"]["commit"] = benchmark_commit
+    planner_provenance["source"]["rlinf_commit"] = evaluator_identity[
+        "evaluator_rlinf_commit"
+    ]
+    planner_provenance["runtime"]["evaluator_rlinf_commit"] = evaluator_identity[
+        "evaluator_rlinf_commit"
+    ]
+    planner_provenance["benchmark"]["commit"] = evaluator_identity[
+        "evaluator_benchmark_commit"
+    ]
     planner["provenance"] = _validate_provenance(
         planner_provenance,
         candidate=planner,
         task="t1_xyz",
-        benchmark_commit=benchmark_commit,
+        allowed_benchmark_commits=allowed_benchmark_commits,
         production=production,
     )
     manifests["t1_xyz"] = {
         "schema_version": CANDIDATE_SCHEMA,
         "task": "t1_xyz",
-        "rlinf_commit": rlinf_commit,
-        "benchmark_commit": benchmark_commit,
         "candidates": [planner],
     }
     source_kind_by_identity[("t1_xyz", _candidate_semantics(planner))] = (
@@ -1146,7 +1460,7 @@ def _build_in_memory(
             task=task,
             offsets=normalized["offsets"],
             spec_path=spec_path,
-            benchmark_commit=benchmark_commit,
+            allowed_benchmark_commits=allowed_benchmark_commits,
             context=context,
             production=production,
         )
@@ -1161,11 +1475,31 @@ def _build_in_memory(
                 )
 
     for task in EXACT_TASKS:
-        if task in normalized["planner_dominance"]:
-            manifests[task]["planner_dominance"] = copy.deepcopy(
-                normalized["planner_dominance"][task]
-            )
+        manifests[task]["evaluator_identity"] = _portable_evaluator_identity(
+            evaluator_identity,
+            from_task_manifest=True,
+        )
+        manifests[task]["planner_dominance"] = _portable_planner_dominance(
+            normalized["planner_dominance"].get(task),
+            task=task,
+        )
         candidates = manifests[task]["candidates"]
+        task_policy_rlinf_commits = sorted(
+            {
+                candidate["provenance"]["source"]["rlinf_commit"]
+                for candidate in candidates
+                if candidate["kind"] == "policy"
+            }
+        )
+        task_policy_benchmark_commits = sorted(
+            {
+                candidate["provenance"]["benchmark"]["commit"]
+                for candidate in candidates
+                if candidate["kind"] == "policy"
+            }
+        )
+        manifests[task]["policy_rlinf_commits"] = task_policy_rlinf_commits
+        manifests[task]["policy_benchmark_commits"] = task_policy_benchmark_commits
         ids = [row["candidate_id"] for row in candidates]
         if len(ids) != len(set(ids)):
             raise ManifestBuildError(f"{task} output candidate IDs are not unique")
@@ -1193,6 +1527,24 @@ def _build_in_memory(
     unused = sorted(set(range(len(overrides))) - used_overrides)
     if unused:
         raise ManifestBuildError(f"unused provenance overrides at indices {unused}")
+    release_policy_rlinf_commits = sorted(
+        {
+            commit
+            for manifest in manifests.values()
+            for commit in manifest["policy_rlinf_commits"]
+        }
+    )
+    release_policy_benchmark_commits = sorted(
+        {
+            commit
+            for manifest in manifests.values()
+            for commit in manifest["policy_benchmark_commits"]
+        }
+    )
+    if set(release_policy_benchmark_commits) != policy_benchmark_commits:
+        raise ManifestBuildError(
+            "evaluator_identity policy benchmark relations do not exactly cover output policies"
+        )
     summary = {
         "release_id": "RLD2",
         "task_count": len(manifests),
@@ -1200,6 +1552,12 @@ def _build_in_memory(
             task: len(manifests[task]["candidates"]) for task in EXACT_TASKS
         },
         "deduplicated_count": len(context.deduplicated),
+        "evaluator_identity": _portable_evaluator_identity(
+            evaluator_identity,
+            from_task_manifest=False,
+        ),
+        "policy_rlinf_commits": release_policy_rlinf_commits,
+        "policy_benchmark_commits": release_policy_benchmark_commits,
         "production": production,
     }
     return manifests, summary
@@ -1220,15 +1578,83 @@ def _inputs_lines(input_files: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(rows) + "\n"
 
 
+def _release_sha256sums(root: Path) -> str:
+    rows = []
+    for path in sorted(
+        (
+            item
+            for item in root.rglob("*")
+            if item.is_file() and item.name != "SHA256SUMS"
+        ),
+        key=lambda item: item.relative_to(root).as_posix(),
+    ):
+        relative = path.relative_to(root).as_posix()
+        rows.append(f"{_sha256(path)}  {relative}")
+    return "\n".join(rows) + "\n"
+
+
+def _validate_release_sha256sums(root: Path) -> None:
+    path = root / "SHA256SUMS"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ManifestBuildError(f"cannot read release SHA256SUMS: {error}") from error
+    declared: dict[str, str] = {}
+    for index, line in enumerate(lines, start=1):
+        if "  " not in line:
+            raise ManifestBuildError(f"malformed release SHA256SUMS line {index}")
+        sha256, relative = line.split("  ", 1)
+        _require_sha256(sha256, f"release SHA256SUMS line {index}")
+        if not relative or relative in declared:
+            raise ManifestBuildError(
+                "release SHA256SUMS paths must be non-empty and unique"
+            )
+        declared[relative] = sha256
+    actual_paths = {
+        item.relative_to(root).as_posix()
+        for item in root.rglob("*")
+        if item.is_file() and item.name != "SHA256SUMS"
+    }
+    if set(declared) != actual_paths:
+        raise ManifestBuildError("release SHA256SUMS missing/extra file inventory")
+    for relative, expected_sha256 in declared.items():
+        resolved = (root / relative).resolve()
+        if (
+            root.resolve() not in resolved.parents
+            or _sha256(resolved) != expected_sha256
+        ):
+            raise ManifestBuildError(f"release SHA256SUMS mismatch for {relative}")
+
+
 def _write_release(
     staging: Path,
     *,
     manifests: Mapping[str, Mapping[str, Any]],
     context: BuildContext,
     spec_sha256: str,
-    spec: Mapping[str, Any],
     summary: Mapping[str, Any],
 ) -> None:
+    evaluator_evidence = []
+    for sha256, source_path in sorted(context.evaluator_evidence_sources.items()):
+        relative = _portable_evidence_path(sha256)
+        destination = staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, destination)
+        if _sha256(destination) != sha256:
+            raise ManifestBuildError("copied evaluator evidence checksum mismatch")
+        evaluator_evidence.append({"path": relative, "sha256": sha256})
+    calibration_evidence = []
+    for task in EXACT_TASKS:
+        if task not in context.calibration_evidence_sources:
+            continue
+        sha256, source_path = context.calibration_evidence_sources[task]
+        relative = _portable_calibration_path(task, sha256)
+        destination = staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, destination)
+        if _sha256(destination) != sha256:
+            raise ManifestBuildError("copied calibration evidence checksum mismatch")
+        calibration_evidence.append({"task": task, "path": relative, "sha256": sha256})
     manifest_hashes = {}
     for task in EXACT_TASKS:
         path = staging / task / "candidate_manifest.json"
@@ -1246,8 +1672,11 @@ def _write_release(
         "schema_version": RELEASE_SCHEMA,
         "release_id": "RLD2",
         "candidate_schema_version": CANDIDATE_SCHEMA,
-        "rlinf_commit": spec["rlinf_commit"],
-        "benchmark_commit": spec["benchmark_commit"],
+        "evaluator_identity": copy.deepcopy(summary["evaluator_identity"]),
+        "policy_rlinf_commits": list(summary["policy_rlinf_commits"]),
+        "policy_benchmark_commits": list(summary["policy_benchmark_commits"]),
+        "evaluator_evidence": evaluator_evidence,
+        "calibration_evidence": calibration_evidence,
         "tasks": list(EXACT_TASKS),
         "task_manifest_sha256": manifest_hashes,
         "candidate_count": dict(summary["candidate_count"]),
@@ -1259,6 +1688,7 @@ def _write_release(
     }
     release["payload_sha256"] = _payload_sha256(release)
     _write_json(staging / "release_manifest.json", release)
+    (staging / "SHA256SUMS").write_text(_release_sha256sums(staging), encoding="utf-8")
 
 
 def build_release(
@@ -1289,6 +1719,8 @@ def build_release(
         path_maps=_ordered_path_maps(path_maps),
         file_hash_cache={},
         input_files={},
+        evaluator_evidence_sources={},
+        calibration_evidence_sources={},
         inventory_rows=[],
         deduplicated=[],
     )
@@ -1324,7 +1756,6 @@ def build_release(
             manifests=manifests,
             context=context,
             spec_sha256=spec_sha256,
-            spec=spec_payload,
             summary=summary,
         )
         validated = validate_release(staging, production=production)
@@ -1334,7 +1765,12 @@ def build_release(
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    return {**summary, "status": "built", "output_root": str(output_root)}
+    return {
+        **summary,
+        "status": "built",
+        "output_root": str(output_root),
+        "release_manifest_sha256": _sha256(output_root / "release_manifest.json"),
+    }
 
 
 def _read_inventory(path: Path) -> list[dict[str, Any]]:
@@ -1380,15 +1816,122 @@ def _parse_inputs_file(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _validate_evaluator_evidence(
+    value: Any,
+    *,
+    base_dir: Path,
+    release_root: Path,
+    label: str,
+) -> dict[str, Any]:
+    """Resolve portable evidence paths without permitting release-root escape."""
+
+    identity = _validate_evaluator_identity(value, label=label)
+    root = release_root.resolve()
+    for relation in identity["policy_benchmark_relations"]:
+        if relation["relation"] == "identical":
+            continue
+        raw_path = relation["evidence_path"]
+        if Path(raw_path).is_absolute() or _looks_absolute(raw_path):
+            raise ManifestBuildError(
+                f"{label} evaluator evidence path must be relative"
+            )
+        resolved = (base_dir / raw_path).resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ManifestBuildError(
+                f"{label} evaluator evidence escapes the release root"
+            )
+        if not resolved.is_file() or _sha256(resolved) != relation["evidence_sha256"]:
+            raise ManifestBuildError(f"{label} evaluator evidence hash mismatch")
+    return identity
+
+
+def _validate_commit_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ManifestBuildError(f"{label} must be an ordered list")
+    commits = [_require_commit(item, label) for item in value]
+    if commits != sorted(commits) or len(commits) != len(set(commits)):
+        raise ManifestBuildError(f"{label} must be sorted and unique")
+    return commits
+
+
+def _validate_planner_dominance_evidence(
+    value: Any,
+    *,
+    task: str,
+    backend_id: str,
+    manifest_dir: Path,
+    release_root: Path,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or value.get("task") != task:
+        raise ManifestBuildError(f"{task} planner_dominance identity mismatch")
+    if value.get("backend_id") != backend_id:
+        raise ManifestBuildError(
+            f"{task} planner_dominance backend_id differs from evaluator_identity"
+        )
+    calibration = value.get("calibration")
+    expected_keys = {
+        "replay_count",
+        "reset_episode_id",
+        "reset_manifest_sha256",
+        "evidence_path",
+        "evidence_sha256",
+    }
+    if not isinstance(calibration, Mapping) or set(calibration) != expected_keys:
+        raise ManifestBuildError(
+            f"{task} planner-dominance calibration inventory mismatch"
+        )
+    evidence_sha256 = _require_sha256(
+        calibration.get("evidence_sha256"),
+        f"{task} planner-dominance evidence",
+    )
+    evidence_path = calibration.get("evidence_path")
+    if (
+        not isinstance(evidence_path, str)
+        or Path(evidence_path).is_absolute()
+        or (_looks_absolute(evidence_path))
+    ):
+        raise ManifestBuildError(f"{task} calibration evidence path must be relative")
+    resolved = (manifest_dir / evidence_path).resolve()
+    root = release_root.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ManifestBuildError(f"{task} calibration evidence escapes release root")
+    if not resolved.is_file() or _sha256(resolved) != evidence_sha256:
+        raise ManifestBuildError(f"{task} calibration evidence hash mismatch")
+    return copy.deepcopy(dict(value))
+
+
 def validate_release(output_root: Path, *, production: bool = False) -> dict[str, Any]:
     """Validate an already-built release without rewriting any files."""
 
     output_root = output_root.resolve()
+    _validate_release_sha256sums(output_root)
     release_path = output_root / "release_manifest.json"
     release = _load_json(release_path, "RLD2 release manifest")
+    expected_release_keys = {
+        "schema_version",
+        "release_id",
+        "candidate_schema_version",
+        "evaluator_identity",
+        "policy_rlinf_commits",
+        "policy_benchmark_commits",
+        "evaluator_evidence",
+        "calibration_evidence",
+        "tasks",
+        "task_manifest_sha256",
+        "candidate_count",
+        "deduplicated",
+        "input_spec_sha256",
+        "input_inventory_sha256",
+        "inputs_sha256_sha256",
+        "production_validated",
+        "payload_sha256",
+    }
     if (
-        release.get("schema_version") != RELEASE_SCHEMA
-        or release.get("release_id") != "RLD2"
+        set(release) != expected_release_keys
+        or (release.get("schema_version") != RELEASE_SCHEMA)
+        or (release.get("release_id") != "RLD2")
     ):
         raise ManifestBuildError("RLD2 release manifest identity mismatch")
     stored_payload_sha = release.get("payload_sha256")
@@ -1398,10 +1941,62 @@ def validate_release(output_root: Path, *, production: bool = False) -> dict[str
         raise ManifestBuildError("RLD2 release manifest payload hash mismatch")
     if tuple(release.get("tasks", [])) != EXACT_TASKS:
         raise ManifestBuildError("RLD2 release task inventory is not exact14")
-    rlinf_commit = _require_commit(release.get("rlinf_commit"), "release RLinf commit")
-    benchmark_commit = _require_commit(
-        release.get("benchmark_commit"), "release benchmark commit"
+    if release.get("candidate_schema_version") != CANDIDATE_SCHEMA:
+        raise ManifestBuildError("RLD2 release candidate schema mismatch")
+    if "rlinf_commit" in release or "benchmark_commit" in release:
+        raise ManifestBuildError(
+            "RLD2 v0.2 release must not declare singular policy authority commits"
+        )
+    evaluator_identity = _validate_evaluator_evidence(
+        release.get("evaluator_identity"),
+        base_dir=output_root,
+        release_root=output_root,
+        label="RLD2 release manifest",
     )
+    release_policy_rlinf_commits = _validate_commit_list(
+        release.get("policy_rlinf_commits"), "release policy_rlinf_commits"
+    )
+    release_policy_benchmark_commits = _validate_commit_list(
+        release.get("policy_benchmark_commits"), "release policy_benchmark_commits"
+    )
+    relation_commits = [
+        relation["policy_benchmark_commit"]
+        for relation in evaluator_identity["policy_benchmark_relations"]
+    ]
+    if relation_commits != release_policy_benchmark_commits:
+        raise ManifestBuildError(
+            "release evaluator relations do not exactly cover policy_benchmark_commits"
+        )
+    expected_evidence = [
+        {
+            "path": relation["evidence_path"],
+            "sha256": relation["evidence_sha256"],
+        }
+        for relation in evaluator_identity["policy_benchmark_relations"]
+        if relation["relation"] == "checkpoint-compatible"
+    ]
+    if release.get("evaluator_evidence") != expected_evidence:
+        raise ManifestBuildError("release evaluator evidence inventory mismatch")
+    release_calibration_evidence = release.get("calibration_evidence")
+    if not isinstance(release_calibration_evidence, list):
+        raise ManifestBuildError(
+            "release calibration evidence inventory must be a list"
+        )
+    calibration_tasks = [
+        row.get("task")
+        for row in release_calibration_evidence
+        if isinstance(row, Mapping)
+    ]
+    expected_calibration_order = [
+        task for task in EXACT_TASKS if task in calibration_tasks
+    ]
+    if len(calibration_tasks) != len(release_calibration_evidence) or (
+        calibration_tasks != expected_calibration_order
+        or len(calibration_tasks) != len(set(calibration_tasks))
+    ):
+        raise ManifestBuildError(
+            "release calibration evidence inventory must follow exact14 task order"
+        )
     if production and release.get("production_validated") is not True:
         raise ManifestBuildError("release was not built with production validation")
 
@@ -1434,22 +2029,71 @@ def validate_release(output_root: Path, *, production: bool = False) -> dict[str
         expected_inventory[key] = row
 
     actual_inventory_keys = set()
+    recomputed_release_policy_rlinf_commits: set[str] = set()
+    recomputed_release_policy_benchmark_commits: set[str] = set()
+    recomputed_calibration_evidence: list[dict[str, str]] = []
+    allowed_benchmark_commits = set(release_policy_benchmark_commits) | {
+        evaluator_identity["evaluator_benchmark_commit"]
+    }
     for task in EXACT_TASKS:
         path = discovered[task]
         if _sha256(path) != expected_hashes[task]:
             raise ManifestBuildError(f"{task} candidate manifest hash mismatch")
         payload = _load_json(path, f"{task} candidate manifest")
-        if (
+        expected_manifest_keys = {
+            "schema_version",
+            "task",
+            "evaluator_identity",
+            "policy_rlinf_commits",
+            "policy_benchmark_commits",
+            "candidates",
+            "planner_dominance",
+        }
+        if set(payload) != expected_manifest_keys or (
             payload.get("schema_version") != CANDIDATE_SCHEMA
             or payload.get("task") != task
         ):
             raise ManifestBuildError(f"{task} candidate manifest schema/task mismatch")
-        if payload.get("rlinf_commit") != rlinf_commit:
-            raise ManifestBuildError(f"{task} evaluator RLinf commit mismatch")
-        if payload.get("benchmark_commit") != benchmark_commit:
-            raise ManifestBuildError(f"{task} benchmark commit mismatch")
-        if production and not isinstance(payload.get("planner_dominance"), Mapping):
+        manifest_evaluator_identity = _validate_evaluator_evidence(
+            payload.get("evaluator_identity"),
+            base_dir=path.parent,
+            release_root=output_root,
+            label=f"{task} candidate manifest",
+        )
+        if _evaluator_identity_semantics(
+            manifest_evaluator_identity
+        ) != _evaluator_identity_semantics(evaluator_identity):
+            raise ManifestBuildError(
+                f"{task} evaluator_identity differs from the release identity"
+            )
+        task_policy_rlinf_commits = _validate_commit_list(
+            payload.get("policy_rlinf_commits"),
+            f"{task} policy_rlinf_commits",
+        )
+        task_policy_benchmark_commits = _validate_commit_list(
+            payload.get("policy_benchmark_commits"),
+            f"{task} policy_benchmark_commits",
+        )
+        planner_dominance = _validate_planner_dominance_evidence(
+            payload.get("planner_dominance"),
+            task=task,
+            backend_id=evaluator_identity["backend_id"],
+            manifest_dir=path.parent,
+            release_root=output_root,
+        )
+        if production and not isinstance(planner_dominance, Mapping):
             raise ManifestBuildError(f"{task} production planner_dominance is missing")
+        if planner_dominance is not None:
+            calibration = planner_dominance["calibration"]
+            recomputed_calibration_evidence.append(
+                {
+                    "task": task,
+                    "path": _portable_calibration_path(
+                        task, calibration["evidence_sha256"]
+                    ),
+                    "sha256": calibration["evidence_sha256"],
+                }
+            )
         candidates = payload.get("candidates")
         if not isinstance(candidates, list) or len(candidates) != expected_counts[task]:
             raise ManifestBuildError(f"{task} candidate count mismatch")
@@ -1465,15 +2109,23 @@ def validate_release(output_root: Path, *, production: bool = False) -> dict[str
         semantic_keys = [_candidate_semantics(row) for row in candidates]
         if len(semantic_keys) != len(set(semantic_keys)):
             raise ManifestBuildError(f"{task} candidate semantics are duplicated")
+        recomputed_task_policy_rlinf_commits: set[str] = set()
+        recomputed_task_policy_benchmark_commits: set[str] = set()
         for index, candidate in enumerate(candidates):
             provenance = _validate_provenance(
                 candidate.get("provenance"),
                 candidate=candidate,
                 task=task,
-                benchmark_commit=benchmark_commit,
+                allowed_benchmark_commits=allowed_benchmark_commits,
                 production=production,
             )
             if candidate.get("kind") == "policy":
+                recomputed_task_policy_rlinf_commits.add(
+                    provenance["source"]["rlinf_commit"]
+                )
+                recomputed_task_policy_benchmark_commits.add(
+                    provenance["benchmark"]["commit"]
+                )
                 policy_path = candidate.get("policy_path")
                 policy_sha = _require_sha256(
                     candidate.get("policy_sha256"),
@@ -1486,6 +2138,15 @@ def validate_release(output_root: Path, *, production: bool = False) -> dict[str
                     raise ManifestBuildError(
                         f"policy hash mismatch for {task}/{candidate.get('candidate_id')}"
                     )
+            elif (
+                provenance["source"]["rlinf_commit"]
+                != evaluator_identity["evaluator_rlinf_commit"]
+                or provenance["benchmark"]["commit"]
+                != evaluator_identity["evaluator_benchmark_commit"]
+            ):
+                raise ManifestBuildError(
+                    f"{task} planner provenance is not bound to evaluator_identity"
+                )
             inventory = expected_inventory.get((task, index))
             if inventory is None:
                 raise ManifestBuildError(
@@ -1504,9 +2165,41 @@ def validate_release(output_root: Path, *, production: bool = False) -> dict[str
                     f"input inventory provenance mismatch for {task}/{index}"
                 )
             actual_inventory_keys.add((task, index))
+        if sorted(recomputed_task_policy_rlinf_commits) != task_policy_rlinf_commits:
+            raise ManifestBuildError(
+                f"{task} policy_rlinf_commits do not recompute from candidates"
+            )
+        if (
+            sorted(recomputed_task_policy_benchmark_commits)
+            != task_policy_benchmark_commits
+        ):
+            raise ManifestBuildError(
+                f"{task} policy_benchmark_commits do not recompute from candidates"
+            )
+        recomputed_release_policy_rlinf_commits.update(
+            recomputed_task_policy_rlinf_commits
+        )
+        recomputed_release_policy_benchmark_commits.update(
+            recomputed_task_policy_benchmark_commits
+        )
     if actual_inventory_keys != set(expected_inventory):
         raise ManifestBuildError(
             "input inventory contains candidates outside exact14 manifests"
+        )
+    if sorted(recomputed_release_policy_rlinf_commits) != release_policy_rlinf_commits:
+        raise ManifestBuildError(
+            "release policy_rlinf_commits do not recompute from exact14 candidates"
+        )
+    if (
+        sorted(recomputed_release_policy_benchmark_commits)
+        != release_policy_benchmark_commits
+    ):
+        raise ManifestBuildError(
+            "release policy_benchmark_commits do not recompute from exact14 candidates"
+        )
+    if recomputed_calibration_evidence != release_calibration_evidence:
+        raise ManifestBuildError(
+            "release calibration evidence inventory does not recompute from exact14"
         )
 
     inputs_path = output_root / "INPUTS.sha256"
@@ -1523,6 +2216,8 @@ def validate_release(output_root: Path, *, production: bool = False) -> dict[str
         "release_id": "RLD2",
         "task_count": len(EXACT_TASKS),
         "candidate_count": dict(expected_counts),
+        "evaluator_identity": evaluator_identity,
+        "release_manifest_sha256": _sha256(release_path),
         "production": production,
     }
 

@@ -23,8 +23,10 @@ import pytest
 
 from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
     CANDIDATE_SCHEMA,
+    EVALUATOR_IDENTITY_SCHEMA,
     EXACT_TASKS,
     INPUT_SPEC_SCHEMA,
+    LEGACY_CANDIDATE_SCHEMA,
     LEGACY_TASKS,
     PROVENANCE_SCHEMA,
     ManifestBuildError,
@@ -32,17 +34,22 @@ from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
     validate_release,
 )
 
-OLD_RLINF_COMMIT = "1" * 40
-RLD2_RLINF_COMMIT = "2" * 40
-BENCHMARK_COMMIT = "3" * 40
-SOURCE_RLINF_COMMIT = "4" * 40
-EVALUATOR_COMMIT = "5" * 40
+BASE_POLICY_COMMIT = "1" * 40
+SPHERE_POLICY_COMMIT = "2" * 40
+REPLAN_POLICY_COMMIT = "3" * 40
+A4_POLICY_COMMIT = "4" * 40
+D1_POLICY_COMMIT = "5" * 40
+A3_POLICY_COMMIT = "6" * 40
+POLICY_BENCHMARK_COMMIT = "7" * 40
+EVALUATOR_RLINF_COMMIT = "8" * 40
+EVALUATOR_BENCHMARK_COMMIT = "9" * 40
+EVALUATOR_BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
 
 SOURCE_BY_TASK = {
-    "t1_xyz": ("RLE0", None),
-    "t1_so3": ("RLOPT-SO3", "A4"),
-    "t2_se3": ("RLOPT-SE3", "D1"),
-    "p0_grasp": ("RLOPT-P0G", "A3"),
+    "t1_xyz": ("RLE0", None, BASE_POLICY_COMMIT),
+    "t1_so3": ("RLOPT-SO3", "A4", A4_POLICY_COMMIT),
+    "t2_se3": ("RLOPT-SE3", "D1", D1_POLICY_COMMIT),
+    "p0_grasp": ("RLOPT-P0G", "A3", A3_POLICY_COMMIT),
 }
 
 
@@ -66,6 +73,7 @@ def _provenance(
     train_seed: int,
     policy_path: Path,
     policy_sha256: str,
+    source_rlinf_commit: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": PROVENANCE_SCHEMA,
@@ -84,13 +92,13 @@ def _provenance(
         "source": {
             "manifest_path": f"evidence/{experiment.lower()}-formal.json",
             "manifest_sha256": "6" * 64,
-            "rlinf_commit": SOURCE_RLINF_COMMIT,
+            "rlinf_commit": source_rlinf_commit,
         },
         "runtime": {
             "id": "mujoco311-rs140-v1",
-            "evaluator_rlinf_commit": EVALUATOR_COMMIT,
+            "evaluator_rlinf_commit": EVALUATOR_RLINF_COMMIT,
         },
-        "benchmark": {"commit": BENCHMARK_COMMIT},
+        "benchmark": {"commit": POLICY_BENCHMARK_COMMIT},
         "config": {"path": "config.yaml", "sha256": "7" * 64},
         "state_schema": {
             "schema_version": "dynamic-state-v1",
@@ -118,13 +126,20 @@ def _make_inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
     old_policy_root = tmp_path / "old-policies"
     snapshots = {}
     for index, task in enumerate(LEGACY_TASKS):
+        old_rlinf_commit = (
+            SPHERE_POLICY_COMMIT
+            if task == "t4_sphere"
+            else REPLAN_POLICY_COMMIT
+            if task == "t5_replan"
+            else BASE_POLICY_COMMIT
+        )
         policy_path = old_policy_root / task / "best_policy.pt"
         policy_sha256 = _write_blob(policy_path, f"old-policy:{task}")
         payload = {
-            "schema_version": CANDIDATE_SCHEMA,
+            "schema_version": LEGACY_CANDIDATE_SCHEMA,
             "task": task,
-            "rlinf_commit": OLD_RLINF_COMMIT,
-            "benchmark_commit": BENCHMARK_COMMIT,
+            "rlinf_commit": old_rlinf_commit,
+            "benchmark_commit": POLICY_BENCHMARK_COMMIT,
             "candidates": [
                 {"candidate_id": "planner", "kind": "planner"},
                 {
@@ -142,7 +157,7 @@ def _make_inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
         snapshots[str(manifest_path)] = manifest_path.read_bytes()
 
     additions = []
-    for task, (experiment, arm) in SOURCE_BY_TASK.items():
+    for task, (experiment, arm, source_rlinf_commit) in SOURCE_BY_TASK.items():
         policies = []
         for seed in range(1, 6):
             policy_path = tmp_path / "new-policies" / task / f"seed-{seed}.pt"
@@ -158,16 +173,41 @@ def _make_inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
                         train_seed=seed,
                         policy_path=policy_path,
                         policy_sha256=policy_sha256,
+                        source_rlinf_commit=source_rlinf_commit,
                     ),
                 }
             )
         additions.append({"task": task, "policies": policies})
+    compatibility_path = tmp_path / "evidence" / "benchmark-compatibility.json"
+    compatibility_sha256 = _write_blob(
+        compatibility_path,
+        json.dumps(
+            {
+                "policy_benchmark_commit": POLICY_BENCHMARK_COMMIT,
+                "evaluator_benchmark_commit": EVALUATOR_BENCHMARK_COMMIT,
+                "status": "checkpoint-compatible",
+            },
+            sort_keys=True,
+        ),
+    )
     spec = {
         "schema_version": INPUT_SPEC_SCHEMA,
         "release_id": "RLD2",
         "candidate_schema_version": CANDIDATE_SCHEMA,
-        "rlinf_commit": RLD2_RLINF_COMMIT,
-        "benchmark_commit": BENCHMARK_COMMIT,
+        "evaluator_identity": {
+            "schema_version": EVALUATOR_IDENTITY_SCHEMA,
+            "evaluator_rlinf_commit": EVALUATOR_RLINF_COMMIT,
+            "evaluator_benchmark_commit": EVALUATOR_BENCHMARK_COMMIT,
+            "backend_id": EVALUATOR_BACKEND_ID,
+            "policy_benchmark_relations": [
+                {
+                    "policy_benchmark_commit": POLICY_BENCHMARK_COMMIT,
+                    "relation": "checkpoint-compatible",
+                    "evidence_path": str(compatibility_path),
+                    "evidence_sha256": compatibility_sha256,
+                }
+            ],
+        },
         "stochastic_expansion": {
             "include_deterministic": True,
             "exploration_seed_offsets": [1, 2, 3, 4, 5, 6],
@@ -183,6 +223,77 @@ def _make_inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
 
 def _read_spec(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _canonical_payload_sha256(value: dict[str, Any]) -> str:
+    payload = dict(value)
+    payload.pop("payload_sha256", None)
+    canonical = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _refresh_release_integrity(output: Path) -> None:
+    release_path = output / "release_manifest.json"
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    release["task_manifest_sha256"] = {
+        task: hashlib.sha256(
+            (output / task / "candidate_manifest.json").read_bytes()
+        ).hexdigest()
+        for task in EXACT_TASKS
+    }
+    release["payload_sha256"] = _canonical_payload_sha256(release)
+    _write_json(release_path, release)
+    rows = []
+    for path in sorted(
+        (
+            item
+            for item in output.rglob("*")
+            if item.is_file() and item.name != "SHA256SUMS"
+        ),
+        key=lambda item: item.relative_to(output).as_posix(),
+    ):
+        rows.append(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  "
+            f"{path.relative_to(output).as_posix()}"
+        )
+    (output / "SHA256SUMS").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def _dominance_contract(tmp_path: Path, task: str) -> dict[str, Any]:
+    evidence_path = tmp_path / "calibration" / f"{task}.json"
+    evidence_sha256 = _write_blob(
+        evidence_path,
+        json.dumps(
+            {
+                "schema_version": "test-calibration-v0",
+                "task": task,
+                "backend_id": EVALUATOR_BACKEND_ID,
+                "replays": [1, 2, 3],
+            },
+            sort_keys=True,
+        ),
+    )
+    return {
+        "schema_version": "test-planner-dominance-v0",
+        "task": task,
+        "backend_id": EVALUATOR_BACKEND_ID,
+        "quality_schema": {},
+        "calibration": {
+            "replay_count": 3,
+            "reset_episode_id": f"{task}-reset-0",
+            "reset_manifest_sha256": "a" * 64,
+            "evidence_path": str(evidence_path),
+            "evidence_sha256": evidence_sha256,
+        },
+        "metrics": {},
+        "tie_break_order": [],
+    }
 
 
 def test_build_outputs_exact14_and_preserves_incumbents_and_old_inputs(
@@ -210,6 +321,25 @@ def test_build_outputs_exact14_and_preserves_incumbents_and_old_inputs(
     assert so3["candidates"][1]["candidate_id"] == "t1_so3-incumbent-deterministic"
     assert len(so3["candidates"]) == 37
     assert all("provenance" in candidate for candidate in so3["candidates"])
+    assert so3["policy_rlinf_commits"] == sorted([BASE_POLICY_COMMIT, A4_POLICY_COMMIT])
+    assert "rlinf_commit" not in so3 and "benchmark_commit" not in so3
+    assert so3["evaluator_identity"]["policy_benchmark_relations"][0][
+        "evidence_path"
+    ].startswith("../evidence/benchmark-compatibility/")
+    release = json.loads((output / "release_manifest.json").read_text())
+    assert release["policy_rlinf_commits"] == sorted(
+        {
+            BASE_POLICY_COMMIT,
+            SPHERE_POLICY_COMMIT,
+            REPLAN_POLICY_COMMIT,
+            A4_POLICY_COMMIT,
+            D1_POLICY_COMMIT,
+            A3_POLICY_COMMIT,
+        }
+    )
+    assert release["policy_benchmark_commits"] == [POLICY_BENCHMARK_COMMIT]
+    assert "rlinf_commit" not in release and "benchmark_commit" not in release
+    assert (output / "SHA256SUMS").is_file()
     assert (output / "input_inventory.jsonl").is_file()
     assert (output / "INPUTS.sha256").is_file()
     for path_value, before in old_snapshots.items():
@@ -323,7 +453,7 @@ def test_production_validation_rejects_null_incumbent_provenance(
     old_root, spec_path, _ = _make_inputs(tmp_path)
     spec = _read_spec(spec_path)
     spec["planner_dominance"] = {
-        task: {"schema_version": "test-planner-dominance-v0"} for task in EXACT_TASKS
+        task: _dominance_contract(tmp_path, task) for task in EXACT_TASKS
     }
     _write_json(spec_path, spec)
 
@@ -334,3 +464,165 @@ def test_production_validation_rejects_null_incumbent_provenance(
             output_root=tmp_path / "release",
             production=True,
         )
+
+
+def test_evaluator_compatibility_evidence_hash_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    spec = _read_spec(spec_path)
+    relation = spec["evaluator_identity"]["policy_benchmark_relations"][0]
+    relation["evidence_sha256"] = "0" * 64
+    _write_json(spec_path, spec)
+
+    with pytest.raises(
+        ManifestBuildError, match="benchmark-compatibility-evidence hash mismatch"
+    ):
+        build_release(
+            old_manifest_root=old_root,
+            input_spec=spec_path,
+            output_root=tmp_path / "release",
+        )
+
+
+def test_planner_backend_must_match_evaluator_identity(tmp_path: Path) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    spec = _read_spec(spec_path)
+    contract = _dominance_contract(tmp_path, "t1_xyz")
+    contract["backend_id"] = "wrong-backend"
+    spec["planner_dominance"] = {"t1_xyz": contract}
+    _write_json(spec_path, spec)
+
+    with pytest.raises(ManifestBuildError, match="backend_id mismatch"):
+        build_release(
+            old_manifest_root=old_root,
+            input_spec=spec_path,
+            output_root=tmp_path / "release",
+        )
+
+
+def test_calibration_evidence_is_portable_and_release_inventoried(
+    tmp_path: Path,
+) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    spec = _read_spec(spec_path)
+    spec["planner_dominance"] = {"t1_xyz": _dominance_contract(tmp_path, "t1_xyz")}
+    _write_json(spec_path, spec)
+    output = tmp_path / "release"
+
+    build_release(
+        old_manifest_root=old_root,
+        input_spec=spec_path,
+        output_root=output,
+    )
+    manifest_path = output / "t1_xyz" / "candidate_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    calibration = manifest["planner_dominance"]["calibration"]
+    assert calibration["evidence_path"].startswith("../evidence/calibration/t1_xyz-")
+    release = json.loads((output / "release_manifest.json").read_text())
+    assert release["calibration_evidence"] == [
+        {
+            "task": "t1_xyz",
+            "path": calibration["evidence_path"].removeprefix("../"),
+            "sha256": calibration["evidence_sha256"],
+        }
+    ]
+    validate_release(output)
+
+
+def test_mixed_task_evaluator_identity_fails_after_hashes_are_resealed(
+    tmp_path: Path,
+) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    output = tmp_path / "release"
+    build_release(
+        old_manifest_root=old_root,
+        input_spec=spec_path,
+        output_root=output,
+    )
+    path = output / "t1_belt" / "candidate_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["evaluator_identity"]["evaluator_rlinf_commit"] = "a" * 40
+    _write_json(path, manifest)
+    _refresh_release_integrity(output)
+
+    with pytest.raises(ManifestBuildError, match="differs from the release identity"):
+        validate_release(output)
+
+
+def test_v02_rejects_singular_policy_authority_even_when_resealed(
+    tmp_path: Path,
+) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    output = tmp_path / "release"
+    build_release(
+        old_manifest_root=old_root,
+        input_spec=spec_path,
+        output_root=output,
+    )
+    path = output / "t1_belt" / "candidate_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["rlinf_commit"] = BASE_POLICY_COMMIT
+    _write_json(path, manifest)
+    _refresh_release_integrity(output)
+
+    with pytest.raises(ManifestBuildError, match="schema/task mismatch"):
+        validate_release(output)
+
+
+def test_evaluator_evidence_cannot_escape_release_root(tmp_path: Path) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    output = tmp_path / "release"
+    build_release(
+        old_manifest_root=old_root,
+        input_spec=spec_path,
+        output_root=output,
+    )
+    path = output / "t1_belt" / "candidate_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["evaluator_identity"]["policy_benchmark_relations"][0]["evidence_path"] = (
+        "../../outside.json"
+    )
+    _write_json(path, manifest)
+    _refresh_release_integrity(output)
+
+    with pytest.raises(ManifestBuildError, match="escapes the release root"):
+        validate_release(output)
+
+
+def test_release_sha256sums_rejects_missing_or_extra_files(tmp_path: Path) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    output = tmp_path / "release"
+    build_release(
+        old_manifest_root=old_root,
+        input_spec=spec_path,
+        output_root=output,
+    )
+    (output / "rogue.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ManifestBuildError, match="missing/extra"):
+        validate_release(output)
+
+
+def test_release_calibration_inventory_missing_row_fails_when_resealed(
+    tmp_path: Path,
+) -> None:
+    old_root, spec_path, _ = _make_inputs(tmp_path)
+    spec = _read_spec(spec_path)
+    spec["planner_dominance"] = {"t1_xyz": _dominance_contract(tmp_path, "t1_xyz")}
+    _write_json(spec_path, spec)
+    output = tmp_path / "release"
+    build_release(
+        old_manifest_root=old_root,
+        input_spec=spec_path,
+        output_root=output,
+    )
+    release_path = output / "release_manifest.json"
+    release = json.loads(release_path.read_text())
+    release["calibration_evidence"] = []
+    release["payload_sha256"] = _canonical_payload_sha256(release)
+    _write_json(release_path, release)
+    _refresh_release_integrity(output)
+
+    with pytest.raises(ManifestBuildError, match="does not recompute"):
+        validate_release(output)
