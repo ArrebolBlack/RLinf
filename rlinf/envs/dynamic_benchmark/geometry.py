@@ -77,6 +77,16 @@ def pose_xyzw_to_wxyz(pose_xyzw: Any) -> np.ndarray:
     return np.concatenate([pose[:3], quat_xyzw_to_wxyz(pose[3:])])
 
 
+def pose_wxyz_to_xyzw(pose_wxyz: Any) -> np.ndarray:
+    """Reorder a wxyz pose to [x, y, z, qx, qy, qz, qw]."""
+
+    pose = _as_array(pose_wxyz, context="pose_wxyz_to_xyzw")
+    if pose.shape != (7,):
+        raise ValueError(f"pose must be length 7, got {pose.shape}")
+    quat = _normalized_quat(pose[3:])
+    return np.concatenate([pose[:3], quat[[1, 2, 3, 0]]])
+
+
 def invert_pose_wxyz(pose_wxyz: Any) -> np.ndarray:
     """Invert a rigid transform given as [x, y, z, qw, qx, qy, qz]."""
 
@@ -136,6 +146,46 @@ def quaternion_geodesic_wxyz(quat_a_wxyz: Any, quat_b_wxyz: Any) -> float:
     return 2.0 * float(np.arccos(np.clip(dot, -1.0, 1.0)))
 
 
+def closing_axis_object_alignment_rad(
+    object_pose_wxyz: Any,
+    fingerpad_closing_axis_world: Any,
+    object_axis_local: Any = (1.0, 0.0, 0.0),
+) -> float:
+    """Return the closing/object-axis angle modulo finger exchange."""
+
+    object_pose = _as_array(object_pose_wxyz, context="alignment.object")
+    closing_axis = _as_array(
+        fingerpad_closing_axis_world, context="alignment.closing_axis"
+    ).reshape(-1)
+    local_axis = _as_array(object_axis_local, context="alignment.object_axis").reshape(
+        -1
+    )
+    if object_pose.shape != (7,):
+        raise ValueError("alignment requires a length-7 object pose")
+    if closing_axis.shape != (3,) or local_axis.shape != (3,):
+        raise ValueError("alignment axes must be length 3")
+    closing_norm = float(np.linalg.norm(closing_axis))
+    local_norm = float(np.linalg.norm(local_axis))
+    if closing_norm <= 0.0 or local_norm <= 0.0:
+        raise ValueError("alignment axes must have non-zero norm")
+    closing_axis = closing_axis / closing_norm
+    local_axis = local_axis / local_norm
+    object_axis_world = quat_wxyz_to_matrix(object_pose[3:]) @ local_axis
+    cosine = float(np.clip(np.abs(np.dot(closing_axis, object_axis_world)), -1.0, 1.0))
+    return float(np.arccos(cosine))
+
+
+def quaternion_yaw_wxyz(quat_wxyz: Any) -> float:
+    """Return the extrinsic-z yaw angle of a wxyz quaternion."""
+
+    w, x, y, z = _normalized_quat(
+        _as_array(quat_wxyz, context="quaternion_yaw_wxyz")
+    )
+    return float(
+        np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    )
+
+
 def rotation_vector_world(
     prev_pose_wxyz: Any,
     cur_pose_wxyz: Any,
@@ -190,13 +240,16 @@ def eef_velocity_world(
 
 
 __all__ = [
+    "closing_axis_object_alignment_rad",
     "compose_pose_wxyz",
     "eef_velocity_world",
     "invert_pose_wxyz",
     "object_in_eef_pose_wxyz",
     "pose_xyzw_to_wxyz",
+    "pose_wxyz_to_xyzw",
     "quat_wxyz_to_matrix",
     "quat_xyzw_to_wxyz",
     "quaternion_geodesic_wxyz",
+    "quaternion_yaw_wxyz",
     "rotation_vector_world",
 ]

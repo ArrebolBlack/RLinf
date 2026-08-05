@@ -32,6 +32,7 @@ import torch
 
 from .feature_registry import FeatureRegistry
 from .geometry import (
+    closing_axis_object_alignment_rad,
     eef_velocity_world,
     object_in_eef_pose_wxyz,
     quaternion_geodesic_wxyz,
@@ -701,6 +702,13 @@ class DynamicBenchmarkEnv(gym.Env):
             timeout_penalty=float(_cfg_get(self.cfg, "reward_timeout_penalty", -1.0)),
             step_penalty=float(_cfg_get(self.cfg, "reward_step_penalty", -0.01)),
             action_l2_scale=float(_cfg_get(self.cfg, "reward_action_l2_scale", -0.001)),
+            lift_shaping_weight=float(
+                _cfg_get(self.cfg, "reward_lift_shaping_weight", 0.0)
+            ),
+            orientation_shaping_weight=float(
+                _cfg_get(self.cfg, "reward_orientation_shaping_weight", 0.0)
+            ),
+            lift_target_m=float(_cfg_get(self.cfg, "reward_lift_target_m", 0.08)),
         )
 
     @property
@@ -791,6 +799,9 @@ class DynamicBenchmarkEnv(gym.Env):
                 task_ids=self._task_ids,
                 observation=observation,
                 factors=request.factors,
+                derived_features=tuple(
+                    _cfg_get(self.cfg, "state_derived_features", [])
+                ),
             )
         base = self._state_schema.encode(
             observation=observation,
@@ -1073,6 +1084,11 @@ class DynamicBenchmarkEnv(gym.Env):
         process_planner_action_s = np.zeros(self.num_envs, dtype=np.float64)
         process_environment_step_s = np.zeros(self.num_envs, dtype=np.float64)
         stepped = np.zeros(self.num_envs, dtype=bool)
+        dense_shaping_enabled = any(
+            tracker.dense_shaping_enabled for tracker in self.reward_trackers
+        )
+        object_z_rows = np.full(self.num_envs, np.nan, dtype=np.float64)
+        alignment_error_rows = np.full(self.num_envs, np.nan, dtype=np.float64)
         active_items: list[tuple[int, np.ndarray]] = []
         for index in range(self.num_envs):
             if self._needs_reset[index]:
@@ -1149,6 +1165,20 @@ class DynamicBenchmarkEnv(gym.Env):
             request = self._requests[index]
             assert request is not None
             event_name_rows[index] = list(event_names)
+            if dense_shaping_enabled:
+                privileged = result.observation.privileged
+                try:
+                    object_z_rows[index] = float(
+                        np.asarray(privileged["object_pose_wxyz"])[2]
+                    )
+                    alignment_error_rows[index] = float(
+                        closing_axis_object_alignment_rad(
+                            privileged["object_pose_wxyz"],
+                            privileged["fingerpad_closing_axis_world"],
+                        )
+                    )
+                except (KeyError, IndexError, ValueError, TypeError):
+                    pass
             active_stage_progresses[index] = float(result.active_stage_progress)
             geometry = self._current_geometry(result.observation)
             ee_velocity = self._update_eef_velocity(index, result.observation)
@@ -1163,6 +1193,16 @@ class DynamicBenchmarkEnv(gym.Env):
                 terminated=bool(result.terminated),
                 truncated=bool(result.truncated),
                 termination_reason=result.termination_reason,
+                object_z_m=(
+                    float(object_z_rows[index])
+                    if np.isfinite(object_z_rows[index])
+                    else None
+                ),
+                alignment_error_rad=(
+                    float(alignment_error_rows[index])
+                    if np.isfinite(alignment_error_rows[index])
+                    else None
+                ),
             )
             registry_inputs = {
                 "action_l2": float(np.square(action.values).sum()),
@@ -1217,6 +1257,30 @@ class DynamicBenchmarkEnv(gym.Env):
         if self.record_metrics:
             self.returns += reward_tensor
             self.success_once |= success_tensor
+        reward_inputs: dict[str, Any] = {
+            "stepped": torch.as_tensor(stepped, dtype=torch.bool),
+            "action": torch.as_tensor(applied_action_array, dtype=torch.float64),
+            "event_names": event_name_rows,
+            "active_stage_progress": torch.as_tensor(
+                active_stage_progresses, dtype=torch.float64
+            ),
+            "success": success_tensor.clone(),
+            "terminated": termination_tensor.clone(),
+            "truncated": truncation_tensor.clone(),
+            "termination_reason": list(termination_reasons),
+            "registry": registry_input_rows,
+        }
+        if dense_shaping_enabled:
+            reward_inputs.update(
+                {
+                    "object_z_m": torch.as_tensor(
+                        object_z_rows, dtype=torch.float64
+                    ),
+                    "alignment_error_rad": torch.as_tensor(
+                        alignment_error_rows, dtype=torch.float64
+                    ),
+                }
+            )
         infos: dict[str, Any] = {
             "success": success_tensor,
             "trajectory_completion": completion_tensor,
@@ -1227,19 +1291,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 )
                 for name in sorted({name for row in component_rows for name in row})
             },
-            "reward_inputs": {
-                "stepped": torch.as_tensor(stepped, dtype=torch.bool),
-                "action": torch.as_tensor(applied_action_array, dtype=torch.float64),
-                "event_names": event_name_rows,
-                "active_stage_progress": torch.as_tensor(
-                    active_stage_progresses, dtype=torch.float64
-                ),
-                "success": success_tensor.clone(),
-                "terminated": termination_tensor.clone(),
-                "truncated": truncation_tensor.clone(),
-                "termination_reason": list(termination_reasons),
-                "registry": registry_input_rows,
-            },
+            "reward_inputs": reward_inputs,
             "process_timings": {
                 "planner_action_s": torch.as_tensor(
                     process_planner_action_s, dtype=torch.float64
@@ -1432,6 +1484,7 @@ class DynamicBenchmarkEnv(gym.Env):
         }
 
     def _checkpoint_identity(self) -> dict[str, Any]:
+        cfg = getattr(self, "cfg", {})
         identity = {
             "task_id": self.task_id,
             "split": self.split_name,
@@ -1445,6 +1498,23 @@ class DynamicBenchmarkEnv(gym.Env):
             "process_start_method": self.process_start_method,
             "state_schema": self.state_schema,
         }
+        lift_weight = float(_cfg_get(cfg, "reward_lift_shaping_weight", 0.0))
+        orientation_weight = float(
+            _cfg_get(cfg, "reward_orientation_shaping_weight", 0.0)
+        )
+        derived_features = tuple(_cfg_get(cfg, "state_derived_features", []))
+        if lift_weight or orientation_weight or derived_features:
+            identity.update(
+                {
+                    "reward_lift_shaping_weight": lift_weight,
+                    "reward_orientation_shaping_weight": orientation_weight,
+                    "state_derived_features": derived_features,
+                }
+            )
+        if lift_weight:
+            identity["reward_lift_target_m"] = float(
+                _cfg_get(cfg, "reward_lift_target_m", 0.08)
+            )
         if not self.infra_is_default:
             identity["infra_identity"] = self.infra_identity
         return identity

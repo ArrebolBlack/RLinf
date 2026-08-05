@@ -21,7 +21,8 @@ from typing import Any
 
 import numpy as np
 
-REWARD_SCHEMA_VERSION = "rlinf-dynamic-benchmark-reward-v0.2"
+LEGACY_REWARD_SCHEMA_VERSION = "rlinf-dynamic-benchmark-reward-v0.2"
+REWARD_SCHEMA_VERSION = "rlinf-dynamic-benchmark-reward-v0.3"
 DEFAULT_SAFETY_FAILURES = frozenset(
     {
         "drop",
@@ -48,7 +49,11 @@ DEFAULT_SAFETY_FAILURES = frozenset(
 
 
 class DynamicBenchmarkReward:
-    """Potential-difference reward with terminal and action-cost terms."""
+    """Potential-difference reward with terminal and action-cost terms.
+
+    Optional dense shaping terms are disabled by default (weight 0.0), so
+    baseline runs are numerically identical to reward schema v0.2.
+    """
 
     def __init__(
         self,
@@ -61,6 +66,10 @@ class DynamicBenchmarkReward:
         timeout_penalty: float = -1.0,
         step_penalty: float = -0.01,
         action_l2_scale: float = -0.001,
+        lift_shaping_weight: float = 0.0,
+        orientation_shaping_weight: float = 0.0,
+        lift_target_m: float = 0.08,
+        lift_hold_event: str = "bilateral_hold",
         safety_failures: Sequence[str] = tuple(DEFAULT_SAFETY_FAILURES),
     ) -> None:
         self.success_stages = tuple(success_stages)
@@ -73,29 +82,110 @@ class DynamicBenchmarkReward:
         self.timeout_penalty = float(timeout_penalty)
         self.step_penalty = float(step_penalty)
         self.action_l2_scale = float(action_l2_scale)
+        self.lift_shaping_weight = float(lift_shaping_weight)
+        self.orientation_shaping_weight = float(orientation_shaping_weight)
+        self.lift_target_m = float(lift_target_m)
+        self.lift_hold_event = str(lift_hold_event)
         self.safety_failures = frozenset(safety_failures)
+        if (
+            not np.isfinite(self.lift_shaping_weight)
+            or self.lift_shaping_weight < 0.0
+        ):
+            raise ValueError("lift_shaping_weight must be finite and non-negative")
+        if (
+            not np.isfinite(self.orientation_shaping_weight)
+            or self.orientation_shaping_weight < 0.0
+        ):
+            raise ValueError(
+                "orientation_shaping_weight must be finite and non-negative"
+            )
+        if not np.isfinite(self.lift_target_m) or self.lift_target_m <= 0.0:
+            raise ValueError("lift_target_m must be finite and positive")
         self._previous_potential = 0.0
+        self._lift_hold_seen = False
+        self._object_z_at_hold: float | None = None
+        self._previous_lift_potential = 0.0
+        self._previous_orientation_potential = 0.0
 
     def reset(self) -> None:
         self._previous_potential = 0.0
+        self._lift_hold_seen = False
+        self._object_z_at_hold = None
+        self._previous_lift_potential = 0.0
+        self._previous_orientation_potential = 0.0
 
-    def state_dict(self) -> dict[str, float | str]:
+    @property
+    def dense_shaping_enabled(self) -> bool:
+        """Whether the optional SO(3) diagnostic shaping state is active."""
+
+        return bool(self.lift_shaping_weight or self.orientation_shaping_weight)
+
+    def state_dict(self) -> dict[str, float | str | bool | None]:
         """Return the minimal state required for bit-exact reward resume."""
 
+        if not self.dense_shaping_enabled:
+            return {
+                "schema_version": LEGACY_REWARD_SCHEMA_VERSION,
+                "previous_potential": self._previous_potential,
+            }
         return {
             "schema_version": REWARD_SCHEMA_VERSION,
             "previous_potential": self._previous_potential,
+            "lift_hold_seen": self._lift_hold_seen,
+            "object_z_at_hold": self._object_z_at_hold,
+            "previous_lift_potential": self._previous_lift_potential,
+            "previous_orientation_potential": self._previous_orientation_potential,
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore reward potential after validating its schema and range."""
 
-        if state.get("schema_version") != REWARD_SCHEMA_VERSION:
+        schema_version = state.get("schema_version")
+        if schema_version not in {
+            LEGACY_REWARD_SCHEMA_VERSION,
+            REWARD_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported Dynamic Benchmark reward checkpoint schema")
+        if (
+            schema_version == LEGACY_REWARD_SCHEMA_VERSION
+            and self.dense_shaping_enabled
+        ):
+            raise ValueError(
+                "reward v0.2 checkpoint cannot resume enabled dense shaping"
+            )
         previous = float(state["previous_potential"])
         if not np.isfinite(previous) or not 0.0 <= previous <= 1.0:
             raise ValueError("reward previous_potential must be finite and in [0, 1]")
         self._previous_potential = previous
+        if schema_version == REWARD_SCHEMA_VERSION:
+            required = {
+                "lift_hold_seen",
+                "object_z_at_hold",
+                "previous_lift_potential",
+                "previous_orientation_potential",
+            }
+            missing = sorted(required - set(state))
+            if missing:
+                raise ValueError(
+                    f"reward v0.3 checkpoint is missing fields: {missing}"
+                )
+        self._lift_hold_seen = bool(state.get("lift_hold_seen", False))
+        object_z_at_hold = state.get("object_z_at_hold")
+        self._object_z_at_hold = (
+            None if object_z_at_hold is None else float(object_z_at_hold)
+        )
+        if self._object_z_at_hold is not None and not np.isfinite(
+            self._object_z_at_hold
+        ):
+            raise ValueError("reward object_z_at_hold must be finite or None")
+        for name in (
+            "previous_lift_potential",
+            "previous_orientation_potential",
+        ):
+            value = float(state.get(name, 0.0))
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"reward {name} must be finite and in [0, 1]")
+            setattr(self, f"_{name}", value)
 
     def potential(
         self, *, event_names: Sequence[str], active_stage_progress: float
@@ -121,6 +211,8 @@ class DynamicBenchmarkReward:
         terminated: bool,
         truncated: bool,
         termination_reason: str | None,
+        object_z_m: float | None = None,
+        alignment_error_rad: float | None = None,
     ) -> tuple[float, dict[str, float]]:
         action_array = np.asarray(action, dtype=np.float64)
         if action_array.shape != (7,) or not np.all(np.isfinite(action_array)):
@@ -128,6 +220,51 @@ class DynamicBenchmarkReward:
         current_potential = self.potential(
             event_names=event_names,
             active_stage_progress=active_stage_progress,
+        )
+        if object_z_m is not None and not np.isfinite(float(object_z_m)):
+            raise ValueError("reward object_z_m must be finite or None")
+        if alignment_error_rad is not None and not np.isfinite(
+            float(alignment_error_rad)
+        ):
+            raise ValueError("reward alignment_error_rad must be finite or None")
+        if not self._lift_hold_seen and self.lift_hold_event in event_names:
+            self._lift_hold_seen = True
+        if (
+            self._lift_hold_seen
+            and self._object_z_at_hold is None
+            and object_z_m is not None
+        ):
+            self._object_z_at_hold = (
+                float(object_z_m) if object_z_m is not None else None
+            )
+        lift_potential = self._previous_lift_potential
+        if (
+            self._lift_hold_seen
+            and self._object_z_at_hold is not None
+            and object_z_m is not None
+        ):
+            lift_potential = float(
+                np.clip(
+                    (float(object_z_m) - self._object_z_at_hold)
+                    / self.lift_target_m,
+                    0.0,
+                    1.0,
+                )
+            )
+        orientation_potential = self._previous_orientation_potential
+        if alignment_error_rad is not None:
+            orientation_potential = float(
+                np.clip(
+                    1.0 - float(alignment_error_rad) / (np.pi / 2.0),
+                    0.0,
+                    1.0,
+                )
+            )
+        lift_shaping = self.lift_shaping_weight * (
+            lift_potential - self._previous_lift_potential
+        )
+        orientation_shaping = self.orientation_shaping_weight * (
+            orientation_potential - self._previous_orientation_potential
         )
         components = {
             "progress": self.progress_scale
@@ -139,6 +276,13 @@ class DynamicBenchmarkReward:
             "safety": 0.0,
             "timeout": 0.0,
         }
+        if self.dense_shaping_enabled:
+            components.update(
+                {
+                    "lift_shaping": float(lift_shaping),
+                    "orientation_shaping": float(orientation_shaping),
+                }
+            )
         if terminated and not success:
             if termination_reason in self.safety_failures:
                 components["safety"] = self.safety_penalty
@@ -147,14 +291,20 @@ class DynamicBenchmarkReward:
         elif truncated:
             components["timeout"] = self.timeout_penalty
         self._previous_potential = current_potential
+        self._previous_lift_potential = lift_potential
+        self._previous_orientation_potential = orientation_potential
         total = float(sum(components.values()))
         components["total"] = total
         components["potential"] = current_potential
         return total, components
 
     def to_dict(self) -> Mapping[str, Any]:
-        return {
-            "schema_version": REWARD_SCHEMA_VERSION,
+        payload = {
+            "schema_version": (
+                REWARD_SCHEMA_VERSION
+                if self.dense_shaping_enabled
+                else LEGACY_REWARD_SCHEMA_VERSION
+            ),
             "success_stages": list(self.success_stages),
             "progress_scale": self.progress_scale,
             "success_bonus": self.success_bonus,
@@ -165,10 +315,21 @@ class DynamicBenchmarkReward:
             "action_l2_scale": self.action_l2_scale,
             "safety_failures": sorted(self.safety_failures),
         }
+        if self.dense_shaping_enabled:
+            payload.update(
+                {
+                    "lift_shaping_weight": self.lift_shaping_weight,
+                    "orientation_shaping_weight": self.orientation_shaping_weight,
+                    "lift_target_m": self.lift_target_m,
+                    "lift_hold_event": self.lift_hold_event,
+                }
+            )
+        return payload
 
 
 __all__ = [
     "DEFAULT_SAFETY_FAILURES",
     "DynamicBenchmarkReward",
+    "LEGACY_REWARD_SCHEMA_VERSION",
     "REWARD_SCHEMA_VERSION",
 ]

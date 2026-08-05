@@ -610,7 +610,16 @@ def test_borrowed_evaluation_prepare_failure_restores_training_state(
     assert runtime.training_checkpoint is None
 
 
-def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state() -> None:
+@pytest.mark.parametrize(
+    "checkpoint_schema",
+    (
+        "rlinf-dynamic-benchmark-checkpoint-v0.2",
+        "rlinf-dynamic-benchmark-checkpoint-v0.3",
+    ),
+)
+def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
+    checkpoint_schema: str,
+) -> None:
     identity = {"task_id": "t4_sphere", "num_envs": 2}
     request_rows = [
         {
@@ -663,7 +672,7 @@ def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state() ->
             self._manifest_cursor = self.num_envs
 
     checkpoint = {
-        "schema_version": "rlinf-dynamic-benchmark-checkpoint-v0.2",
+        "schema_version": checkpoint_schema,
         "identity": identity,
         "identity_sha256": hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

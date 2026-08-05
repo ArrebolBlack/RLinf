@@ -89,6 +89,9 @@ class TrainConfig:
     actor_bc_weight: float
     residual_scale: float
     reward_safety_penalty: float
+    reward_lift_shaping_weight: float
+    reward_orientation_shaping_weight: float
+    state_derived_features: tuple[str, ...]
     critic_lr: float
     alpha_lr: float
     initial_alpha: float
@@ -502,6 +505,24 @@ def _parser() -> argparse.ArgumentParser:
         default=-10.0,
         help="Terminal reward applied to safety failures during training.",
     )
+    parser.add_argument(
+        "--reward-lift-shaping-weight",
+        type=float,
+        default=0.0,
+        help="Dense post-grasp lift shaping weight (non-negative).",
+    )
+    parser.add_argument(
+        "--reward-orientation-shaping-weight",
+        type=float,
+        default=0.0,
+        help="Dense grasp-axis alignment shaping weight (non-negative).",
+    )
+    parser.add_argument(
+        "--state-derived-feature",
+        action="append",
+        default=[],
+        help="Current-state derived feature name (repeatable).",
+    )
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--initial-alpha", type=float, default=0.01)
@@ -605,6 +626,9 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         actor_bc_weight=args.actor_bc_weight,
         residual_scale=args.residual_scale,
         reward_safety_penalty=args.reward_safety_penalty,
+        reward_lift_shaping_weight=args.reward_lift_shaping_weight,
+        reward_orientation_shaping_weight=args.reward_orientation_shaping_weight,
+        state_derived_features=tuple(args.state_derived_feature),
         critic_lr=args.critic_lr,
         alpha_lr=args.alpha_lr,
         initial_alpha=args.initial_alpha,
@@ -687,6 +711,24 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         or config.reward_safety_penalty > 0.0
     ):
         raise ValueError("reward_safety_penalty must be finite and non-positive")
+    if (
+        not math.isfinite(config.reward_lift_shaping_weight)
+        or config.reward_lift_shaping_weight < 0.0
+    ):
+        raise ValueError("reward_lift_shaping_weight must be finite and non-negative")
+    if (
+        not math.isfinite(config.reward_orientation_shaping_weight)
+        or config.reward_orientation_shaping_weight < 0.0
+    ):
+        raise ValueError(
+            "reward_orientation_shaping_weight must be finite and non-negative"
+        )
+    if config.state_derived_features:
+        from rlinf.envs.dynamic_benchmark.state_schema import DERIVED_FEATURES
+
+        unknown = sorted(set(config.state_derived_features) - set(DERIVED_FEATURES))
+        if unknown:
+            raise ValueError(f"unknown derived state features: {unknown}")
     if config.algorithm in {"bc", "rlpd", "residual_rlpd"} and config.demo_episodes < 1:
         raise ValueError("BC/RLPD requires at least one demonstration episode")
     if config.batch_size < 2 or config.replay_capacity < config.batch_size:
@@ -726,6 +768,9 @@ def _env_cfg(
         "reward_safety_penalty": config.reward_safety_penalty,
         "features": dict(getattr(config, "features", {}) or {}),
         "reward_components": dict(getattr(config, "reward_components", {}) or {}),
+        "reward_lift_shaping_weight": config.reward_lift_shaping_weight,
+        "reward_orientation_shaping_weight": config.reward_orientation_shaping_weight,
+        "state_derived_features": list(config.state_derived_features),
     }
 
 
@@ -888,6 +933,9 @@ def _demo_replay_identity(
         "demo_max_attempts": config.demo_max_attempts,
         "allow_failed_demos": config.allow_failed_demos,
         "reward_safety_penalty": config.reward_safety_penalty,
+        "reward_lift_shaping_weight": config.reward_lift_shaping_weight,
+        "reward_orientation_shaping_weight": config.reward_orientation_shaping_weight,
+        "state_derived_features": list(config.state_derived_features),
         "train_manifest_seed": config.train_manifest_seed,
         "manifest_size": config.manifest_size,
         "image_size": config.image_size,
@@ -1317,9 +1365,10 @@ def _rewind_evaluation_environment(
 ) -> None:
     """Reset a frozen evaluation manifest without replaying expensive sim state."""
 
-    if initial_checkpoint.get("schema_version") != (
-        "rlinf-dynamic-benchmark-checkpoint-v0.2"
-    ):
+    if initial_checkpoint.get("schema_version") not in {
+        "rlinf-dynamic-benchmark-checkpoint-v0.2",
+        "rlinf-dynamic-benchmark-checkpoint-v0.3",
+    }:
         raise ValueError("unsupported evaluation rewind checkpoint schema")
     expected_identity = env._checkpoint_identity()
     checkpoint_identity = dict(initial_checkpoint["identity"])

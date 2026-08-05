@@ -75,6 +75,12 @@ def _independent_trackers(env: DynamicBenchmarkEnv) -> list[DynamicBenchmarkRewa
             timeout_penalty=schema["timeout_penalty"],
             step_penalty=schema["step_penalty"],
             action_l2_scale=schema["action_l2_scale"],
+            lift_shaping_weight=schema.get("lift_shaping_weight", 0.0),
+            orientation_shaping_weight=schema.get(
+                "orientation_shaping_weight", 0.0
+            ),
+            lift_target_m=schema.get("lift_target_m", 0.08),
+            lift_hold_event=schema.get("lift_hold_event", "bilateral_hold"),
             safety_failures=schema["safety_failures"],
         )
         for _ in range(env.num_envs)
@@ -92,6 +98,19 @@ def _verify_reward(
     for index, tracker in enumerate(trackers):
         if not bool(inputs["stepped"][index]):
             continue
+        object_z_m = inputs.get("object_z_m")
+        alignment_error_rad = inputs.get("alignment_error_rad")
+        object_z_value = (
+            None
+            if object_z_m is None or not np.isfinite(float(object_z_m[index]))
+            else float(object_z_m[index])
+        )
+        alignment_value = (
+            None
+            if alignment_error_rad is None
+            or not np.isfinite(float(alignment_error_rad[index]))
+            else float(alignment_error_rad[index])
+        )
         total, expected = tracker.step(
             action=inputs["action"][index].numpy(),
             event_names=inputs["event_names"][index],
@@ -100,6 +119,8 @@ def _verify_reward(
             terminated=bool(inputs["terminated"][index]),
             truncated=bool(inputs["truncated"][index]),
             termination_reason=inputs["termination_reason"][index],
+            object_z_m=object_z_value,
+            alignment_error_rad=alignment_value,
         )
         maximum_error = max(maximum_error, abs(total - float(reward[index])))
         for name, value in expected.items():

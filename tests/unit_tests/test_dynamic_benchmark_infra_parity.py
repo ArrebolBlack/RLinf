@@ -133,6 +133,20 @@ def test_checkpoint_identity_records_infra_only_when_enabled() -> None:
     assert enabled_env._checkpoint_identity() != other_env._checkpoint_identity()
 
 
+def test_checkpoint_identity_records_lift_target_when_shaping_is_enabled() -> None:
+    env = _bare_env()
+    env.cfg = {
+        "reward_lift_shaping_weight": 2.0,
+        "reward_orientation_shaping_weight": 0.0,
+        "reward_lift_target_m": 0.12,
+    }
+
+    identity = env._checkpoint_identity()
+
+    assert identity["reward_lift_shaping_weight"] == 2.0
+    assert identity["reward_lift_target_m"] == 0.12
+
+
 def test_enabled_feature_reencode_is_deterministic_after_restore() -> None:
     """Simulate load_checkpoint_state's re-encode after restoring derived state."""
 
