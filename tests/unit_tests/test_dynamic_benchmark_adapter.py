@@ -20,7 +20,10 @@ import numpy as np
 import pytest
 
 from rlinf.envs import SupportedEnvType
-from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
+from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
+    DynamicBenchmarkEnv,
+    _task_quality_make_kwargs,
+)
 from rlinf.envs.dynamic_benchmark.reward import DynamicBenchmarkReward
 from rlinf.envs.dynamic_benchmark.state_schema import (
     ALLOWED_PRIVILEGED_KEYS,
@@ -47,6 +50,18 @@ def _observation() -> SimpleNamespace:
 
 def test_dynamic_benchmark_env_type_is_registered() -> None:
     assert SupportedEnvType("dynamic_benchmark") is SupportedEnvType.DYNAMIC_BENCHMARK
+
+
+def test_task_quality_constructor_identity_is_explicit_and_paired() -> None:
+    assert _task_quality_make_kwargs(None, None) == {}
+    assert _task_quality_make_kwargs("quality-v1", "backend-v1") == {
+        "task_quality_schema_version": "quality-v1",
+        "task_quality_evaluator_backend_id": "backend-v1",
+    }
+    with pytest.raises(ValueError, match="requires both"):
+        _task_quality_make_kwargs("quality-v1", None)
+    with pytest.raises(ValueError, match="trimmed"):
+        _task_quality_make_kwargs(" quality-v1", "backend-v1")
 
 
 def test_manifest_cache_round_trip_validates_identity_without_regeneration() -> None:

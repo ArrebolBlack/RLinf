@@ -122,7 +122,14 @@ def _tree_sha256sums(root: Path) -> str:
 
 
 def _environment_config(
-    *, task: str, split: str, manifest_seed: int, image_size: int, policy: Mapping[str, Any] | None
+    *,
+    task: str,
+    split: str,
+    manifest_seed: int,
+    image_size: int,
+    policy: Mapping[str, Any] | None,
+    task_quality_schema_version: str,
+    task_quality_evaluator_backend_id: str,
 ) -> dict[str, Any]:
     config = {
         "task_id": task,
@@ -134,6 +141,8 @@ def _environment_config(
         "auto_reset": False,
         "ignore_terminations": False,
         "group_size": 1,
+        "task_quality_schema_version": task_quality_schema_version,
+        "task_quality_evaluator_backend_id": task_quality_evaluator_backend_id,
     }
     if policy is not None:
         config.update(
@@ -207,6 +216,7 @@ def collect_compatibility_probe(
         from se3_wam.benchmark.config import task_config_sha256
         from se3_wam.benchmark.contracts import canonical_json
         from se3_wam.benchmark.evaluation import manifest_record
+        from se3_wam.benchmark.task_quality import task_quality_schema_manifest
 
         from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
             DynamicBenchmarkEnv,
@@ -248,6 +258,10 @@ def collect_compatibility_probe(
             manifest_seed=normalized["manifest_seed"],
             image_size=int(config.get("image_size", 64)),
             policy=config,
+            task_quality_schema_version=task_quality_schema_manifest(
+                normalized["task"]
+            )["schema_version"],
+            task_quality_evaluator_backend_id=BACKEND_ID,
         )
         env = DynamicBenchmarkEnv(
             cfg=env_config,
@@ -517,6 +531,15 @@ def collect_planner_calibration(
     """Replay one frozen planner action tape in three fresh environments."""
 
     normalized = _validate_job(job)
+    quality_schema = contract_template.get("quality_schema")
+    if (
+        not isinstance(quality_schema, Mapping)
+        or quality_schema.get("task_id") != normalized["task"]
+        or not isinstance(quality_schema.get("schema_version"), str)
+        or not quality_schema["schema_version"]
+        or contract_template.get("backend_id") != normalized["backend_id"]
+    ):
+        raise LaunchGateError("planner calibration task-quality contract mismatch")
 
     def build(staging: Path) -> dict[str, Any]:
         from se3_wam.benchmark.contracts import canonical_json
@@ -532,6 +555,8 @@ def collect_planner_calibration(
             manifest_seed=normalized["manifest_seed"],
             image_size=normalized["image_size"],
             policy=None,
+            task_quality_schema_version=quality_schema["schema_version"],
+            task_quality_evaluator_backend_id=normalized["backend_id"],
         )
 
         def make_env() -> Any:

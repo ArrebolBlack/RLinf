@@ -36,11 +36,32 @@ from examples.embodiment.prepare_dynamic_benchmark_rld2_launch_gate import (
     _build_package,
     validate_package,
 )
+from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
+    _environment_config,
+)
 
 POLICY_COMMIT = "1" * 40
 BENCHMARK_COMMIT = "2" * 40
 EVALUATOR_COMMIT = "3" * 40
 EVALUATOR_BENCHMARK_COMMIT = "4" * 40
+
+
+def test_rld2_environment_config_explicitly_enables_task_quality() -> None:
+    config = _environment_config(
+        task="t1_xyz",
+        split="validation",
+        manifest_seed=20262150,
+        image_size=64,
+        policy=None,
+        task_quality_schema_version="db0-episode-task-quality-v1",
+        task_quality_evaluator_backend_id="mujoco311-rs140-v1-rld2-quality",
+    )
+
+    assert config["task_quality_schema_version"] == "db0-episode-task-quality-v1"
+    assert (
+        config["task_quality_evaluator_backend_id"]
+        == "mujoco311-rs140-v1-rld2-quality"
+    )
 
 
 def _write_json(path: Path, value: Any) -> None:

@@ -55,6 +55,36 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     return getattr(cfg, key, default)
 
 
+def _task_quality_make_kwargs(
+    schema_version: Any,
+    evaluator_backend_id: Any,
+) -> dict[str, str]:
+    """Validate and return the opt-in canonical task-quality constructor args."""
+
+    if (schema_version is None) != (evaluator_backend_id is None):
+        raise ValueError(
+            "Dynamic Benchmark task quality requires both schema version and "
+            "evaluator backend ID"
+        )
+    if schema_version is None:
+        return {}
+    if (
+        not isinstance(schema_version, str)
+        or not schema_version
+        or schema_version != schema_version.strip()
+        or not isinstance(evaluator_backend_id, str)
+        or not evaluator_backend_id
+        or evaluator_backend_id != evaluator_backend_id.strip()
+    ):
+        raise ValueError(
+            "Dynamic Benchmark task-quality identities must be non-empty trimmed strings"
+        )
+    return {
+        "task_quality_schema_version": schema_version,
+        "task_quality_evaluator_backend_id": evaluator_backend_id,
+    }
+
+
 def _torch_clone(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.clone()
@@ -181,11 +211,16 @@ class _DynamicBenchmarkProcessHandler:
 
             self._make_privileged_teacher = make_privileged_teacher
         self._indices = indices
+        task_quality_kwargs = _task_quality_make_kwargs(
+            payload.get("task_quality_schema_version"),
+            payload.get("task_quality_evaluator_backend_id"),
+        )
         self._envs = {
             index: make_mujoco_env(
                 self._task_id,
                 image_size=int(payload["image_size"]),
                 camera_observations=bool(payload["camera_observations"]),
+                **task_quality_kwargs,
             )
             for index in indices
         }
@@ -415,6 +450,16 @@ class DynamicBenchmarkEnv(gym.Env):
         if self.image_size < 64:
             raise ValueError("Dynamic Benchmark image_size must be at least 64")
         self.camera_observations = bool(_cfg_get(cfg, "camera_observations", False))
+        task_quality_kwargs = _task_quality_make_kwargs(
+            _cfg_get(cfg, "task_quality_schema_version", None),
+            _cfg_get(cfg, "task_quality_evaluator_backend_id", None),
+        )
+        self.task_quality_schema_version = task_quality_kwargs.get(
+            "task_quality_schema_version"
+        )
+        self.task_quality_evaluator_backend_id = task_quality_kwargs.get(
+            "task_quality_evaluator_backend_id"
+        )
         self.auto_reset = bool(_cfg_get(cfg, "auto_reset", True))
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
         self.worker_threads = int(_cfg_get(cfg, "worker_threads", 1))
@@ -471,6 +516,7 @@ class DynamicBenchmarkEnv(gym.Env):
                     "image_size": self.image_size,
                     "camera_observations": self.camera_observations,
                     "process_residual_planner": self.process_residual_planner,
+                    **task_quality_kwargs,
                 },
                 start_method=self.process_start_method,
                 timeout_s=self.process_timeout_s,
@@ -495,6 +541,7 @@ class DynamicBenchmarkEnv(gym.Env):
                     self.task_id,
                     image_size=self.image_size,
                     camera_observations=self.camera_observations,
+                    **task_quality_kwargs,
                 )
                 for _ in range(self.num_envs)
             ]
@@ -1537,6 +1584,11 @@ class DynamicBenchmarkEnv(gym.Env):
             )
         if not self.infra_is_default:
             identity["infra_identity"] = self.infra_identity
+        if self.task_quality_schema_version is not None:
+            identity["task_quality"] = {
+                "schema_version": self.task_quality_schema_version,
+                "evaluator_backend_id": self.task_quality_evaluator_backend_id,
+            }
         return identity
 
     def load_checkpoint_state(

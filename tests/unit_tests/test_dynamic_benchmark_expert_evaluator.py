@@ -180,6 +180,8 @@ def test_expert_rollout_and_replay_use_separate_fresh_raw_envs() -> None:
         task_id = "t5_replan"
         image_size = 64
         camera_observations = False
+        task_quality_schema_version = "quality-v1"
+        task_quality_evaluator_backend_id = "backend-v1"
         horizon_steps = 120
 
         def __init__(self) -> None:
@@ -244,6 +246,26 @@ def test_expert_rollout_and_replay_use_separate_fresh_raw_envs() -> None:
     )
 
     assert result == {"passed": True}
+    assert vector_env.make_calls == [
+        (
+            "t5_replan",
+            {
+                "image_size": 64,
+                "camera_observations": False,
+                "task_quality_schema_version": "quality-v1",
+                "task_quality_evaluator_backend_id": "backend-v1",
+            },
+        ),
+        (
+            "t5_replan",
+            {
+                "image_size": 64,
+                "camera_observations": False,
+                "task_quality_schema_version": "quality-v1",
+                "task_quality_evaluator_backend_id": "backend-v1",
+            },
+        ),
+    ]
     assert vector_env.replay.closed
     assert vector_env.arm_calls == [
         (vector_env.rollout, request),

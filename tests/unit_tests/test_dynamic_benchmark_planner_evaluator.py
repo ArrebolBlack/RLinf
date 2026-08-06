@@ -160,6 +160,8 @@ def test_planner_rollout_replaces_raw_env_and_resets_requested_row_once() -> Non
         task_id = "t5_replan"
         image_size = 64
         camera_observations = False
+        task_quality_schema_version = "quality-v1"
+        task_quality_evaluator_backend_id = "backend-v1"
         horizon_steps = 120
 
         def __init__(self) -> None:
@@ -199,7 +201,15 @@ def test_planner_rollout_replaces_raw_env_and_resets_requested_row_once() -> Non
 
     assert observation == "fresh-observation"
     assert vector_env.make_calls == [
-        ("t5_replan", {"image_size": 64, "camera_observations": False})
+        (
+            "t5_replan",
+            {
+                "image_size": 64,
+                "camera_observations": False,
+                "task_quality_schema_version": "quality-v1",
+                "task_quality_evaluator_backend_id": "backend-v1",
+            },
+        )
     ]
     assert vector_env.fresh.reset_calls == [request]
     assert vector_env.arm_calls == [(vector_env.fresh, request)]

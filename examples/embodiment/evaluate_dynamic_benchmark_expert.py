@@ -325,10 +325,19 @@ def _replay_actions_on_fresh_env(
         from se3_wam.benchmark.evaluation import replay_actions
 
         replay_fn = replay_actions
+    from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
+        _task_quality_make_kwargs,
+    )
+
+    task_quality_kwargs = _task_quality_make_kwargs(
+        getattr(vector_env, "task_quality_schema_version", None),
+        getattr(vector_env, "task_quality_evaluator_backend_id", None),
+    )
     raw_env = vector_env._make_mujoco_env(
         task_id,
         image_size=vector_env.image_size,
         camera_observations=vector_env.camera_observations,
+        **task_quality_kwargs,
     )
     try:
         return replay_fn(
@@ -349,10 +358,19 @@ def _reset_rollout_on_fresh_env(*, vector_env: Any, request: Any) -> Any:
         raise ValueError("expert evaluation requires exactly one vector member")
     if request.task_id != vector_env.task_id:
         raise ValueError("expert evaluation request task does not match the environment")
+    from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
+        _task_quality_make_kwargs,
+    )
+
+    task_quality_kwargs = _task_quality_make_kwargs(
+        getattr(vector_env, "task_quality_schema_version", None),
+        getattr(vector_env, "task_quality_evaluator_backend_id", None),
+    )
     raw_env = vector_env._make_mujoco_env(
         vector_env.task_id,
         image_size=vector_env.image_size,
         camera_observations=vector_env.camera_observations,
+        **task_quality_kwargs,
     )
     try:
         if int(raw_env.horizon_steps) != int(vector_env.horizon_steps):
