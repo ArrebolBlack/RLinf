@@ -1573,8 +1573,15 @@ def _validate_calibration_evidence(
         "payload_sha256",
     }:
         raise ReleaseAuditError(f"{task} calibration evidence field inventory mismatch")
+    calibration_evaluator_identity = {
+        "evaluator_rlinf_commit": evaluator_identity_raw["evaluator_rlinf_commit"],
+        "evaluator_benchmark_commit": evaluator_identity_raw[
+            "evaluator_benchmark_commit"
+        ],
+        "backend_id": evaluator_identity_raw["backend_id"],
+    }
     expected_evaluator_sha256 = hashlib.sha256(
-        _canonical_json(evaluator_identity_raw).encode("utf-8")
+        _canonical_json(calibration_evaluator_identity).encode("utf-8")
     ).hexdigest()
     if (
         evidence.get("schema_version") != CALIBRATION_EVIDENCE_SCHEMA

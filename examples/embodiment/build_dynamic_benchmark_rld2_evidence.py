@@ -105,6 +105,30 @@ def _payload_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def _calibration_evaluator_identity(value: Mapping[str, Any]) -> dict[str, str]:
+    """Return the planner-only evaluator identity bound by calibration.
+
+    Checkpoint compatibility relations describe policy inputs, while planner
+    calibration executes no policy.  Keeping them out of this projection also
+    makes the measured calibration portable into a candidate release whose
+    relation evidence has release-relative paths.
+    """
+
+    return {
+        "evaluator_rlinf_commit": _require_commit(
+            value.get("evaluator_rlinf_commit"),
+            "calibration evaluator RLinf commit",
+        ),
+        "evaluator_benchmark_commit": _require_commit(
+            value.get("evaluator_benchmark_commit"),
+            "calibration evaluator benchmark commit",
+        ),
+        "backend_id": _require_string(
+            value.get("backend_id"), "calibration evaluator backend"
+        ),
+    }
+
+
 def _artifact_bytes(value: Mapping[str, Any]) -> bytes:
     return (
         json.dumps(dict(value), allow_nan=False, indent=2) + "\n"
@@ -590,13 +614,7 @@ def build_calibration_evidence(
     evaluator_identity = raw.get("evaluator_identity")
     if not isinstance(evaluator_identity, Mapping):
         raise EvidenceError("calibration evaluator identity is missing")
-    _require_commit(
-        evaluator_identity.get("evaluator_rlinf_commit"), "calibration evaluator RLinf commit"
-    )
-    _require_commit(
-        evaluator_identity.get("evaluator_benchmark_commit"),
-        "calibration evaluator benchmark commit",
-    )
+    calibration_evaluator_identity = _calibration_evaluator_identity(evaluator_identity)
     if evaluator_identity.get("backend_id") != backend_id:
         raise EvidenceError("calibration evaluator backend mismatch")
     if raw.get("split") not in {"train", "validation"} or raw.get(
@@ -616,7 +634,7 @@ def build_calibration_evidence(
         "schema_version": CALIBRATION_EVIDENCE_SCHEMA,
         "task": task,
         "backend_id": backend_id,
-        "evaluator_identity_sha256": _payload_sha256(evaluator_identity),
+        "evaluator_identity_sha256": _payload_sha256(calibration_evaluator_identity),
         "split": raw["split"],
         "test_exposure": dict(raw["test_exposure"]),
         "reset_manifest_sha256": reset_manifest_sha256,
@@ -671,7 +689,8 @@ def validate_calibration_evidence(
         evidence.get("schema_version") != CALIBRATION_EVIDENCE_SCHEMA
         or evidence.get("task") != contract.get("task")
         or evidence.get("backend_id") != contract.get("backend_id")
-        or evidence.get("evaluator_identity_sha256") != _payload_sha256(evaluator_identity)
+        or evidence.get("evaluator_identity_sha256")
+        != _payload_sha256(_calibration_evaluator_identity(evaluator_identity))
         or evidence.get("split") not in {"train", "validation"}
         or evidence.get("test_exposure") != {"test_id": False, "test_ood": False}
         or evidence.get("reset_manifest_sha256") != calibration.get("reset_manifest_sha256")

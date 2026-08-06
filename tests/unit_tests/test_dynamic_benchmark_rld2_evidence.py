@@ -269,6 +269,13 @@ def test_calibration_builds_fresh_replay_drifts_and_validates() -> None:
     assert drifts["control_steps"] == 0.0
     assert contract["calibration"]["replay_count"] == 3
     assert len(contract["calibration"]["evidence_sha256"]) == 64
+    assert evidence["evaluator_identity_sha256"] == _payload_sha256(
+        {
+            "evaluator_rlinf_commit": EVALUATOR_RLinf,
+            "evaluator_benchmark_commit": EVALUATOR_BENCHMARK,
+            "backend_id": BACKEND_ID,
+        }
+    )
 
 
 def test_calibration_rejects_reused_environment_and_test_exposure() -> None:

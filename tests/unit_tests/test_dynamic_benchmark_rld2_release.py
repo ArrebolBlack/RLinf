@@ -402,7 +402,13 @@ def _make_fixture(tmp_path: Path) -> _Fixture:
             "schema_version": "rlinf-dynamic-benchmark-planner-calibration-evidence-v0.1",
             "task": task,
             "backend_id": BACKEND_ID,
-            "evaluator_identity_sha256": _payload_sha256(task_identity),
+            "evaluator_identity_sha256": _payload_sha256(
+                {
+                    "evaluator_rlinf_commit": EVALUATOR_RLinf,
+                    "evaluator_benchmark_commit": EVALUATOR_BENCHMARK,
+                    "backend_id": BACKEND_ID,
+                }
+            ),
             "split": "validation",
             "test_exposure": {"test_id": False, "test_ood": False},
             "reset_manifest_sha256": "2" * 64,

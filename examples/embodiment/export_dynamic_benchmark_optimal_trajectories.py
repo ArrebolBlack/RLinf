@@ -1471,7 +1471,17 @@ def _validate_calibration_evidence(
         evidence.get("task") != planner_dominance["task"]
         or evidence.get("backend_id") != planner_dominance["backend_id"]
         or evidence.get("evaluator_identity_sha256")
-        != _payload_sha256(evaluator_identity)
+        != _payload_sha256(
+            {
+                "evaluator_rlinf_commit": evaluator_identity[
+                    "evaluator_rlinf_commit"
+                ],
+                "evaluator_benchmark_commit": evaluator_identity[
+                    "evaluator_benchmark_commit"
+                ],
+                "backend_id": evaluator_identity["backend_id"],
+            }
+        )
     ):
         raise ValueError("planner calibration evaluator identity mismatch")
     if evidence.get("split") not in {"train", "validation"} or evidence.get(
