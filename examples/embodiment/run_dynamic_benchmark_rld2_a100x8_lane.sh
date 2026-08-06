@@ -31,8 +31,7 @@ run_id="$3"
 run_root="$4"
 
 [[ -d "$package_root" ]] || die "package root is missing"
-[[ "$lane" =~ ^L[0-7]$ && "$lane" != "L1" ]] ||
-  die "lane must be one of L0,L2-L7"
+[[ "$lane" =~ ^L[0-7]$ ]] || die "lane must be one of L0-L7"
 [[ "$run_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "unsafe run id"
 [[ ! -e "$run_root" ]] || die "refusing to overwrite run root"
 
@@ -58,9 +57,17 @@ root = Path(sys.argv[1]).resolve()
 lane = sys.argv[2]
 package = json.loads((root / "launch_package.json").read_text())
 plan = json.loads((root / "lanes" / f"{lane}.json").read_text())
-if package.get("status") != "blocked-awaiting-allocation":
+allowed_lanes = [f"L{index}" for index in range(8)]
+if (
+    package.get("schema_version")
+    != "rlinf-dynamic-benchmark-rld2-launch-package-v0.2"
+    or package.get("status") != "blocked-awaiting-allocation"
+    or package.get("allowed_lanes") != allowed_lanes
+    or list(package.get("lanes", {})) != allowed_lanes
+    or "forbidden_lane" in package
+):
     raise SystemExit("launch package state mismatch")
-if package.get("forbidden_lane") == lane or lane not in package.get("lanes", {}):
+if lane not in package["lanes"]:
     raise SystemExit("lane is not declared by package")
 if plan.get("lane") != lane:
     raise SystemExit("lane plan identity mismatch")

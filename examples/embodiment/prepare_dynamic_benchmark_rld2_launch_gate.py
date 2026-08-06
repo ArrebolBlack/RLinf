@@ -53,7 +53,7 @@ CHECKPOINT_REQUEST_SCHEMA = (
 )
 CALIBRATION_JOB_SCHEMA = "rlinf-dynamic-benchmark-rld2-calibration-job-v0.1"
 LANE_PLAN_SCHEMA = "rlinf-dynamic-benchmark-rld2-lane-plan-v0.1"
-PACKAGE_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-package-v0.1"
+PACKAGE_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-package-v0.2"
 PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
 POLICY_SCHEMA = "rlinf-dynamic-benchmark-expert-policy-v0.1"
 BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
@@ -63,7 +63,7 @@ REQUIRED_ADDITIONS = {
     "t2_se3": ("RLOPT-SE3", "D1"),
     "p0_grasp": ("RLOPT-P0G", "A3"),
 }
-DEFAULT_LANES = ("L0", "L2", "L3", "L4", "L5", "L6", "L7")
+DEFAULT_LANES = ("L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7")
 LANE_UUIDS = {
     "L0": "GPU-4a88a785-f469-753c-9189-84154bb9a117",
     "L1": "GPU-ebe372b5-0e21-3bd2-35bd-222538da2102",
@@ -627,10 +627,10 @@ def _build_package(
 ) -> dict[str, Any]:
     if output_root.exists():
         raise LaunchGateError(f"refusing to overwrite output root: {output_root}")
-    if not lanes or len(lanes) != len(set(lanes)) or any(lane not in LANE_UUIDS for lane in lanes):
-        raise LaunchGateError("lane inventory is empty, duplicated, or invalid")
-    if "L1" in lanes:
-        raise LaunchGateError("RLD2 launch gate must not schedule blocked L1")
+    if tuple(lanes) != DEFAULT_LANES:
+        raise LaunchGateError(
+            "lane inventory must exactly match L0-L7 in canonical order"
+        )
     rlinf_identity = _git_identity(rlinf_source_root, rlinf_commit, "RLinf")
     se3_identity = _git_identity(se3_source_root, se3_commit, "SE3-WAM")
     spec = _source_spec(source_spec_path)
@@ -971,9 +971,9 @@ def _build_package(
             "rlinf_source": rlinf_identity,
             "se3_source": se3_identity,
             "backend_id": backend_id,
+            "allowed_lanes": list(DEFAULT_LANES),
             "lanes": lane_plans,
             "allocation_required_before_execution": True,
-            "forbidden_lane": "L1",
         }
         package["payload_sha256"] = _payload_sha256(package)
         _write_json(staging / "launch_package.json", package)
@@ -1004,6 +1004,7 @@ def validate_package(root: Path) -> dict[str, Any]:
     root = root.resolve()
     _validate_sha256sums(root)
     package = _load_json(root / "launch_package.json", "launch package")
+    lane_summaries = package.get("lanes")
     if (
         package.get("schema_version") != PACKAGE_SCHEMA
         or tuple(package.get("tasks", [])) != EXACT_TASKS
@@ -1011,7 +1012,10 @@ def validate_package(root: Path) -> dict[str, Any]:
         or package.get("status") != "blocked-awaiting-allocation"
         or package.get("production_release") is not False
         or package.get("allocation_required_before_execution") is not True
-        or package.get("forbidden_lane") != "L1"
+        or package.get("allowed_lanes") != list(DEFAULT_LANES)
+        or not isinstance(lane_summaries, dict)
+        or tuple(lane_summaries) != DEFAULT_LANES
+        or "forbidden_lane" in package
     ):
         raise LaunchGateError("launch package identity or state mismatch")
     stored_payload = package.get("payload_sha256")
@@ -1036,6 +1040,48 @@ def validate_package(root: Path) -> dict[str, Any]:
             raise LaunchGateError("compatibility request schema mismatch")
         if row.get("lane") not in package["lanes"]:
             raise LaunchGateError("compatibility request uses an undeclared lane")
+    calibration_paths = list(root.glob("calibration/*/job.json"))
+    if {path.parent.name for path in calibration_paths} != set(EXACT_TASKS):
+        raise LaunchGateError("planner calibration job set is not exact14")
+    calibration_jobs = {
+        path.parent.name: _load_json(path, "planner calibration job")
+        for path in calibration_paths
+    }
+    for task, job in calibration_jobs.items():
+        if (
+            job.get("schema_version") != CALIBRATION_JOB_SCHEMA
+            or job.get("task") != task
+            or job.get("lane") not in lane_summaries
+            or job.get("replay_count") != 3
+        ):
+            raise LaunchGateError("planner calibration job identity mismatch")
+    lane_plan_paths = list(root.glob("lanes/*.json"))
+    if {path.stem for path in lane_plan_paths} != set(DEFAULT_LANES):
+        raise LaunchGateError("lane plan set is not exact L0-L7")
+    for lane in DEFAULT_LANES:
+        plan = _load_json(root / "lanes" / f"{lane}.json", "lane plan")
+        expected_calibration = [
+            f"calibration/{task}/job.json"
+            for task in EXACT_TASKS
+            if calibration_jobs[task]["lane"] == lane
+        ]
+        expected_requests = [
+            row["request_id"] for row in requests if row["lane"] == lane
+        ]
+        if (
+            plan.get("schema_version") != LANE_PLAN_SCHEMA
+            or plan.get("release_id") != "RLD2"
+            or plan.get("lane") != lane
+            or plan.get("expected_gpu_uuid") != LANE_UUIDS[lane]
+            or plan.get("calibration_jobs") != expected_calibration
+            or plan.get("compatibility_request_ids") != expected_requests
+            or lane_summaries[lane]
+            != {
+                "calibration_job_count": len(expected_calibration),
+                "compatibility_request_count": len(expected_requests),
+            }
+        ):
+            raise LaunchGateError("lane plan coverage or identity mismatch")
     return {
         "status": "validated",
         "task_count": len(manifests),

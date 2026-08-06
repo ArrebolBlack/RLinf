@@ -27,7 +27,9 @@ from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
     LEGACY_TASKS,
 )
 from examples.embodiment.prepare_dynamic_benchmark_rld2_launch_gate import (
+    DEFAULT_LANES,
     LAUNCH_CANDIDATE_SCHEMA,
+    PACKAGE_SCHEMA,
     REQUIRED_ADDITIONS,
     SOURCE_SPEC_SCHEMA,
     LaunchGateError,
@@ -202,7 +204,7 @@ def test_prepare_exact14_launch_gate_and_validate(
         se3_source_root=se3_root,
         se3_commit=EVALUATOR_BENCHMARK_COMMIT,
         backend_id="mujoco311-rs140-v1-rld2-quality",
-        lanes=("L0", "L2"),
+        lanes=DEFAULT_LANES,
         manifest_seed=20262150,
         checkpoint_loader=lambda path: payloads[str(path.resolve())],
         quality_schema_loader=_quality_schema,
@@ -213,9 +215,12 @@ def test_prepare_exact14_launch_gate_and_validate(
     validated = validate_package(output)
     assert validated["task_count"] == 14
     package = json.loads((output / "launch_package.json").read_text())
+    assert package["schema_version"] == PACKAGE_SCHEMA
     assert package["status"] == "blocked-awaiting-allocation"
     assert package["production_release"] is False
-    assert package["forbidden_lane"] == "L1"
+    assert package["allowed_lanes"] == list(DEFAULT_LANES)
+    assert tuple(package["lanes"]) == DEFAULT_LANES
+    assert "forbidden_lane" not in package
     manifests = {
         path.parent.name: json.loads(path.read_text())
         for path in output.glob("candidates/*/candidate_manifest.json")
@@ -228,13 +233,13 @@ def test_prepare_exact14_launch_gate_and_validate(
     )
     assert len(manifests["t1_xyz"]["candidates"]) == 36
     assert len(manifests["t1_so3"]["candidates"]) == 37
-    assert len(package["lanes"]) == 2
+    assert len(package["lanes"]) == 8
     assert sum(
         row["calibration_job_count"] for row in package["lanes"].values()
     ) == 14
 
 
-def test_prepare_refuses_overwrite_and_blocked_l1(
+def test_prepare_refuses_overwrite_and_non_exact_lane_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old_root, source_spec, payloads = _inputs(tmp_path)
@@ -262,10 +267,16 @@ def test_prepare_refuses_overwrite_and_blocked_l1(
         "quality_schema_loader": _quality_schema,
     }
     with pytest.raises(LaunchGateError, match="overwrite"):
-        _build_package(**kwargs, lanes=("L0",))
+        _build_package(**kwargs, lanes=DEFAULT_LANES)
     output.rmdir()
-    with pytest.raises(LaunchGateError, match="blocked L1"):
-        _build_package(**kwargs, lanes=("L1",))
+    invalid_lane_sets = (
+        DEFAULT_LANES[:-1],
+        DEFAULT_LANES + ("L7",),
+        tuple(reversed(DEFAULT_LANES)),
+    )
+    for lanes in invalid_lane_sets:
+        with pytest.raises(LaunchGateError, match="exactly match L0-L7"):
+            _build_package(**kwargs, lanes=lanes)
 
 
 def test_package_validation_detects_tampering(
@@ -290,7 +301,7 @@ def test_package_validation_detects_tampering(
         se3_source_root=se3_root,
         se3_commit=EVALUATOR_BENCHMARK_COMMIT,
         backend_id="mujoco311-rs140-v1-rld2-quality",
-        lanes=("L0",),
+        lanes=DEFAULT_LANES,
         manifest_seed=20262150,
         checkpoint_loader=lambda path: payloads[str(path.resolve())],
         quality_schema_loader=_quality_schema,

@@ -625,7 +625,7 @@ def run_lane(package_root: Path, lane: str, output_root: Path) -> dict[str, Any]
     package_root = package_root.resolve()
     validate_package(package_root)
     package = _load_json(package_root / "launch_package.json", "launch package")
-    if lane not in package["lanes"] or lane == package["forbidden_lane"]:
+    if lane not in package["lanes"]:
         raise LaunchGateError(f"lane {lane} is not authorized by the launch package")
     _git_identity(
         Path(package["rlinf_source"]["path"]),
