@@ -757,6 +757,16 @@ def _build_package(
                 expected_seed=policy["seed"],
                 checkpoint_loader=checkpoint_loader,
             )
+            configured_residual = inventory["config"].get("residual_scale")
+            if (
+                group["residual_scale"] is None
+                or isinstance(configured_residual, bool)
+                or not isinstance(configured_residual, (int, float))
+                or float(configured_residual) != float(group["residual_scale"])
+            ):
+                raise LaunchGateError(
+                    f"frozen candidate residual scale differs from checkpoint for {task}"
+                )
             key = (task, inventory["sha256"])
             existing = checkpoint_rows.get(key)
             if existing is not None and existing != inventory:
