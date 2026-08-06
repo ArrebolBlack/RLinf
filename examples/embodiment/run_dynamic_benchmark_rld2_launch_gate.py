@@ -91,7 +91,7 @@ def _payload_sha256(value: Any) -> str:
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(value, allow_nan=False, indent=2) + "\n",
         encoding="utf-8",
     )
 

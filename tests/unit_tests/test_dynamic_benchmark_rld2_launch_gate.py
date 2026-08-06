@@ -40,6 +40,9 @@ from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
     _environment_config,
     copy_json,
 )
+from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
+    _write_json as write_launch_result_json,
+)
 
 POLICY_COMMIT = "1" * 40
 BENCHMARK_COMMIT = "2" * 40
@@ -65,7 +68,9 @@ def test_rld2_environment_config_explicitly_enables_task_quality() -> None:
     )
 
 
-def test_copy_json_preserves_task_quality_component_order() -> None:
+def test_task_quality_component_order_survives_json_round_trips(
+    tmp_path: Path,
+) -> None:
     value = {
         "components": {
             "terminal_goal_planar_error_m": {"value": 0.1},
@@ -74,8 +79,12 @@ def test_copy_json_preserves_task_quality_component_order() -> None:
     }
 
     copied = copy_json(value)
+    output = tmp_path / "calibration_evidence.json"
+    write_launch_result_json(output, copied)
+    persisted = json.loads(output.read_text(encoding="utf-8"))
 
     assert list(copied["components"]) == list(value["components"])
+    assert list(persisted["components"]) == list(value["components"])
     with pytest.raises(ValueError, match="Out of range float values"):
         copy_json({"components": {"quality": {"value": float("nan")}}})
 
