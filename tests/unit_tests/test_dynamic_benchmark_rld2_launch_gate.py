@@ -21,6 +21,9 @@ from typing import Any
 
 import pytest
 
+from examples.embodiment.build_dynamic_benchmark_rld2_evidence import (
+    _artifact_sha256,
+)
 from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
     EXACT_TASKS,
     LEGACY_CANDIDATE_SCHEMA,
@@ -85,6 +88,7 @@ def test_task_quality_component_order_survives_json_round_trips(
 
     assert list(copied["components"]) == list(value["components"])
     assert list(persisted["components"]) == list(value["components"])
+    assert hashlib.sha256(output.read_bytes()).hexdigest() == _artifact_sha256(copied)
     with pytest.raises(ValueError, match="Out of range float values"):
         copy_json({"components": {"quality": {"value": float("nan")}}})
 

@@ -106,7 +106,9 @@ def _payload_sha256(value: Mapping[str, Any]) -> str:
 
 
 def _artifact_bytes(value: Mapping[str, Any]) -> bytes:
-    return (json.dumps(dict(value), indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return (
+        json.dumps(dict(value), allow_nan=False, indent=2) + "\n"
+    ).encode("utf-8")
 
 
 def _artifact_sha256(value: Mapping[str, Any]) -> str:
