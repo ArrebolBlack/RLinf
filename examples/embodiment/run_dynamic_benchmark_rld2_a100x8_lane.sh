@@ -15,6 +15,8 @@
 
 set -Eeuo pipefail
 umask 027
+export GIT_OPTIONAL_LOCKS=0
+export PYTHONDONTWRITEBYTECODE=1
 
 die() {
   printf 'RLD2_LAUNCH_FATAL: %s\n' "$*" >&2
