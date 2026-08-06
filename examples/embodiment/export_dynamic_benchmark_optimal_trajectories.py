@@ -27,8 +27,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,14 @@ from typing import Any
 import numpy as np
 import torch
 
+if __package__ in {None, ""}:
+    # Keep the documented ``python examples/embodiment/<script>.py`` entrypoint
+    # usable without relying on an ambient PYTHONPATH.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from examples.embodiment.build_dynamic_benchmark_rld2_evidence import (
+    validate_compatibility_evidence,
+)
 from examples.embodiment.evaluate_dynamic_benchmark_expert import (
     _device,
     _load_inference_policy,
@@ -51,13 +60,39 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
 )
 
 CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.1"
+CANDIDATE_SCHEMA_V2 = "rlinf-dynamic-benchmark-optimal-candidates-v0.2"
+CANDIDATE_SCHEMAS = (CANDIDATE_SCHEMA, CANDIDATE_SCHEMA_V2)
+EVALUATOR_IDENTITY_SCHEMA = (
+    "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
+)
+CALIBRATION_EVIDENCE_SCHEMA = (
+    "rlinf-dynamic-benchmark-planner-calibration-evidence-v0.1"
+)
+CANDIDATE_RELEASE_SCHEMA = "rlinf-dynamic-benchmark-rld2-candidate-release-v0.2"
 EXPORT_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-v0.1"
 ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.1"
 STATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-state-v0.1"
 PROGRESS_SCHEMA = "rlinf-dynamic-benchmark-optimal-progress-v0.1"
 RENDER_PARITY_SKIP_SCHEMA = "rlinf-dynamic-benchmark-render-parity-skip-v0.1"
+LEGACY_SELECTION_MODE = "legacy-lexicographic"
+PLANNER_PARETO_SELECTION_MODE = "planner-pareto"
+SELECTION_MODES = (LEGACY_SELECTION_MODE, PLANNER_PARETO_SELECTION_MODE)
+FIRST_ELIGIBLE_SEARCH_MODE = "first-eligible"
+FULL_POOL_SEARCH_MODE = "full-pool"
+CANDIDATE_SEARCH_MODES = (FIRST_ELIGIBLE_SEARCH_MODE, FULL_POOL_SEARCH_MODE)
+PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
+BASE_DOMINANCE_METRICS = (
+    "trajectory_completion",
+    "completion_time_s",
+    "control_steps",
+    "action_l2_sum",
+)
 SELECTION_CONTRACT = (
     "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
+)
+PLANNER_PARETO_SELECTION_CONTRACT = (
+    "success,safety,planner-pareto(trajectory_completion,task_quality.*,"
+    "-completion_time_s,-control_steps,-action_l2_sum);return=diagnostic-only"
 )
 
 
@@ -72,6 +107,7 @@ class CandidateSpec:
     stochastic: bool = False
     exploration_seed_offset: int = 0
     residual_scale: float | None = None
+    provenance: Mapping[str, Any] | None = None
 
 
 @dataclass
@@ -86,6 +122,32 @@ class LoadedCandidate:
     normalizer: RunningNormalizer | None = None
 
 
+@dataclass(frozen=True)
+class CompatibilityEvidence:
+    """One portable policy/evaluator benchmark compatibility proof."""
+
+    policy_benchmark_commit: str
+    source_path: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
+class CalibrationEvidence:
+    """Validated replay calibration evidence to make dataset-local."""
+
+    source_path: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ProvenanceFile:
+    """One source file copied into an immutable dataset provenance path."""
+
+    source_path: Path
+    relative_path: str
+    sha256: str
+
+
 def _candidate_identity(spec: CandidateSpec) -> dict[str, Any]:
     """Return a canonical-JSON-safe candidate identity."""
 
@@ -97,6 +159,7 @@ def _candidate_identity(spec: CandidateSpec) -> dict[str, Any]:
         "stochastic": spec.stochastic,
         "exploration_seed_offset": spec.exploration_seed_offset,
         "residual_scale": spec.residual_scale,
+        "provenance": spec.provenance,
     }
 
 
@@ -104,9 +167,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--expected-candidate-manifest-sha256", required=True)
+    parser.add_argument("--candidate-release-manifest", type=Path)
+    parser.add_argument("--expected-candidate-release-manifest-sha256")
     parser.add_argument("--evaluator-commit", required=True)
-    parser.add_argument("--rlinf-commit", required=True)
-    parser.add_argument("--benchmark-commit", required=True)
+    parser.add_argument(
+        "--evaluator-benchmark-commit",
+        help="required by candidate schema v0.2; evaluator SE3-WAM commit",
+    )
+    parser.add_argument("--rlinf-commit", help="candidate schema v0.1 policy commit")
+    parser.add_argument("--benchmark-commit", help="candidate schema v0.1 policy benchmark commit")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--split", choices=("train", "validation"), required=True)
     parser.add_argument("--manifest-seed", type=int, required=True)
@@ -114,6 +183,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-resets", type=int, default=200)
     parser.add_argument("--initial-k", type=int, default=8)
     parser.add_argument("--max-k", type=int, choices=(8, 16, 32), default=32)
+    parser.add_argument(
+        "--candidate-search-mode",
+        choices=CANDIDATE_SEARCH_MODES,
+        default=FIRST_ELIGIBLE_SEARCH_MODE,
+        help=(
+            "first-eligible preserves K escalation; full-pool evaluates every "
+            "manifest candidate for every reset"
+        ),
+    )
+    parser.add_argument(
+        "--selection-mode",
+        choices=SELECTION_MODES,
+        default=LEGACY_SELECTION_MODE,
+    )
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
@@ -126,19 +209,26 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _full_commit(name: str, value: str) -> str:
-    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+def _full_commit(name: str, value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
         raise ValueError(f"{name} must be a full lowercase Git commit")
     return value
 
 
-def _expected_sha256(value: str, name: str) -> str:
-    normalized = value.lower()
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
+def _expected_sha256(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise ValueError(f"{name} must be 64 lowercase hexadecimal characters")
-    return normalized
+    return value
 
 
 def _payload_sha256(payload: Mapping[str, Any]) -> str:
@@ -187,25 +277,639 @@ def _quality_score(record: Mapping[str, Any]) -> tuple[float, ...]:
 
 def _eligible(record: Mapping[str, Any]) -> bool:
     replay = record.get("replay_validation")
+    for key in ("success", "safety_failure", "finite_and_bounded"):
+        if not isinstance(record.get(key), bool):
+            raise ValueError(f"attempt {key} must be boolean")
+    if not isinstance(replay, Mapping) or not isinstance(replay.get("passed"), bool):
+        raise ValueError("attempt replay-validation passed flag must be boolean")
     return bool(
         record.get("success")
         and not record.get("safety_failure")
         and record.get("finite_and_bounded")
-        and isinstance(replay, Mapping)
         and replay.get("passed")
     )
 
 
-def _select_winner(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Select one eligible winner with a stable candidate-index tie-break."""
+def _selection_contract(selection_mode: str) -> str:
+    if selection_mode == LEGACY_SELECTION_MODE:
+        return SELECTION_CONTRACT
+    if selection_mode == PLANNER_PARETO_SELECTION_MODE:
+        return PLANNER_PARETO_SELECTION_CONTRACT
+    raise ValueError(f"unsupported selection mode {selection_mode!r}")
+
+
+def _metric_contract(
+    value: Any,
+    *,
+    metric_name: str,
+    direction: str,
+) -> dict[str, Any]:
+    """Validate one replay-calibrated planner-dominance metric contract."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"planner-dominance metric {metric_name!r} must be a mapping")
+    common = {
+        "direction",
+        "max_observed_replay_drift",
+        "scientific_resolution",
+    }
+    expected = (
+        common | {"numeric_floor_absolute", "numeric_floor_relative"}
+        if metric_name == "action_l2_sum"
+        else common | {"numeric_floor"}
+    )
+    if set(value) != expected or value.get("direction") != direction:
+        raise ValueError(f"planner-dominance metric {metric_name!r} contract mismatch")
+    drift = _finite_number(
+        value["max_observed_replay_drift"],
+        f"planner-dominance metric {metric_name!r} drift",
+    )
+    resolution = _finite_number(
+        value["scientific_resolution"],
+        f"planner-dominance metric {metric_name!r} scientific resolution",
+    )
+    if drift < 0.0:
+        raise ValueError(f"planner-dominance metric {metric_name!r} drift is invalid")
+    if resolution <= 0.0:
+        raise ValueError(f"planner-dominance metric {metric_name!r} resolution is invalid")
+    normalized = {
+        "direction": direction,
+        "max_observed_replay_drift": drift,
+        "scientific_resolution": resolution,
+    }
+    if metric_name == "action_l2_sum":
+        absolute = _finite_number(
+            value["numeric_floor_absolute"],
+            "action_l2_sum absolute numeric floor",
+        )
+        relative = _finite_number(
+            value["numeric_floor_relative"],
+            "action_l2_sum relative numeric floor",
+        )
+        if absolute != 1.0e-6 or relative != 1.0e-6:
+            raise ValueError("action_l2_sum numeric floor must be max(1e-6, 1e-6*|planner|)")
+        normalized.update(
+            numeric_floor_absolute=absolute,
+            numeric_floor_relative=relative,
+        )
+    else:
+        floor = _finite_number(
+            value["numeric_floor"],
+            f"planner-dominance metric {metric_name!r} numeric floor",
+        )
+        expected_floor = 0.0 if metric_name == "control_steps" else 1.0e-6
+        if floor != expected_floor:
+            raise ValueError(
+                f"planner-dominance metric {metric_name!r} numeric floor mismatch"
+            )
+        if metric_name == "control_steps" and resolution < 1.0:
+            raise ValueError("control_steps strict scientific resolution must be at least one")
+        if metric_name == "completion_time_s" and resolution != 0.002:
+            raise ValueError("completion_time_s scientific resolution must be one 0.002 s physics step")
+        normalized["numeric_floor"] = floor
+    return normalized
+
+
+def _finite_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a JSON number, not bool or string")
+    normalized = float(value)
+    if not np.isfinite(normalized):
+        raise ValueError(f"{name} must be finite")
+    return normalized
+
+
+def _validate_planner_dominance_contract(
+    payload: Mapping[str, Any],
+    *,
+    task: str,
+    selection_mode: str,
+) -> dict[str, Any] | None:
+    """Validate the task/backend-specific utility and replay calibration contract."""
+
+    raw = payload.get("planner_dominance")
+    if selection_mode == LEGACY_SELECTION_MODE:
+        if raw is not None:
+            raise ValueError("planner_dominance requires selection-mode=planner-pareto")
+        return None
+    if selection_mode != PLANNER_PARETO_SELECTION_MODE or not isinstance(raw, Mapping):
+        raise ValueError("planner-pareto requires a planner_dominance candidate-manifest contract")
+    expected_keys = {
+        "schema_version",
+        "task",
+        "backend_id",
+        "quality_schema",
+        "calibration",
+        "metrics",
+        "tie_break_order",
+    }
+    if set(raw) != expected_keys or raw.get("schema_version") != PLANNER_DOMINANCE_SCHEMA:
+        raise ValueError("planner-dominance schema or field inventory mismatch")
+    if raw.get("task") != task:
+        raise ValueError("planner-dominance task identity mismatch")
+    backend_id = raw.get("backend_id")
+    if not isinstance(backend_id, str) or not backend_id or backend_id.strip() != backend_id:
+        raise ValueError("planner-dominance backend identity is missing")
+    quality_schema = raw.get("quality_schema")
+    if not isinstance(quality_schema, Mapping) or set(quality_schema) != {
+        "schema_version",
+        "task_id",
+        "task_config_sha256",
+        "components",
+        "schema_sha256",
+    }:
+        raise ValueError("planner-dominance quality schema inventory is invalid")
+    quality_schema_version = quality_schema.get("schema_version")
+    if not isinstance(quality_schema_version, str) or not quality_schema_version:
+        raise ValueError("planner-dominance quality schema version is missing")
+    if quality_schema.get("task_id") != task:
+        raise ValueError("planner-dominance quality schema task identity mismatch")
+    task_config_sha256 = _expected_sha256(
+        quality_schema.get("task_config_sha256"),
+        "planner-dominance task config SHA-256",
+    )
+    quality_schema_sha256 = _expected_sha256(
+        quality_schema.get("schema_sha256"),
+        "planner-dominance quality schema SHA-256",
+    )
+    components = quality_schema.get("components")
+    if not isinstance(components, list) or not components:
+        raise ValueError("planner-dominance quality components are missing")
+    normalized_components: list[dict[str, Any]] = []
+    component_names: set[str] = set()
+    for metadata in components:
+        if (
+            not isinstance(metadata, Mapping)
+            or set(metadata)
+            != {
+                "name",
+                "direction",
+                "unit",
+                "scientific_resolution",
+                "reducer",
+                "source",
+                "description",
+            }
+        ):
+            raise ValueError("planner-dominance quality component metadata is invalid")
+        name = metadata.get("name")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.strip() != name
+            or "." in name
+            or name in component_names
+        ):
+            raise ValueError("planner-dominance quality component name is invalid")
+        direction = metadata.get("direction")
+        unit = metadata.get("unit")
+        reducer = metadata.get("reducer")
+        source = metadata.get("source")
+        description = metadata.get("description")
+        resolution = _finite_number(
+            metadata.get("scientific_resolution"),
+            f"quality component {name!r} scientific resolution",
+        )
+        if direction not in {"minimize", "maximize"}:
+            raise ValueError(f"quality component {name!r} direction is invalid")
+        if not isinstance(unit, str) or not unit:
+            raise ValueError(f"quality component {name!r} unit is missing")
+        if reducer not in {"minimum", "maximum", "terminal"}:
+            raise ValueError(f"quality component {name!r} reducer is invalid")
+        if not isinstance(source, str) or not source or source.strip() != source:
+            raise ValueError(f"quality component {name!r} source is missing")
+        if (
+            not isinstance(description, str)
+            or not description
+            or description.strip() != description
+        ):
+            raise ValueError(f"quality component {name!r} description is missing")
+        if resolution <= 0.0:
+            raise ValueError(f"quality component {name!r} resolution is invalid")
+        component_names.add(name)
+        # Preserve the canonical upstream row byte-for-byte at the JSON-value
+        # level.  The list order and every source/description field are part of
+        # ``schema_sha256``; the name index used below is deliberately separate.
+        normalized_components.append(dict(metadata))
+    normalized_quality_schema = {
+        "schema_version": quality_schema_version,
+        "task_id": task,
+        "task_config_sha256": task_config_sha256,
+        "components": normalized_components,
+        "schema_sha256": quality_schema_sha256,
+    }
+    recomputed_quality_schema_sha256 = _payload_sha256(
+        {
+            "schema_version": quality_schema_version,
+            "task_id": task,
+            "task_config_sha256": task_config_sha256,
+            "components": list(components),
+        }
+    )
+    if quality_schema_sha256 != recomputed_quality_schema_sha256:
+        raise ValueError("planner-dominance quality schema SHA-256 does not recompute")
+    calibration = raw.get("calibration")
+    if not isinstance(calibration, Mapping) or set(calibration) != {
+        "replay_count",
+        "reset_episode_id",
+        "reset_manifest_sha256",
+        "evidence_path",
+        "evidence_sha256",
+    }:
+        raise ValueError("planner-dominance calibration evidence inventory mismatch")
+    replay_count = calibration.get("replay_count")
+    reset_episode_id = calibration.get("reset_episode_id")
+    if isinstance(replay_count, bool) or not isinstance(replay_count, int) or replay_count < 3:
+        raise ValueError("planner-dominance calibration requires at least three replays")
+    if (
+        not isinstance(reset_episode_id, str)
+        or not reset_episode_id
+        or reset_episode_id.strip() != reset_episode_id
+    ):
+        raise ValueError("planner-dominance calibration reset identity is missing")
+    evidence_path = calibration.get("evidence_path")
+    if (
+        not isinstance(evidence_path, str)
+        or not evidence_path
+        or evidence_path.strip() != evidence_path
+    ):
+        raise ValueError("planner-dominance calibration evidence path is missing")
+    normalized_calibration = {
+        "replay_count": replay_count,
+        "reset_episode_id": reset_episode_id,
+        "reset_manifest_sha256": _expected_sha256(
+            calibration.get("reset_manifest_sha256"),
+            "planner-dominance calibration reset manifest SHA-256",
+        ),
+        "evidence_path": evidence_path,
+        "evidence_sha256": _expected_sha256(
+            calibration.get("evidence_sha256"),
+            "planner-dominance calibration evidence SHA-256",
+        ),
+    }
+    metrics = raw.get("metrics")
+    if not isinstance(metrics, Mapping) or set(metrics) != {
+        "trajectory_completion",
+        "task_quality",
+        "completion_time_s",
+        "control_steps",
+        "action_l2_sum",
+    }:
+        raise ValueError("planner-dominance metric inventory mismatch")
+    quality_metrics = metrics.get("task_quality")
+    component_index = {row["name"]: row for row in normalized_components}
+    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(component_index):
+        raise ValueError("planner-dominance quality metric mapping is incomplete")
+    normalized_metrics = {
+        "trajectory_completion": _metric_contract(
+            metrics["trajectory_completion"],
+            metric_name="trajectory_completion",
+            direction="max",
+        ),
+        "task_quality": {
+            name: _metric_contract(
+                quality_metrics[name],
+                metric_name=f"task_quality.{name}",
+                direction=(
+                    "max"
+                    if component_index[name]["direction"] == "maximize"
+                    else "min"
+                ),
+            )
+            for name in component_index
+        },
+        "completion_time_s": _metric_contract(
+            metrics["completion_time_s"],
+            metric_name="completion_time_s",
+            direction="min",
+        ),
+        "control_steps": _metric_contract(
+            metrics["control_steps"],
+            metric_name="control_steps",
+            direction="min",
+        ),
+        "action_l2_sum": _metric_contract(
+            metrics["action_l2_sum"],
+            metric_name="action_l2_sum",
+            direction="min",
+        ),
+    }
+    for name in component_index:
+        if normalized_metrics["task_quality"][name][
+            "scientific_resolution"
+        ] != component_index[name]["scientific_resolution"]:
+            raise ValueError(
+                f"quality component {name!r} calibration resolution differs from schema"
+            )
+    metric_keys = [
+        "trajectory_completion",
+        *(f"task_quality.{name}" for name in component_index),
+        "completion_time_s",
+        "control_steps",
+        "action_l2_sum",
+    ]
+    tie_break_order = raw.get("tie_break_order")
+    if (
+        not isinstance(tie_break_order, list)
+        or len(tie_break_order) != len(metric_keys)
+        or set(tie_break_order) != set(metric_keys)
+    ):
+        raise ValueError("planner-dominance tie-break order must name every quality metric once")
+    normalized = {
+        "schema_version": PLANNER_DOMINANCE_SCHEMA,
+        "task": task,
+        "backend_id": backend_id,
+        "quality_schema": normalized_quality_schema,
+        "calibration": normalized_calibration,
+        "metrics": normalized_metrics,
+        "tie_break_order": list(tie_break_order),
+    }
+    normalized["payload_sha256"] = _payload_sha256(normalized)
+    return normalized
+
+
+def _dominance_metric_keys(contract: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        "trajectory_completion",
+        *(
+            f"task_quality.{component['name']}"
+            for component in contract["quality_schema"]["components"]
+        ),
+        "completion_time_s",
+        "control_steps",
+        "action_l2_sum",
+    )
+
+
+def _metric_spec(contract: Mapping[str, Any], metric_name: str) -> Mapping[str, Any]:
+    if metric_name.startswith("task_quality."):
+        return contract["metrics"]["task_quality"][metric_name.split(".", 1)[1]]
+    return contract["metrics"][metric_name]
+
+
+def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
+    if metric_name.startswith("task_quality."):
+        component = metric_name.split(".", 1)[1]
+        summary = record.get("task_quality")
+        values = summary.get("components") if isinstance(summary, Mapping) else None
+        component_row = values.get(component) if isinstance(values, Mapping) else None
+        if not isinstance(component_row, Mapping) or "value" not in component_row:
+            raise ValueError(
+                f"task quality mapping gap: attempt is missing component {component!r}"
+            )
+        value = _finite_number(
+            component_row["value"],
+            f"task quality component {component!r} value",
+        )
+    else:
+        raw_value = record.get(metric_name)
+        if metric_name == "control_steps":
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, int)
+                or raw_value < 1
+            ):
+                raise ValueError("planner-dominance control_steps must be a positive integer")
+            value = float(raw_value)
+        else:
+            value = _finite_number(
+                raw_value,
+                f"planner-dominance metric {metric_name!r}",
+            )
+            if metric_name == "trajectory_completion" and not 0.0 <= value <= 1.0:
+                raise ValueError("trajectory_completion must be in [0, 1]")
+            if metric_name in {"completion_time_s", "action_l2_sum"} and value < 0.0:
+                raise ValueError(f"planner-dominance metric {metric_name!r} is negative")
+    return value
+
+
+def _validate_attempt_quality(
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> None:
+    summary = record.get("task_quality")
+    schema = contract["quality_schema"]
+    if not isinstance(summary, Mapping):
+        raise ValueError("task quality mapping gap: attempt has no task_quality summary")
+    if set(summary) != {
+        "schema_version",
+        "episode_id",
+        "task_id",
+        "evaluator_backend_id",
+        "schema_sha256",
+        "physics_sample_count",
+        "terminal",
+        "components",
+        "summary_sha256",
+    }:
+        raise ValueError("task quality summary field inventory mismatch")
+    if (
+        summary.get("schema_version") != schema["schema_version"]
+        or summary.get("task_id") != contract["task"]
+        or summary.get("schema_sha256") != schema["schema_sha256"]
+        or summary.get("episode_id") != record.get("episode_id")
+        or summary.get("evaluator_backend_id") != contract["backend_id"]
+    ):
+        raise ValueError("task quality summary identity mismatch")
+    if summary.get("terminal") is not True:
+        raise ValueError("task quality summary must be terminal")
+    summary_sha256 = _expected_sha256(
+        summary.get("summary_sha256"),
+        "task quality summary SHA-256",
+    )
+    summary_payload = dict(summary)
+    summary_payload.pop("summary_sha256")
+    if summary_sha256 != _payload_sha256(summary_payload):
+        raise ValueError("task quality summary SHA-256 does not recompute")
+    sample_count = summary.get("physics_sample_count")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 1:
+        raise ValueError("task quality summary physics sample count is invalid")
+    values = summary.get("components")
+    schema_components = schema["components"]
+    expected_names = [component["name"] for component in schema_components]
+    expected = set(expected_names)
+    if not isinstance(values, Mapping) or set(values) != expected:
+        missing = sorted(expected - set(values) if isinstance(values, Mapping) else expected)
+        extra = sorted(set(values) - expected if isinstance(values, Mapping) else set())
+        raise ValueError(f"task quality mapping gap: missing={missing}, extra={extra}")
+    if list(values) != expected_names:
+        raise ValueError("task quality component order differs from the canonical schema")
+    for frozen_schema in schema_components:
+        name = frozen_schema["name"]
+        component = values[name]
+        frozen = {
+            key: frozen_schema[key]
+            for key in ("direction", "unit", "scientific_resolution", "reducer")
+        }
+        if not isinstance(component, Mapping) or set(component) != {
+            "value",
+            "direction",
+            "unit",
+            "scientific_resolution",
+            "reducer",
+        }:
+            raise ValueError(f"task quality component {name!r} inventory mismatch")
+        _finite_number(
+            component["scientific_resolution"],
+            f"task quality component {name!r} scientific resolution",
+        )
+        if any(component.get(key) != frozen[key] for key in frozen):
+            raise ValueError(f"task quality component {name!r} metadata mismatch")
+        _metric_value(record, f"task_quality.{name}")
+
+
+def _metric_thresholds(
+    metric_name: str,
+    reference_value: float,
+    spec: Mapping[str, Any],
+) -> tuple[float, float]:
+    if metric_name == "action_l2_sum":
+        floor = max(
+            float(spec["numeric_floor_absolute"]),
+            float(spec["numeric_floor_relative"]) * abs(reference_value),
+        )
+    else:
+        floor = float(spec["numeric_floor"])
+    epsilon = max(floor, 2.0 * float(spec["max_observed_replay_drift"]))
+    strict_margin = max(float(spec["scientific_resolution"]), 2.0 * epsilon)
+    if metric_name == "control_steps":
+        strict_margin = max(1.0, strict_margin)
+    return epsilon, strict_margin
+
+
+def _planner_pareto_dominates(
+    record: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> bool:
+    """Return whether record is non-worse on every frozen quality metric."""
+
+    _validate_attempt_quality(record, contract)
+    _validate_attempt_quality(reference, contract)
+    strictly_better = False
+    for metric_name in _dominance_metric_keys(contract):
+        candidate_value = _metric_value(record, metric_name)
+        reference_value = _metric_value(reference, metric_name)
+        spec = _metric_spec(contract, metric_name)
+        epsilon, strict_margin = _metric_thresholds(
+            metric_name,
+            reference_value,
+            spec,
+        )
+        if spec["direction"] == "max":
+            if candidate_value < reference_value - epsilon:
+                return False
+            strictly_better |= candidate_value > reference_value + strict_margin
+        else:
+            if candidate_value > reference_value + epsilon:
+                return False
+            strictly_better |= candidate_value < reference_value - strict_margin
+    return strictly_better
+
+
+def _pareto_frontier(
+    records: list[dict[str, Any]],
+    contract: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in records
+        if not any(
+            other is not record and _planner_pareto_dominates(other, record, contract)
+            for other in records
+        )
+    ]
+
+
+def _planner_pareto_tie_key(
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> tuple[float, ...]:
+    values = []
+    for metric_name in contract["tie_break_order"]:
+        value = _metric_value(record, metric_name)
+        values.append(value if _metric_spec(contract, metric_name)["direction"] == "max" else -value)
+    values.append(-float(int(record["candidate_index"])))
+    return tuple(values)
+
+
+def _select_winner(
+    records: list[dict[str, Any]],
+    *,
+    selection_mode: str = LEGACY_SELECTION_MODE,
+    planner_dominance: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Select one eligible winner under the requested planner comparison."""
 
     eligible = [record for record in records if _eligible(record)]
     if not eligible:
         return None
-    return max(
-        eligible,
-        key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
+    if selection_mode == LEGACY_SELECTION_MODE:
+        if planner_dominance is not None:
+            raise ValueError("legacy selection must not declare planner dominance")
+        selectable = eligible
+        return max(
+            selectable,
+            key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
+        )
+    if selection_mode == PLANNER_PARETO_SELECTION_MODE:
+        if planner_dominance is None:
+            raise ValueError("planner-pareto selection requires a frozen dominance contract")
+        planner = next(
+            (record for record in records if int(record["candidate_index"]) == 0),
+            None,
+        )
+        if planner is None:
+            raise ValueError("planner-pareto selection requires candidate index zero")
+        eligible_rl = [record for record in eligible if int(record["candidate_index"]) != 0]
+        for record in eligible_rl:
+            _validate_attempt_quality(record, planner_dominance)
+        if not _eligible(planner):
+            selectable = eligible_rl
+        else:
+            _validate_attempt_quality(planner, planner_dominance)
+            selectable = [
+                record
+                for record in eligible_rl
+                if _planner_pareto_dominates(record, planner, planner_dominance)
+            ]
+            if not selectable:
+                return planner
+        if not selectable:
+            return None
+        frontier = _pareto_frontier(selectable, planner_dominance)
+        return max(frontier, key=lambda record: _planner_pareto_tie_key(record, planner_dominance))
+    raise ValueError(f"unsupported selection mode {selection_mode!r}")
+
+
+def _selection_result(
+    records: list[dict[str, Any]],
+    winner: Mapping[str, Any] | None,
+    *,
+    selection_mode: str,
+) -> dict[str, Any]:
+    """Record the algorithm-neutral source decision separately from quality metrics."""
+
+    planner = next(
+        (record for record in records if int(record["candidate_index"]) == 0),
+        None,
     )
+    if planner is None:
+        raise ValueError("selection result requires candidate index zero")
+    if selection_mode == LEGACY_SELECTION_MODE:
+        source_kind = "legacy" if winner is not None else "rejected"
+    elif winner is None:
+        source_kind = "rejected"
+    elif int(winner["candidate_index"]) == 0:
+        source_kind = "planner_fallback"
+    else:
+        source_kind = "expert_dominant"
+    return {
+        "source_kind": source_kind,
+        "planner_eligible": _eligible(planner),
+        "winner_candidate_id": None if winner is None else winner["candidate_id"],
+        "winner_candidate_index": None if winner is None else int(winner["candidate_index"]),
+    }
 
 
 def _render_parity_failure_reason(error: BaseException | str) -> str | None:
@@ -251,22 +955,62 @@ def _budget_sequence(initial_k: int, max_k: int) -> tuple[int, ...]:
     return tuple(values)
 
 
+def _candidate_budgets(
+    search_mode: str,
+    *,
+    initial_k: int,
+    max_k: int,
+    candidate_pool_size: int,
+) -> tuple[int, ...]:
+    """Resolve the actual per-reset candidate budgets for a frozen pool."""
+
+    if candidate_pool_size < 1:
+        raise ValueError("candidate pool must not be empty")
+    if search_mode == FULL_POOL_SEARCH_MODE:
+        return (candidate_pool_size,)
+    if search_mode != FIRST_ELIGIBLE_SEARCH_MODE:
+        raise ValueError(f"unsupported candidate search mode {search_mode!r}")
+    if candidate_pool_size < max_k:
+        raise ValueError(f"candidate manifest must contain at least max_k={max_k} candidates")
+    return _budget_sequence(initial_k, max_k)
+
+
 def _validate_candidate_manifest(
     payload: Mapping[str, Any],
     *,
     manifest_path: Path,
-    rlinf_commit: str,
-    benchmark_commit: str,
+    rlinf_commit: str | None,
+    benchmark_commit: str | None,
     max_k: int,
 ) -> tuple[str, tuple[CandidateSpec, ...]]:
     """Validate and resolve the frozen candidate pool without loading policies."""
 
-    if payload.get("schema_version") != CANDIDATE_SCHEMA:
+    schema_version = payload.get("schema_version")
+    if schema_version not in CANDIDATE_SCHEMAS:
         raise ValueError("unsupported optimal-trajectory candidate schema")
-    if payload.get("rlinf_commit") != rlinf_commit:
-        raise ValueError("candidate manifest RLinf commit mismatch")
-    if payload.get("benchmark_commit") != benchmark_commit:
-        raise ValueError("candidate manifest benchmark commit mismatch")
+    if schema_version == CANDIDATE_SCHEMA:
+        if rlinf_commit is None or benchmark_commit is None:
+            raise ValueError("candidate schema v0.1 requires policy RLinf/benchmark commits")
+        if payload.get("rlinf_commit") != rlinf_commit:
+            raise ValueError("candidate manifest RLinf commit mismatch")
+        if payload.get("benchmark_commit") != benchmark_commit:
+            raise ValueError("candidate manifest benchmark commit mismatch")
+    else:
+        expected_v2_keys = {
+            "schema_version",
+            "task",
+            "evaluator_identity",
+            "policy_rlinf_commits",
+            "policy_benchmark_commits",
+            "candidates",
+            "planner_dominance",
+        }
+        if set(payload) != expected_v2_keys:
+            raise ValueError("candidate schema v0.2 top-level inventory mismatch")
+        if rlinf_commit is not None or benchmark_commit is not None:
+            raise ValueError(
+                "candidate schema v0.2 forbids legacy singular policy commit arguments"
+            )
     task = payload.get("task")
     if not isinstance(task, str) or not task:
         raise ValueError("candidate manifest task identity is missing")
@@ -281,8 +1025,11 @@ def _validate_candidate_manifest(
         "stochastic",
         "exploration_seed_offset",
         "residual_scale",
+        "provenance",
     }
     specs = []
+    policy_rlinf_commits: set[str] = set()
+    policy_benchmark_commits: set[str] = set()
     for row in rows:
         if not isinstance(row, dict) or set(row) - allowed:
             raise ValueError("candidate row is not a supported mapping")
@@ -304,9 +1051,24 @@ def _validate_candidate_manifest(
             raise ValueError("candidate exploration_seed_offset must be in [0, 2**31)")
         residual_scale = row.get("residual_scale")
         if residual_scale is not None:
-            residual_scale = float(residual_scale)
+            residual_scale = _finite_number(
+                residual_scale,
+                f"candidate {candidate_id!r} residual_scale",
+            )
             if not 0.0 < residual_scale <= 1.0:
                 raise ValueError("candidate residual_scale must be in (0, 1]")
+        provenance = row.get("provenance")
+        if provenance is not None:
+            if not isinstance(provenance, Mapping) or not provenance:
+                raise ValueError("candidate provenance must be a non-empty mapping")
+            try:
+                provenance = json.loads(
+                    json.dumps(provenance, allow_nan=False, sort_keys=True)
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("candidate provenance must be canonical-JSON-safe") from error
+        if schema_version == CANDIDATE_SCHEMA_V2 and provenance is None:
+            raise ValueError("candidate schema v0.2 requires provenance for every candidate")
         policy_path = None
         policy_sha256 = None
         if kind == "planner":
@@ -322,9 +1084,56 @@ def _validate_candidate_manifest(
             if not policy_path.is_absolute():
                 policy_path = (manifest_path.parent / policy_path).resolve()
             policy_sha256 = _expected_sha256(
-                str(row.get("policy_sha256", "")),
+                row.get("policy_sha256"),
                 f"candidate {candidate_id} policy_sha256",
             )
+            if provenance is not None:
+                source = provenance.get("source")
+                checkpoint = provenance.get("checkpoint")
+                benchmark = provenance.get("benchmark")
+                if not isinstance(source, Mapping):
+                    raise ValueError(f"candidate {candidate_id!r} provenance has no source")
+                source_rlinf_commit = _full_commit(
+                    f"candidate {candidate_id!r} provenance source RLinf commit",
+                    source.get("rlinf_commit"),
+                )
+                if not isinstance(checkpoint, Mapping):
+                    raise ValueError(f"candidate {candidate_id!r} provenance has no checkpoint")
+                if checkpoint.get("sha256") != policy_sha256:
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance checkpoint SHA-256 mismatch"
+                    )
+                provenance_path = checkpoint.get("path")
+                if not isinstance(provenance_path, str) or not provenance_path:
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance checkpoint path is missing"
+                    )
+                resolved_provenance_path = Path(provenance_path)
+                if not resolved_provenance_path.is_absolute():
+                    resolved_provenance_path = (
+                        manifest_path.parent / resolved_provenance_path
+                    ).resolve()
+                if resolved_provenance_path != policy_path:
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance checkpoint path mismatch"
+                    )
+                if not isinstance(benchmark, Mapping):
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance has no benchmark"
+                    )
+                source_benchmark_commit = _full_commit(
+                    f"candidate {candidate_id!r} provenance benchmark commit",
+                    benchmark.get("commit"),
+                )
+                if (
+                    schema_version == CANDIDATE_SCHEMA
+                    and source_benchmark_commit != benchmark_commit
+                ):
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance benchmark mismatch"
+                    )
+                policy_rlinf_commits.add(source_rlinf_commit)
+                policy_benchmark_commits.add(source_benchmark_commit)
         specs.append(
             CandidateSpec(
                 candidate_id=candidate_id,
@@ -334,6 +1143,7 @@ def _validate_candidate_manifest(
                 stochastic=stochastic,
                 exploration_seed_offset=seed_offset,
                 residual_scale=residual_scale,
+                provenance=provenance,
             )
         )
     ids = [spec.candidate_id for spec in specs]
@@ -343,15 +1153,553 @@ def _validate_candidate_manifest(
         raise ValueError("candidate manifest must contain exactly one planner")
     if specs[0].kind != "planner":
         raise ValueError("the frozen candidate pool must put its planner at index zero")
+    if schema_version == CANDIDATE_SCHEMA_V2:
+        if payload.get("policy_rlinf_commits") != sorted(policy_rlinf_commits):
+            raise ValueError("candidate v0.2 policy RLinf commit inventory mismatch")
+        if payload.get("policy_benchmark_commits") != sorted(policy_benchmark_commits):
+            raise ValueError("candidate v0.2 policy benchmark commit inventory mismatch")
     return task, tuple(specs)
+
+
+def _policy_source_commits(
+    spec: CandidateSpec,
+    *,
+    fallback_rlinf_commit: str | None,
+    fallback_benchmark_commit: str | None,
+) -> tuple[str, str]:
+    """Return per-policy authority, falling back only for schema v0.1."""
+
+    if spec.kind != "policy":
+        raise ValueError("policy source commit requested for a non-policy candidate")
+    if spec.provenance is None:
+        if fallback_rlinf_commit is None or fallback_benchmark_commit is None:
+            raise ValueError(
+                f"candidate {spec.candidate_id!r} has no per-policy source authority"
+            )
+        return fallback_rlinf_commit, fallback_benchmark_commit
+    source = spec.provenance.get("source")
+    benchmark = spec.provenance.get("benchmark")
+    if not isinstance(source, Mapping) or not isinstance(benchmark, Mapping):
+        raise ValueError(f"candidate {spec.candidate_id!r} provenance source is incomplete")
+    return (
+        _full_commit(
+            f"candidate {spec.candidate_id!r} provenance source RLinf commit",
+            source.get("rlinf_commit"),
+        ),
+        _full_commit(
+            f"candidate {spec.candidate_id!r} provenance benchmark commit",
+            benchmark.get("commit"),
+        ),
+    )
+
+
+def _task_compatibility_inventory(
+    specs: Sequence[CandidateSpec],
+    *,
+    task: str,
+    policy_benchmark_commit: str,
+) -> list[dict[str, Any]]:
+    """Project unique task/checkpoint identities for compatibility coverage."""
+
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for spec in specs:
+        if spec.kind != "policy" or spec.provenance is None:
+            continue
+        source = spec.provenance.get("source")
+        benchmark = spec.provenance.get("benchmark")
+        state_schema = spec.provenance.get("state_schema")
+        if (
+            not isinstance(source, Mapping)
+            or not isinstance(benchmark, Mapping)
+            or not isinstance(state_schema, Mapping)
+            or benchmark.get("commit") != policy_benchmark_commit
+        ):
+            continue
+        state_dim = state_schema.get("state_dim")
+        mask_dim = state_schema.get("mask_dim")
+        if (
+            isinstance(state_dim, bool)
+            or not isinstance(state_dim, int)
+            or state_dim < 1
+            or isinstance(mask_dim, bool)
+            or not isinstance(mask_dim, int)
+            or mask_dim < 0
+        ):
+            raise ValueError("candidate compatibility state dimensions are invalid")
+        if spec.policy_sha256 is None:
+            raise ValueError("candidate compatibility policy SHA-256 is missing")
+        row = {
+            "task": task,
+            "policy_sha256": spec.policy_sha256,
+            "policy_rlinf_commit": _full_commit(
+                f"candidate {spec.candidate_id!r} compatibility RLinf commit",
+                source.get("rlinf_commit"),
+            ),
+            "policy_benchmark_commit": policy_benchmark_commit,
+            "policy_state_schema_sha256": _expected_sha256(
+                state_schema.get("sha256"),
+                f"candidate {spec.candidate_id!r} compatibility state schema",
+            ),
+            "policy_state_dim": state_dim,
+            "policy_mask_dim": mask_dim,
+        }
+        key = (task, spec.policy_sha256)
+        previous = rows.get(key)
+        if previous is not None and previous != row:
+            raise ValueError("candidate rollout expansions carry mixed compatibility provenance")
+        rows[key] = row
+    return [rows[key] for key in sorted(rows)]
+
+
+def _resolve_candidate_release_file(manifest_path: Path, relative: str) -> Path:
+    """Resolve one portable input while forbidding release-root escapes."""
+
+    relative_path = Path(relative)
+    if relative_path.is_absolute():
+        raise ValueError("candidate release evidence path must be relative")
+    release_root = manifest_path.resolve().parent.parent
+    resolved = (manifest_path.parent / relative_path).resolve()
+    if not resolved.is_relative_to(release_root) or not resolved.is_file():
+        raise ValueError("candidate release evidence escapes or is missing from the release")
+    return resolved
+
+
+def _validate_evaluator_identity(
+    payload: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+    specs: tuple[CandidateSpec, ...],
+    evaluator_rlinf_commit: str,
+    evaluator_benchmark_commit: str | None,
+    planner_dominance: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, tuple[CompatibilityEvidence, ...]]:
+    """Validate v0.2 evaluator identity and portable compatibility evidence."""
+
+    if payload.get("schema_version") == CANDIDATE_SCHEMA:
+        if payload.get("evaluator_identity") is not None:
+            raise ValueError("candidate schema v0.1 cannot declare evaluator_identity")
+        return None, ()
+    if payload.get("schema_version") != CANDIDATE_SCHEMA_V2:
+        raise ValueError("unsupported candidate schema for evaluator identity")
+    if evaluator_benchmark_commit is None:
+        raise ValueError(
+            "candidate schema v0.2 requires --evaluator-benchmark-commit"
+        )
+    raw = payload.get("evaluator_identity")
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "schema_version",
+        "evaluator_rlinf_commit",
+        "evaluator_benchmark_commit",
+        "backend_id",
+        "policy_benchmark_relations",
+    }:
+        raise ValueError("candidate evaluator identity inventory mismatch")
+    if raw.get("schema_version") != EVALUATOR_IDENTITY_SCHEMA:
+        raise ValueError("candidate evaluator identity schema mismatch")
+    if raw.get("evaluator_rlinf_commit") != evaluator_rlinf_commit:
+        raise ValueError("candidate evaluator RLinf commit differs from the CLI")
+    if raw.get("evaluator_benchmark_commit") != evaluator_benchmark_commit:
+        raise ValueError("candidate evaluator benchmark commit differs from the CLI")
+    backend_id = raw.get("backend_id")
+    if not isinstance(backend_id, str) or not backend_id or backend_id.strip() != backend_id:
+        raise ValueError("candidate evaluator backend identity is missing")
+    if planner_dominance is None or planner_dominance.get("backend_id") != backend_id:
+        raise ValueError("planner-dominance backend differs from evaluator identity")
+
+    policy_benchmark_commits = payload.get("policy_benchmark_commits")
+    relations = raw.get("policy_benchmark_relations")
+    if (
+        not isinstance(policy_benchmark_commits, list)
+        or not isinstance(relations, list)
+        or not relations
+    ):
+        raise ValueError("candidate policy benchmark relation inventory mismatch")
+    normalized_relations: list[dict[str, Any]] = []
+    evidence: list[CompatibilityEvidence] = []
+    relation_commits: list[str] = []
+    for relation in relations:
+        if not isinstance(relation, Mapping) or set(relation) != {
+            "policy_benchmark_commit",
+            "relation",
+            "evidence_path",
+            "evidence_sha256",
+        }:
+            raise ValueError("candidate policy benchmark relation row mismatch")
+        policy_commit = _full_commit(
+            "policy benchmark relation commit",
+            relation.get("policy_benchmark_commit"),
+        )
+        relation_commits.append(policy_commit)
+        relation_name = relation.get("relation")
+        evidence_path = relation.get("evidence_path")
+        evidence_sha256 = relation.get("evidence_sha256")
+        if relation_name == "identical":
+            if (
+                policy_commit != evaluator_benchmark_commit
+                or evidence_path is not None
+                or evidence_sha256 is not None
+            ):
+                raise ValueError("identical benchmark relation is inconsistent")
+        elif relation_name == "checkpoint-compatible":
+            if policy_commit == evaluator_benchmark_commit:
+                raise ValueError("identical benchmark commits cannot claim compatibility")
+            if not isinstance(evidence_path, str) or not evidence_path:
+                raise ValueError("checkpoint-compatible relation has no evidence path")
+            expected_evidence_sha256 = _expected_sha256(
+                evidence_sha256,
+                "benchmark compatibility evidence SHA-256",
+            )
+            source_path = _resolve_candidate_release_file(
+                manifest_path,
+                evidence_path,
+            )
+            if _sha256(source_path) != expected_evidence_sha256:
+                raise ValueError("benchmark compatibility evidence SHA-256 mismatch")
+            proof = validate_compatibility_evidence(
+                json.loads(source_path.read_text(encoding="utf-8"))
+            )
+            if (
+                proof["policy_benchmark_commit"] != policy_commit
+                or proof["evaluator_rlinf_commit"] != evaluator_rlinf_commit
+                or proof["evaluator_benchmark_commit"] != evaluator_benchmark_commit
+                or proof["backend_id"] != backend_id
+            ):
+                raise ValueError("benchmark compatibility evidence identity mismatch")
+            expected_task_inventory = _task_compatibility_inventory(
+                specs,
+                task=payload["task"],
+                policy_benchmark_commit=policy_commit,
+            )
+            proof_task_inventory = [
+                {
+                    "task": probe["task"],
+                    "policy_sha256": probe["policy_sha256"],
+                    "policy_rlinf_commit": probe["policy_rlinf_commit"],
+                    "policy_benchmark_commit": proof["policy_benchmark_commit"],
+                    "policy_state_schema_sha256": probe[
+                        "policy_state_schema_sha256"
+                    ],
+                    "policy_state_dim": probe["policy_state_dim"],
+                    "policy_mask_dim": probe["policy_mask_dim"],
+                }
+                for probe in proof["probes"]
+                if probe["task"] == payload["task"]
+            ]
+            if proof_task_inventory != expected_task_inventory:
+                raise ValueError(
+                    "benchmark compatibility evidence does not cover the task policy pool"
+                )
+            evidence.append(
+                CompatibilityEvidence(
+                    policy_benchmark_commit=policy_commit,
+                    source_path=source_path,
+                    sha256=expected_evidence_sha256,
+                )
+            )
+        else:
+            raise ValueError(f"unsupported policy benchmark relation {relation_name!r}")
+        normalized_relations.append(dict(relation))
+    if (
+        relation_commits != sorted(set(relation_commits))
+        or relation_commits != policy_benchmark_commits
+    ):
+        raise ValueError("candidate policy benchmark relations are not canonical or complete")
+
+    planner = specs[0]
+    if planner.provenance is None:
+        raise ValueError("candidate schema v0.2 planner provenance is missing")
+    planner_source = planner.provenance.get("source")
+    planner_runtime = planner.provenance.get("runtime")
+    planner_benchmark = planner.provenance.get("benchmark")
+    if (
+        not isinstance(planner_source, Mapping)
+        or planner_source.get("rlinf_commit") != evaluator_rlinf_commit
+        or not isinstance(planner_runtime, Mapping)
+        or planner_runtime.get("evaluator_rlinf_commit") != evaluator_rlinf_commit
+        or not isinstance(planner_benchmark, Mapping)
+        or planner_benchmark.get("commit") != evaluator_benchmark_commit
+    ):
+        raise ValueError("planner provenance is not bound to the evaluator identity")
+    normalized = {
+        "schema_version": EVALUATOR_IDENTITY_SCHEMA,
+        "evaluator_rlinf_commit": evaluator_rlinf_commit,
+        "evaluator_benchmark_commit": evaluator_benchmark_commit,
+        "backend_id": backend_id,
+        "policy_benchmark_relations": normalized_relations,
+    }
+    return normalized, tuple(evidence)
+
+
+def _validate_calibration_evidence(
+    *,
+    manifest_path: Path,
+    planner_dominance: Mapping[str, Any] | None,
+    evaluator_identity: Mapping[str, Any] | None,
+) -> CalibrationEvidence | None:
+    """Verify raw fresh-environment planner replays and recompute every drift."""
+
+    if planner_dominance is None:
+        return None
+    if evaluator_identity is None:
+        raise ValueError("planner calibration requires a frozen evaluator identity")
+    calibration = planner_dominance["calibration"]
+    source_path = _resolve_candidate_release_file(
+        manifest_path,
+        calibration["evidence_path"],
+    )
+    if _sha256(source_path) != calibration["evidence_sha256"]:
+        raise ValueError("planner calibration evidence file SHA-256 mismatch")
+    evidence = json.loads(source_path.read_text(encoding="utf-8"))
+    if not isinstance(evidence, Mapping) or set(evidence) != {
+        "schema_version",
+        "task",
+        "backend_id",
+        "evaluator_identity_sha256",
+        "split",
+        "test_exposure",
+        "reset_manifest_sha256",
+        "replay_count",
+        "replays",
+        "payload_sha256",
+    }:
+        raise ValueError("planner calibration evidence inventory mismatch")
+    if evidence.get("schema_version") != CALIBRATION_EVIDENCE_SCHEMA:
+        raise ValueError("planner calibration evidence schema mismatch")
+    if _payload_sha256(evidence) != evidence.get("payload_sha256"):
+        raise ValueError("planner calibration evidence payload SHA-256 mismatch")
+    if (
+        evidence.get("task") != planner_dominance["task"]
+        or evidence.get("backend_id") != planner_dominance["backend_id"]
+        or evidence.get("evaluator_identity_sha256")
+        != _payload_sha256(evaluator_identity)
+    ):
+        raise ValueError("planner calibration evaluator identity mismatch")
+    if evidence.get("split") not in {"train", "validation"} or evidence.get(
+        "test_exposure"
+    ) != {"test_id": False, "test_ood": False}:
+        raise ValueError("planner calibration evidence used a formal test split")
+    if evidence.get("reset_manifest_sha256") != calibration["reset_manifest_sha256"]:
+        raise ValueError("planner calibration reset manifest mismatch")
+    replay_count = evidence.get("replay_count")
+    replays = evidence.get("replays")
+    if (
+        replay_count != calibration["replay_count"]
+        or isinstance(replay_count, bool)
+        or not isinstance(replay_count, int)
+        or replay_count < 3
+        or not isinstance(replays, list)
+        or len(replays) != replay_count
+    ):
+        raise ValueError("planner calibration replay count mismatch")
+
+    replay_keys = {
+        "replay_index",
+        "environment_instance_id",
+        "episode_id",
+        "reset_request_sha256",
+        "action_sha256",
+        "success",
+        "safety_failure",
+        "finite_and_bounded",
+        "termination_reason",
+        "trajectory_completion",
+        "completion_time_s",
+        "control_steps",
+        "action_l2_sum",
+        "task_quality",
+    }
+    environment_ids: set[str] = set()
+    frozen_identity: tuple[Any, ...] | None = None
+    metric_rows: list[dict[str, Any]] = []
+    for index, raw_replay in enumerate(replays):
+        if not isinstance(raw_replay, Mapping) or set(raw_replay) != replay_keys:
+            raise ValueError("planner calibration replay row inventory mismatch")
+        environment_id = raw_replay.get("environment_instance_id")
+        if (
+            raw_replay.get("replay_index") != index
+            or not isinstance(environment_id, str)
+            or not environment_id
+            or environment_id.strip() != environment_id
+            or environment_id in environment_ids
+        ):
+            raise ValueError("planner calibration did not use unique fresh environments")
+        environment_ids.add(environment_id)
+        episode_id = raw_replay.get("episode_id")
+        if episode_id != calibration["reset_episode_id"]:
+            raise ValueError("planner calibration reset episode identity drifted")
+        reset_request_sha256 = _expected_sha256(
+            raw_replay.get("reset_request_sha256"),
+            "planner calibration reset request SHA-256",
+        )
+        action_sha256 = _expected_sha256(
+            raw_replay.get("action_sha256"),
+            "planner calibration action SHA-256",
+        )
+        if (
+            raw_replay.get("success") is not True
+            or raw_replay.get("safety_failure") is not False
+            or raw_replay.get("finite_and_bounded") is not True
+        ):
+            raise ValueError("planner calibration replay is not successful, safe, and finite")
+        termination_reason = raw_replay.get("termination_reason")
+        if not isinstance(termination_reason, str) or not termination_reason:
+            raise ValueError("planner calibration termination reason is missing")
+        completion = _finite_number(
+            raw_replay["trajectory_completion"],
+            "planner calibration trajectory completion",
+        )
+        completion_time = _finite_number(
+            raw_replay["completion_time_s"],
+            "planner calibration completion time",
+        )
+        control_steps = raw_replay.get("control_steps")
+        action_l2_sum = _finite_number(
+            raw_replay["action_l2_sum"],
+            "planner calibration action L2 sum",
+        )
+        if (
+            not 0.0 <= completion <= 1.0
+            or completion_time <= 0.0
+            or isinstance(control_steps, bool)
+            or not isinstance(control_steps, int)
+            or control_steps < 1
+            or action_l2_sum < 0.0
+        ):
+            raise ValueError("planner calibration replay metrics are invalid")
+        replay = dict(raw_replay)
+        _validate_attempt_quality(replay, planner_dominance)
+        identity = (
+            episode_id,
+            reset_request_sha256,
+            action_sha256,
+            termination_reason,
+            control_steps,
+        )
+        if frozen_identity is None:
+            frozen_identity = identity
+        elif identity != frozen_identity:
+            raise ValueError("planner calibration reset/action/outcome identity drifted")
+        metric_rows.append(replay)
+
+    for metric_name in _dominance_metric_keys(planner_dominance):
+        values = [_metric_value(row, metric_name) for row in metric_rows]
+        observed_drift = max(values) - min(values)
+        frozen_drift = float(
+            _metric_spec(planner_dominance, metric_name)[
+                "max_observed_replay_drift"
+            ]
+        )
+        if not np.isclose(observed_drift, frozen_drift, rtol=0.0, atol=1.0e-15):
+            raise ValueError(
+                f"planner calibration drift does not recompute for {metric_name!r}"
+            )
+    return CalibrationEvidence(
+        source_path=source_path,
+        sha256=calibration["evidence_sha256"],
+    )
+
+
+def _validate_candidate_release_chain(
+    *,
+    candidate_manifest: Path,
+    candidate_manifest_sha256: str,
+    candidate_payload: Mapping[str, Any],
+    release_manifest: Path | None,
+    expected_release_manifest_sha256: str | None,
+) -> tuple[str | None, tuple[ProvenanceFile, ...]]:
+    """Bind one v0.2 task manifest to a production-validated exact-14 release."""
+
+    if candidate_payload.get("schema_version") == CANDIDATE_SCHEMA:
+        if release_manifest is not None or expected_release_manifest_sha256 is not None:
+            raise ValueError("candidate schema v0.1 cannot declare a v0.2 release chain")
+        return None, ()
+    if candidate_payload.get("schema_version") != CANDIDATE_SCHEMA_V2:
+        raise ValueError("unsupported candidate schema for release-chain validation")
+    if release_manifest is None or expected_release_manifest_sha256 is None:
+        raise ValueError(
+            "candidate schema v0.2 requires candidate release manifest and pinned SHA-256"
+        )
+    expected_release_sha256 = _expected_sha256(
+        expected_release_manifest_sha256,
+        "candidate release manifest SHA-256",
+    )
+    candidate_manifest = candidate_manifest.resolve()
+    release_root = candidate_manifest.parent.parent
+    task_value = candidate_payload.get("task")
+    if not isinstance(task_value, str) or not task_value or task_value.strip() != task_value:
+        raise ValueError("candidate task identity is invalid")
+    expected_candidate_path = (
+        release_root / task_value / "candidate_manifest.json"
+    ).resolve()
+    expected_release_path = (release_root / "release_manifest.json").resolve()
+    if candidate_manifest != expected_candidate_path:
+        raise ValueError("candidate manifest is orphaned from the canonical task release path")
+    if release_manifest.resolve() != expected_release_path:
+        raise ValueError("candidate release manifest path is not canonical")
+    if _sha256(expected_release_path) != expected_release_sha256:
+        raise ValueError("candidate release manifest SHA-256 mismatch")
+
+    try:
+        from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
+            validate_release,
+        )
+    except ModuleNotFoundError:
+        # Direct ``python examples/embodiment/export_...py`` execution puts the
+        # script directory, not the repository root, on sys.path.
+        from build_dynamic_benchmark_rld2_manifests import validate_release
+
+    validate_release(release_root, production=True)
+    release = json.loads(expected_release_path.read_text(encoding="utf-8"))
+    if release.get("schema_version") != CANDIDATE_RELEASE_SCHEMA:
+        raise ValueError("candidate release schema mismatch")
+    task_hashes = release.get("task_manifest_sha256")
+    task = task_value
+    task_policy_rlinf_commits = candidate_payload.get("policy_rlinf_commits")
+    task_policy_benchmark_commits = candidate_payload.get("policy_benchmark_commits")
+    release_policy_rlinf_commits = release.get("policy_rlinf_commits")
+    release_policy_benchmark_commits = release.get("policy_benchmark_commits")
+    if (
+        not isinstance(task_hashes, Mapping)
+        or task_hashes.get(task) != candidate_manifest_sha256
+        or release.get("candidate_schema_version") != CANDIDATE_SCHEMA_V2
+        or not isinstance(task_policy_rlinf_commits, list)
+        or not all(isinstance(item, str) for item in task_policy_rlinf_commits)
+        or not isinstance(task_policy_benchmark_commits, list)
+        or not all(isinstance(item, str) for item in task_policy_benchmark_commits)
+        or not isinstance(release_policy_rlinf_commits, list)
+        or not all(isinstance(item, str) for item in release_policy_rlinf_commits)
+        or not isinstance(release_policy_benchmark_commits, list)
+        or not all(isinstance(item, str) for item in release_policy_benchmark_commits)
+        or not set(task_policy_rlinf_commits).issubset(release_policy_rlinf_commits)
+        or not set(task_policy_benchmark_commits).issubset(
+            release_policy_benchmark_commits
+        )
+    ):
+        raise ValueError("candidate task manifest identity differs from its exact-14 release")
+    sha256sums_path = release_root / "SHA256SUMS"
+    if not sha256sums_path.is_file():
+        raise ValueError("candidate release SHA256SUMS is missing")
+    provenance = (
+        ProvenanceFile(
+            source_path=expected_release_path,
+            relative_path="provenance/candidate_release/release_manifest.json",
+            sha256=expected_release_sha256,
+        ),
+        ProvenanceFile(
+            source_path=sha256sums_path,
+            relative_path="provenance/candidate_release/SHA256SUMS",
+            sha256=_sha256(sha256sums_path),
+        ),
+    )
+    return expected_release_sha256, provenance
 
 
 def _load_candidates(
     specs: tuple[CandidateSpec, ...],
     *,
     task: str,
-    rlinf_commit: str,
-    benchmark_commit: str,
+    rlinf_commit: str | None,
+    benchmark_commit: str | None,
     device: torch.device,
 ) -> tuple[LoadedCandidate, ...]:
     loaded = []
@@ -364,10 +1712,15 @@ def _load_candidates(
             if _sha256(spec.policy_path) != spec.policy_sha256:
                 raise ValueError(f"candidate {spec.candidate_id!r} policy SHA-256 mismatch")
             payload = torch.load(spec.policy_path, map_location="cpu", weights_only=False)
+            policy_rlinf_commit, policy_benchmark_commit = _policy_source_commits(
+                spec,
+                fallback_rlinf_commit=rlinf_commit,
+                fallback_benchmark_commit=benchmark_commit,
+            )
             config, state_schema = _validate_policy_payload(
                 payload,
-                rlinf_commit=rlinf_commit,
-                benchmark_commit=benchmark_commit,
+                rlinf_commit=policy_rlinf_commit,
+                benchmark_commit=policy_benchmark_commit,
             )
             if config["task"] != task:
                 raise ValueError(f"candidate {spec.candidate_id!r} task mismatch")
@@ -584,6 +1937,26 @@ def _restore_candidate_start(env: Any, state: Mapping[str, Any]) -> None:
     env._last_obs = {"states": torch.as_tensor(encoded[None, :], dtype=torch.float32)}
 
 
+def _task_quality_from_infos(infos: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read backend-defined task quality without inventing a fallback mapping."""
+
+    raw = infos.get("task_quality")
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 1:
+            raise ValueError("task quality vector must contain exactly one environment")
+        raw = raw[0]
+    if not isinstance(raw, Mapping) or not raw:
+        raise ValueError("task quality summary must be a non-empty mapping")
+    try:
+        # Keep the upstream component insertion order: it is part of the
+        # canonical schema/summary contract and is checked independently.
+        return json.loads(json.dumps(raw, allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError("task quality summary must be canonical-JSON-safe") from error
+
+
 def _rollout(
     *,
     env: Any,
@@ -706,21 +2079,31 @@ def _rollout(
                 active_progress,
             )
         )
-        step_results.append(
-            StepResult(
-                observation=next_observation,
-                terminated=terminated_value,
-                truncated=truncated_value,
-                success=bool(infos["success"][0]),
-                termination_reason=reason,
-                active_stage_progress=active_progress,
+        task_quality = _task_quality_from_infos(infos)
+        step_result_fields = {
+            "observation": next_observation,
+            "terminated": terminated_value,
+            "truncated": truncated_value,
+            "success": bool(infos["success"][0]),
+            "termination_reason": reason,
+            "active_stage_progress": active_progress,
+        }
+        if task_quality is not None:
+            # Reconstruct the canonical typed object so the terminal EpisodeTrace
+            # retains the same quality summary that governed selection.
+            from se3_wam.benchmark.task_quality import EpisodeQualitySummary
+
+            step_result_fields["task_quality"] = EpisodeQualitySummary.from_dict(
+                task_quality
             )
-        )
+        step_results.append(StepResult(**step_result_fields))
         result_info = {
             "success": bool(infos["success"][0]),
             "termination_reason": reason,
             "active_stage_progress": active_progress,
         }
+        if task_quality is not None:
+            result_info["task_quality"] = task_quality
         observation = next_observation
         obs = next_obs
         if len(actions) > int(env.horizon_steps):
@@ -786,6 +2169,7 @@ def _rollout(
         "safety_failure": result_info["termination_reason"] in safety_failures,
         "termination_reason": result_info["termination_reason"],
         "trajectory_completion": completion,
+        "task_quality": result_info.get("task_quality"),
         "completion_time_s": completion_time,
         "return": float(reward_array.sum(dtype=np.float64)),
         "control_steps": len(actions),
@@ -886,6 +2270,91 @@ def _root_checksums(root: Path) -> int:
     return len(paths)
 
 
+def _compatibility_evidence_rows(
+    evidence: tuple[CompatibilityEvidence, ...],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "policy_benchmark_commit": row.policy_benchmark_commit,
+            "relative_path": f"provenance/evidence/{row.sha256}.json",
+            "sha256": row.sha256,
+        }
+        for row in evidence
+    ]
+
+
+def _materialize_compatibility_evidence(
+    output: Path,
+    evidence: tuple[CompatibilityEvidence, ...],
+) -> None:
+    """Copy validated source evidence into the self-contained dataset root."""
+
+    for source, frozen in zip(
+        evidence,
+        _compatibility_evidence_rows(evidence),
+        strict=True,
+    ):
+        _copy_provenance_file(
+            output,
+            source.source_path,
+            frozen["relative_path"],
+            source.sha256,
+        )
+
+
+def _calibration_evidence_row(
+    evidence: CalibrationEvidence | None,
+) -> dict[str, str] | None:
+    if evidence is None:
+        return None
+    return {
+        "relative_path": f"provenance/calibration/{evidence.sha256}.json",
+        "sha256": evidence.sha256,
+    }
+
+
+def _provenance_file_rows(files: tuple[ProvenanceFile, ...]) -> list[dict[str, str]]:
+    return [
+        {"relative_path": row.relative_path, "sha256": row.sha256}
+        for row in files
+    ]
+
+
+def _copy_provenance_file(output: Path, source: Path, relative: str, sha256: str) -> None:
+    destination = output / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise ValueError("dataset provenance destination must not be a symbolic link")
+    if not destination.exists():
+        shutil.copyfile(source, destination)
+    if not destination.is_file() or _sha256(destination) != sha256:
+        raise ValueError("dataset provenance copy does not match its SHA-256")
+
+
+def _materialize_additional_provenance(
+    output: Path,
+    *,
+    calibration: CalibrationEvidence | None,
+    release_files: tuple[ProvenanceFile, ...],
+) -> None:
+    if calibration is not None:
+        row = _calibration_evidence_row(calibration)
+        assert row is not None
+        _copy_provenance_file(
+            output,
+            calibration.source_path,
+            row["relative_path"],
+            calibration.sha256,
+        )
+    for source in release_files:
+        _copy_provenance_file(
+            output,
+            source.source_path,
+            source.relative_path,
+            source.sha256,
+        )
+
+
 def main() -> None:
     from se3_wam.benchmark.contracts import canonical_json
     from se3_wam.benchmark.dataset import write_episode_atomic
@@ -906,10 +2375,13 @@ def main() -> None:
         raise ValueError("max_resets must be at least accepted_episodes > 0")
     if args.image_size < 64:
         raise ValueError("image_size must be at least 64")
-    budgets = _budget_sequence(args.initial_k, args.max_k)
+    if (
+        args.selection_mode == PLANNER_PARETO_SELECTION_MODE
+        and args.candidate_search_mode != FULL_POOL_SEARCH_MODE
+    ):
+        raise ValueError("planner-pareto selection requires candidate-search-mode=full-pool")
+    selection_contract = _selection_contract(args.selection_mode)
     evaluator_commit = _full_commit("evaluator_commit", args.evaluator_commit)
-    rlinf_commit = _full_commit("rlinf_commit", args.rlinf_commit)
-    benchmark_commit = _full_commit("benchmark_commit", args.benchmark_commit)
     candidate_manifest_sha256 = _expected_sha256(
         args.expected_candidate_manifest_sha256,
         "expected candidate manifest SHA-256",
@@ -917,12 +2389,83 @@ def main() -> None:
     if _sha256(args.candidate_manifest) != candidate_manifest_sha256:
         raise ValueError("candidate manifest SHA-256 mismatch")
     candidate_payload = json.loads(args.candidate_manifest.read_text(encoding="utf-8"))
+    candidate_schema_version = candidate_payload.get("schema_version")
+    if candidate_schema_version == CANDIDATE_SCHEMA:
+        if args.rlinf_commit is None or args.benchmark_commit is None:
+            raise ValueError(
+                "candidate schema v0.1 requires --rlinf-commit and --benchmark-commit"
+            )
+        rlinf_commit = _full_commit("rlinf_commit", args.rlinf_commit)
+        benchmark_commit = _full_commit("benchmark_commit", args.benchmark_commit)
+        evaluator_benchmark_commit = (
+            None
+            if args.evaluator_benchmark_commit is None
+            else _full_commit(
+                "evaluator_benchmark_commit",
+                args.evaluator_benchmark_commit,
+            )
+        )
+    elif candidate_schema_version == CANDIDATE_SCHEMA_V2:
+        if args.rlinf_commit is not None or args.benchmark_commit is not None:
+            raise ValueError(
+                "candidate schema v0.2 forbids legacy singular policy commit arguments"
+            )
+        if args.evaluator_benchmark_commit is None:
+            raise ValueError(
+                "candidate schema v0.2 requires --evaluator-benchmark-commit"
+            )
+        rlinf_commit = None
+        benchmark_commit = None
+        evaluator_benchmark_commit = _full_commit(
+            "evaluator_benchmark_commit",
+            args.evaluator_benchmark_commit,
+        )
+    else:
+        raise ValueError("unsupported optimal-trajectory candidate schema")
+    (
+        candidate_release_manifest_sha256,
+        candidate_release_provenance_files,
+    ) = _validate_candidate_release_chain(
+        candidate_manifest=args.candidate_manifest,
+        candidate_manifest_sha256=candidate_manifest_sha256,
+        candidate_payload=candidate_payload,
+        release_manifest=args.candidate_release_manifest,
+        expected_release_manifest_sha256=(
+            args.expected_candidate_release_manifest_sha256
+        ),
+    )
     task, specs = _validate_candidate_manifest(
         candidate_payload,
         manifest_path=args.candidate_manifest.resolve(),
         rlinf_commit=rlinf_commit,
         benchmark_commit=benchmark_commit,
+        max_k=args.max_k if args.candidate_search_mode == FIRST_ELIGIBLE_SEARCH_MODE else 1,
+    )
+    planner_dominance = _validate_planner_dominance_contract(
+        candidate_payload,
+        task=task,
+        selection_mode=args.selection_mode,
+    )
+    evaluator_identity, compatibility_evidence = _validate_evaluator_identity(
+        candidate_payload,
+        manifest_path=args.candidate_manifest.resolve(),
+        specs=specs,
+        evaluator_rlinf_commit=evaluator_commit,
+        evaluator_benchmark_commit=evaluator_benchmark_commit,
+        planner_dominance=planner_dominance,
+    )
+    calibration_evidence = _validate_calibration_evidence(
+        manifest_path=args.candidate_manifest.resolve(),
+        planner_dominance=planner_dominance,
+        evaluator_identity=evaluator_identity,
+    )
+    if planner_dominance is not None and any(spec.provenance is None for spec in specs):
+        raise ValueError("planner-pareto candidate manifest requires provenance for every candidate")
+    budgets = _candidate_budgets(
+        args.candidate_search_mode,
+        initial_k=args.initial_k,
         max_k=args.max_k,
+        candidate_pool_size=len(specs),
     )
     device = _device(args.device)
     candidates = _load_candidates(
@@ -983,11 +2526,30 @@ def main() -> None:
         reset_manifest_sha256 = hashlib.sha256(
             reset_manifest_text.encode("utf-8")
         ).hexdigest()
-        source_identity = {
-            "evaluator_rlinf_commit": evaluator_commit,
-            "policy_rlinf_commit": rlinf_commit,
-            "benchmark_commit": benchmark_commit,
-        }
+        if candidate_schema_version == CANDIDATE_SCHEMA:
+            assert rlinf_commit is not None and benchmark_commit is not None
+            source_identity = {
+                "evaluator_rlinf_commit": evaluator_commit,
+                "policy_rlinf_commit": rlinf_commit,
+                "benchmark_commit": benchmark_commit,
+            }
+        else:
+            assert evaluator_benchmark_commit is not None
+            source_identity = {
+                "evaluator_rlinf_commit": evaluator_commit,
+                "evaluator_benchmark_commit": evaluator_benchmark_commit,
+                "policy_rlinf_commits": list(candidate_payload["policy_rlinf_commits"]),
+                "policy_benchmark_commits": list(
+                    candidate_payload["policy_benchmark_commits"]
+                ),
+            }
+        compatibility_evidence_rows = _compatibility_evidence_rows(
+            compatibility_evidence
+        )
+        calibration_evidence_row = _calibration_evidence_row(calibration_evidence)
+        candidate_release_provenance = _provenance_file_rows(
+            candidate_release_provenance_files
+        )
         export_state = {
             "schema_version": STATE_SCHEMA,
             "task": task,
@@ -996,9 +2558,20 @@ def main() -> None:
             "manifest_size": manifest_size,
             "max_resets": args.max_resets,
             "accepted_target": args.accepted_episodes,
-            "initial_k": args.initial_k,
-            "max_k": args.max_k,
+            "candidate_search_mode": args.candidate_search_mode,
+            "candidate_pool_size": len(candidates),
+            "initial_k": budgets[0],
+            "max_k": budgets[-1],
             "budget_sequence": list(budgets),
+            "selection_mode": args.selection_mode,
+            "selection_contract": selection_contract,
+            "planner_dominance": planner_dominance,
+            "candidate_schema_version": candidate_schema_version,
+            "evaluator_identity": evaluator_identity,
+            "compatibility_evidence": compatibility_evidence_rows,
+            "calibration_evidence": calibration_evidence_row,
+            "candidate_release_manifest_sha256": candidate_release_manifest_sha256,
+            "candidate_release_provenance": candidate_release_provenance,
             "image_size": args.image_size,
             "device": str(device),
             "candidate_manifest_sha256": candidate_manifest_sha256,
@@ -1021,6 +2594,12 @@ def main() -> None:
                 raise ValueError("refusing to resume a sealed export")
             if _sha256(run_output / "candidate_manifest.json") != candidate_manifest_sha256:
                 raise ValueError("resume candidate-manifest copy checksum mismatch")
+            _materialize_compatibility_evidence(run_output, compatibility_evidence)
+            _materialize_additional_provenance(
+                run_output,
+                calibration=calibration_evidence,
+                release_files=candidate_release_provenance_files,
+            )
             if reset_manifest_path.read_text(encoding="utf-8") != reset_manifest_text:
                 raise ValueError("resume reset manifest does not match the requested run")
             stored_state = json.loads(export_state_path.read_text(encoding="utf-8"))
@@ -1085,6 +2664,12 @@ def main() -> None:
         else:
             run_output.mkdir(parents=True)
             shutil.copyfile(args.candidate_manifest, run_output / "candidate_manifest.json")
+            _materialize_compatibility_evidence(run_output, compatibility_evidence)
+            _materialize_additional_provenance(
+                run_output,
+                calibration=calibration_evidence,
+                release_files=candidate_release_provenance_files,
+            )
             reset_manifest_path.write_text(reset_manifest_text, encoding="utf-8")
             for path in (attempts_path, winners_path, reset_results_path):
                 path.write_text("", encoding="utf-8")
@@ -1157,10 +2742,22 @@ def main() -> None:
                     _append_jsonl(attempts_path, record)
                     reset_attempts.append(record)
                     attempt_count += 1
-                winner = _select_winner(reset_attempts)
+                winner = _select_winner(
+                    reset_attempts,
+                    selection_mode=args.selection_mode,
+                    planner_dominance=planner_dominance,
+                )
                 budget_used = budget
-                if winner is not None:
+                if (
+                    winner is not None
+                    and args.candidate_search_mode == FIRST_ELIGIBLE_SEARCH_MODE
+                ):
                     break
+            selection_result = _selection_result(
+                reset_attempts,
+                winner,
+                selection_mode=args.selection_mode,
+            )
             attempted_resets += 1
             budget_histogram[str(budget_used)] += 1
             reset_result = {
@@ -1169,6 +2766,9 @@ def main() -> None:
                 "source_group_id": row.source_group_id,
                 "candidate_count": len(reset_attempts),
                 "budget_used": budget_used,
+                "candidate_search_mode": args.candidate_search_mode,
+                "selection_mode": args.selection_mode,
+                "selection_result": selection_result,
                 "accepted": winner is not None,
                 "winner_candidate_id": None if winner is None else winner["candidate_id"],
                 "winner_candidate_index": None if winner is None else winner["candidate_index"],
@@ -1188,6 +2788,17 @@ def main() -> None:
                         trace_metadata={
                             "candidate_manifest_sha256": candidate_manifest_sha256,
                             "budget_used": budget_used,
+                            "candidate_search_mode": args.candidate_search_mode,
+                            "selection_mode": args.selection_mode,
+                            "selection_contract": selection_contract,
+                            "planner_dominance": planner_dominance,
+                            "evaluator_identity": evaluator_identity,
+                            "compatibility_evidence": compatibility_evidence_rows,
+                            "calibration_evidence": calibration_evidence_row,
+                            "candidate_release_manifest_sha256": (
+                                candidate_release_manifest_sha256
+                            ),
+                            "selection_result": selection_result,
                             "winner_quality_score": list(_quality_score(winner)),
                             "lightweight_action_sha256": winner["action_sha256"],
                             "source_identity": source_identity,
@@ -1195,7 +2806,7 @@ def main() -> None:
                     )
                     if trace is None:
                         raise RuntimeError("winner render did not return an episode trace")
-                    for key in (
+                    parity_keys = (
                         "episode_id",
                         "success",
                         "safety_failure",
@@ -1206,7 +2817,10 @@ def main() -> None:
                         "control_steps",
                         "action_l2_sum",
                         "action_sha256",
-                    ):
+                    )
+                    if planner_dominance is not None:
+                        parity_keys += ("task_quality",)
+                    for key in parity_keys:
                         if render_record[key] != winner[key]:
                             raise RuntimeError(f"winner render parity failed for {key}")
                     episode_record = write_episode_atomic(run_output, trace)
@@ -1216,7 +2830,17 @@ def main() -> None:
                         "candidate_index": candidate.index,
                         "candidate_count": len(reset_attempts),
                         "budget_used": budget_used,
-                        "selection_contract": SELECTION_CONTRACT,
+                        "candidate_search_mode": args.candidate_search_mode,
+                        "selection_mode": args.selection_mode,
+                        "selection_contract": selection_contract,
+                        "planner_dominance": planner_dominance,
+                        "evaluator_identity": evaluator_identity,
+                        "compatibility_evidence": compatibility_evidence_rows,
+                        "calibration_evidence": calibration_evidence_row,
+                        "candidate_release_manifest_sha256": (
+                            candidate_release_manifest_sha256
+                        ),
+                        "selection_result": selection_result,
                         "quality_score": list(_quality_score(winner)),
                         "lightweight_attempt_tape": winner["attempt_tape"],
                         "lightweight_attempt_tape_sha256": winner["attempt_tape_sha256"],
@@ -1295,6 +2919,8 @@ def main() -> None:
                     "accepted_count": accepted,
                     "attempted_reset_count": attempted_resets,
                     "candidate_attempt_count": attempt_count,
+                    "candidate_search_mode": args.candidate_search_mode,
+                    "selection_mode": args.selection_mode,
                     "budget_histogram": dict(budget_histogram),
                 },
             )
@@ -1326,11 +2952,21 @@ def main() -> None:
             "accepted_count": accepted,
             "attempted_reset_count": attempted_resets,
             "candidate_attempt_count": attempt_count,
-            "initial_k": args.initial_k,
-            "max_k": args.max_k,
+            "candidate_search_mode": args.candidate_search_mode,
+            "candidate_pool_size": len(candidates),
+            "initial_k": budgets[0],
+            "max_k": budgets[-1],
             "budget_sequence": list(budgets),
             "budget_histogram": budget_histogram,
-            "selection_contract": SELECTION_CONTRACT,
+            "selection_mode": args.selection_mode,
+            "selection_contract": selection_contract,
+            "planner_dominance": planner_dominance,
+            "candidate_schema_version": candidate_schema_version,
+            "evaluator_identity": evaluator_identity,
+            "compatibility_evidence": compatibility_evidence_rows,
+            "calibration_evidence": calibration_evidence_row,
+            "candidate_release_manifest_sha256": candidate_release_manifest_sha256,
+            "candidate_release_provenance": candidate_release_provenance,
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "reset_manifest_sha256": _sha256(reset_manifest_path),
             "export_state_sha256": export_state_sha256,

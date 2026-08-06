@@ -228,6 +228,7 @@ def test_attempt_tape_round_trip_recomputes_shapes_hashes_and_score(tmp_path: Pa
         "safety_failure": False,
         "finite_and_bounded": True,
         "trajectory_completion": 1.0,
+        "completion_time_s": steps * 0.002,
         "return": float(arrays["rewards"].sum(dtype=np.float64)),
         "control_steps": steps,
         "action_l2_sum": float(np.square(arrays["actions"]).sum()),

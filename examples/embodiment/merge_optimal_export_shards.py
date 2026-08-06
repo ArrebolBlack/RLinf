@@ -37,12 +37,14 @@ from typing import Any
 
 from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     EXPORT_SCHEMA,
+    FIRST_ELIGIBLE_SEARCH_MODE,
+    LEGACY_SELECTION_MODE,
     PROGRESS_SCHEMA,
-    SELECTION_CONTRACT,
     _atomic_json,
     _file_boundary,
     _payload_sha256,
     _root_checksums,
+    _selection_contract,
 )
 
 
@@ -115,6 +117,20 @@ def _kept_recovery_events(events: list[str], *, max_reset: int) -> list[str]:
     return kept
 
 
+def _tree_inventory(root: Path) -> dict[str, str]:
+    """Return an exact relative-path/SHA-256 inventory for a portable tree."""
+
+    if not root.exists():
+        return {}
+    if not root.is_dir():
+        raise ValueError(f"expected directory, got {root}")
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def main() -> None:
     args = _parser().parse_args()
     root = args.root.resolve()
@@ -132,6 +148,10 @@ def main() -> None:
     all_recovery_events: list[str] = []
     resume_count = 0
     started_unix_s: float | None = None
+    reference_export_state: dict[str, Any] | None = None
+    reference_candidate_sha256: str | None = None
+    reference_reset_sha256: str | None = None
+    reference_provenance: dict[str, str] | None = None
     for shard in shard_dirs:
         complete = shard / "shard_complete.json"
         if not complete.is_file():
@@ -147,8 +167,31 @@ def main() -> None:
         resume_count += int(progress.get("resume_count", 0))
         if started_unix_s is None or progress.get("started_unix_s", float("inf")) < started_unix_s:
             started_unix_s = progress.get("started_unix_s")
+        shard_export_state = json.loads(
+            (shard / "export_state.json").read_text(encoding="utf-8")
+        )
+        shard_candidate_sha256 = hashlib.sha256(
+            (shard / "candidate_manifest.json").read_bytes()
+        ).hexdigest()
+        shard_reset_sha256 = hashlib.sha256(
+            (shard / "reset_manifest.jsonl").read_bytes()
+        ).hexdigest()
+        shard_provenance = _tree_inventory(shard / "provenance")
+        if reference_export_state is None:
+            reference_export_state = shard_export_state
+            reference_candidate_sha256 = shard_candidate_sha256
+            reference_reset_sha256 = shard_reset_sha256
+            reference_provenance = shard_provenance
+        elif (
+            shard_export_state != reference_export_state
+            or shard_candidate_sha256 != reference_candidate_sha256
+            or shard_reset_sha256 != reference_reset_sha256
+            or shard_provenance != reference_provenance
+        ):
+            raise ValueError(f"{shard} has a different frozen export contract")
     if started_unix_s is None:
         raise ValueError("no shard start time found")
+    assert reference_export_state is not None
 
     all_results.sort(key=lambda row: int(row["reset_index"]))
     reset_index_by_episode: dict[str, int] = {
@@ -174,7 +217,7 @@ def main() -> None:
         budget_histogram[key] = budget_histogram.get(key, 0) + 1
 
     reference = shard_dirs[0]
-    export_state = json.loads((reference / "export_state.json").read_text(encoding="utf-8"))
+    export_state = reference_export_state
     task = export_state["task"]
     split = export_state["split"]
     image_size = int(export_state["image_size"])
@@ -191,6 +234,8 @@ def main() -> None:
     shutil.copyfile(reference / "candidate_manifest.json", output / "candidate_manifest.json")
     shutil.copyfile(reference / "export_state.json", output / "export_state.json")
     shutil.copyfile(reference / "reset_manifest.jsonl", output / "reset_manifest.jsonl")
+    if (reference / "provenance").is_dir():
+        shutil.copytree(reference / "provenance", output / "provenance")
 
     _write_jsonl(output / "attempts.jsonl", kept_attempts)
     _write_jsonl(output / "reset_results.jsonl", kept_results)
@@ -258,11 +303,30 @@ def main() -> None:
         "accepted_count": len(kept_winners),
         "attempted_reset_count": len(kept_results),
         "candidate_attempt_count": len(kept_attempts),
+        "candidate_search_mode": export_state.get(
+            "candidate_search_mode", FIRST_ELIGIBLE_SEARCH_MODE
+        ),
+        "candidate_pool_size": export_state.get("candidate_pool_size"),
         "initial_k": initial_k,
         "max_k": max_k,
         "budget_sequence": list(export_state["budget_sequence"]),
         "budget_histogram": budget_histogram,
-        "selection_contract": SELECTION_CONTRACT,
+        "selection_mode": export_state.get("selection_mode", LEGACY_SELECTION_MODE),
+        "selection_contract": export_state.get(
+            "selection_contract",
+            _selection_contract(export_state.get("selection_mode", LEGACY_SELECTION_MODE)),
+        ),
+        "planner_dominance": export_state.get("planner_dominance"),
+        "candidate_schema_version": export_state.get("candidate_schema_version"),
+        "evaluator_identity": export_state.get("evaluator_identity"),
+        "compatibility_evidence": export_state.get("compatibility_evidence"),
+        "calibration_evidence": export_state.get("calibration_evidence"),
+        "candidate_release_manifest_sha256": export_state.get(
+            "candidate_release_manifest_sha256"
+        ),
+        "candidate_release_provenance": export_state.get(
+            "candidate_release_provenance"
+        ),
         "candidate_manifest_sha256": candidate_manifest_sha256,
         "reset_manifest_sha256": hashlib.sha256(reset_manifest_path.read_bytes()).hexdigest(),
         "export_state_sha256": progress["export_state_sha256"],
