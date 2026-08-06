@@ -180,10 +180,23 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, dict[str, Any]]]:
     return old_root, source_spec, payloads
 
 
+def _runtime_deps(tmp_path: Path) -> Path:
+    root = tmp_path / "runtime-deps"
+    dependency = root / "omegaconf" / "__init__.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text('__version__ = "2.3.1"\n', encoding="utf-8")
+    sha256 = hashlib.sha256(dependency.read_bytes()).hexdigest()
+    (root / "SHA256SUMS").write_text(
+        f"{sha256}  omegaconf/__init__.py\n", encoding="utf-8"
+    )
+    return root
+
+
 def test_prepare_exact14_launch_gate_and_validate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old_root, source_spec, payloads = _inputs(tmp_path)
+    runtime_deps = _runtime_deps(tmp_path)
     rlinf_root = tmp_path / "rlinf"
     se3_root = tmp_path / "se3"
     rlinf_root.mkdir()
@@ -203,6 +216,7 @@ def test_prepare_exact14_launch_gate_and_validate(
         rlinf_commit=EVALUATOR_COMMIT,
         se3_source_root=se3_root,
         se3_commit=EVALUATOR_BENCHMARK_COMMIT,
+        runtime_deps_root=runtime_deps,
         backend_id="mujoco311-rs140-v1-rld2-quality",
         lanes=DEFAULT_LANES,
         manifest_seed=20262150,
@@ -221,6 +235,7 @@ def test_prepare_exact14_launch_gate_and_validate(
     assert package["allowed_lanes"] == list(DEFAULT_LANES)
     assert tuple(package["lanes"]) == DEFAULT_LANES
     assert "forbidden_lane" not in package
+    assert package["runtime_deps"]["path"] == str(runtime_deps.resolve())
     manifests = {
         path.parent.name: json.loads(path.read_text())
         for path in output.glob("candidates/*/candidate_manifest.json")
@@ -243,6 +258,7 @@ def test_prepare_refuses_overwrite_and_non_exact_lane_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old_root, source_spec, payloads = _inputs(tmp_path)
+    runtime_deps = _runtime_deps(tmp_path)
     rlinf_root = tmp_path / "rlinf"
     se3_root = tmp_path / "se3"
     rlinf_root.mkdir()
@@ -261,6 +277,7 @@ def test_prepare_refuses_overwrite_and_non_exact_lane_inventory(
         "rlinf_commit": EVALUATOR_COMMIT,
         "se3_source_root": se3_root,
         "se3_commit": EVALUATOR_BENCHMARK_COMMIT,
+        "runtime_deps_root": runtime_deps,
         "backend_id": "mujoco311-rs140-v1-rld2-quality",
         "manifest_seed": 20262150,
         "checkpoint_loader": lambda path: payloads[str(path.resolve())],
@@ -283,6 +300,7 @@ def test_package_validation_detects_tampering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     old_root, source_spec, payloads = _inputs(tmp_path)
+    runtime_deps = _runtime_deps(tmp_path)
     rlinf_root = tmp_path / "rlinf"
     se3_root = tmp_path / "se3"
     rlinf_root.mkdir()
@@ -300,6 +318,7 @@ def test_package_validation_detects_tampering(
         rlinf_commit=EVALUATOR_COMMIT,
         se3_source_root=se3_root,
         se3_commit=EVALUATOR_BENCHMARK_COMMIT,
+        runtime_deps_root=runtime_deps,
         backend_id="mujoco311-rs140-v1-rld2-quality",
         lanes=DEFAULT_LANES,
         manifest_seed=20262150,

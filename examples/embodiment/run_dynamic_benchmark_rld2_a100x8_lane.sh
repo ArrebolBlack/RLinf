@@ -60,7 +60,7 @@ plan = json.loads((root / "lanes" / f"{lane}.json").read_text())
 allowed_lanes = [f"L{index}" for index in range(8)]
 if (
     package.get("schema_version")
-    != "rlinf-dynamic-benchmark-rld2-launch-package-v0.2"
+    != "rlinf-dynamic-benchmark-rld2-launch-package-v0.3"
     or package.get("status") != "blocked-awaiting-allocation"
     or package.get("allowed_lanes") != allowed_lanes
     or list(package.get("lanes", {})) != allowed_lanes
@@ -76,16 +76,21 @@ print(package["rlinf_source"]["path"])
 print(package["rlinf_source"]["commit"])
 print(package["se3_source"]["path"])
 print(package["se3_source"]["commit"])
+print(package["runtime_deps"]["path"])
+print(package["runtime_deps"]["sha256sums_sha256"])
 PY
 )
-[[ ${#identity[@]} -eq 5 ]] || die "cannot read package source identity"
+[[ ${#identity[@]} -eq 7 ]] || die "cannot read package source identity"
 expected_uuid="${identity[0]}"
 rlinf_root="${identity[1]}"
 rlinf_commit="${identity[2]}"
 se3_root="${identity[3]}"
 se3_commit="${identity[4]}"
+runtime_deps_root="${identity[5]}"
+runtime_deps_sha256="${identity[6]}"
 
-for item in "$expected_uuid" "$rlinf_root" "$rlinf_commit" "$se3_root" "$se3_commit"; do
+for item in "$expected_uuid" "$rlinf_root" "$rlinf_commit" "$se3_root" "$se3_commit" \
+  "$runtime_deps_root" "$runtime_deps_sha256"; do
   [[ "$item" != *$'\n'* && "$item" != *$'\r'* ]] || die "unsafe package identity"
 done
 [[ "$(git -C "$rlinf_root" rev-parse HEAD)" == "$rlinf_commit" ]] ||
@@ -96,11 +101,19 @@ done
   die "SE3-WAM snapshot commit mismatch"
 [[ -z "$(git -C "$se3_root" status --porcelain --untracked-files=all)" ]] ||
   die "SE3-WAM snapshot is not clean"
+[[ -d "$runtime_deps_root" && -f "$runtime_deps_root/SHA256SUMS" ]] ||
+  die "runtime dependency snapshot is missing"
+[[ "$(sha256sum "$runtime_deps_root/SHA256SUMS" | awk '{print $1}')" == \
+  "$runtime_deps_sha256" ]] || die "runtime dependency manifest mismatch"
+(
+  cd "$runtime_deps_root"
+  sha256sum --strict -c SHA256SUMS
+) >/dev/null || die "runtime dependency snapshot verification failed"
 
 lane_number="${lane#L}"
 runtime_root="$run_root/runtime"
 output_root="$run_root/output"
-export PYTHONPATH="$rlinf_root:$se3_root/src"
+export PYTHONPATH="$runtime_deps_root:$rlinf_root:$se3_root/src"
 
 # The authoritative wrapper obtains the resource lock and fails if keepalive or
 # another task still owns the lane.  This launcher never stops keepalive itself.

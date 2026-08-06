@@ -53,7 +53,7 @@ CHECKPOINT_REQUEST_SCHEMA = (
 )
 CALIBRATION_JOB_SCHEMA = "rlinf-dynamic-benchmark-rld2-calibration-job-v0.1"
 LANE_PLAN_SCHEMA = "rlinf-dynamic-benchmark-rld2-lane-plan-v0.1"
-PACKAGE_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-package-v0.2"
+PACKAGE_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-package-v0.3"
 PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
 POLICY_SCHEMA = "rlinf-dynamic-benchmark-expert-policy-v0.1"
 BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
@@ -598,6 +598,18 @@ def _validate_sha256sums(root: Path) -> None:
             raise LaunchGateError(f"SHA256SUMS mismatch for {relative}")
 
 
+def _runtime_deps_identity(root: Path) -> dict[str, str]:
+    root = root.resolve()
+    checksum_path = root / "SHA256SUMS"
+    if not root.is_dir() or not checksum_path.is_file():
+        raise LaunchGateError("runtime dependency snapshot or SHA256SUMS is missing")
+    _validate_sha256sums(root)
+    return {
+        "path": str(root),
+        "sha256sums_sha256": _sha256(checksum_path),
+    }
+
+
 def _origin_from_path(path: str) -> tuple[str, str]:
     parts = Path(path).parts
     try:
@@ -619,6 +631,7 @@ def _build_package(
     rlinf_commit: str,
     se3_source_root: Path,
     se3_commit: str,
+    runtime_deps_root: Path,
     backend_id: str,
     lanes: Sequence[str],
     manifest_seed: int,
@@ -633,6 +646,7 @@ def _build_package(
         )
     rlinf_identity = _git_identity(rlinf_source_root, rlinf_commit, "RLinf")
     se3_identity = _git_identity(se3_source_root, se3_commit, "SE3-WAM")
+    runtime_deps_identity = _runtime_deps_identity(runtime_deps_root)
     spec = _source_spec(source_spec_path)
     spec_sha256 = _sha256(source_spec_path)
     old_manifests = _discover_old_manifests(
@@ -970,6 +984,7 @@ def _build_package(
             "old_manifest_root": str(old_manifest_root.resolve()),
             "rlinf_source": rlinf_identity,
             "se3_source": se3_identity,
+            "runtime_deps": runtime_deps_identity,
             "backend_id": backend_id,
             "allowed_lanes": list(DEFAULT_LANES),
             "lanes": lane_plans,
@@ -1023,6 +1038,13 @@ def validate_package(root: Path) -> dict[str, Any]:
     unhashed.pop("payload_sha256", None)
     if stored_payload != _payload_sha256(unhashed):
         raise LaunchGateError("launch package payload hash mismatch")
+    runtime_deps = package.get("runtime_deps")
+    if not isinstance(runtime_deps, Mapping):
+        raise LaunchGateError("runtime dependency identity is missing")
+    runtime_deps_root = Path(str(runtime_deps.get("path", ""))).resolve()
+    runtime_identity = _runtime_deps_identity(runtime_deps_root)
+    if runtime_deps != runtime_identity:
+        raise LaunchGateError("runtime dependency identity mismatch")
     manifests = list(root.glob("candidates/*/candidate_manifest.json"))
     if {path.parent.name for path in manifests} != set(EXACT_TASKS):
         raise LaunchGateError("launch candidate manifest set is not exact14")
@@ -1100,6 +1122,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rlinf-commit")
     parser.add_argument("--se3-source-root", type=Path)
     parser.add_argument("--se3-commit")
+    parser.add_argument("--runtime-deps-root", type=Path)
     parser.add_argument("--backend-id", default=BACKEND_ID)
     parser.add_argument("--lane", action="append", dest="lanes")
     parser.add_argument("--manifest-seed", type=int, default=20262150)
@@ -1116,6 +1139,7 @@ def main() -> None:
             args.rlinf_commit,
             args.se3_source_root,
             args.se3_commit,
+            args.runtime_deps_root,
             args.lanes,
         )
         if any(value is not None for value in forbidden):
@@ -1129,6 +1153,7 @@ def main() -> None:
             "rlinf_commit": args.rlinf_commit,
             "se3_source_root": args.se3_source_root,
             "se3_commit": args.se3_commit,
+            "runtime_deps_root": args.runtime_deps_root,
         }
         missing = [key for key, value in required.items() if value is None]
         if missing:
@@ -1141,6 +1166,7 @@ def main() -> None:
             rlinf_commit=_require_commit(args.rlinf_commit, "RLinf evaluator commit"),
             se3_source_root=args.se3_source_root,
             se3_commit=_require_commit(args.se3_commit, "SE3 evaluator commit"),
+            runtime_deps_root=args.runtime_deps_root,
             backend_id=args.backend_id,
             lanes=tuple(args.lanes or DEFAULT_LANES),
             manifest_seed=args.manifest_seed,
