@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,7 +47,12 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _validate_candidate_manifest,
     _write_attempt_tape,
 )
-from examples.embodiment.merge_optimal_export_shards import _kept_recovery_events
+from examples.embodiment.merge_optimal_export_shards import (
+    _expected_shard_indices,
+    _kept_recovery_events,
+    _load_shard_receipts,
+    _validate_shard_records,
+)
 
 
 def _record(candidate_index: int, *, value: float = 1.0) -> dict:
@@ -209,6 +215,106 @@ def test_shard_merge_keeps_only_render_skip_events_in_the_sealed_prefix() -> Non
     assert _kept_recovery_events(events, max_reset=5) == events[:2]
     with pytest.raises(ValueError, match="malformed"):
         _kept_recovery_events(["render_parity_skip:bad"], max_reset=5)
+
+
+def _shard_receipt(*, shard_index: int = 0, shard_count: int = 1) -> dict:
+    return {
+        "schema_version": "rlinf-dynamic-benchmark-optimal-shard-v0.1",
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "accepted_count": 2,
+        "attempted_reset_count": 2,
+        "candidate_attempt_count": 4,
+        "candidate_search_mode": "full-pool",
+        "selection_mode": "planner-pareto",
+        "budget_histogram": {"2": 2},
+    }
+
+
+def _shard_records() -> tuple[list[dict], list[dict], list[dict]]:
+    results = [
+        {
+            "reset_index": index,
+            "episode_id": f"episode-{index}",
+            "candidate_count": 2,
+            "budget_used": 2,
+            "candidate_search_mode": "full-pool",
+            "selection_mode": "planner-pareto",
+            "accepted": True,
+        }
+        for index in range(2)
+    ]
+    attempts = [
+        {"episode_id": f"episode-{reset_index}", "candidate_index": candidate_index}
+        for reset_index in range(2)
+        for candidate_index in range(2)
+    ]
+    winners = [
+        {"request": {"episode_id": f"episode-{index}"}} for index in range(2)
+    ]
+    return results, attempts, winners
+
+
+def test_shard_merge_requires_exact_directory_and_receipt_inventory(tmp_path: Path) -> None:
+    for index in (0, 2):
+        shard = tmp_path / f"shard-{index:02d}"
+        shard.mkdir()
+        receipt = _shard_receipt(shard_index=index, shard_count=3)
+        (shard / "shard_complete.json").write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not exact and gap-free"):
+        _load_shard_receipts(tmp_path)
+
+
+def test_shard_merge_proves_exact_reset_and_full_pool_coverage(tmp_path: Path) -> None:
+    export_state = {
+        "max_resets": 2,
+        "candidate_pool_size": 2,
+        "candidate_search_mode": "full-pool",
+        "selection_mode": "planner-pareto",
+    }
+    reset_manifest = [{"episode_id": f"episode-{index}"} for index in range(2)]
+    results, attempts, winners = _shard_records()
+
+    _validate_shard_records(
+        shard=tmp_path / "shard-00",
+        receipt=_shard_receipt(),
+        export_state=export_state,
+        reset_manifest=reset_manifest,
+        results=results,
+        attempts=attempts,
+        winners=winners,
+    )
+    assert _expected_shard_indices(max_resets=200, shard_count=8, shard_index=0) == list(
+        range(25)
+    )
+    assert _expected_shard_indices(max_resets=200, shard_count=8, shard_index=7) == list(
+        range(175, 200)
+    )
+
+    duplicate_results = [dict(results[0]), {**results[1], "reset_index": 0}]
+    with pytest.raises(ValueError, match="duplicate, gap, or order mismatch"):
+        _validate_shard_records(
+            shard=tmp_path / "shard-00",
+            receipt=_shard_receipt(),
+            export_state=export_state,
+            reset_manifest=reset_manifest,
+            results=duplicate_results,
+            attempts=attempts,
+            winners=winners,
+        )
+
+    duplicate_attempts = [*attempts[:3], {**attempts[3], "candidate_index": 0}]
+    with pytest.raises(ValueError, match="candidate coverage"):
+        _validate_shard_records(
+            shard=tmp_path / "shard-00",
+            receipt=_shard_receipt(),
+            export_state=export_state,
+            reset_manifest=reset_manifest,
+            results=results,
+            attempts=duplicate_attempts,
+            winners=winners,
+        )
 
 
 def test_attempt_tape_round_trip_recomputes_shapes_hashes_and_score(tmp_path: Path) -> None:

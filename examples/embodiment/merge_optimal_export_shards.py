@@ -69,6 +69,167 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+_SHARD_RECEIPT_KEYS = {
+    "schema_version",
+    "shard_index",
+    "shard_count",
+    "accepted_count",
+    "attempted_reset_count",
+    "candidate_attempt_count",
+    "candidate_search_mode",
+    "selection_mode",
+    "budget_histogram",
+}
+
+
+def _load_shard_receipts(root: Path) -> tuple[list[Path], list[dict[str, Any]]]:
+    """Load an exact, gap-free shard directory and completion inventory."""
+
+    shard_like = sorted(path for path in root.iterdir() if path.is_dir() and path.name.startswith("shard-"))
+    malformed = [path.name for path in shard_like if re.fullmatch(r"shard-\d{2}", path.name) is None]
+    if malformed:
+        raise ValueError(f"malformed shard directories: {malformed}")
+    if not shard_like:
+        raise ValueError(f"no shard-* directories under {root}")
+
+    receipts: list[dict[str, Any]] = []
+    for shard in shard_like:
+        complete = shard / "shard_complete.json"
+        if not complete.is_file():
+            raise ValueError(f"{shard} is missing shard_complete.json")
+        receipt = json.loads(complete.read_text(encoding="utf-8"))
+        if not isinstance(receipt, dict) or set(receipt) != _SHARD_RECEIPT_KEYS:
+            raise ValueError(f"{shard} has an invalid shard completion receipt")
+        receipts.append(receipt)
+
+    raw_shard_counts = [receipt.get("shard_count") for receipt in receipts]
+    if (
+        any(isinstance(value, bool) or not isinstance(value, int) for value in raw_shard_counts)
+        or any(not 1 <= value <= 99 for value in raw_shard_counts)
+    ):
+        raise ValueError("shard_count must be an integer in [1, 99]")
+    shard_counts = set(raw_shard_counts)
+    if len(shard_counts) != 1:
+        raise ValueError("shard completion receipts disagree on shard_count")
+    shard_count = shard_counts.pop()
+    expected_names = [f"shard-{index:02d}" for index in range(shard_count)]
+    actual_names = [path.name for path in shard_like]
+    if actual_names != expected_names:
+        raise ValueError(
+            "shard directory inventory is not exact and gap-free: "
+            f"expected={expected_names}, actual={actual_names}"
+        )
+    for index, receipt in enumerate(receipts):
+        if (
+            receipt.get("schema_version")
+            != "rlinf-dynamic-benchmark-optimal-shard-v0.1"
+            or receipt.get("shard_index") != index
+            or receipt.get("shard_count") != shard_count
+        ):
+            raise ValueError(f"shard-{index:02d} completion identity mismatch")
+    return shard_like, receipts
+
+
+def _expected_shard_indices(
+    *, max_resets: int, shard_count: int, shard_index: int
+) -> list[int]:
+    """Return the exporter's exact contiguous reset slice for one shard."""
+
+    if max_resets < 1 or shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("invalid reset-shard dimensions")
+    step = (max_resets + shard_count - 1) // shard_count
+    start = shard_index * step
+    return list(range(start, min(start + step, max_resets)))
+
+
+def _validate_shard_records(
+    *,
+    shard: Path,
+    receipt: dict[str, Any],
+    export_state: dict[str, Any],
+    reset_manifest: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    attempts: list[dict[str, Any]],
+    winners: list[dict[str, Any]],
+) -> None:
+    """Prove exact reset and full-pool coverage for one completed shard."""
+
+    shard_index = receipt["shard_index"]
+    shard_count = receipt["shard_count"]
+    max_resets = export_state.get("max_resets")
+    candidate_pool_size = export_state.get("candidate_pool_size")
+    if (
+        isinstance(max_resets, bool)
+        or not isinstance(max_resets, int)
+        or max_resets < 1
+        or isinstance(candidate_pool_size, bool)
+        or not isinstance(candidate_pool_size, int)
+        or candidate_pool_size < 1
+    ):
+        raise ValueError(f"{shard} export state has invalid reset or candidate dimensions")
+    if len(reset_manifest) != max_resets:
+        raise ValueError(f"{shard} reset manifest length differs from max_resets")
+    expected_indices = _expected_shard_indices(
+        max_resets=max_resets,
+        shard_count=shard_count,
+        shard_index=shard_index,
+    )
+    actual_indices = [row.get("reset_index") for row in results]
+    if actual_indices != expected_indices:
+        raise ValueError(
+            f"{shard} reset coverage has a duplicate, gap, or order mismatch: "
+            f"expected={expected_indices}, actual={actual_indices}"
+        )
+    if (
+        receipt.get("attempted_reset_count") != len(results)
+        or receipt.get("candidate_attempt_count") != len(attempts)
+        or receipt.get("accepted_count") != len(winners)
+        or receipt.get("candidate_search_mode")
+        != export_state.get("candidate_search_mode")
+        or receipt.get("selection_mode") != export_state.get("selection_mode")
+    ):
+        raise ValueError(f"{shard} completion receipt differs from its sealed rows")
+    if (
+        export_state.get("candidate_search_mode") != "full-pool"
+        or export_state.get("selection_mode") != "planner-pareto"
+    ):
+        raise ValueError(f"{shard} is not a full-pool planner-pareto export")
+
+    attempts_by_episode: dict[str, list[dict[str, Any]]] = {}
+    for attempt in attempts:
+        episode_id = attempt.get("episode_id")
+        if not isinstance(episode_id, str):
+            raise ValueError(f"{shard} attempt has no episode identity")
+        attempts_by_episode.setdefault(episode_id, []).append(attempt)
+    winner_ids = [_winner_episode_id(row) for row in winners]
+    if len(winner_ids) != len(set(winner_ids)):
+        raise ValueError(f"{shard} contains duplicate winner episodes")
+    expected_winner_ids: list[str] = []
+    for reset_index, result in zip(expected_indices, results, strict=True):
+        expected_episode = reset_manifest[reset_index].get("episode_id")
+        if not isinstance(expected_episode, str) or result.get("episode_id") != expected_episode:
+            raise ValueError(f"{shard} reset result differs from the frozen reset manifest")
+        if (
+            result.get("candidate_count") != candidate_pool_size
+            or result.get("budget_used") != candidate_pool_size
+            or result.get("candidate_search_mode") != "full-pool"
+            or result.get("selection_mode") != "planner-pareto"
+        ):
+            raise ValueError(f"{shard} reset did not evaluate the exact full pool")
+        episode_attempts = attempts_by_episode.pop(expected_episode, [])
+        candidate_indices = [row.get("candidate_index") for row in episode_attempts]
+        if candidate_indices != list(range(candidate_pool_size)):
+            raise ValueError(
+                f"{shard} candidate coverage has a duplicate, gap, or order mismatch"
+            )
+        if result.get("accepted") is True:
+            expected_winner_ids.append(expected_episode)
+    if attempts_by_episode:
+        raise ValueError(f"{shard} contains attempts outside its reset slice")
+    if winner_ids != expected_winner_ids:
+        raise ValueError(f"{shard} winner inventory differs from accepted reset results")
+
+
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -136,11 +297,7 @@ def main() -> None:
     root = args.root.resolve()
     if not root.is_dir():
         raise FileNotFoundError(root)
-    shard_dirs = sorted(
-        path for path in root.iterdir() if path.is_dir() and re.fullmatch(r"shard-\d{2}", path.name)
-    )
-    if not shard_dirs:
-        raise ValueError(f"no shard-* directories under {root}")
+    shard_dirs, shard_receipts = _load_shard_receipts(root)
 
     all_results: list[dict[str, Any]] = []
     all_attempts: list[dict[str, Any]] = []
@@ -152,13 +309,11 @@ def main() -> None:
     reference_candidate_sha256: str | None = None
     reference_reset_sha256: str | None = None
     reference_provenance: dict[str, str] | None = None
-    for shard in shard_dirs:
-        complete = shard / "shard_complete.json"
-        if not complete.is_file():
-            raise ValueError(f"{shard} is missing shard_complete.json")
-        all_results.extend(_read_jsonl(shard / "reset_results.jsonl"))
-        all_attempts.extend(_read_jsonl(shard / "attempts.jsonl"))
-        all_winners.extend(_read_jsonl(shard / "winner_manifest.jsonl"))
+    reset_manifest: list[dict[str, Any]] | None = None
+    for shard, receipt in zip(shard_dirs, shard_receipts, strict=True):
+        shard_results = _read_jsonl(shard / "reset_results.jsonl")
+        shard_attempts = _read_jsonl(shard / "attempts.jsonl")
+        shard_winners = _read_jsonl(shard / "winner_manifest.jsonl")
         progress = json.loads((shard / "progress.json").read_text(encoding="utf-8"))
         recovery_events = progress.get("recovery_events")
         if not isinstance(recovery_events, list):
@@ -176,12 +331,14 @@ def main() -> None:
         shard_reset_sha256 = hashlib.sha256(
             (shard / "reset_manifest.jsonl").read_bytes()
         ).hexdigest()
+        shard_reset_manifest = _read_jsonl(shard / "reset_manifest.jsonl")
         shard_provenance = _tree_inventory(shard / "provenance")
         if reference_export_state is None:
             reference_export_state = shard_export_state
             reference_candidate_sha256 = shard_candidate_sha256
             reference_reset_sha256 = shard_reset_sha256
             reference_provenance = shard_provenance
+            reset_manifest = shard_reset_manifest
         elif (
             shard_export_state != reference_export_state
             or shard_candidate_sha256 != reference_candidate_sha256
@@ -189,9 +346,25 @@ def main() -> None:
             or shard_provenance != reference_provenance
         ):
             raise ValueError(f"{shard} has a different frozen export contract")
+        assert reset_manifest is not None
+        _validate_shard_records(
+            shard=shard,
+            receipt=receipt,
+            export_state=shard_export_state,
+            reset_manifest=reset_manifest,
+            results=shard_results,
+            attempts=shard_attempts,
+            winners=shard_winners,
+        )
+        all_results.extend(shard_results)
+        all_attempts.extend(shard_attempts)
+        all_winners.extend(shard_winners)
     if started_unix_s is None:
         raise ValueError("no shard start time found")
     assert reference_export_state is not None
+    expected_global_indices = list(range(int(reference_export_state["max_resets"])))
+    if [row["reset_index"] for row in all_results] != expected_global_indices:
+        raise ValueError("merged reset coverage is not exact, ordered, and gap-free")
 
     all_results.sort(key=lambda row: int(row["reset_index"]))
     reset_index_by_episode: dict[str, int] = {
