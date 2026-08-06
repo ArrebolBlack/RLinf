@@ -518,9 +518,16 @@ def _replay_planner_actions(
 
 
 def copy_json(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Round-trip a mapping through canonical JSON to reject non-JSON values."""
+    """Round-trip JSON values without reordering scientific component mappings."""
 
-    return json.loads(_canonical_json(value))
+    return json.loads(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
 
 
 def collect_planner_calibration(

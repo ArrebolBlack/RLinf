@@ -38,6 +38,7 @@ from examples.embodiment.prepare_dynamic_benchmark_rld2_launch_gate import (
 )
 from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
     _environment_config,
+    copy_json,
 )
 
 POLICY_COMMIT = "1" * 40
@@ -62,6 +63,21 @@ def test_rld2_environment_config_explicitly_enables_task_quality() -> None:
         config["task_quality_evaluator_backend_id"]
         == "mujoco311-rs140-v1-rld2-quality"
     )
+
+
+def test_copy_json_preserves_task_quality_component_order() -> None:
+    value = {
+        "components": {
+            "terminal_goal_planar_error_m": {"value": 0.1},
+            "maximum_rim_impulse_n_s": {"value": 0.2},
+        }
+    }
+
+    copied = copy_json(value)
+
+    assert list(copied["components"]) == list(value["components"])
+    with pytest.raises(ValueError, match="Out of range float values"):
+        copy_json({"components": {"quality": {"value": float("nan")}}})
 
 
 def _write_json(path: Path, value: Any) -> None:
