@@ -1957,6 +1957,8 @@ def _task_quality_from_infos(infos: Mapping[str, Any]) -> dict[str, Any] | None:
         if len(raw) != 1:
             raise ValueError("task quality vector must contain exactly one environment")
         raw = raw[0]
+    if raw is None:
+        return None
     if not isinstance(raw, Mapping) or not raw:
         raise ValueError("task quality summary must be a non-empty mapping")
     try:
@@ -2245,21 +2247,42 @@ def _make_env(
     manifest_size: int,
     image_size: int,
     camera_observations: bool,
+    policy: Mapping[str, Any] | None = None,
+    task_quality_schema_version: str | None = None,
+    task_quality_evaluator_backend_id: str | None = None,
 ) -> Any:
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 
+    config = {
+        "task_id": task,
+        "split": split,
+        "manifest_seed": manifest_seed,
+        "manifest_size": manifest_size,
+        "image_size": image_size,
+        "camera_observations": camera_observations,
+        "auto_reset": False,
+        "ignore_terminations": False,
+        "group_size": 1,
+    }
+    if task_quality_schema_version is not None:
+        config.update(
+            task_quality_schema_version=task_quality_schema_version,
+            task_quality_evaluator_backend_id=task_quality_evaluator_backend_id,
+        )
+    if policy is not None:
+        config.update(
+            features=policy.get("features", {}),
+            reward_components=policy.get("reward_components", {}),
+            reward_lift_shaping_weight=float(
+                policy.get("reward_lift_shaping_weight", 0.0)
+            ),
+            reward_orientation_shaping_weight=float(
+                policy.get("reward_orientation_shaping_weight", 0.0)
+            ),
+            state_derived_features=list(policy.get("state_derived_features", [])),
+        )
     return DynamicBenchmarkEnv(
-        cfg={
-            "task_id": task,
-            "split": split,
-            "manifest_seed": manifest_seed,
-            "manifest_size": manifest_size,
-            "image_size": image_size,
-            "camera_observations": camera_observations,
-            "auto_reset": False,
-            "ignore_terminations": False,
-            "group_size": 1,
-        },
+        cfg=config,
         num_envs=1,
         seed_offset=0,
         total_num_processes=1,
@@ -2485,38 +2508,85 @@ def main() -> None:
         benchmark_commit=benchmark_commit,
         device=device,
     )
-    reference_schemas = {
-        canonical_json(candidate.state_schema)
-        for candidate in candidates
-        if candidate.state_schema is not None
-    }
-    if len(reference_schemas) > 1:
-        raise ValueError("candidate policies disagree on state schema")
-
     manifest_size = args.max_resets + args.max_resets % 2
-    light_env = _make_env(
-        task=task,
-        split=args.split,
-        manifest_seed=args.manifest_seed,
-        manifest_size=manifest_size,
-        image_size=64,
-        camera_observations=False,
+    quality_schema_version = (
+        None
+        if planner_dominance is None
+        else str(planner_dominance["quality_schema"]["schema_version"])
     )
-    render_env = _make_env(
-        task=task,
-        split=args.split,
-        manifest_seed=args.manifest_seed,
-        manifest_size=manifest_size,
-        image_size=args.image_size,
-        camera_observations=True,
+    quality_backend_id = (
+        None if planner_dominance is None else str(planner_dominance["backend_id"])
     )
+
+    def make_env_pair(
+        policy: Mapping[str, Any] | None,
+    ) -> tuple[Any, Any]:
+        common = {
+            "task": task,
+            "split": args.split,
+            "manifest_seed": args.manifest_seed,
+            "manifest_size": manifest_size,
+            "policy": policy,
+            "task_quality_schema_version": quality_schema_version,
+            "task_quality_evaluator_backend_id": quality_backend_id,
+        }
+        return (
+            _make_env(
+                **common,
+                image_size=64,
+                camera_observations=False,
+            ),
+            _make_env(
+                **common,
+                image_size=args.image_size,
+                camera_observations=True,
+            ),
+        )
+
+    light_env, render_env = make_env_pair(None)
+    default_schema_key = canonical_json(light_env.state_schema)
+    schema_configs: dict[str, Mapping[str, Any]] = {}
+    for candidate in candidates:
+        if candidate.state_schema is None:
+            continue
+        assert candidate.config is not None
+        schema_configs.setdefault(
+            canonical_json(candidate.state_schema), candidate.config
+        )
+    env_pairs = {default_schema_key: (light_env, render_env)}
+    for schema_key, policy_config in schema_configs.items():
+        if schema_key == default_schema_key:
+            continue
+        pair = make_env_pair(policy_config)
+        if canonical_json(pair[0].state_schema) != schema_key:
+            pair[0].close()
+            pair[1].close()
+            raise ValueError("export environment state schema does not match policy group")
+        env_pairs[schema_key] = pair
+    candidate_env_keys = [
+        default_schema_key
+        if candidate.state_schema is None
+        else canonical_json(candidate.state_schema)
+        for candidate in candidates
+    ]
+
+    def reset_all_envs() -> None:
+        for lightweight, rendered in env_pairs.values():
+            lightweight.reset(options={"env_idx": [0]})
+            rendered.reset(options={"env_idx": [0]})
+
     try:
         light_manifest = [manifest_record(row) for row in light_env._manifest_rows]
         render_manifest = [manifest_record(row) for row in render_env._manifest_rows]
         if canonical_json(light_manifest) != canonical_json(render_manifest):
             raise RuntimeError("lightweight and render manifests disagree")
-        if reference_schemas and canonical_json(light_env.state_schema) not in reference_schemas:
-            raise ValueError("export environment state schema does not match policies")
+        for variant_light, variant_render in env_pairs.values():
+            if canonical_json(
+                [manifest_record(row) for row in variant_light._manifest_rows]
+            ) != canonical_json(light_manifest) or canonical_json(
+                [manifest_record(row) for row in variant_render._manifest_rows]
+            ) != canonical_json(light_manifest):
+                raise RuntimeError("state-schema environment manifests disagree")
         rows = list(light_env._manifest_rows[: args.max_resets])
         if sharded:
             step = (len(rows) + args.shard_count - 1) // args.shard_count
@@ -2524,8 +2594,7 @@ def main() -> None:
             shard_rows = rows[start : start + step]
             run_output = shard_output
             for _ in range(start):
-                light_env.reset(options={"env_idx": [0]})
-                render_env.reset(options={"env_idx": [0]})
+                reset_all_envs()
         else:
             start = 0
             shard_rows = rows
@@ -2714,27 +2783,33 @@ def main() -> None:
                 break
             if local_index < attempted_resets:
                 if local_index + 1 < len(shard_rows):
-                    light_env.reset(options={"env_idx": [0]})
-                    render_env.reset(options={"env_idx": [0]})
+                    reset_all_envs()
                 continue
-            light_request = light_env._requests[0]
-            render_request = render_env._requests[0]
-            if (
-                light_request is None
-                or render_request is None
-                or light_request.episode_id != row.request.episode_id
-                or render_request.episode_id != row.request.episode_id
-            ):
-                raise RuntimeError("rollout order diverged from the frozen reset manifest")
-            initial_state = light_env.checkpoint_state()
+            for variant_light, variant_render in env_pairs.values():
+                light_request = variant_light._requests[0]
+                render_request = variant_render._requests[0]
+                if (
+                    light_request is None
+                    or render_request is None
+                    or light_request.episode_id != row.request.episode_id
+                    or render_request.episode_id != row.request.episode_id
+                ):
+                    raise RuntimeError(
+                        "rollout order diverged from the frozen reset manifest"
+                    )
+            initial_states = {
+                key: pair[0].checkpoint_state() for key, pair in env_pairs.items()
+            }
             reset_attempts: list[dict[str, Any]] = []
             winner = None
             budget_used = budgets[-1]
             for budget in budgets:
                 for candidate in candidates[len(reset_attempts) : budget]:
-                    _restore_candidate_start(light_env, initial_state)
+                    env_key = candidate_env_keys[candidate.index]
+                    candidate_env = env_pairs[env_key][0]
+                    _restore_candidate_start(candidate_env, initial_states[env_key])
                     record, arrays, _ = _rollout(
-                        env=light_env,
+                        env=candidate_env,
                         candidate=candidate,
                         device=device,
                         capture_trace=False,
@@ -2786,11 +2861,13 @@ def main() -> None:
             _append_jsonl(reset_results_path, reset_result)
             if winner is not None:
                 candidate = candidates[int(winner["candidate_index"])]
+                winner_env_key = candidate_env_keys[candidate.index]
+                winner_render_env = env_pairs[winner_env_key][1]
                 tape_path = run_output / winner["attempt_tape"]
                 replay_actions_array = np.load(tape_path)["actions"]
                 try:
                     render_record, _, trace = _rollout(
-                        env=render_env,
+                        env=winner_render_env,
                         candidate=candidate,
                         device=device,
                         capture_trace=True,
@@ -2905,8 +2982,7 @@ def main() -> None:
                 ),
             )
             if local_index + 1 < len(shard_rows):
-                light_env.reset(options={"env_idx": [0]})
-                render_env.reset(options={"env_idx": [0]})
+                reset_all_envs()
 
         if _sha256(args.candidate_manifest) != candidate_manifest_sha256:
             raise RuntimeError("candidate manifest changed during export")
@@ -3010,8 +3086,9 @@ def main() -> None:
                 f"accepted {accepted}/{args.accepted_episodes} winners within {attempted_resets} resets"
             )
     finally:
-        light_env.close()
-        render_env.close()
+        for lightweight, rendered in env_pairs.values():
+            lightweight.close()
+            rendered.close()
 
 
 if __name__ == "__main__":

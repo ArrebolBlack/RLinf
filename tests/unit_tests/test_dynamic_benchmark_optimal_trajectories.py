@@ -42,6 +42,7 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _render_parity_skip,
     _restore_candidate_start,
     _select_winner,
+    _task_quality_from_infos,
     _validate_candidate_manifest,
     _write_attempt_tape,
 )
@@ -71,6 +72,12 @@ def test_budget_sequence_doubles_to_frozen_maximum() -> None:
     assert _budget_sequence(12, 32) == (12, 24, 32)
     with pytest.raises(ValueError, match="candidate budgets"):
         _budget_sequence(16, 8)
+
+
+def test_missing_vector_task_quality_remains_an_absent_summary() -> None:
+    assert _task_quality_from_infos({"task_quality": [None]}) is None
+    with pytest.raises(ValueError, match="non-empty mapping"):
+        _task_quality_from_infos({"task_quality": [{}]})
 
 
 def test_candidate_manifest_is_commit_bound_and_resolves_relative_paths(
