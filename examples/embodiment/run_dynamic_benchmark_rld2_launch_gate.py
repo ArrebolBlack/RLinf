@@ -460,7 +460,21 @@ def _replay_planner_actions(
         or completion_time is None
         or not isinstance(task_quality, Mapping)
     ):
-        raise LaunchGateError("planner calibration replay was not successful and safe")
+        diagnostics = {
+            "task": task,
+            "replay_index": replay_index,
+            "success": success,
+            "safety_failure": safety_failure,
+            "termination_reason": termination_reason,
+            "trajectory_completion": float(completion),
+            "completion_time_s": completion_time,
+            "task_quality_is_mapping": isinstance(task_quality, Mapping),
+            "event_names": [event.name for event in events],
+        }
+        raise LaunchGateError(
+            "planner calibration replay was not successful and safe: "
+            + _canonical_json(diagnostics)
+        )
     finite = bool(
         np.isfinite(actions).all()
         and np.max(np.abs(actions)) <= 1.0
