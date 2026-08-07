@@ -481,6 +481,38 @@ class DynamicBenchmarkEnv(gym.Env):
         )
         if self.process_residual_planner and not self.worker_processes:
             raise ValueError("process residual planner requires process workers")
+        self.gpu_native = bool(_cfg_get(cfg, "gpu_native", False))
+        self._gpu_backend = None
+        if self.gpu_native:
+            if self.worker_processes:
+                raise ValueError(
+                    "Dynamic Benchmark GPU-native mode forbids process workers"
+                )
+            if self.worker_threads != 1:
+                raise ValueError(
+                    "Dynamic Benchmark GPU-native mode requires worker_threads=1"
+                )
+            export_dir = _cfg_get(cfg, "gpu_native_export_dir", None)
+            if not export_dir:
+                raise ValueError(
+                    "Dynamic Benchmark GPU-native mode requires gpu_native_export_dir"
+                )
+            from .gpu_backend import GpuNativeBackendEnv
+
+            self._gpu_backend = GpuNativeBackendEnv(
+                task_id=self.task_id,
+                num_envs=self.num_envs,
+                export_dir=str(export_dir),
+                device_ordinal=int(_cfg_get(cfg, "gpu_native_device_ordinal", 0)),
+                image_size=self.image_size,
+            )
+            self.envs = []
+            self._executor = None
+            self.horizon_steps = int(
+                self._load_task_config(self.task_id)["clock"]["horizon_steps"]
+            )
+            if self.horizon_steps < 1:
+                raise ValueError("Dynamic Benchmark GPU horizon must be positive")
         self.use_rel_reward = False
         self.group_size = int(_cfg_get(cfg, "group_size", 1))
         self.num_group = max(1, self.num_envs // max(1, self.group_size))
@@ -501,7 +533,7 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_rows: tuple[Any, ...] = ()
         self._refresh_manifest()
         self._process_vector = None
-        if self.worker_processes:
+        if not self.gpu_native and self.worker_processes:
             from .process_vector import OrderedProcessVector
 
             self.envs = []
@@ -535,7 +567,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 raise RuntimeError(
                     "Dynamic Benchmark vector members disagree on horizon"
                 )
-        else:
+        elif not self.gpu_native:
             self.envs = [
                 self._make_mujoco_env(
                     self.task_id,
@@ -674,6 +706,10 @@ class DynamicBenchmarkEnv(gym.Env):
         separate from reset makes validation borrowing exactly reversible.
         """
 
+        if self._gpu_backend is not None:
+            raise ValueError(
+                "Dynamic Benchmark GPU-native mode does not support manifest contexts"
+            )
         try:
             split = self._Split(str(split_name))
         except ValueError as exc:
@@ -735,6 +771,8 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_cursor = 0
 
     def _next_request(self) -> Any:
+        if self._gpu_backend is not None:
+            return self._gpu_backend.next_request()
         if self._manifest_cursor == len(self._manifest_rows):
             self._manifest_generation += 1
             self._refresh_manifest()
@@ -1067,6 +1105,14 @@ class DynamicBenchmarkEnv(gym.Env):
                 (index, self._unpack_process_observation(payload))
                 for index, payload in self._process_vector.run("reset", reset_items)
             ]
+        elif self._gpu_backend is not None:
+            requests = [None] * self.num_envs
+            for index, request in reset_items:
+                requests[index] = request
+            observations = self._gpu_backend.reset(requests)
+            reset_results = [
+                (int(index), observations[int(index)]) for index in indices
+            ]
         elif self._executor is None or len(reset_items) < 2:
             reset_results = [self._reset_one(item) for item in reset_items]
         else:
@@ -1220,6 +1266,48 @@ class DynamicBenchmarkEnv(gym.Env):
                         result,
                         payload["event_names"],
                         payload.get("task_quality"),
+                    )
+                )
+        elif self._gpu_backend is not None:
+            policy_steps = self._gpu_backend.policy_steps()
+            commands = []
+            command_sources: list[tuple[int, np.ndarray]] = []
+            for index in range(self.num_envs):
+                observation = self._raw_observations[index]
+                request = self._requests[index]
+                if observation is None or request is None:
+                    raise RuntimeError(
+                        "Dynamic Benchmark vector member is not initialized"
+                    )
+                commands.append(
+                    self._ActionCommand(
+                        mode=request.action_mode,
+                        values=action_array[index],
+                        policy_step=int(policy_steps[index]),
+                    )
+                )
+                command_sources.append((index, action_array[index]))
+            step_results = []
+            for (index, values), result in zip(
+                command_sources, self._gpu_backend.step(commands), strict=True
+            ):
+                request = self._requests[index]
+                assert request is not None
+                action = self._ActionCommand(
+                    mode=request.action_mode,
+                    values=values,
+                    policy_step=int(policy_steps[index]),
+                )
+                step_results.append(
+                    (
+                        index,
+                        action,
+                        result,
+                        tuple(
+                            event.name
+                            for event in result.observation.events_since_last_observation
+                        ),
+                        getattr(result, "task_quality", None),
                     )
                 )
         elif self._executor is None or len(active_items) < 2:
@@ -1471,7 +1559,15 @@ class DynamicBenchmarkEnv(gym.Env):
             or any(item is None for item in self._raw_observations)
         ):
             raise RuntimeError("Dynamic Benchmark checkpoint requires initialized envs")
-        if self._process_vector is None:
+        if self._gpu_backend is not None:
+            snapshots = [
+                {
+                    "env_state": None,
+                    "observation": _pack_process_observation(observation),
+                }
+                for observation in self._raw_observations
+            ]
+        elif self._process_vector is None:
             snapshots = []
             for env, observation in zip(
                 self.envs, self._raw_observations, strict=True
@@ -1565,6 +1661,12 @@ class DynamicBenchmarkEnv(gym.Env):
             "process_start_method": self.process_start_method,
             "state_schema": self.state_schema,
         }
+        if self._gpu_backend is not None:
+            identity["gpu_native"] = True
+            identity["gpu_native_export_dir"] = self._gpu_backend.export_dir
+            identity["gpu_native_device_ordinal"] = int(
+                _cfg_get(self.cfg, "gpu_native_device_ordinal", 0)
+            )
         lift_weight = float(_cfg_get(cfg, "reward_lift_shaping_weight", 0.0))
         orientation_weight = float(
             _cfg_get(cfg, "reward_orientation_shaping_weight", 0.0)
@@ -1707,7 +1809,9 @@ class DynamicBenchmarkEnv(gym.Env):
                 raise ValueError(
                     "Dynamic Benchmark checkpoint observation identity does not match request"
                 )
-            if self._process_vector is None:
+            if self._gpu_backend is not None:
+                raw_observations.append(authoritative_observation)
+            elif self._process_vector is None:
                 env = self.envs[index]
                 env.reset(request)
                 observed = env.load_state(env_state)
@@ -1807,8 +1911,44 @@ class DynamicBenchmarkEnv(gym.Env):
             target_name = "_elapsed_steps" if name == "elapsed_steps" else name
             setattr(self, target_name, value)
         self._is_start = bool(state["is_start"])
+        if self._gpu_backend is not None:
+            self._resync_gpu_backend()
+
+    def _resync_gpu_backend(self) -> None:
+        """Restart backend lanes on the restored requests and rebuild states.
+
+        The GPU-native backend snapshot is device-resident and not serialized
+        into checkpoints.  On resume the backend is therefore restarted from
+        the checkpoint's requests, and the vector state is re-encoded from the
+        fresh lanes; the policy, optimizer, normalizer, reward and metric
+        state are restored exactly.  This is a documented resume boundary, not
+        a mid-episode bit-exact environment restore.
+        """
+
+        backend = self._gpu_backend
+        assert backend is not None
+        observations = backend.reset(tuple(self._requests))
+        encoded = np.stack(
+            [
+                self._encode(observation, request, env_index=index)
+                for index, (observation, request) in enumerate(
+                    zip(observations, self._requests, strict=True)
+                )
+            ]
+        )
+        states = torch.as_tensor(encoded, dtype=torch.float32)
+        if states.shape != self._last_obs["states"].shape:
+            raise RuntimeError("GPU-native resume changed the vector state shape")
+        self._last_obs = {"states": states}
+        for index, observation in enumerate(observations):
+            self._raw_observations[index] = observation
+        self._needs_reset[:] = False
+        self._is_start = True
 
     def close(self) -> None:
+        if self._gpu_backend is not None:
+            self._gpu_backend.close()
+            self._gpu_backend = None
         if self._process_vector is not None:
             self._process_vector.close()
             self._process_vector = None
