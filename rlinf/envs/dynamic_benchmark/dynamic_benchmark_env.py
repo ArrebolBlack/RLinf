@@ -508,8 +508,10 @@ class DynamicBenchmarkEnv(gym.Env):
             )
             self.envs = []
             self._executor = None
+            from se3_wam.benchmark.config import load_task_config
+
             self.horizon_steps = int(
-                self._load_task_config(self.task_id)["clock"]["horizon_steps"]
+                load_task_config(self.task_id)["clock"]["horizon_steps"]
             )
             if self.horizon_steps < 1:
                 raise ValueError("Dynamic Benchmark GPU horizon must be positive")
