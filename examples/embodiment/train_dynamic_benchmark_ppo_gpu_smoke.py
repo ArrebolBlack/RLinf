@@ -372,7 +372,7 @@ def main() -> int:
 
     args = _parser().parse_args()
     config = _config(args)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.output / "checkpoint_latest.pt"
 
     random.seed(config.seed)
