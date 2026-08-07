@@ -892,10 +892,6 @@ def _validate_attempt_quality(
         )
         extra = sorted(set(values) - expected if isinstance(values, Mapping) else set())
         raise ValueError(f"task quality mapping gap: missing={missing}, extra={extra}")
-    if list(values) != expected_names:
-        raise ValueError(
-            "task quality component order differs from the canonical schema"
-        )
     for frozen_schema in schema_components:
         name = frozen_schema["name"]
         component = values[name]

@@ -33,6 +33,7 @@ import pytest
 from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
     EVALUATOR_IDENTITY_SCHEMA,
     _audit_evaluator_identity,
+    _payload_sha256,
 )
 from examples.embodiment.build_dynamic_benchmark_rld2_evidence import (
     build_compatibility_evidence,
@@ -215,3 +216,86 @@ def test_extra_provenance_fields_still_fail_closed(tmp_path: Path) -> None:
             candidate_payload=candidate,
             planner_dominance={"backend_id": BACKEND_ID},
         )
+
+
+def _quality_summary(component_order: list[str]) -> dict[str, Any]:
+    resolutions = {
+        "terminal_goal_planar_error_m": 0.0005,
+        "maximum_rim_impulse_n_s": 0.001,
+    }
+    summary = {
+        "schema_version": "db0-episode-task-quality-v1",
+        "task_id": "t2_trans",
+        "evaluator_backend_id": BACKEND_ID,
+        "schema_sha256": "0" * 64,
+        "episode_id": "ep",
+        "physics_sample_count": 500,
+        "terminal": True,
+        "components": {
+            name: {
+                "value": 0.0,
+                "direction": "minimize",
+                "unit": "N*s" if name.endswith("impulse_n_s") else "m",
+                "scientific_resolution": resolutions[name],
+                "reducer": "maximum" if name.endswith("impulse_n_s") else "terminal",
+            }
+            for name in component_order
+        },
+    }
+    summary["summary_sha256"] = _payload_sha256(summary)
+    return summary
+
+
+def _quality_contract() -> dict[str, Any]:
+    return {
+        "task": "t2_trans",
+        "backend_id": BACKEND_ID,
+        "quality_schema": {
+            "schema_version": "db0-episode-task-quality-v1",
+            "task_id": "t2_trans",
+            "schema_sha256": "0" * 64,
+            "components": [
+                {
+                    "name": "terminal_goal_planar_error_m",
+                    "direction": "minimize",
+                    "unit": "m",
+                    "scientific_resolution": 0.0005,
+                    "reducer": "terminal",
+                },
+                {
+                    "name": "maximum_rim_impulse_n_s",
+                    "direction": "minimize",
+                    "unit": "N*s",
+                    "scientific_resolution": 0.001,
+                    "reducer": "maximum",
+                },
+            ],
+        },
+    }
+
+
+def test_attempt_quality_accepts_non_canonical_component_order() -> None:
+    from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
+        _validate_attempt_quality,
+    )
+
+    record = {
+        "episode_id": "ep",
+        "task_quality": _quality_summary(
+            ["maximum_rim_impulse_n_s", "terminal_goal_planar_error_m"]
+        ),
+    }
+    _validate_attempt_quality(record, _quality_contract())
+
+
+def test_attempt_quality_still_rejects_missing_component() -> None:
+    from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
+        _validate_attempt_quality,
+    )
+
+    record = {
+        "episode_id": "ep",
+        "task_quality": _quality_summary(["terminal_goal_planar_error_m"]),
+    }
+    with pytest.raises(ValueError, match="mapping gap"):
+        _validate_attempt_quality(record, _quality_contract())
