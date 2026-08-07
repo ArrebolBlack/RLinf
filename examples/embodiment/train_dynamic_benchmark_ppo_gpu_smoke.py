@@ -168,9 +168,16 @@ class RunningNormalizer:
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self.count < 2:
             return None
-        variance = self.m2 / (self.count - 1)
-        scale = torch.sqrt(variance + self.epsilon).to(device)
-        return self.mean.to(device), scale
+        variance = self.m2 / max(1, self.count - 1)
+        mean = self.mean.clone()
+        scale = torch.sqrt(torch.clamp(variance, min=self.epsilon**2))
+        if self.mask_dim:
+            mean[-self.mask_dim :] = 0.0
+            scale[-self.mask_dim :] = 1.0
+        return (
+            mean.to(device=device, dtype=torch.float32),
+            scale.to(device=device, dtype=torch.float32),
+        )
 
     def normalize(
         self,
