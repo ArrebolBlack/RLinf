@@ -66,14 +66,17 @@ class _Fixture:
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "".join(
-            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in rows
         ),
         encoding="utf-8",
     )
@@ -121,7 +124,9 @@ def _quality_schema(task: str) -> dict[str, Any]:
     return schema
 
 
-def _metric(direction: str, resolution: float, *, steps: bool = False) -> dict[str, Any]:
+def _metric(
+    direction: str, resolution: float, *, steps: bool = False
+) -> dict[str, Any]:
     return {
         "direction": direction,
         "max_observed_replay_drift": 0.0,
@@ -289,7 +294,11 @@ def _candidate_manifest(
         "policy_benchmark_commits": [POLICY_BENCHMARK],
         "planner_dominance": _contract(task, calibration_path, calibration_sha256),
         "candidates": [
-            {"candidate_id": "planner", "kind": "planner", "provenance": _provenance(policy=False)},
+            {
+                "candidate_id": "planner",
+                "kind": "planner",
+                "provenance": _provenance(policy=False),
+            },
             {
                 "candidate_id": "policy-1",
                 "kind": "policy",
@@ -365,7 +374,9 @@ def _write_input_manifest(fixture: _Fixture) -> None:
             "candidate_release_root": str(fixture.candidate_root.resolve()),
             "candidate_release_manifest_sha256": fixture.candidate_release_sha256,
             "candidate_release_checksums_sha256": fixture.candidate_checksums_sha256,
-            "tasks": [fixture.records[task] for task in EXACT_TASKS if task in fixture.records],
+            "tasks": [
+                fixture.records[task] for task in EXACT_TASKS if task in fixture.records
+            ],
         }
     )
     _write_json(fixture.input_manifest, payload)
@@ -394,10 +405,12 @@ def _make_fixture(tmp_path: Path) -> _Fixture:
     inventory_rows: list[dict[str, Any]] = []
     calibration_rows: list[dict[str, Any]] = []
     for task in EXACT_TASKS:
-        task_identity = _evaluator_identity("../evidence/benchmark-compatibility/proof.json")
-        task_identity["policy_benchmark_relations"][0][
-            "evidence_sha256"
-        ] = compatibility_sha256
+        task_identity = _evaluator_identity(
+            "../evidence/benchmark-compatibility/proof.json"
+        )
+        task_identity["policy_benchmark_relations"][0]["evidence_sha256"] = (
+            compatibility_sha256
+        )
         calibration = {
             "schema_version": "rlinf-dynamic-benchmark-planner-calibration-evidence-v0.1",
             "task": task,
@@ -449,10 +462,12 @@ def _make_fixture(tmp_path: Path) -> _Fixture:
         f"{_sha256(source)}  source\tsynthetic\t{source.resolve()}\n",
         encoding="utf-8",
     )
-    release_identity = _evaluator_identity("evidence/benchmark-compatibility/proof.json")
-    release_identity["policy_benchmark_relations"][0][
-        "evidence_sha256"
-    ] = compatibility_sha256
+    release_identity = _evaluator_identity(
+        "evidence/benchmark-compatibility/proof.json"
+    )
+    release_identity["policy_benchmark_relations"][0]["evidence_sha256"] = (
+        compatibility_sha256
+    )
     release_manifest = _seal_payload(
         {
             "schema_version": CANDIDATE_RELEASE_SCHEMA,
@@ -467,7 +482,7 @@ def _make_fixture(tmp_path: Path) -> _Fixture:
                     "sha256": compatibility_sha256,
                 }
             ],
-            "calibration_evidence": sorted(calibration_rows, key=lambda row: row["task"]),
+            "calibration_evidence": list(calibration_rows),
             "tasks": list(EXACT_TASKS),
             "task_manifest_sha256": {
                 task: _sha256(candidate_root / task / "candidate_manifest.json")
@@ -521,7 +536,9 @@ def _make_fixture(tmp_path: Path) -> _Fixture:
         results: list[dict[str, Any]] = []
         for index in range(ACCEPTED_PER_TASK):
             episode_id = f"{task}-{index:03d}"
-            attempts.extend((_attempt(task, episode_id, 0), _attempt(task, episode_id, 1)))
+            attempts.extend(
+                (_attempt(task, episode_id, 0), _attempt(task, episode_id, 1))
+            )
             results.append(
                 {
                     "reset_index": index,
@@ -622,7 +639,9 @@ def test_exact14_release_builds_then_independent_audit_grants_eligibility(
     assert report["status"] == "passed"
     assert report["release_eligible"] is True
     assert report["summary"]["accepted_count"] == 1400
-    manifest = json.loads((output / "release_manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (output / "release_manifest.json").read_text(encoding="utf-8")
+    )
     assert manifest["tasks"] == list(EXACT_TASKS)
     assert manifest["aggregate"]["source_counts"] == {"expert_dominant": 1400}
 
@@ -636,7 +655,9 @@ def test_release_input_rejects_missing_task(tmp_path: Path) -> None:
         _collect_release(fixture.input_manifest, release_auditor_commit=AUDITOR_COMMIT)
 
 
-def test_release_rejects_string_accepted_even_when_dataset_is_resealed(tmp_path: Path) -> None:
+def test_release_rejects_string_accepted_even_when_dataset_is_resealed(
+    tmp_path: Path,
+) -> None:
     fixture = _make_fixture(tmp_path)
     task = "t1_xyz"
     path = Path(fixture.records[task]["dataset_root"]) / "reset_results.jsonl"
@@ -675,5 +696,7 @@ def test_release_rejects_candidate_release_hash_tamper(tmp_path: Path) -> None:
     payload["release_id"] = "tampered"
     _write_json(path, payload)
 
-    with pytest.raises(ReleaseAuditError, match="file hash tamper|release-manifest hash mismatch"):
+    with pytest.raises(
+        ReleaseAuditError, match="file hash tamper|release-manifest hash mismatch"
+    ):
         _collect_release(fixture.input_manifest, release_auditor_commit=AUDITOR_COMMIT)

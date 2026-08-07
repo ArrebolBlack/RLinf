@@ -206,7 +206,9 @@ def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(dict(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(dict(value), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -230,7 +232,9 @@ def _safe_root_file(root: Path, relative: str) -> Path:
         raise ReleaseAuditError(f"unsafe root-relative path {relative!r}")
     path = root.joinpath(*pure.parts)
     if path.is_symlink():
-        raise ReleaseAuditError(f"RLD2 roots must not contain symlinked files: {relative}")
+        raise ReleaseAuditError(
+            f"RLD2 roots must not contain symlinked files: {relative}"
+        )
     resolved = path.resolve()
     if not resolved.is_relative_to(root.resolve()):
         raise ReleaseAuditError(f"root-relative path escapes RLD2 root: {relative!r}")
@@ -247,23 +251,25 @@ def _verify_root_checksums(root: Path, expected_sha256: str) -> int:
     ):
         parts = line.split("  ", maxsplit=1)
         if len(parts) != 2:
-            raise ReleaseAuditError(f"{root.name} SHA256SUMS:{line_number} is malformed")
+            raise ReleaseAuditError(
+                f"{root.name} SHA256SUMS:{line_number} is malformed"
+            )
         digest = _require_sha256(parts[0], f"SHA256SUMS:{line_number}")
         relative = parts[1]
         if relative in declared:
             raise ReleaseAuditError(f"{root.name} SHA256SUMS duplicates {relative!r}")
         path = _safe_root_file(root, relative)
         if not path.is_file() or path.name == "SHA256SUMS":
-            raise ReleaseAuditError(f"{root.name} checksum target is missing: {relative!r}")
+            raise ReleaseAuditError(
+                f"{root.name} checksum target is missing: {relative!r}"
+            )
         if _sha256(path) != digest:
             raise ReleaseAuditError(f"{root.name} file hash tamper: {relative!r}")
         declared[relative] = digest
     actual = {
         path.relative_to(root).as_posix()
         for path in root.rglob("*")
-        if path.is_file()
-        and path.name != "SHA256SUMS"
-        and ".staging" not in path.parts
+        if path.is_file() and path.name != "SHA256SUMS" and ".staging" not in path.parts
     }
     if actual != set(declared):
         raise ReleaseAuditError(
@@ -286,7 +292,11 @@ def _candidate_semantics(candidate: Mapping[str, Any]) -> dict[str, Any]:
             raise ReleaseAuditError("candidate residual_scale is invalid")
     stochastic = candidate.get("stochastic", False)
     offset = candidate.get("exploration_seed_offset", 0)
-    if not isinstance(stochastic, bool) or isinstance(offset, bool) or not isinstance(offset, int):
+    if (
+        not isinstance(stochastic, bool)
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+    ):
         raise ReleaseAuditError("candidate rollout semantics are invalid")
     return {
         "kind": "policy",
@@ -346,7 +356,9 @@ def _metric_contract(value: Any, *, metric_name: str, direction: str) -> dict[st
         if floor != expected_floor:
             raise ReleaseAuditError(f"planner metric {metric_name!r} floor mismatch")
         if metric_name == "control_steps" and resolution < 1.0:
-            raise ReleaseAuditError("control_steps scientific resolution must be at least one")
+            raise ReleaseAuditError(
+                "control_steps scientific resolution must be at least one"
+            )
         if metric_name == "completion_time_s" and resolution != 0.002:
             raise ReleaseAuditError(
                 "completion_time_s scientific resolution must be one 0.002 s physics step"
@@ -355,7 +367,9 @@ def _metric_contract(value: Any, *, metric_name: str, direction: str) -> dict[st
     return normalized
 
 
-def _normalize_contract(candidate_payload: Mapping[str, Any], task: str) -> dict[str, Any]:
+def _normalize_contract(
+    candidate_payload: Mapping[str, Any], task: str
+) -> dict[str, Any]:
     """Independently normalize the frozen utility and calibration contract."""
 
     raw = candidate_payload.get("planner_dominance")
@@ -372,7 +386,11 @@ def _normalize_contract(candidate_payload: Mapping[str, Any], task: str) -> dict
     if raw.get("schema_version") != PLANNER_DOMINANCE_SCHEMA or raw.get("task") != task:
         raise ReleaseAuditError(f"{task} planner-dominance schema/task mismatch")
     backend_id = raw.get("backend_id")
-    if not isinstance(backend_id, str) or not backend_id or backend_id.strip() != backend_id:
+    if (
+        not isinstance(backend_id, str)
+        or not backend_id
+        or backend_id.strip() != backend_id
+    ):
         raise ReleaseAuditError(f"{task} planner backend identity is missing")
     quality = raw.get("quality_schema")
     if not isinstance(quality, Mapping) or set(quality) != {
@@ -461,8 +479,14 @@ def _normalize_contract(candidate_payload: Mapping[str, Any], task: str) -> dict
         raise ReleaseAuditError(f"{task} planner calibration inventory mismatch")
     replay_count = calibration.get("replay_count")
     reset_episode_id = calibration.get("reset_episode_id")
-    if isinstance(replay_count, bool) or not isinstance(replay_count, int) or replay_count < 3:
-        raise ReleaseAuditError(f"{task} planner calibration requires at least three replays")
+    if (
+        isinstance(replay_count, bool)
+        or not isinstance(replay_count, int)
+        or replay_count < 3
+    ):
+        raise ReleaseAuditError(
+            f"{task} planner calibration requires at least three replays"
+        )
     if not isinstance(reset_episode_id, str) or not reset_episode_id.strip():
         raise ReleaseAuditError(f"{task} planner calibration reset identity is missing")
     evidence_path = calibration.get("evidence_path")
@@ -490,8 +514,12 @@ def _normalize_contract(candidate_payload: Mapping[str, Any], task: str) -> dict
     }:
         raise ReleaseAuditError(f"{task} planner metric inventory mismatch")
     quality_metrics = metrics.get("task_quality")
-    component_index = {component["name"]: component for component in normalized_components}
-    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(component_index):
+    component_index = {
+        component["name"]: component for component in normalized_components
+    }
+    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(
+        component_index
+    ):
         raise ReleaseAuditError(f"{task} quality metric mapping is incomplete")
     normalized_metrics = {
         "trajectory_completion": _metric_contract(
@@ -526,7 +554,9 @@ def _normalize_contract(candidate_payload: Mapping[str, Any], task: str) -> dict
             normalized_metrics["task_quality"][name]["scientific_resolution"]
             != component["scientific_resolution"]
         ):
-            raise ReleaseAuditError(f"{task}/{name} calibration resolution differs from schema")
+            raise ReleaseAuditError(
+                f"{task}/{name} calibration resolution differs from schema"
+            )
     metric_names = [
         "trajectory_completion",
         *(f"task_quality.{name}" for name in component_index),
@@ -630,7 +660,9 @@ def _validate_compatibility_evidence(
         or evidence.get("test_exposure") != {"test_id": False, "test_ood": False}
         or evidence.get("payload_sha256") != _payload_sha256(evidence)
     ):
-        raise ReleaseAuditError("compatibility evidence identity, split, or payload mismatch")
+        raise ReleaseAuditError(
+            "compatibility evidence identity, split, or payload mismatch"
+        )
     _require_commit(policy_benchmark_commit, "compatibility policy benchmark commit")
     _require_commit(
         evidence.get("evaluator_rlinf_commit"),
@@ -680,7 +712,9 @@ def _validate_compatibility_evidence(
     previous_key: tuple[str, str] | None = None
     for index, raw_probe in enumerate(probes):
         if not isinstance(raw_probe, Mapping) or set(raw_probe) != expected_probe_keys:
-            raise ReleaseAuditError(f"compatibility probe {index} field inventory mismatch")
+            raise ReleaseAuditError(
+                f"compatibility probe {index} field inventory mismatch"
+            )
         probe = dict(raw_probe)
         task = probe.get("task")
         if not isinstance(task, str) or task not in EXACT_TASKS:
@@ -741,7 +775,9 @@ def _validate_compatibility_evidence(
             or dimensions["policy_mask_dim"] != dimensions["evaluator_mask_dim"]
             or dimensions["policy_action_dim"] != dimensions["evaluator_action_dim"]
         ):
-            raise ReleaseAuditError(f"compatibility probe {index} schema/dimension mismatch")
+            raise ReleaseAuditError(
+                f"compatibility probe {index} schema/dimension mismatch"
+            )
         key = (task, policy_sha256)
         if previous_key is not None and key <= previous_key:
             raise ReleaseAuditError("compatibility probes must be sorted and unique")
@@ -785,7 +821,9 @@ def _policy_authority(
             continue
         provenance = candidate.get("provenance")
         source = provenance.get("source") if isinstance(provenance, Mapping) else None
-        benchmark = provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        benchmark = (
+            provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        )
         if not isinstance(source, Mapping) or not isinstance(benchmark, Mapping):
             raise ReleaseAuditError(
                 f"{task}/{candidate.get('candidate_id')} policy authority is missing"
@@ -821,7 +859,9 @@ def _compatibility_inventory_rows(
         )
         provenance = candidate.get("provenance")
         source = provenance.get("source") if isinstance(provenance, Mapping) else None
-        benchmark = provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        benchmark = (
+            provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        )
         state_schema = (
             provenance.get("state_schema") if isinstance(provenance, Mapping) else None
         )
@@ -841,7 +881,9 @@ def _compatibility_inventory_rows(
             or not isinstance(mask_dim, int)
             or mask_dim < 0
         ):
-            raise ReleaseAuditError(f"{task} compatibility state dimensions are invalid")
+            raise ReleaseAuditError(
+                f"{task} compatibility state dimensions are invalid"
+            )
         row = {
             "task": task,
             "policy_sha256": policy_sha256,
@@ -865,7 +907,9 @@ def _compatibility_inventory_rows(
             )
         rows[key] = row
     if not rows:
-        raise ReleaseAuditError(f"{task} compatibility inventory has no policy checkpoints")
+        raise ReleaseAuditError(
+            f"{task} compatibility inventory has no policy checkpoints"
+        )
     return [rows[key] for key in sorted(rows)]
 
 
@@ -900,7 +944,9 @@ def _validate_evaluator_identity(
     )
     relations = value.get("policy_benchmark_relations")
     if not isinstance(relations, list):
-        raise ReleaseAuditError(f"{task} policy/evaluator benchmark relations are missing")
+        raise ReleaseAuditError(
+            f"{task} policy/evaluator benchmark relations are missing"
+        )
     commits = [
         row.get("policy_benchmark_commit") if isinstance(row, Mapping) else None
         for row in relations
@@ -917,7 +963,9 @@ def _validate_evaluator_identity(
             "evidence_path",
             "evidence_sha256",
         }:
-            raise ReleaseAuditError(f"{task} benchmark relation field inventory mismatch")
+            raise ReleaseAuditError(
+                f"{task} benchmark relation field inventory mismatch"
+            )
         policy_commit = _require_commit(
             row.get("policy_benchmark_commit"), f"{task} policy benchmark relation"
         )
@@ -928,7 +976,9 @@ def _validate_evaluator_identity(
                 or row.get("evidence_path") is not None
                 or row.get("evidence_sha256") is not None
             ):
-                raise ReleaseAuditError(f"{task} identical benchmark relation is invalid")
+                raise ReleaseAuditError(
+                    f"{task} identical benchmark relation is invalid"
+                )
             evidence_path = None
             evidence_sha256 = None
         elif relation == "checkpoint-compatible":
@@ -954,7 +1004,9 @@ def _validate_evaluator_identity(
             )
             evidence_path = str(evidence)
         else:
-            raise ReleaseAuditError(f"{task} benchmark relation {relation!r} is unsupported")
+            raise ReleaseAuditError(
+                f"{task} benchmark relation {relation!r} is unsupported"
+            )
         normalized_relations.append(
             {
                 "policy_benchmark_commit": policy_commit,
@@ -1008,7 +1060,9 @@ def _validate_candidate_manifest(
         )
     candidates = payload.get("candidates")
     if not isinstance(candidates, list) or len(candidates) < 2:
-        raise ReleaseAuditError(f"{task} frozen pool must contain planner and RL candidates")
+        raise ReleaseAuditError(
+            f"{task} frozen pool must contain planner and RL candidates"
+        )
     if candidates[0].get("kind") != "planner":
         raise ReleaseAuditError(f"{task} planner must be candidate index zero")
     ids: list[str] = []
@@ -1020,11 +1074,15 @@ def _validate_candidate_manifest(
         if not isinstance(candidate_id, str) or not candidate_id:
             raise ReleaseAuditError(f"{task} candidate {index} ID is missing")
         if not isinstance(candidate.get("provenance"), Mapping):
-            raise ReleaseAuditError(f"{task} candidate {candidate_id} provenance is missing")
+            raise ReleaseAuditError(
+                f"{task} candidate {candidate_id} provenance is missing"
+            )
         ids.append(candidate_id)
         semantics.append(_canonical_json(_candidate_semantics(candidate)))
     if len(ids) != len(set(ids)) or len(semantics) != len(set(semantics)):
-        raise ReleaseAuditError(f"{task} candidate IDs or rollout semantics are duplicated")
+        raise ReleaseAuditError(
+            f"{task} candidate IDs or rollout semantics are duplicated"
+        )
     if sum(candidate.get("kind") == "planner" for candidate in candidates) != 1:
         raise ReleaseAuditError(f"{task} must contain exactly one planner")
     policy_rlinf_commits, policy_benchmark_commits = _policy_authority(
@@ -1080,7 +1138,9 @@ def _validate_inventory_task(
             raise ReleaseAuditError(f"{task} input inventory index is not an integer")
     rows.sort(key=lambda row: row["candidate_index"])
     if [row.get("candidate_index") for row in rows] != list(range(len(candidates))):
-        raise ReleaseAuditError(f"{task} input inventory indices are missing or duplicated")
+        raise ReleaseAuditError(
+            f"{task} input inventory indices are missing or duplicated"
+        )
     for index, (row, candidate) in enumerate(zip(rows, candidates, strict=True)):
         if row.get("schema_version") != INPUT_INVENTORY_SCHEMA:
             raise ReleaseAuditError(f"{task} input record {index} schema mismatch")
@@ -1092,7 +1152,9 @@ def _validate_inventory_task(
             or row.get("semantics_sha256") != _payload_sha256(semantics)
             or row.get("provenance") != candidate.get("provenance")
         ):
-            raise ReleaseAuditError(f"{task} input record {index} differs from candidate pool")
+            raise ReleaseAuditError(
+                f"{task} input record {index} differs from candidate pool"
+            )
     return _input_subset_hash(rows)
 
 
@@ -1128,10 +1190,14 @@ def _candidate_release_file(
 def _verify_candidate_inputs(path: Path, expected_sha256: str) -> None:
     if _sha256(path) != expected_sha256:
         raise ReleaseAuditError("candidate release INPUTS.sha256 identity mismatch")
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         parts = line.split("  ", maxsplit=1)
         if len(parts) != 2:
-            raise ReleaseAuditError(f"candidate INPUTS.sha256:{line_number} is malformed")
+            raise ReleaseAuditError(
+                f"candidate INPUTS.sha256:{line_number} is malformed"
+            )
         digest = _require_sha256(parts[0], f"candidate INPUTS.sha256:{line_number}")
         fields = parts[1].split("\t")
         if len(fields) != 3:
@@ -1170,7 +1236,9 @@ def _validate_candidate_release(
             "candidate release schema, production status, payload, or exact14 mismatch"
         )
     if "rlinf_commit" in release or "benchmark_commit" in release:
-        raise ReleaseAuditError("candidate release must not use singular policy authority")
+        raise ReleaseAuditError(
+            "candidate release must not use singular policy authority"
+        )
     policy_rlinf_commits = _sorted_commits(
         release.get("policy_rlinf_commits"), "candidate release policy RLinf commits"
     )
@@ -1195,19 +1263,28 @@ def _validate_candidate_release(
         if relation["relation"] == "checkpoint-compatible"
     ]
     if release.get("evaluator_evidence") != expected_evaluator_evidence:
-        raise ReleaseAuditError("candidate release evaluator evidence inventory mismatch")
+        raise ReleaseAuditError(
+            "candidate release evaluator evidence inventory mismatch"
+        )
     calibration_rows = release.get("calibration_evidence")
     if not isinstance(calibration_rows, list) or [
-        row.get("task") if isinstance(row, Mapping) else None for row in calibration_rows
-    ] != sorted(EXACT_TASKS):
-        raise ReleaseAuditError("candidate release calibration evidence is not sorted exact14")
+        row.get("task") if isinstance(row, Mapping) else None
+        for row in calibration_rows
+    ] != list(EXACT_TASKS):
+        raise ReleaseAuditError(
+            "candidate release calibration evidence is not exact14-ordered"
+        )
     calibration_paths: dict[str, Path] = {}
     for row in calibration_rows:
         if not isinstance(row, Mapping) or set(row) != {"task", "path", "sha256"}:
-            raise ReleaseAuditError("candidate release calibration evidence row is invalid")
+            raise ReleaseAuditError(
+                "candidate release calibration evidence row is invalid"
+            )
         task_value = row["task"]
         if not isinstance(task_value, str) or task_value not in EXACT_TASKS:
-            raise ReleaseAuditError("candidate release calibration task identity is invalid")
+            raise ReleaseAuditError(
+                "candidate release calibration task identity is invalid"
+            )
         task = task_value
         digest = _require_sha256(row["sha256"], f"{task} calibration evidence")
         calibration_paths[task] = _candidate_release_file(
@@ -1229,14 +1306,22 @@ def _validate_candidate_release(
     for path in root.rglob("candidate_manifest.json"):
         task = path.parent.name
         if task in discovered:
-            raise ReleaseAuditError(f"candidate release duplicates task manifest {task}")
+            raise ReleaseAuditError(
+                f"candidate release duplicates task manifest {task}"
+            )
         discovered[task] = path.resolve()
     if set(discovered) != set(EXACT_TASKS):
-        raise ReleaseAuditError("candidate release contains missing, extra, or orphan task manifests")
+        raise ReleaseAuditError(
+            "candidate release contains missing, extra, or orphan task manifests"
+        )
     for task in EXACT_TASKS:
-        digest = _require_sha256(hashes[task], f"{task} candidate release task manifest")
+        digest = _require_sha256(
+            hashes[task], f"{task} candidate release task manifest"
+        )
         if _sha256(discovered[task]) != digest:
-            raise ReleaseAuditError(f"{task} candidate release task-manifest hash mismatch")
+            raise ReleaseAuditError(
+                f"{task} candidate release task-manifest hash mismatch"
+            )
         count = counts[task]
         if isinstance(count, bool) or not isinstance(count, int) or count < 2:
             raise ReleaseAuditError(f"{task} candidate release pool size is invalid")
@@ -1283,11 +1368,17 @@ def _contract_from_audit_summary(
 ) -> None:
     if "planner_dominance" in summary:
         if summary.get("planner_dominance") != expected:
-            raise ReleaseAuditError(f"{task} task audit carries mixed planner calibration")
+            raise ReleaseAuditError(
+                f"{task} task audit carries mixed planner calibration"
+            )
         return
-    if summary.get("planner_dominance_payload_sha256") == expected.get("payload_sha256"):
+    if summary.get("planner_dominance_payload_sha256") == expected.get(
+        "payload_sha256"
+    ):
         return
-    raise ReleaseAuditError(f"{task} task audit does not bind the planner-dominance contract")
+    raise ReleaseAuditError(
+        f"{task} task audit does not bind the planner-dominance contract"
+    )
 
 
 def _evaluator_from_audit_summary(
@@ -1298,9 +1389,13 @@ def _evaluator_from_audit_summary(
 ) -> None:
     if "evaluator_identity" in summary:
         if summary.get("evaluator_identity") != expected:
-            raise ReleaseAuditError(f"{task} task audit carries swapped evaluator identity")
+            raise ReleaseAuditError(
+                f"{task} task audit carries swapped evaluator identity"
+            )
         return
-    expected_hash = hashlib.sha256(_canonical_json(expected).encode("utf-8")).hexdigest()
+    expected_hash = hashlib.sha256(
+        _canonical_json(expected).encode("utf-8")
+    ).hexdigest()
     if summary.get("evaluator_identity_sha256") == expected_hash:
         return
     raise ReleaseAuditError(f"{task} task audit does not bind evaluator identity")
@@ -1336,12 +1431,13 @@ def _validate_task_audit(
         or audit.get("dataset_card_sha256") != card_sha256
         or audit.get("checksums_sha256") != checksums_sha256
         or audit.get("candidate_manifest_sha256") != candidate_sha256
-        or audit.get("candidate_release_manifest_sha256")
-        != candidate_release_sha256
+        or audit.get("candidate_release_manifest_sha256") != candidate_release_sha256
     ):
         raise ReleaseAuditError(f"{task} independent audit input identity mismatch")
     if audit.get("status") != "passed" or audit.get("training_eligible") is not True:
-        raise ReleaseAuditError(f"{task} independent audit did not grant training eligibility")
+        raise ReleaseAuditError(
+            f"{task} independent audit did not grant training eligibility"
+        )
     _require_commit(audit.get("auditor_commit"), f"{task} per-task auditor commit")
     summary = audit.get("summary")
     if not isinstance(summary, Mapping):
@@ -1369,7 +1465,9 @@ def _eligible(record: Mapping[str, Any]) -> bool:
         if not isinstance(record.get(key), bool):
             raise ReleaseAuditError(f"attempt {key} must be a native JSON boolean")
     if not isinstance(replay, Mapping) or not isinstance(replay.get("passed"), bool):
-        raise ReleaseAuditError("attempt replay-validation passed must be a native boolean")
+        raise ReleaseAuditError(
+            "attempt replay-validation passed must be a native boolean"
+        )
     return (
         record["success"]
         and not record["safety_failure"]
@@ -1402,9 +1500,13 @@ def _metric_value(record: Mapping[str, Any], name: str) -> float:
         component_name = name.split(".", 1)[1]
         summary = record.get("task_quality")
         components = summary.get("components") if isinstance(summary, Mapping) else None
-        component = components.get(component_name) if isinstance(components, Mapping) else None
+        component = (
+            components.get(component_name) if isinstance(components, Mapping) else None
+        )
         if not isinstance(component, Mapping) or "value" not in component:
-            raise ReleaseAuditError(f"task quality mapping is missing {component_name!r}")
+            raise ReleaseAuditError(
+                f"task quality mapping is missing {component_name!r}"
+            )
         value = _number(component["value"], f"task quality {component_name!r} value")
     else:
         raw_value = record[name]
@@ -1414,7 +1516,9 @@ def _metric_value(record: Mapping[str, Any], name: str) -> float:
                 or not isinstance(raw_value, int)
                 or raw_value < 1
             ):
-                raise ReleaseAuditError("control_steps must be a positive native integer")
+                raise ReleaseAuditError(
+                    "control_steps must be a positive native integer"
+                )
             value = float(raw_value)
         else:
             value = _number(raw_value, f"planner metric {name!r}")
@@ -1455,7 +1559,9 @@ def _metric_thresholds(
     return epsilon, strict_margin
 
 
-def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
+def _validate_attempt_quality(
+    record: Mapping[str, Any], contract: Mapping[str, Any]
+) -> None:
     summary = record.get("task_quality")
     schema = contract["quality_schema"]
     if not isinstance(summary, Mapping) or set(summary) != {
@@ -1483,7 +1589,11 @@ def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, 
     ):
         raise ReleaseAuditError("task quality summary identity or hash mismatch")
     sample_count = summary.get("physics_sample_count")
-    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 1:
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 1
+    ):
         raise ReleaseAuditError("task quality physics sample count is invalid")
     components = summary.get("components")
     expected_names = [item["name"] for item in schema["components"]]
@@ -1499,10 +1609,14 @@ def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, 
             "scientific_resolution",
             "reducer",
         }:
-            raise ReleaseAuditError(f"task quality component {name!r} inventory mismatch")
+            raise ReleaseAuditError(
+                f"task quality component {name!r} inventory mismatch"
+            )
         for key in ("direction", "unit", "scientific_resolution", "reducer"):
             if component.get(key) != metadata[key]:
-                raise ReleaseAuditError(f"task quality component {name!r} metadata mismatch")
+                raise ReleaseAuditError(
+                    f"task quality component {name!r} metadata mismatch"
+                )
         _metric_value(record, f"task_quality.{name}")
 
 
@@ -1556,7 +1670,9 @@ def _validate_calibration_evidence(
         release_root=candidate_release_root,
     )
     if evidence_path != release_evidence_path.resolve():
-        raise ReleaseAuditError(f"{task} calibration path differs from release inventory")
+        raise ReleaseAuditError(
+            f"{task} calibration path differs from release inventory"
+        )
     if _sha256(evidence_path) != calibration["evidence_sha256"]:
         raise ReleaseAuditError(f"{task} calibration evidence hash tamper")
     evidence = _load_json(evidence_path, f"{task} calibration evidence")
@@ -1590,8 +1706,7 @@ def _validate_calibration_evidence(
         or evidence.get("evaluator_identity_sha256") != expected_evaluator_sha256
         or evidence.get("split") not in {"train", "validation"}
         or evidence.get("test_exposure") != {"test_id": False, "test_ood": False}
-        or evidence.get("reset_manifest_sha256")
-        != calibration["reset_manifest_sha256"]
+        or evidence.get("reset_manifest_sha256") != calibration["reset_manifest_sha256"]
         or evidence.get("payload_sha256") != _payload_sha256(evidence)
     ):
         raise ReleaseAuditError(f"{task} calibration evidence identity mismatch")
@@ -1627,7 +1742,9 @@ def _validate_calibration_evidence(
     metric_values = {name: [] for name in _metric_names(contract)}
     for index, replay in enumerate(replays):
         if not isinstance(replay, Mapping) or set(replay) != expected_replay_keys:
-            raise ReleaseAuditError(f"{task} calibration replay {index} inventory mismatch")
+            raise ReleaseAuditError(
+                f"{task} calibration replay {index} inventory mismatch"
+            )
         replay_index = replay.get("replay_index")
         environment_id = replay.get("environment_instance_id")
         control_steps = replay.get("control_steps")
@@ -1642,7 +1759,9 @@ def _validate_calibration_evidence(
             or not isinstance(control_steps, int)
             or control_steps < 1
         ):
-            raise ReleaseAuditError(f"{task} calibration replay {index} index/env/steps invalid")
+            raise ReleaseAuditError(
+                f"{task} calibration replay {index} index/env/steps invalid"
+            )
         environment_ids.add(environment_id)
         reset_request_sha256 = _require_sha256(
             replay.get("reset_request_sha256"), f"{task} calibration reset request"
@@ -1671,7 +1790,9 @@ def _validate_calibration_evidence(
             or replay.get("safety_failure") is not False
             or replay.get("finite_and_bounded") is not True
         ):
-            raise ReleaseAuditError(f"{task} calibration replay {index} hard gates failed")
+            raise ReleaseAuditError(
+                f"{task} calibration replay {index} hard gates failed"
+            )
         _number(replay.get("trajectory_completion"), f"{task} trajectory_completion")
         _number(replay.get("completion_time_s"), f"{task} completion_time_s")
         _number(replay.get("action_l2_sum"), f"{task} action_l2_sum")
@@ -1796,7 +1917,9 @@ def _audit_source_labels_and_deltas(
         seen_episodes.add(episode_id)
         records = grouped.get(episode_id)
         if records is None or set(records) != set(range(len(candidates))):
-            raise ReleaseAuditError(f"{task}/{episode_id} did not run the full frozen pool")
+            raise ReleaseAuditError(
+                f"{task}/{episode_id} did not run the full frozen pool"
+            )
         candidate_count = result.get("candidate_count")
         budget_used = result.get("budget_used")
         if (
@@ -1827,7 +1950,9 @@ def _audit_source_labels_and_deltas(
             or not isinstance(selected_index, int)
             or selected_index not in records
         ):
-            raise ReleaseAuditError(f"{task}/{episode_id} selected candidate index is invalid")
+            raise ReleaseAuditError(
+                f"{task}/{episode_id} selected candidate index is invalid"
+            )
         expected_source = (
             "rejected"
             if selected_index is None
@@ -1845,27 +1970,41 @@ def _audit_source_labels_and_deltas(
         if not isinstance(planner_eligible_label, bool) or (
             planner_eligible_label is not _eligible(planner)
         ):
-            raise ReleaseAuditError(f"{task}/{episode_id} planner eligibility is mislabeled")
+            raise ReleaseAuditError(
+                f"{task}/{episode_id} planner eligibility is mislabeled"
+            )
         if selected_index is None:
             if selection.get("winner_candidate_id") is not None:
-                raise ReleaseAuditError(f"{task}/{episode_id} rejected selection names a winner")
+                raise ReleaseAuditError(
+                    f"{task}/{episode_id} rejected selection names a winner"
+                )
         else:
             selected = records[selected_index]
             if selection.get("winner_candidate_id") != selected.get("candidate_id"):
-                raise ReleaseAuditError(f"{task}/{episode_id} selected candidate ID mismatch")
+                raise ReleaseAuditError(
+                    f"{task}/{episode_id} selected candidate ID mismatch"
+                )
             if not _eligible(selected):
-                raise ReleaseAuditError(f"{task}/{episode_id} selected attempt is ineligible")
+                raise ReleaseAuditError(
+                    f"{task}/{episode_id} selected attempt is ineligible"
+                )
             if selected_index == 0 and not _eligible(planner):
-                raise ReleaseAuditError(f"{task}/{episode_id} ineligible planner was used as fallback")
-            if selected_index > 0 and _eligible(planner) and not _planner_pareto_dominates(
-                selected, planner, contract
+                raise ReleaseAuditError(
+                    f"{task}/{episode_id} ineligible planner was used as fallback"
+                )
+            if (
+                selected_index > 0
+                and _eligible(planner)
+                and not _planner_pareto_dominates(selected, planner, contract)
             ):
                 raise ReleaseAuditError(
                     f"{task}/{episode_id} expert_dominant winner does not dominate planner"
                 )
         published = result.get("accepted")
         if not isinstance(published, bool):
-            raise ReleaseAuditError(f"{task}/{episode_id} accepted must be a native boolean")
+            raise ReleaseAuditError(
+                f"{task}/{episode_id} accepted must be a native boolean"
+            )
         published_index = result.get("winner_candidate_index")
         if published:
             if (
@@ -1873,9 +2012,12 @@ def _audit_source_labels_and_deltas(
                 or isinstance(published_index, bool)
                 or not isinstance(published_index, int)
                 or published_index != selected_index
-                or result.get("winner_candidate_id") != selection.get("winner_candidate_id")
+                or result.get("winner_candidate_id")
+                != selection.get("winner_candidate_id")
             ):
-                raise ReleaseAuditError(f"{task}/{episode_id} published winner identity mismatch")
+                raise ReleaseAuditError(
+                    f"{task}/{episode_id} published winner identity mismatch"
+                )
             accepted += 1
             source_counts[expected_source] += 1
             selected = records[selected_index]
@@ -1884,7 +2026,9 @@ def _audit_source_labels_and_deltas(
                     planner_value = _metric_value(planner, name)
                     winner_value = _metric_value(selected, name)
                     spec = _metric_spec(contract, name)
-                    epsilon, strict_margin = _metric_thresholds(name, planner_value, spec)
+                    epsilon, strict_margin = _metric_thresholds(
+                        name, planner_value, spec
+                    )
                 except (KeyError, TypeError, ValueError):
                     deltas[name].unavailable()
                     continue
@@ -1899,22 +2043,33 @@ def _audit_source_labels_and_deltas(
                     strict_margin=strict_margin,
                 )
         else:
-            if result.get("winner_candidate_id") is not None or published_index is not None:
-                raise ReleaseAuditError(f"{task}/{episode_id} rejected publication names a winner")
+            if (
+                result.get("winner_candidate_id") is not None
+                or published_index is not None
+            ):
+                raise ReleaseAuditError(
+                    f"{task}/{episode_id} rejected publication names a winner"
+                )
             if result.get("render_parity_skip") is None and selected_index is not None:
                 raise ReleaseAuditError(
                     f"{task}/{episode_id} unpublished selection lacks render-parity evidence"
                 )
             source_counts["reject"] += 1
     if set(grouped) != seen_episodes:
-        raise ReleaseAuditError(f"{task} attempts include resets absent from reset results")
+        raise ReleaseAuditError(
+            f"{task} attempts include resets absent from reset results"
+        )
     if accepted != ACCEPTED_PER_TASK:
         raise ReleaseAuditError(
             f"{task} has {accepted} accepted winners, expected {ACCEPTED_PER_TASK}"
         )
     if source_counts["expert_dominant"] + source_counts["planner_fallback"] != accepted:
         raise ReleaseAuditError(f"{task} accepted source-kind counts do not sum to 100")
-    return dict(source_counts), {name: value.payload() for name, value in deltas.items()}, len(results)
+    return (
+        dict(source_counts),
+        {name: value.payload() for name, value in deltas.items()},
+        len(results),
+    )
 
 
 def _validate_card(
@@ -1980,8 +2135,12 @@ def _validate_card(
         or source.get("policy_rlinf_commits") != list(policy_rlinf_commits)
         or source.get("policy_benchmark_commits") != list(policy_benchmark_commits)
     ):
-        raise ReleaseAuditError(f"{task} candidate/card runtime or benchmark identity mismatch")
-    _require_commit(source["evaluator_rlinf_commit"], f"{task} evaluator RLinf identity")
+        raise ReleaseAuditError(
+            f"{task} candidate/card runtime or benchmark identity mismatch"
+        )
+    _require_commit(
+        source["evaluator_rlinf_commit"], f"{task} evaluator RLinf identity"
+    )
     _require_commit(
         source["evaluator_benchmark_commit"], f"{task} evaluator benchmark identity"
     )
@@ -2005,7 +2164,9 @@ def _load_release_inputs(path: Path) -> tuple[dict[str, Any], list[dict[str, Any
         or payload.get("release_id") != RELEASE_ID
         or payload.get("payload_sha256") != _payload_sha256(payload)
     ):
-        raise ReleaseAuditError("release-input schema, release ID, or payload hash mismatch")
+        raise ReleaseAuditError(
+            "release-input schema, release ID, or payload hash mismatch"
+        )
     _require_sha256(
         payload.get("candidate_release_manifest_sha256"),
         "release-input candidate release manifest",
@@ -2017,11 +2178,16 @@ def _load_release_inputs(path: Path) -> tuple[dict[str, Any], list[dict[str, Any
     records = payload.get("tasks")
     if not isinstance(records, list):
         raise ReleaseAuditError("release-input tasks must be a list")
-    task_ids = [record.get("task") if isinstance(record, Mapping) else None for record in records]
+    task_ids = [
+        record.get("task") if isinstance(record, Mapping) else None
+        for record in records
+    ]
     if tuple(task_ids) != EXACT_TASKS:
         missing = sorted(set(EXACT_TASKS) - set(task_ids))
         extra = sorted(set(task_ids) - set(EXACT_TASKS), key=str)
-        duplicates = sorted(task for task, count in Counter(task_ids).items() if count > 1)
+        duplicates = sorted(
+            task for task, count in Counter(task_ids).items() if count > 1
+        )
         raise ReleaseAuditError(
             "release-input task inventory is not ordered exact14: "
             f"missing={missing}, extra={extra}, duplicates={duplicates}"
@@ -2029,7 +2195,9 @@ def _load_release_inputs(path: Path) -> tuple[dict[str, Any], list[dict[str, Any
     normalized: list[dict[str, Any]] = []
     for record in records:
         if not isinstance(record, Mapping) or set(record) != _TASK_INPUT_KEYS:
-            raise ReleaseAuditError("release-input task record field inventory mismatch")
+            raise ReleaseAuditError(
+                "release-input task record field inventory mismatch"
+            )
         row = dict(record)
         for key in (
             "dataset_card_sha256",
@@ -2043,7 +2211,9 @@ def _load_release_inputs(path: Path) -> tuple[dict[str, Any], list[dict[str, Any
     return payload, normalized
 
 
-def _collect_release(input_manifest: Path, *, release_auditor_commit: str) -> dict[str, Any]:
+def _collect_release(
+    input_manifest: Path, *, release_auditor_commit: str
+) -> dict[str, Any]:
     input_manifest = _rld2_path(str(input_manifest.resolve()), "release input manifest")
     input_payload, inputs = _load_release_inputs(input_manifest)
     candidate_release_root = _rld2_path(
@@ -2091,21 +2261,22 @@ def _collect_release(input_manifest: Path, *, release_auditor_commit: str) -> di
             row["input_inventory_path"], f"{task} input inventory"
         )
         if root in seen_roots or audit_path in seen_audits:
-            raise ReleaseAuditError("release-input dataset roots and audits must be unique")
+            raise ReleaseAuditError(
+                "release-input dataset roots and audits must be unique"
+            )
         seen_roots.add(root)
         seen_audits.add(audit_path)
         if (
             task_inventory_path != inventory_path
             or row["input_inventory_sha256"] != inventory_sha256
         ):
-            raise ReleaseAuditError("mixed input inventories are forbidden in one release")
+            raise ReleaseAuditError(
+                "mixed input inventories are forbidden in one release"
+            )
 
         checksum_entries = _verify_root_checksums(root, row["checksums_sha256"])
         candidate_path = root / "candidate_manifest.json"
-        if (
-            row["candidate_manifest_sha256"]
-            != candidate_release["task_hashes"][task]
-        ):
+        if row["candidate_manifest_sha256"] != candidate_release["task_hashes"][task]:
             raise ReleaseAuditError(
                 f"{task} is orphaned from the pinned candidate release"
             )
@@ -2124,7 +2295,9 @@ def _collect_release(input_manifest: Path, *, release_auditor_commit: str) -> di
             candidate_release_root=candidate_release_root,
         )
         if len(candidates) != candidate_release["candidate_counts"][task]:
-            raise ReleaseAuditError(f"{task} candidate count differs from candidate release")
+            raise ReleaseAuditError(
+                f"{task} candidate count differs from candidate release"
+            )
         if evaluator_identity != candidate_release["evaluator_identity"]:
             raise ReleaseAuditError(
                 f"{task} evaluator identity differs from pinned candidate release"
@@ -2254,7 +2427,9 @@ def _collect_release(input_manifest: Path, *, release_auditor_commit: str) -> di
             aggregate_common[name].paired_count += accumulator.paired_count
             aggregate_common[name].unavailable_count += accumulator.unavailable_count
             aggregate_common[name].better_count += accumulator.better_count
-            aggregate_common[name].within_tolerance_count += accumulator.within_tolerance_count
+            aggregate_common[
+                name
+            ].within_tolerance_count += accumulator.within_tolerance_count
             aggregate_common[name].worse_count += accumulator.worse_count
 
     assert (
@@ -2266,15 +2441,24 @@ def _collect_release(input_manifest: Path, *, release_auditor_commit: str) -> di
         ACCEPTED_PER_TASK * len(EXACT_TASKS)
     ):
         raise ReleaseAuditError("release accepted source counts do not sum to 1400")
-    if sorted(release_policy_rlinf_commits) != candidate_release["policy_rlinf_commits"]:
-        raise ReleaseAuditError("policy RLinf commit union differs from candidate release")
+    if (
+        sorted(release_policy_rlinf_commits)
+        != candidate_release["policy_rlinf_commits"]
+    ):
+        raise ReleaseAuditError(
+            "policy RLinf commit union differs from candidate release"
+        )
     if (
         sorted(release_policy_benchmark_commits)
         != candidate_release["policy_benchmark_commits"]
     ):
-        raise ReleaseAuditError("policy benchmark commit union differs from candidate release")
+        raise ReleaseAuditError(
+            "policy benchmark commit union differs from candidate release"
+        )
     if set(release_relations) != set(release_policy_benchmark_commits):
-        raise ReleaseAuditError("compatibility relation inventory differs from release policies")
+        raise ReleaseAuditError(
+            "compatibility relation inventory differs from release policies"
+        )
     for policy_commit in sorted(release_policy_benchmark_commits):
         relation = release_relations[policy_commit]
         if relation["relation"] == "identical":
@@ -2373,7 +2557,9 @@ def audit_release(
 ) -> dict[str, Any]:
     """Independently reopen and audit a sealed release manifest."""
 
-    release_root = _rld2_path(str(release_root.resolve()), "release root", directory=True)
+    release_root = _rld2_path(
+        str(release_root.resolve()), "release root", directory=True
+    )
     expected_manifest = _require_sha256(
         expected_release_manifest_sha256, "expected release-manifest SHA-256"
     )
@@ -2406,7 +2592,9 @@ def audit_release(
             or sealed.get("release_eligible") is not False
             or sealed.get("payload_sha256") != _payload_sha256(sealed)
         ):
-            raise ReleaseAuditError("sealed release-manifest identity or payload mismatch")
+            raise ReleaseAuditError(
+                "sealed release-manifest identity or payload mismatch"
+            )
         recomputed = _collect_release(
             input_manifest,
             release_auditor_commit=_require_commit(
@@ -2414,7 +2602,9 @@ def audit_release(
             ),
         )
         if recomputed != sealed:
-            raise ReleaseAuditError("release manifest does not reproduce from sealed inputs")
+            raise ReleaseAuditError(
+                "release manifest does not reproduce from sealed inputs"
+            )
         report.update(
             status="passed",
             release_eligible=True,
