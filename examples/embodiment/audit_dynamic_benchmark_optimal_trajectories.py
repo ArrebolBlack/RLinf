@@ -41,9 +41,7 @@ except ModuleNotFoundError:
 CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.1"
 CANDIDATE_SCHEMA_V2 = "rlinf-dynamic-benchmark-optimal-candidates-v0.2"
 CANDIDATE_SCHEMAS = (CANDIDATE_SCHEMA, CANDIDATE_SCHEMA_V2)
-EVALUATOR_IDENTITY_SCHEMA = (
-    "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
-)
+EVALUATOR_IDENTITY_SCHEMA = "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
 CALIBRATION_EVIDENCE_SCHEMA = (
     "rlinf-dynamic-benchmark-planner-calibration-evidence-v0.1"
 )
@@ -203,7 +201,9 @@ def _verify_root_checksums(root: Path, expected_sha256: str) -> int:
     if set(declared) != actual:
         missing = sorted(actual - set(declared))
         extra = sorted(set(declared) - actual)
-        raise ValueError(f"root checksum inventory mismatch: missing={missing}, extra={extra}")
+        raise ValueError(
+            f"root checksum inventory mismatch: missing={missing}, extra={extra}"
+        )
     return len(declared)
 
 
@@ -275,7 +275,9 @@ def _candidate_rows(
         if kind not in {"planner", "policy"}:
             raise ValueError(f"candidate {candidate_id!r} has invalid kind")
         if not isinstance(row.get("stochastic", False), bool):
-            raise ValueError(f"candidate {candidate_id!r} stochastic flag is not boolean")
+            raise ValueError(
+                f"candidate {candidate_id!r} stochastic flag is not boolean"
+            )
         seed_offset = row.get("exploration_seed_offset", 0)
         if (
             isinstance(seed_offset, bool)
@@ -297,7 +299,10 @@ def _candidate_rows(
         if schema_version == CANDIDATE_SCHEMA_V2 and provenance is None:
             raise ValueError("candidate schema v0.2 has a provenance gap")
         if kind == "planner":
-            if row.get("policy_path") is not None or row.get("policy_sha256") is not None:
+            if (
+                row.get("policy_path") is not None
+                or row.get("policy_sha256") is not None
+            ):
                 raise ValueError("planner candidate unexpectedly names a policy file")
             if schema_version == CANDIDATE_SCHEMA_V2:
                 assert isinstance(provenance, Mapping)
@@ -328,7 +333,9 @@ def _candidate_rows(
                 checkpoint = provenance.get("checkpoint")
                 benchmark = provenance.get("benchmark")
                 if not isinstance(source_row, Mapping):
-                    raise ValueError(f"candidate {candidate_id!r} provenance has no source")
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance has no source"
+                    )
                 policy_source_commits.add(
                     _full_commit(
                         f"candidate {candidate_id!r} source RLinf commit",
@@ -343,9 +350,7 @@ def _candidate_rows(
                     raise ValueError(
                         f"candidate {candidate_id!r} checkpoint provenance mismatch"
                     )
-                if (
-                    not isinstance(benchmark, Mapping)
-                ):
+                if not isinstance(benchmark, Mapping):
                     raise ValueError(
                         f"candidate {candidate_id!r} benchmark provenance is missing"
                     )
@@ -357,7 +362,9 @@ def _candidate_rows(
                 )
             else:
                 if schema_version == CANDIDATE_SCHEMA_V2:
-                    raise ValueError("candidate schema v0.2 policy authority is missing")
+                    raise ValueError(
+                        "candidate schema v0.2 policy authority is missing"
+                    )
         ids.append(candidate_id)
     if len(ids) != len(set(ids)) or planner_count != 1:
         raise ValueError("candidate IDs must be unique and contain exactly one planner")
@@ -366,13 +373,15 @@ def _candidate_rows(
     if schema_version == CANDIDATE_SCHEMA_V2:
         expected_rlinf = sorted(policy_source_commits)
         expected_benchmark = sorted(policy_benchmark_commits)
-        if payload.get("policy_rlinf_commits") != expected_rlinf or source.get(
-            "policy_rlinf_commits"
-        ) != expected_rlinf:
+        if (
+            payload.get("policy_rlinf_commits") != expected_rlinf
+            or source.get("policy_rlinf_commits") != expected_rlinf
+        ):
             raise ValueError("policy RLinf commit inventory does not recompute")
-        if payload.get("policy_benchmark_commits") != expected_benchmark or source.get(
-            "policy_benchmark_commits"
-        ) != expected_benchmark:
+        if (
+            payload.get("policy_benchmark_commits") != expected_benchmark
+            or source.get("policy_benchmark_commits") != expected_benchmark
+        ):
             raise ValueError("policy benchmark commit inventory does not recompute")
         evaluator_identity = payload.get("evaluator_identity")
         if not isinstance(evaluator_identity, Mapping) or (
@@ -464,7 +473,9 @@ def _metric_contract(
     if drift < 0.0:
         raise ValueError(f"planner-dominance metric {metric_name!r} drift is invalid")
     if resolution <= 0.0:
-        raise ValueError(f"planner-dominance metric {metric_name!r} resolution is invalid")
+        raise ValueError(
+            f"planner-dominance metric {metric_name!r} resolution is invalid"
+        )
     normalized = {
         "direction": direction,
         "max_observed_replay_drift": drift,
@@ -496,7 +507,9 @@ def _metric_contract(
         if metric_name == "control_steps" and resolution < 1.0:
             raise ValueError("control_steps scientific resolution must be at least one")
         if metric_name == "completion_time_s" and resolution != 0.002:
-            raise ValueError("completion_time_s scientific resolution must be one 0.002 s physics step")
+            raise ValueError(
+                "completion_time_s scientific resolution must be one 0.002 s physics step"
+            )
         normalized["numeric_floor"] = floor
     return normalized
 
@@ -510,24 +523,34 @@ def _planner_dominance_contract(
     raw = candidate_payload.get("planner_dominance")
     if selection_mode == LEGACY_SELECTION_MODE:
         if raw is not None:
-            raise ValueError("legacy candidate manifest unexpectedly declares planner dominance")
+            raise ValueError(
+                "legacy candidate manifest unexpectedly declares planner dominance"
+            )
         return None
     if selection_mode != PLANNER_PARETO_SELECTION_MODE or not isinstance(raw, Mapping):
         raise ValueError("planner-pareto candidate manifest has no dominance contract")
-    if set(raw) != {
-        "schema_version",
-        "task",
-        "backend_id",
-        "quality_schema",
-        "calibration",
-        "metrics",
-        "tie_break_order",
-    } or raw.get("schema_version") != PLANNER_DOMINANCE_SCHEMA:
+    if (
+        set(raw)
+        != {
+            "schema_version",
+            "task",
+            "backend_id",
+            "quality_schema",
+            "calibration",
+            "metrics",
+            "tie_break_order",
+        }
+        or raw.get("schema_version") != PLANNER_DOMINANCE_SCHEMA
+    ):
         raise ValueError("planner-dominance schema or field inventory mismatch")
     if raw.get("task") != task:
         raise ValueError("planner-dominance task mismatch")
     backend_id = raw.get("backend_id")
-    if not isinstance(backend_id, str) or not backend_id or backend_id.strip() != backend_id:
+    if (
+        not isinstance(backend_id, str)
+        or not backend_id
+        or backend_id.strip() != backend_id
+    ):
         raise ValueError("planner-dominance backend identity is missing")
     quality_schema = raw.get("quality_schema")
     if not isinstance(quality_schema, Mapping) or set(quality_schema) != {
@@ -557,19 +580,15 @@ def _planner_dominance_contract(
     normalized_components: list[dict[str, Any]] = []
     component_names: set[str] = set()
     for metadata in components:
-        if (
-            not isinstance(metadata, Mapping)
-            or set(metadata)
-            != {
-                "name",
-                "direction",
-                "unit",
-                "scientific_resolution",
-                "reducer",
-                "source",
-                "description",
-            }
-        ):
+        if not isinstance(metadata, Mapping) or set(metadata) != {
+            "name",
+            "direction",
+            "unit",
+            "scientific_resolution",
+            "reducer",
+            "source",
+            "description",
+        }:
             raise ValueError("planner-dominance quality component metadata is invalid")
         name = metadata.get("name")
         if (
@@ -637,8 +656,14 @@ def _planner_dominance_contract(
         raise ValueError("planner-dominance calibration inventory mismatch")
     replay_count = calibration.get("replay_count")
     reset_episode_id = calibration.get("reset_episode_id")
-    if isinstance(replay_count, bool) or not isinstance(replay_count, int) or replay_count < 3:
-        raise ValueError("planner-dominance calibration requires at least three replays")
+    if (
+        isinstance(replay_count, bool)
+        or not isinstance(replay_count, int)
+        or replay_count < 3
+    ):
+        raise ValueError(
+            "planner-dominance calibration requires at least three replays"
+        )
     if not isinstance(reset_episode_id, str) or not reset_episode_id:
         raise ValueError("planner-dominance calibration reset identity is missing")
     evidence_path = calibration.get("evidence_path")
@@ -672,7 +697,9 @@ def _planner_dominance_contract(
         raise ValueError("planner-dominance metric inventory mismatch")
     quality_metrics = metrics.get("task_quality")
     component_index = {row["name"]: row for row in normalized_components}
-    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(component_index):
+    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(
+        component_index
+    ):
         raise ValueError("planner-dominance quality mapping is incomplete")
     normalized_metrics = {
         "trajectory_completion": _metric_contract(
@@ -685,9 +712,7 @@ def _planner_dominance_contract(
                 quality_metrics[name],
                 metric_name=f"task_quality.{name}",
                 direction=(
-                    "max"
-                    if component_index[name]["direction"] == "maximize"
-                    else "min"
+                    "max" if component_index[name]["direction"] == "maximize" else "min"
                 ),
             )
             for name in component_index
@@ -709,9 +734,10 @@ def _planner_dominance_contract(
         ),
     }
     for name in component_index:
-        if normalized_metrics["task_quality"][name][
-            "scientific_resolution"
-        ] != component_index[name]["scientific_resolution"]:
+        if (
+            normalized_metrics["task_quality"][name]["scientific_resolution"]
+            != component_index[name]["scientific_resolution"]
+        ):
             raise ValueError(
                 f"quality component {name!r} calibration resolution differs from schema"
             )
@@ -768,7 +794,9 @@ def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
         values = summary.get("components") if isinstance(summary, Mapping) else None
         component_row = values.get(component) if isinstance(values, Mapping) else None
         if not isinstance(component_row, Mapping) or "value" not in component_row:
-            raise ValueError(f"task quality mapping gap: missing component {component!r}")
+            raise ValueError(
+                f"task quality mapping gap: missing component {component!r}"
+            )
         value = _finite_number(
             component_row["value"],
             f"task quality component {component!r} value",
@@ -781,7 +809,9 @@ def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
                 or not isinstance(raw_value, int)
                 or raw_value < 1
             ):
-                raise ValueError("planner-dominance control_steps must be a positive integer")
+                raise ValueError(
+                    "planner-dominance control_steps must be a positive integer"
+                )
             value = float(raw_value)
         else:
             value = _finite_number(
@@ -791,7 +821,9 @@ def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
             if metric_name == "trajectory_completion" and not 0.0 <= value <= 1.0:
                 raise ValueError("trajectory_completion must be in [0, 1]")
             if metric_name in {"completion_time_s", "action_l2_sum"} and value < 0.0:
-                raise ValueError(f"planner-dominance metric {metric_name!r} is negative")
+                raise ValueError(
+                    f"planner-dominance metric {metric_name!r} is negative"
+                )
     return value
 
 
@@ -804,11 +836,15 @@ def _finite_number(value: Any, name: str) -> float:
     return normalized
 
 
-def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
+def _validate_attempt_quality(
+    record: Mapping[str, Any], contract: Mapping[str, Any]
+) -> None:
     summary = record.get("task_quality")
     schema = contract["quality_schema"]
     if not isinstance(summary, Mapping):
-        raise ValueError("task quality mapping gap: attempt has no task_quality summary")
+        raise ValueError(
+            "task quality mapping gap: attempt has no task_quality summary"
+        )
     if set(summary) != {
         "schema_version",
         "episode_id",
@@ -840,18 +876,26 @@ def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, 
     if summary_sha256 != _payload_sha256(summary_payload):
         raise ValueError("task quality summary SHA-256 does not recompute")
     sample_count = summary.get("physics_sample_count")
-    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 1:
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 1
+    ):
         raise ValueError("task quality summary physics sample count is invalid")
     values = summary.get("components")
     schema_components = schema["components"]
     expected_names = [component["name"] for component in schema_components]
     expected = set(expected_names)
     if not isinstance(values, Mapping) or set(values) != expected:
-        missing = sorted(expected - set(values) if isinstance(values, Mapping) else expected)
+        missing = sorted(
+            expected - set(values) if isinstance(values, Mapping) else expected
+        )
         extra = sorted(set(values) - expected if isinstance(values, Mapping) else set())
         raise ValueError(f"task quality mapping gap: missing={missing}, extra={extra}")
     if list(values) != expected_names:
-        raise ValueError("task quality component order differs from the canonical schema")
+        raise ValueError(
+            "task quality component order differs from the canonical schema"
+        )
     for frozen_schema in schema_components:
         name = frozen_schema["name"]
         component = values[name]
@@ -940,7 +984,11 @@ def _pareto_tie_key(
     values = []
     for metric_name in contract["tie_break_order"]:
         value = _metric_value(record, metric_name)
-        values.append(value if _metric_spec(contract, metric_name)["direction"] == "max" else -value)
+        values.append(
+            value
+            if _metric_spec(contract, metric_name)["direction"] == "max"
+            else -value
+        )
     values.append(-float(int(record["candidate_index"])))
     return tuple(values)
 
@@ -959,18 +1007,25 @@ def _selected(
             raise ValueError("legacy selection unexpectedly declares planner dominance")
         return max(
             eligible,
-            key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
+            key=lambda record: (
+                _quality_score(record),
+                -int(record["candidate_index"]),
+            ),
         )
     elif selection_mode == PLANNER_PARETO_SELECTION_MODE:
         if planner_dominance is None:
-            raise ValueError("planner-pareto selection requires a frozen dominance contract")
+            raise ValueError(
+                "planner-pareto selection requires a frozen dominance contract"
+            )
         planner = next(
             (record for record in records if int(record["candidate_index"]) == 0),
             None,
         )
         if planner is None:
             raise ValueError("planner-pareto selection requires candidate index zero")
-        eligible_rl = [record for record in eligible if int(record["candidate_index"]) != 0]
+        eligible_rl = [
+            record for record in eligible if int(record["candidate_index"]) != 0
+        ]
         for record in eligible_rl:
             _validate_attempt_quality(record, planner_dominance)
         if not _eligible(planner):
@@ -988,7 +1043,10 @@ def _selected(
         raise ValueError(f"unsupported selection mode {selection_mode!r}")
     if not selectable:
         return None
-    return max(_frontier(selectable, planner_dominance), key=lambda record: _pareto_tie_key(record, planner_dominance))
+    return max(
+        _frontier(selectable, planner_dominance),
+        key=lambda record: _pareto_tie_key(record, planner_dominance),
+    )
 
 
 def _selection_result(
@@ -1017,7 +1075,9 @@ def _selection_result(
         "source_kind": source_kind,
         "planner_eligible": _eligible(planner),
         "winner_candidate_id": None if winner is None else winner["candidate_id"],
-        "winner_candidate_index": None if winner is None else int(winner["candidate_index"]),
+        "winner_candidate_index": None
+        if winner is None
+        else int(winner["candidate_index"]),
     }
 
 
@@ -1084,7 +1144,9 @@ def _task_compatibility_inventory(
             continue
         provenance = candidate.get("provenance")
         source = provenance.get("source") if isinstance(provenance, Mapping) else None
-        benchmark = provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        benchmark = (
+            provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        )
         state_schema = (
             provenance.get("state_schema") if isinstance(provenance, Mapping) else None
         )
@@ -1141,7 +1203,9 @@ def _audit_evaluator_identity(
         if card.get("evaluator_identity") is not None or card.get(
             "compatibility_evidence", []
         ) not in (None, []):
-            raise ValueError("legacy dataset unexpectedly declares v0.2 evaluator identity")
+            raise ValueError(
+                "legacy dataset unexpectedly declares v0.2 evaluator identity"
+            )
         return None
     raw = candidate_payload.get("evaluator_identity")
     if not isinstance(raw, Mapping) or set(raw) != {
@@ -1212,7 +1276,9 @@ def _audit_evaluator_identity(
                 raise ValueError("identical benchmark relation is inconsistent")
         elif relation_name == "checkpoint-compatible":
             if policy_commit == evaluator_benchmark_commit:
-                raise ValueError("identical benchmark commits cannot claim compatibility")
+                raise ValueError(
+                    "identical benchmark commits cannot claim compatibility"
+                )
             digest = _expected_sha256(
                 evidence_sha256,
                 "benchmark compatibility evidence SHA-256",
@@ -1232,13 +1298,18 @@ def _audit_evaluator_identity(
     ):
         raise ValueError("candidate benchmark relations are not canonical or complete")
     if card.get("evaluator_identity") != dict(raw):
-        raise ValueError("dataset-card evaluator identity differs from candidate manifest")
+        raise ValueError(
+            "dataset-card evaluator identity differs from candidate manifest"
+        )
     if card.get("compatibility_evidence") != expected_evidence:
         raise ValueError("dataset-card compatibility evidence inventory mismatch")
     for row in expected_evidence:
         proof_path = _audit_provenance_file(
             root,
-            row,
+            {
+                "relative_path": row["relative_path"],
+                "sha256": row["sha256"],
+            },
             expected_relative_path=row["relative_path"],
             expected_sha256=row["sha256"],
         )
@@ -1269,7 +1340,9 @@ def _audit_evaluator_identity(
             if probe["task"] == candidate_payload["task"]
         ]
         if proof_task_inventory != expected_task_inventory:
-            raise ValueError("compatibility evidence does not cover the task policy pool")
+            raise ValueError(
+                "compatibility evidence does not cover the task policy pool"
+            )
     return dict(raw)
 
 
@@ -1284,7 +1357,9 @@ def _audit_candidate_release_chain(
         if card.get("candidate_release_manifest_sha256") is not None or card.get(
             "candidate_release_provenance", []
         ) not in (None, []):
-            raise ValueError("legacy dataset unexpectedly declares a v0.2 release chain")
+            raise ValueError(
+                "legacy dataset unexpectedly declares a v0.2 release chain"
+            )
         return
     release_sha256 = _expected_sha256(
         card.get("candidate_release_manifest_sha256"),
@@ -1339,7 +1414,9 @@ def _audit_candidate_release_chain(
         or _payload_sha256(release) != release.get("payload_sha256")
         or tuple(release.get("tasks", [])) != EXACT_TASKS
     ):
-        raise ValueError("candidate release manifest is not a production exact-14 release")
+        raise ValueError(
+            "candidate release manifest is not a production exact-14 release"
+        )
     task = str(card["task"])
     task_hashes = release.get("task_manifest_sha256")
     candidate_counts = release.get("candidate_count")
@@ -1417,7 +1494,9 @@ def _audit_calibration_evidence(
 ) -> dict[str, float]:
     if planner_dominance is None:
         if card.get("calibration_evidence") is not None:
-            raise ValueError("legacy dataset unexpectedly declares calibration evidence")
+            raise ValueError(
+                "legacy dataset unexpectedly declares calibration evidence"
+            )
         return {}
     if evaluator_identity is None:
         raise ValueError("planner calibration has no evaluator identity")
@@ -1452,9 +1531,7 @@ def _audit_calibration_evidence(
         or evidence.get("evaluator_identity_sha256")
         != _payload_sha256(
             {
-                "evaluator_rlinf_commit": evaluator_identity[
-                    "evaluator_rlinf_commit"
-                ],
+                "evaluator_rlinf_commit": evaluator_identity["evaluator_rlinf_commit"],
                 "evaluator_benchmark_commit": evaluator_identity[
                     "evaluator_benchmark_commit"
                 ],
@@ -1510,7 +1587,9 @@ def _audit_calibration_evidence(
             or environment_id.strip() != environment_id
             or environment_id in environment_ids
         ):
-            raise ValueError("planner calibration did not use unique fresh environments")
+            raise ValueError(
+                "planner calibration did not use unique fresh environments"
+            )
         environment_ids.add(environment_id)
         episode_id = raw_replay.get("episode_id")
         if episode_id != calibration["reset_episode_id"]:
@@ -1528,7 +1607,9 @@ def _audit_calibration_evidence(
             or raw_replay.get("safety_failure") is not False
             or raw_replay.get("finite_and_bounded") is not True
         ):
-            raise ValueError("planner calibration replay is not successful, safe, and finite")
+            raise ValueError(
+                "planner calibration replay is not successful, safe, and finite"
+            )
         termination_reason = raw_replay.get("termination_reason")
         if not isinstance(termination_reason, str) or not termination_reason:
             raise ValueError("planner calibration termination reason is missing")
@@ -1566,16 +1647,16 @@ def _audit_calibration_evidence(
         if frozen_identity is None:
             frozen_identity = identity
         elif identity != frozen_identity:
-            raise ValueError("planner calibration reset/action/outcome identity drifted")
+            raise ValueError(
+                "planner calibration reset/action/outcome identity drifted"
+            )
         metric_rows.append(replay)
     observed_drifts: dict[str, float] = {}
     for metric_name in _metric_names(planner_dominance):
         values = [_metric_value(row, metric_name) for row in metric_rows]
         observed = max(values) - min(values)
         frozen = float(
-            _metric_spec(planner_dominance, metric_name)[
-                "max_observed_replay_drift"
-            ]
+            _metric_spec(planner_dominance, metric_name)["max_observed_replay_drift"]
         )
         if not math.isclose(observed, frozen, rel_tol=0.0, abs_tol=1.0e-15):
             raise ValueError(
@@ -1610,7 +1691,9 @@ def _render_parity_skip_events(recovery_events: Any) -> dict[int, dict[str, str]
         try:
             reset_index = int(parts[2])
         except ValueError as error:
-            raise ValueError("render-parity recovery reset index is malformed") from error
+            raise ValueError(
+                "render-parity recovery reset index is malformed"
+            ) from error
         episode_id, message = parts[3], parts[4]
         reason = _render_parity_failure_reason(message)
         if reset_index < 0 or not episode_id or reason is None:
@@ -1745,7 +1828,9 @@ def _audit_attempt_tape(
     if np.any(terminated[:-1]) or np.any(truncated[:-1]):
         raise ValueError("attempt has a pre-terminal done flag")
     if bool(terminated[-1]) == bool(truncated[-1]):
-        raise ValueError("attempt must terminate or truncate exactly once at its final step")
+        raise ValueError(
+            "attempt must terminate or truncate exactly once at its final step"
+        )
     finite = bool(
         np.all(np.isfinite(states))
         and np.all(np.isfinite(policy_actions))
@@ -1757,12 +1842,18 @@ def _audit_attempt_tape(
     if finite != bool(record["finite_and_bounded"]):
         raise ValueError("attempt finite/bounded status does not recompute")
     hashes = {
-        "state_sha256": hashlib.sha256(np.ascontiguousarray(states).tobytes()).hexdigest(),
+        "state_sha256": hashlib.sha256(
+            np.ascontiguousarray(states).tobytes()
+        ).hexdigest(),
         "policy_action_sha256": hashlib.sha256(
             np.ascontiguousarray(policy_actions).tobytes()
         ).hexdigest(),
-        "action_sha256": hashlib.sha256(np.ascontiguousarray(actions).tobytes()).hexdigest(),
-        "reward_sha256": hashlib.sha256(np.ascontiguousarray(rewards).tobytes()).hexdigest(),
+        "action_sha256": hashlib.sha256(
+            np.ascontiguousarray(actions).tobytes()
+        ).hexdigest(),
+        "reward_sha256": hashlib.sha256(
+            np.ascontiguousarray(rewards).tobytes()
+        ).hexdigest(),
     }
     if any(record.get(key) != value for key, value in hashes.items()):
         raise ValueError("attempt array content checksum does not recompute")
@@ -1855,17 +1946,17 @@ def _audit_winner_episode(
         or teacher.get("source_identity") != card["source_identity"]
         or teacher.get("planner_dominance") != planner_dominance
         or teacher.get("evaluator_identity") != card.get("evaluator_identity")
-        or teacher.get("compatibility_evidence")
-        != card.get("compatibility_evidence")
+        or teacher.get("compatibility_evidence") != card.get("compatibility_evidence")
         or teacher.get("calibration_evidence") != card.get("calibration_evidence")
         or teacher.get("candidate_release_manifest_sha256")
         != card.get("candidate_release_manifest_sha256")
         or teacher.get("selection_result") != winner.get("selection_result")
     ):
         raise ValueError("winner episode selection provenance does not recompute")
-    if "candidate_search_mode" in card and teacher.get(
-        "candidate_search_mode"
-    ) != candidate_search_mode:
+    if (
+        "candidate_search_mode" in card
+        and teacher.get("candidate_search_mode") != candidate_search_mode
+    ):
         raise ValueError("winner episode candidate-search provenance mismatch")
     if "selection_mode" in card and teacher.get("selection_mode") != selection_mode:
         raise ValueError("winner episode selection-mode provenance mismatch")
@@ -1875,7 +1966,9 @@ def _audit_winner_episode(
         np.ascontiguousarray(action_values).tobytes()
     ).hexdigest()
     if rendered_action_sha256 != attempt["action_sha256"]:
-        raise ValueError("winner RGB-D trajectory differs from its selected lightweight action tape")
+        raise ValueError(
+            "winner RGB-D trajectory differs from its selected lightweight action tape"
+        )
 
 
 def _audit_export_state_and_progress(
@@ -1920,16 +2013,20 @@ def _audit_export_state_and_progress(
     expected_selection_contract = _selection_contract(card_selection_mode)
     if card.get("selection_contract") != expected_selection_contract:
         raise ValueError("dataset-card selection contract does not match its mode")
-    if "selection_contract" in state and state.get(
-        "selection_contract"
-    ) != expected_selection_contract:
+    if (
+        "selection_contract" in state
+        and state.get("selection_contract") != expected_selection_contract
+    ):
         raise ValueError("export-state selection contract does not match its mode")
     for payload_name, payload in (("dataset card", card), ("export state", state)):
-        if "candidate_pool_size" in payload and int(payload["candidate_pool_size"]) != len(
-            candidate_rows
-        ):
+        if "candidate_pool_size" in payload and int(
+            payload["candidate_pool_size"]
+        ) != len(candidate_rows):
             raise ValueError(f"{payload_name} candidate pool size mismatch")
-        if card_search_mode == FULL_POOL_SEARCH_MODE and "candidate_pool_size" not in payload:
+        if (
+            card_search_mode == FULL_POOL_SEARCH_MODE
+            and "candidate_pool_size" not in payload
+        ):
             raise ValueError(f"full-pool {payload_name} is missing candidate pool size")
     expected_state_values = {
         "task": card["task"],
@@ -1950,7 +2047,9 @@ def _audit_export_state_and_progress(
     if int(state.get("max_resets", -1)) != len(reset_rows):
         raise ValueError("export-state max_resets does not match reset manifest")
     state_candidates = state.get("candidates")
-    if not isinstance(state_candidates, list) or len(state_candidates) != len(candidate_rows):
+    if not isinstance(state_candidates, list) or len(state_candidates) != len(
+        candidate_rows
+    ):
         raise ValueError("export-state candidate inventory mismatch")
     for index, (state_row, manifest_row) in enumerate(
         zip(state_candidates, candidate_rows, strict=True)
@@ -1966,12 +2065,20 @@ def _audit_export_state_and_progress(
             "residual_scale",
             "provenance",
         ):
-            default = False if key == "stochastic" else 0 if key == "exploration_seed_offset" else None
+            default = (
+                False
+                if key == "stochastic"
+                else 0
+                if key == "exploration_seed_offset"
+                else None
+            )
             if state_row.get(key) != manifest_row.get(key, default):
                 raise ValueError(f"export-state candidate {index} differs for {key}")
         policy_path = state_row.get("policy_path")
         if manifest_row["kind"] == "policy" and not isinstance(policy_path, str):
-            raise ValueError(f"export-state candidate {index} has no resolved policy path")
+            raise ValueError(
+                f"export-state candidate {index} has no resolved policy path"
+            )
         if manifest_row["kind"] == "planner" and policy_path is not None:
             raise ValueError("export-state planner unexpectedly has a policy path")
 
@@ -2090,7 +2197,10 @@ def _audit_dataset(
     if _sha256(root / "reset_manifest.jsonl") != card.get("reset_manifest_sha256"):
         raise ValueError("reset-manifest identity mismatch")
     attempted_reset_count = int(card["attempted_reset_count"])
-    if len(reset_rows) < attempted_reset_count or len(reset_results) != attempted_reset_count:
+    if (
+        len(reset_rows) < attempted_reset_count
+        or len(reset_results) != attempted_reset_count
+    ):
         raise ValueError("reset manifest/results count mismatch")
     if len(attempt_rows) != int(card["candidate_attempt_count"]):
         raise ValueError("attempt count does not match the dataset card")
@@ -2168,7 +2278,9 @@ def _audit_dataset(
         else set()
     )
     if actual_lightweight_files != referenced_tapes:
-        raise ValueError("lightweight tape inventory contains missing or unreferenced files")
+        raise ValueError(
+            "lightweight tape inventory contains missing or unreferenced files"
+        )
 
     winner_by_episode: dict[str, dict[str, Any]] = {}
     for winner in winner_rows:
@@ -2190,7 +2302,10 @@ def _audit_dataset(
     for reset_index, result in enumerate(reset_results):
         reset = reset_rows[reset_index]
         episode_id = reset["episode_id"]
-        if result.get("reset_index") != reset_index or result.get("episode_id") != episode_id:
+        if (
+            result.get("reset_index") != reset_index
+            or result.get("episode_id") != episode_id
+        ):
             raise ValueError("reset-result order or identity mismatch")
         for key in ("source_group_id",):
             if result.get(key) != reset.get(key):
@@ -2200,11 +2315,15 @@ def _audit_dataset(
         budget_used = int(result["budget_used"])
         if candidate_count != budget_used or budget_used not in budgets:
             raise ValueError("reset-result candidate count/budget mismatch")
-        if "candidate_search_mode" in result and result.get(
-            "candidate_search_mode"
-        ) != candidate_search_mode:
+        if (
+            "candidate_search_mode" in result
+            and result.get("candidate_search_mode") != candidate_search_mode
+        ):
             raise ValueError("reset-result candidate-search mode mismatch")
-        if "selection_mode" in result and result.get("selection_mode") != selection_mode:
+        if (
+            "selection_mode" in result
+            and result.get("selection_mode") != selection_mode
+        ):
             raise ValueError("reset-result selection mode mismatch")
         if candidate_search_mode == FULL_POOL_SEARCH_MODE and (
             result.get("candidate_search_mode") != FULL_POOL_SEARCH_MODE
@@ -2213,7 +2332,9 @@ def _audit_dataset(
             raise ValueError("full-pool reset did not attempt every candidate")
         if len(records) != candidate_count:
             raise ValueError("attempt rows do not match reset-result candidate count")
-        if [int(row["candidate_index"]) for row in records] != list(range(candidate_count)):
+        if [int(row["candidate_index"]) for row in records] != list(
+            range(candidate_count)
+        ):
             raise ValueError("attempted candidates are not the frozen pool prefix")
         budget_position = budgets.index(budget_used)
         if candidate_search_mode == FIRST_ELIGIBLE_SEARCH_MODE:
@@ -2256,18 +2377,24 @@ def _audit_dataset(
             if reset_index in skip_events:
                 raise ValueError("render-parity recovery event has no selected attempt")
             if budget_used != budgets[-1] or winner is not None:
-                raise ValueError("rejected reset did not exhaust max_k or unexpectedly has a winner")
-            if result.get("winner_candidate_id") is not None or result.get(
-                "winner_candidate_index"
-            ) is not None:
+                raise ValueError(
+                    "rejected reset did not exhaust max_k or unexpectedly has a winner"
+                )
+            if (
+                result.get("winner_candidate_id") is not None
+                or result.get("winner_candidate_index") is not None
+            ):
                 raise ValueError("rejected reset names a winner")
             continue
         if not accepted_label:
             if winner is not None:
-                raise ValueError("render-parity skipped reset unexpectedly has a winner")
-            if result.get("winner_candidate_id") is not None or result.get(
-                "winner_candidate_index"
-            ) is not None:
+                raise ValueError(
+                    "render-parity skipped reset unexpectedly has a winner"
+                )
+            if (
+                result.get("winner_candidate_id") is not None
+                or result.get("winner_candidate_index") is not None
+            ):
                 raise ValueError("render-parity skipped reset names a winner")
             protocol = _audit_render_parity_skip(
                 result,
@@ -2278,13 +2405,17 @@ def _audit_dataset(
             consumed_skip_events.add(reset_index)
             continue
         if result.get("render_parity_skip") is not None or reset_index in skip_events:
-            raise ValueError("accepted reset unexpectedly carries render-parity skip evidence")
+            raise ValueError(
+                "accepted reset unexpectedly carries render-parity skip evidence"
+            )
         if (
             result.get("winner_candidate_id") != selected["candidate_id"]
-            or int(result.get("winner_candidate_index", -1)) != int(selected["candidate_index"])
+            or int(result.get("winner_candidate_index", -1))
+            != int(selected["candidate_index"])
             or winner is None
             or winner.get("candidate_id") != selected["candidate_id"]
-            or int(winner.get("candidate_index", -1)) != int(selected["candidate_index"])
+            or int(winner.get("candidate_index", -1))
+            != int(selected["candidate_index"])
             or int(winner.get("candidate_count", -1)) != candidate_count
             or int(winner.get("budget_used", -1)) != budget_used
             or winner.get("selection_contract") != selection_contract
@@ -2293,17 +2424,23 @@ def _audit_dataset(
             or winner.get("lightweight_attempt_tape_sha256")
             != selected["attempt_tape_sha256"]
         ):
-            raise ValueError("published winner does not match independently selected attempt")
+            raise ValueError(
+                "published winner does not match independently selected attempt"
+            )
         if (
             selection_mode == PLANNER_PARETO_SELECTION_MODE
             or "selection_result" in winner
         ) and winner.get("selection_result") != expected_selection_result:
             raise ValueError("published winner selection provenance mismatch")
-        if "candidate_search_mode" in winner and winner.get(
-            "candidate_search_mode"
-        ) != candidate_search_mode:
+        if (
+            "candidate_search_mode" in winner
+            and winner.get("candidate_search_mode") != candidate_search_mode
+        ):
             raise ValueError("published winner candidate-search mode mismatch")
-        if "selection_mode" in winner and winner.get("selection_mode") != selection_mode:
+        if (
+            "selection_mode" in winner
+            and winner.get("selection_mode") != selection_mode
+        ):
             raise ValueError("published winner selection mode mismatch")
         if winner.get("planner_dominance") != planner_dominance:
             raise ValueError("published winner planner-dominance contract mismatch")
