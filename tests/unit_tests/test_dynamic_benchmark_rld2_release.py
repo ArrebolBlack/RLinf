@@ -646,6 +646,29 @@ def test_exact14_release_builds_then_independent_audit_grants_eligibility(
     assert manifest["aggregate"]["source_counts"] == {"expert_dominant": 1400}
 
 
+def test_release_accepts_audit_with_release_sha_in_summary(tmp_path: Path) -> None:
+    fixture = _make_fixture(tmp_path)
+    record = fixture.records["p0_grasp"]
+    audit_path = Path(record["audit_path"])
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    release_sha = audit.pop("candidate_release_manifest_sha256")
+    audit["summary"]["candidate_release_manifest_sha256"] = release_sha
+    _seal_payload(audit)
+    _write_json(audit_path, audit)
+    record["audit_sha256"] = _sha256(audit_path)
+    _write_input_manifest(fixture)
+
+    output = fixture.root / "release" / "unified14-summary-sha"
+    report = build_and_audit_release(
+        input_manifest=fixture.input_manifest,
+        output_root=output,
+        auditor_commit=AUDITOR_COMMIT,
+    )
+
+    assert report["status"] == "passed"
+    assert report["release_eligible"] is True
+
+
 def test_release_input_rejects_missing_task(tmp_path: Path) -> None:
     fixture = _make_fixture(tmp_path)
     fixture.records.pop("t1_xyz")

@@ -1426,12 +1426,18 @@ def _validate_task_audit(
     if not isinstance(audit_root_value, str) or not audit_root_value:
         raise ReleaseAuditError(f"{task} independent audit root is invalid")
     audited_root = Path(audit_root_value).resolve()
+    summary = audit.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ReleaseAuditError(f"{task} independent audit summary is missing")
+    audited_release_sha256 = audit.get("candidate_release_manifest_sha256")
+    if audited_release_sha256 is None:
+        audited_release_sha256 = summary.get("candidate_release_manifest_sha256")
     if (
         audited_root != root
         or audit.get("dataset_card_sha256") != card_sha256
         or audit.get("checksums_sha256") != checksums_sha256
         or audit.get("candidate_manifest_sha256") != candidate_sha256
-        or audit.get("candidate_release_manifest_sha256") != candidate_release_sha256
+        or audited_release_sha256 != candidate_release_sha256
     ):
         raise ReleaseAuditError(f"{task} independent audit input identity mismatch")
     if audit.get("status") != "passed" or audit.get("training_eligible") is not True:
@@ -1439,9 +1445,6 @@ def _validate_task_audit(
             f"{task} independent audit did not grant training eligibility"
         )
     _require_commit(audit.get("auditor_commit"), f"{task} per-task auditor commit")
-    summary = audit.get("summary")
-    if not isinstance(summary, Mapping):
-        raise ReleaseAuditError(f"{task} independent audit summary is missing")
     accepted_count = summary.get("accepted_count")
     if (
         summary.get("task") != task
