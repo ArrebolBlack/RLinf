@@ -1600,8 +1600,8 @@ def _validate_attempt_quality(
         raise ReleaseAuditError("task quality physics sample count is invalid")
     components = summary.get("components")
     expected_names = [item["name"] for item in schema["components"]]
-    if not isinstance(components, Mapping) or list(components) != expected_names:
-        raise ReleaseAuditError("task quality component order/inventory mismatch")
+    if not isinstance(components, Mapping) or set(components) != set(expected_names):
+        raise ReleaseAuditError("task quality component inventory mismatch")
     for metadata in schema["components"]:
         name = metadata["name"]
         component = components[name]
