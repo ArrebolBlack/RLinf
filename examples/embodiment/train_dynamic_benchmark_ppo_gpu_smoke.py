@@ -286,13 +286,13 @@ def _ppo_update(
     rollout: dict[str, torch.Tensor],
     device: torch.device,
 ) -> dict[str, float]:
-    states = rollout["states"]
-    actions = rollout["actions"]
-    raw_actions = rollout["raw_actions"]
-    old_log_prob = rollout["log_prob"]
+    states = rollout["states"].to(device)
+    actions = rollout["actions"].to(device)
+    raw_actions = rollout["raw_actions"].to(device)
+    old_log_prob = rollout["log_prob"].to(device)
     returns = rollout["returns"].to(device)
     advantages = rollout["advantages"].to(device)
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
     totals: dict[str, list[float]] = {
         "policy_loss": [],
         "value_loss": [],
@@ -303,21 +303,21 @@ def _ppo_update(
     }
     updates = 0
     for _ in range(config.ppo_epochs):
-        indices = torch.randperm(states.shape[0], device="cpu")
+        indices = torch.randperm(states.shape[0], device=device)
         for start in range(0, states.shape[0], config.minibatch_size):
             selected = indices[start : start + config.minibatch_size]
             if selected.numel() < 2:
                 continue
-            batch = states.index_select(0, selected).to(device)
-            batch_actions = actions.index_select(0, selected).to(device)
-            batch_raw = raw_actions.index_select(0, selected).to(device)
+            batch = states.index_select(0, selected)
+            batch_actions = actions.index_select(0, selected)
+            batch_raw = raw_actions.index_select(0, selected)
             mean, log_std = model._sample_actions(batch)
             distribution = Normal(mean, torch.exp(log_std))
             new_log_prob = (
                 distribution.log_prob(batch_raw)
                 - torch.log(1.0 - batch_actions.square() + 1e-6)
             ).sum(dim=-1)
-            log_ratio = new_log_prob - old_log_prob.index_select(0, selected).to(device)
+            log_ratio = new_log_prob - old_log_prob.index_select(0, selected)
             ratio = log_ratio.exp()
             unclipped = -advantages.index_select(0, selected) * ratio
             clipped = -advantages.index_select(0, selected) * ratio.clamp(
@@ -325,10 +325,9 @@ def _ppo_update(
             )
             policy_loss = torch.maximum(unclipped, clipped).mean()
             predicted_values = model.value_head(batch).squeeze(-1)
-            value_loss = (
-                0.5
-                * (predicted_values - returns.index_select(0, selected)).square().mean()
-            )
+            value_loss = 0.5 * (
+                predicted_values - returns.index_select(0, selected)
+            ).square().mean()
             entropy = distribution.entropy().sum(dim=-1).mean()
             loss = (
                 policy_loss
@@ -337,24 +336,15 @@ def _ppo_update(
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), config.max_grad_norm
-            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
             optimizer.step()
             updates += 1
             totals["policy_loss"].append(float(policy_loss.detach()))
             totals["value_loss"].append(float(value_loss.detach()))
             totals["entropy"].append(float(entropy.detach()))
-            totals["approx_kl"].append(
-                float(((ratio - 1.0) - log_ratio).mean().detach())
-            )
+            totals["approx_kl"].append(float(((ratio - 1.0) - log_ratio).mean().detach()))
             totals["clip_fraction"].append(
-                float(
-                    ((ratio - 1.0).abs() > config.clip_coef)
-                    .to(torch.float32)
-                    .mean()
-                    .detach()
-                )
+                float(((ratio - 1.0).abs() > config.clip_coef).to(torch.float32).mean().detach())
             )
             totals["grad_norm"].append(float(grad_norm.detach()))
     return {name: float(np.mean(values)) for name, values in totals.items()}
