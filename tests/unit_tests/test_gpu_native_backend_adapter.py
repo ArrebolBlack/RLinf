@@ -227,6 +227,7 @@ def test_adapter_request_mapping(fake_se3_wam: _FakeSe3Wam) -> None:
     second = backend.next_request()
     assert first.episode_id != second.episode_id
     assert first.task_id == "p0_grasp" and first.seed == 7
+    assert first.observation_track.value == "state"
     assert first.factors == _FakeRequest().factors
     assert backend.policy_steps().tolist() == [0, 1, 2]
     results = backend.step([None] * 3)
@@ -351,3 +352,4 @@ def test_next_request_bypasses_manifest(fake_se3_wam: _FakeSe3Wam) -> None:
     request = env._next_request()
     assert request.seed == 7
     assert request.episode_id.startswith("p0_grasp-gpu-")
+    assert request.observation_track.value == "state"

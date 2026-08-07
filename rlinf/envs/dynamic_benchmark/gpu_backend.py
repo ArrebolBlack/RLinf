@@ -108,6 +108,7 @@ class GpuNativeBackendEnv:
             raise GpuNativeBackendUnavailableError(
                 "frozen export task_id does not match the requested task"
             )
+        self._observation_track = ObservationTrack.STATE
         self._episode_counter = 0
 
     @property
@@ -139,11 +140,20 @@ class GpuNativeBackendEnv:
         return self._frozen_request
 
     def next_request(self) -> Any:
-        """Return the frozen export request with a fresh per-lane episode id."""
+        """Return the frozen export request with a fresh per-lane episode id.
+
+        The observation track is normalized to the adapter's STATE contract:
+        the wrapper validates requests against its contract before the engine
+        re-normalizes them to the frozen artifact identity internally.
+        """
         request = self._frozen_request
         episode_id = f"{self._task_id}-gpu-{self._episode_counter:08d}"
         self._episode_counter += 1
-        return replace(request, episode_id=episode_id)
+        return replace(
+            request,
+            episode_id=episode_id,
+            observation_track=self._observation_track,
+        )
 
     def policy_steps(self) -> Any:
         """Return the host clock policy steps expected for the next commands."""
