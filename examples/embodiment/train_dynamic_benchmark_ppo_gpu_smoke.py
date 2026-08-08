@@ -292,7 +292,9 @@ def _ppo_update(
     old_log_prob = rollout["log_prob"].to(device)
     returns = rollout["returns"].to(device)
     advantages = rollout["advantages"].to(device)
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    advantages = (advantages - advantages.mean()) / (
+        advantages.std(unbiased=False) + 1e-8
+    )
     totals: dict[str, list[float]] = {
         "policy_loss": [],
         "value_loss": [],
@@ -325,9 +327,10 @@ def _ppo_update(
             )
             policy_loss = torch.maximum(unclipped, clipped).mean()
             predicted_values = model.value_head(batch).squeeze(-1)
-            value_loss = 0.5 * (
-                predicted_values - returns.index_select(0, selected)
-            ).square().mean()
+            value_loss = (
+                0.5
+                * (predicted_values - returns.index_select(0, selected)).square().mean()
+            )
             entropy = distribution.entropy().sum(dim=-1).mean()
             loss = (
                 policy_loss
@@ -336,15 +339,24 @@ def _ppo_update(
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.max_grad_norm
+            )
             optimizer.step()
             updates += 1
             totals["policy_loss"].append(float(policy_loss.detach()))
             totals["value_loss"].append(float(value_loss.detach()))
             totals["entropy"].append(float(entropy.detach()))
-            totals["approx_kl"].append(float(((ratio - 1.0) - log_ratio).mean().detach()))
+            totals["approx_kl"].append(
+                float(((ratio - 1.0) - log_ratio).mean().detach())
+            )
             totals["clip_fraction"].append(
-                float(((ratio - 1.0).abs() > config.clip_coef).to(torch.float32).mean().detach())
+                float(
+                    ((ratio - 1.0).abs() > config.clip_coef)
+                    .to(torch.float32)
+                    .mean()
+                    .detach()
+                )
             )
             totals["grad_norm"].append(float(grad_norm.detach()))
     return {name: float(np.mean(values)) for name, values in totals.items()}

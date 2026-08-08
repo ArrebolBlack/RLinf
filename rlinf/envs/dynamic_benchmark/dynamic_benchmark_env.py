@@ -265,7 +265,9 @@ class _DynamicBenchmarkProcessHandler:
         planner = torch.as_tensor(planner_values, dtype=torch.float32, device="cpu")
         residual = torch.as_tensor(residual_values, dtype=torch.float32, device="cpu")
         if planner.shape != (7,) or residual.shape != (7,):
-            raise ValueError("process planner and residual actions must have shape (7,)")
+            raise ValueError(
+                "process planner and residual actions must have shape (7,)"
+            )
         if not 0.0 < residual_scale <= 1.0:
             raise ValueError("process residual_scale must be in (0, 1]")
         return (
@@ -366,7 +368,9 @@ class _DynamicBenchmarkProcessHandler:
             elif command == "save":
                 observation = self._observations.get(index)
                 if observation is None:
-                    raise RuntimeError("process checkpoint requires an initialized observation")
+                    raise RuntimeError(
+                        "process checkpoint requires an initialized observation"
+                    )
                 result = {
                     "env_state": env.save_state(),
                     "observation": _pack_process_observation(observation),
@@ -603,12 +607,16 @@ class DynamicBenchmarkEnv(gym.Env):
         self.returns = torch.zeros(self.num_envs, dtype=torch.float32)
         self.success_once = torch.zeros(self.num_envs, dtype=torch.bool)
         self.reward_trackers = [self._make_reward() for _ in range(self.num_envs)]
-        self.feature_registry = FeatureRegistry.from_config(_cfg_get(cfg, "features", {}))
+        self.feature_registry = FeatureRegistry.from_config(
+            _cfg_get(cfg, "features", {})
+        )
         self.reward_registries = [
             RewardRegistry.from_config(_cfg_get(cfg, "reward_components", {}))
             for _ in range(self.num_envs)
         ]
-        self._action_histories: list[list[np.ndarray]] = [[] for _ in range(self.num_envs)]
+        self._action_histories: list[list[np.ndarray]] = [
+            [] for _ in range(self.num_envs)
+        ]
         self._previous_eef_poses: list[np.ndarray | None] = [None] * self.num_envs
         self._ee_velocities: list[np.ndarray | None] = [None] * self.num_envs
         self._time_to_goals: list[float | None] = [None] * self.num_envs
@@ -755,16 +763,22 @@ class DynamicBenchmarkEnv(gym.Env):
             ) from exc
         generation = int(state["manifest_generation"])
         if generation < 0:
-            raise ValueError("Dynamic Benchmark manifest cache generation must be non-negative")
+            raise ValueError(
+                "Dynamic Benchmark manifest cache generation must be non-negative"
+            )
         rows = tuple(state["manifest_rows"])
         if len(rows) != self.manifest_size:
-            raise ValueError("Dynamic Benchmark manifest cache row count does not match env")
+            raise ValueError(
+                "Dynamic Benchmark manifest cache row count does not match env"
+            )
         if any(
             row.request.task_id != self.task_id
             or str(row.request.split.value) != split_name
             for row in rows
         ):
-            raise ValueError("Dynamic Benchmark manifest cache row identity does not match env")
+            raise ValueError(
+                "Dynamic Benchmark manifest cache row identity does not match env"
+            )
         self.split_name = split_name
         self._split = split
         self.base_manifest_seed = int(state["base_manifest_seed"])
@@ -864,9 +878,8 @@ class DynamicBenchmarkEnv(gym.Env):
 
     @property
     def infra_is_default(self) -> bool:
-        return (
-            self.feature_registry.is_empty
-            and all(registry.is_empty for registry in self.reward_registries)
+        return self.feature_registry.is_empty and all(
+            registry.is_empty for registry in self.reward_registries
         )
 
     @property
@@ -960,9 +973,7 @@ class DynamicBenchmarkEnv(gym.Env):
             ).reshape(-1)
         return geometry
 
-    def _update_eef_velocity(
-        self, index: int, observation: Any
-    ) -> np.ndarray | None:
+    def _update_eef_velocity(self, index: int, observation: Any) -> np.ndarray | None:
         privileged = getattr(observation, "privileged", {})
         if "eef_pose_xyzw" not in privileged:
             return None
@@ -989,7 +1000,9 @@ class DynamicBenchmarkEnv(gym.Env):
         object_twist = np.asarray(privileged["object_twist_world"], dtype=np.float64)
         offset = object_pose[:3] - eef_pose[:3]
         distance = float(np.linalg.norm(offset))
-        relative_velocity = np.asarray(ee_velocity, dtype=np.float64)[:3] - object_twist[:3]
+        relative_velocity = (
+            np.asarray(ee_velocity, dtype=np.float64)[:3] - object_twist[:3]
+        )
         closing_speed = (
             -float(np.dot(offset / max(distance, 1e-9), relative_velocity))
             if distance > 1e-9
@@ -1001,9 +1014,7 @@ class DynamicBenchmarkEnv(gym.Env):
             else float(np.clip(distance / max(closing_speed, 0.01), 0.0, 60.0))
         )
         self._relative_velocity_norms[index] = float(
-            np.linalg.norm(
-                np.asarray(ee_velocity, dtype=np.float64) - object_twist
-            )
+            np.linalg.norm(np.asarray(ee_velocity, dtype=np.float64) - object_twist)
         )
         self._distances[index] = distance
         return time_to_goal, distance
@@ -1239,7 +1250,9 @@ class DynamicBenchmarkEnv(gym.Env):
                 request = self._requests[index]
                 assert observation is not None and request is not None
                 applied_values = payload.get("action_values", action_array[index])
-                applied_action_array[index] = np.asarray(applied_values, dtype=np.float64)
+                applied_action_array[index] = np.asarray(
+                    applied_values, dtype=np.float64
+                )
                 process_planner_action_s[index] = float(
                     payload.get("planner_action_s", 0.0)
                 )
@@ -1377,16 +1390,14 @@ class DynamicBenchmarkEnv(gym.Env):
                 "distance_m": self._distances[index],
                 "time_to_goal_s": self._time_to_goals[index],
             }
-            registry_reward, registry_values, registry_recorded = self.reward_registries[
-                index
-            ].step(registry_inputs)
+            registry_reward, registry_values, registry_recorded = (
+                self.reward_registries[index].step(registry_inputs)
+            )
             registry_input_rows[index] = registry_recorded
             self._action_histories[index].append(
                 np.asarray(action.values, dtype=np.float32)
             )
-            states[index] = self._encode(
-                result.observation, request, env_index=index
-            )
+            states[index] = self._encode(result.observation, request, env_index=index)
             self._raw_observations[index] = result.observation
             rewards[index] = float(reward) + float(registry_reward)
             terminations[index] = bool(result.terminated)
@@ -1429,9 +1440,7 @@ class DynamicBenchmarkEnv(gym.Env):
         if dense_shaping_enabled:
             reward_inputs.update(
                 {
-                    "object_z_m": torch.as_tensor(
-                        object_z_rows, dtype=torch.float64
-                    ),
+                    "object_z_m": torch.as_tensor(object_z_rows, dtype=torch.float64),
                     "alignment_error_rad": torch.as_tensor(
                         alignment_error_rows, dtype=torch.float64
                     ),
@@ -1571,9 +1580,7 @@ class DynamicBenchmarkEnv(gym.Env):
             ]
         elif self._process_vector is None:
             snapshots = []
-            for env, observation in zip(
-                self.envs, self._raw_observations, strict=True
-            ):
+            for env, observation in zip(self.envs, self._raw_observations, strict=True):
                 assert observation is not None
                 snapshots.append(
                     {
@@ -1591,8 +1598,7 @@ class DynamicBenchmarkEnv(gym.Env):
         env_states = [snapshot["env_state"] for snapshot in snapshots]
         raw_observations = [snapshot["observation"] for snapshot in snapshots]
         raw_observation_sha256 = [
-            _observation_payload_sha256(observation)
-            for observation in raw_observations
+            _observation_payload_sha256(observation) for observation in raw_observations
         ]
         last_obs = _torch_clone(self._last_obs)
         last_obs_sha256 = _state_tensor_sha256(last_obs["states"])
@@ -1761,14 +1767,14 @@ class DynamicBenchmarkEnv(gym.Env):
             ("stage_progresses", stage_progresses),
         ):
             if values and len(values) != self.num_envs:
-                raise ValueError(
-                    f"Dynamic Benchmark checkpoint {name} length mismatch"
-                )
+                raise ValueError(f"Dynamic Benchmark checkpoint {name} length mismatch")
         for payload, expected_sha256 in zip(
             raw_observation_payloads, raw_observation_sha256, strict=True
         ):
             if _observation_payload_sha256(payload) != expected_sha256:
-                raise ValueError("Dynamic Benchmark checkpoint observation hash mismatch")
+                raise ValueError(
+                    "Dynamic Benchmark checkpoint observation hash mismatch"
+                )
         from se3_wam.benchmark.api import (
             ActionMode,
             ObservationTrack,
@@ -1885,10 +1891,17 @@ class DynamicBenchmarkEnv(gym.Env):
         if not isinstance(saved_last_obs, Mapping) or set(saved_last_obs) != {"states"}:
             raise ValueError("Dynamic Benchmark checkpoint last observation is invalid")
         saved_states = torch.as_tensor(saved_last_obs["states"]).clone()
-        if saved_states.dtype != torch.float32 or saved_states.shape != encoded_states.shape:
-            raise ValueError("Dynamic Benchmark checkpoint last observation shape mismatch")
+        if (
+            saved_states.dtype != torch.float32
+            or saved_states.shape != encoded_states.shape
+        ):
+            raise ValueError(
+                "Dynamic Benchmark checkpoint last observation shape mismatch"
+            )
         if _state_tensor_sha256(saved_states) != state["last_obs_sha256"]:
-            raise ValueError("Dynamic Benchmark checkpoint last observation hash mismatch")
+            raise ValueError(
+                "Dynamic Benchmark checkpoint last observation hash mismatch"
+            )
         if not torch.equal(encoded_states, saved_states):
             raise RuntimeError(
                 "Dynamic Benchmark checkpoint raw/vector observations are inconsistent"
