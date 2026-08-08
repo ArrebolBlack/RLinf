@@ -29,6 +29,8 @@ import hashlib
 import json
 import os
 import random
+import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -64,6 +66,15 @@ class TensorPPOConfig:
     learning_rate: float
     image_size: int
     device_ordinal: int
+    se3_source: str
+    se3_commit: str
+    se3_tree: str
+    rlinf_source: str
+    rlinf_commit: str
+    rlinf_tree: str
+    runtime_manifest: str
+    runtime_manifest_sha256: str
+    expected_cpuset: str
 
 
 class TensorActorCritic(nn.Module):
@@ -114,6 +125,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--device-ordinal", type=int, default=0)
+    parser.add_argument("--se3-source", type=Path, required=True)
+    parser.add_argument("--se3-commit", required=True)
+    parser.add_argument("--se3-tree", required=True)
+    parser.add_argument("--rlinf-source", type=Path, required=True)
+    parser.add_argument("--rlinf-commit", required=True)
+    parser.add_argument("--rlinf-tree", required=True)
+    parser.add_argument("--runtime-manifest", type=Path, required=True)
+    parser.add_argument("--runtime-manifest-sha256", required=True)
+    parser.add_argument("--expected-cpuset", required=True)
     return parser
 
 
@@ -138,6 +158,15 @@ def _config(args: argparse.Namespace) -> TensorPPOConfig:
         learning_rate=args.learning_rate,
         image_size=args.image_size,
         device_ordinal=args.device_ordinal,
+        se3_source=str(args.se3_source),
+        se3_commit=args.se3_commit,
+        se3_tree=args.se3_tree,
+        rlinf_source=str(args.rlinf_source),
+        rlinf_commit=args.rlinf_commit,
+        rlinf_tree=args.rlinf_tree,
+        runtime_manifest=str(args.runtime_manifest),
+        runtime_manifest_sha256=args.runtime_manifest_sha256,
+        expected_cpuset=args.expected_cpuset,
     )
     for name in ("num_envs", "cohorts", "hidden_size", "ppo_epochs", "minibatch_size"):
         if getattr(config, name) < 1:
@@ -148,6 +177,15 @@ def _config(args: argparse.Namespace) -> TensorPPOConfig:
         raise ValueError("gamma and gae_lambda must be in [0, 1]")
     if not 0.0 < config.clip_coef < 1.0:
         raise ValueError("clip_coef must be in (0, 1)")
+    for name in ("se3_commit", "se3_tree", "rlinf_commit", "rlinf_tree"):
+        value = getattr(config, name)
+        if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"{name} must be a full lowercase Git object id")
+    if len(config.runtime_manifest_sha256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in config.runtime_manifest_sha256
+    ):
+        raise ValueError("runtime_manifest_sha256 must be a lowercase SHA-256")
     return config
 
 
@@ -298,9 +336,143 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _git_output(root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _source_identity(
+    *,
+    root: str,
+    expected_commit: str,
+    expected_tree: str,
+    imported_file: str,
+) -> dict[str, Any]:
+    source = Path(root).resolve(strict=True)
+    loaded = Path(imported_file).resolve(strict=True)
+    if not loaded.is_relative_to(source):
+        raise RuntimeError(f"loaded module {loaded} is outside frozen source {source}")
+    observed_commit = _git_output(source, "rev-parse", "HEAD")
+    observed_tree = _git_output(source, "show", "-s", "--format=%T", "HEAD")
+    dirty = _git_output(source, "status", "--porcelain=v1")
+    if observed_commit != expected_commit or observed_tree != expected_tree or dirty:
+        raise RuntimeError(
+            f"source identity mismatch for {source}: commit={observed_commit}, "
+            f"tree={observed_tree}, dirty={bool(dirty)}"
+        )
+    return {
+        "path": str(source),
+        "loaded_file": str(loaded),
+        "commit": observed_commit,
+        "tree": observed_tree,
+        "tracked_worktree_clean": True,
+    }
+
+
+def _parse_cpuset(value: str) -> set[int]:
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError("expected_cpuset contains an empty item")
+        if "-" in item:
+            start_text, stop_text = item.split("-", 1)
+            start, stop = int(start_text), int(stop_text)
+            if start < 0 or stop < start:
+                raise ValueError("expected_cpuset contains an invalid range")
+            result.update(range(start, stop + 1))
+        else:
+            cpu = int(item)
+            if cpu < 0:
+                raise ValueError("expected_cpuset contains a negative CPU")
+            result.add(cpu)
+    if not result:
+        raise ValueError("expected_cpuset must not be empty")
+    return result
+
+
+def _preflight(config: TensorPPOConfig) -> tuple[dict[str, Any], dict[str, Any]]:
+    import se3_wam
+
+    import rlinf
+
+    if not hasattr(os, "sched_getaffinity"):
+        raise RuntimeError("tensor PPO gate requires Linux CPU-affinity introspection")
+    expected_cpus = _parse_cpuset(config.expected_cpuset)
+    observed_cpus = set(os.sched_getaffinity(0))
+    if observed_cpus != expected_cpus:
+        raise RuntimeError(
+            f"CPU affinity mismatch: expected {sorted(expected_cpus)}, "
+            f"observed {sorted(observed_cpus)}"
+        )
+    sources = {
+        "se3_wam": _source_identity(
+            root=config.se3_source,
+            expected_commit=config.se3_commit,
+            expected_tree=config.se3_tree,
+            imported_file=se3_wam.__file__,
+        ),
+        "rlinf": _source_identity(
+            root=config.rlinf_source,
+            expected_commit=config.rlinf_commit,
+            expected_tree=config.rlinf_tree,
+            imported_file=rlinf.__file__,
+        ),
+    }
+    runtime_path = Path(config.runtime_manifest).resolve(strict=True)
+    observed_manifest_sha256 = _file_sha256(runtime_path)
+    if observed_manifest_sha256 != config.runtime_manifest_sha256:
+        raise RuntimeError("runtime manifest SHA-256 mismatch")
+    runtime = {
+        "path": str(runtime_path),
+        "sha256": observed_manifest_sha256,
+        "payload": json.loads(runtime_path.read_text(encoding="utf-8")),
+    }
+    inventory = {
+        "expected_cpuset": config.expected_cpuset,
+        "observed_cpus": sorted(observed_cpus),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "python_executable": os.path.realpath(sys.executable),
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+    }
+    return {"sources": sources, "runtime": runtime}, inventory
+
+
+def _validate_runtime_versions(provenance: Any, runtime_payload: dict[str, Any]) -> None:
+    expected = runtime_payload.get("versions")
+    if not isinstance(expected, dict):
+        raise RuntimeError("runtime manifest does not contain a versions mapping")
+    observed = dict(provenance.runtime_versions)
+    candidates = {
+        "mujoco": ("mujoco",),
+        "mujoco-warp": ("mujoco-warp", "mujoco-mjx"),
+        "warp-lang": ("warp-lang",),
+    }
+    mismatches = {}
+    for observed_name, expected_names in candidates.items():
+        expected_value = next(
+            (str(expected[name]) for name in expected_names if name in expected),
+            None,
+        )
+        if expected_value is None or observed.get(observed_name) != expected_value:
+            mismatches[observed_name] = {
+                "observed": observed.get(observed_name),
+                "expected": expected_value,
+            }
+    if mismatches:
+        raise RuntimeError(f"runtime manifest/provenance version mismatch: {mismatches}")
+
+
 def main() -> int:
     args = _parser().parse_args()
     config = _config(args)
+    provenance_bundle, inventory = _preflight(config)
     if not torch.cuda.is_available():
         raise RuntimeError("tensor PPO smoke requires CUDA; CPU fallback is forbidden")
     if args.output.exists() and any(args.output.iterdir()):
@@ -321,6 +493,20 @@ def main() -> int:
         image_size=config.image_size,
     )
     try:
+        _validate_runtime_versions(
+            env.provenance,
+            provenance_bundle["runtime"]["payload"],
+        )
+        properties = torch.cuda.get_device_properties(env.device)
+        free_memory, total_memory = torch.cuda.mem_get_info(env.device)
+        inventory.update(
+            {
+                "gpu_name": properties.name,
+                "gpu_compute_capability": [properties.major, properties.minor],
+                "gpu_total_memory_bytes": int(total_memory),
+                "gpu_free_memory_bytes_at_start": int(free_memory),
+            }
+        )
         initial = env.reset()
         observation = initial.observation
         observation_dim = int(observation.shape[1])
@@ -437,10 +623,20 @@ def main() -> int:
             checkpoint_path,
         )
         provenance = env.provenance
+        source_provenance = {
+            "sources": provenance_bundle["sources"],
+            "runtime": {
+                "path": provenance_bundle["runtime"]["path"],
+                "sha256": provenance_bundle["runtime"]["sha256"],
+                "versions": provenance_bundle["runtime"]["payload"]["versions"],
+            },
+        }
         report = {
             "schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-report-v0.1",
             "status": "passed",
             "config": asdict(config),
+            "source_provenance": source_provenance,
+            "inventory": inventory,
             "backend": {
                 "backend_id": provenance.backend_id,
                 "api_version": env.api_version,
