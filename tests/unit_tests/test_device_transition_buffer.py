@@ -75,21 +75,29 @@ class _Tensor:
 class _Torch:
     bool = "bool"
     float32 = "float32"
+    int32 = "int32"
+    int64 = "int64"
+
+    @staticmethod
+    def _numpy_dtype(dtype: Any) -> Any:
+        return {
+            "bool": np.bool_,
+            "float32": np.float32,
+            "int32": np.int32,
+            "int64": np.int64,
+        }[dtype]
 
     @staticmethod
     def empty(shape: tuple[int, ...], *, dtype: Any, device: str) -> _Tensor:
-        numpy_dtype = np.bool_ if dtype == "bool" else np.float32
-        return _Tensor(np.empty(shape, dtype=numpy_dtype), dtype=dtype, device=device)
+        return _Tensor(np.empty(shape, dtype=_Torch._numpy_dtype(dtype)), dtype=dtype, device=device)
 
     @staticmethod
     def ones(shape: tuple[int, ...], *, dtype: Any, device: str) -> _Tensor:
-        numpy_dtype = np.bool_ if dtype == "bool" else np.float32
-        return _Tensor(np.ones(shape, dtype=numpy_dtype), dtype=dtype, device=device)
+        return _Tensor(np.ones(shape, dtype=_Torch._numpy_dtype(dtype)), dtype=dtype, device=device)
 
 
 def _tensor(values: Any, *, dtype: Any = "float32") -> _Tensor:
-    numpy_dtype = np.bool_ if dtype == "bool" else np.float32
-    return _Tensor(np.asarray(values, dtype=numpy_dtype), dtype=dtype)
+    return _Tensor(np.asarray(values, dtype=_Torch._numpy_dtype(dtype)), dtype=dtype)
 
 
 def _buffer() -> Any:
@@ -102,6 +110,9 @@ def _buffer() -> Any:
         observation_dtype="float32",
         action_dtype="float32",
         reward_dtype="float32",
+        event_mask_dtype="int32",
+        terminal_reason_dtype="int32",
+        physics_step_dtype="int64",
         extra_fields={"value": DeviceFieldSpec(shape=(), dtype="float32")},
         torch_module=_Torch,
     )
@@ -116,6 +127,9 @@ def _append(buffer: Any, *, terminated: tuple[int, int]) -> None:
         terminated=_tensor(terminated),
         truncated=_tensor([0, 0]),
         success=_tensor(terminated),
+        event_mask=_tensor([1, 2], dtype="int32"),
+        terminal_reason=_tensor(terminated, dtype="int32"),
+        physics_step=_tensor([25, 25], dtype="int64"),
         extras={"value": _tensor([0.5, 0.6])},
     )
 
@@ -147,6 +161,9 @@ def test_buffer_rejects_cross_device_and_schema_drift() -> None:
             terminated=_tensor([0, 0]),
             truncated=_tensor([0, 0]),
             success=_tensor([0, 0]),
+            event_mask=_tensor([0, 0], dtype="int32"),
+            terminal_reason=_tensor([0, 0], dtype="int32"),
+            physics_step=_tensor([25, 25], dtype="int64"),
         )
 
     wrong_device = _tensor([[1, 2], [3, 4]])
@@ -160,5 +177,8 @@ def test_buffer_rejects_cross_device_and_schema_drift() -> None:
             terminated=_tensor([0, 0]),
             truncated=_tensor([0, 0]),
             success=_tensor([0, 0]),
+            event_mask=_tensor([0, 0], dtype="int32"),
+            terminal_reason=_tensor([0, 0], dtype="int32"),
+            physics_step=_tensor([25, 25], dtype="int64"),
             extras={"value": _tensor([0.5, 0.6])},
         )

@@ -258,6 +258,11 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
 
     reset = backend.reset()
     assert reset.observation.device == device
+    assert reset.episode_ids == (
+        "p0_grasp-gpu-000000000000",
+        "p0_grasp-gpu-000000000001",
+        "p0_grasp-gpu-000000000002",
+    )
     assert len(fake_env.reset_calls[0]) == 3
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
     step = backend.step(action)

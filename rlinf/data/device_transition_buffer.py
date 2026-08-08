@@ -58,6 +58,9 @@ class DeviceTransitionView:
     terminated: Any
     truncated: Any
     success: Any
+    event_mask: Any
+    terminal_reason: Any
+    physics_step: Any
     valid: Any
     extras: Mapping[str, Any]
 
@@ -93,6 +96,9 @@ class DeviceTransitionBuffer:
         observation_dtype: Any,
         action_dtype: Any,
         reward_dtype: Any,
+        event_mask_dtype: Any,
+        terminal_reason_dtype: Any,
+        physics_step_dtype: Any,
         extra_fields: Mapping[str, DeviceFieldSpec] | None = None,
         torch_module: Any | None = None,
     ) -> None:
@@ -120,6 +126,9 @@ class DeviceTransitionBuffer:
             "terminated",
             "truncated",
             "success",
+            "event_mask",
+            "terminal_reason",
+            "physics_step",
             "valid",
         }
         overlap = sorted(reserved & set(specs))
@@ -140,6 +149,9 @@ class DeviceTransitionBuffer:
         self._observation_dtype = observation_dtype
         self._action_dtype = action_dtype
         self._reward_dtype = reward_dtype
+        self._event_mask_dtype = event_mask_dtype
+        self._terminal_reason_dtype = terminal_reason_dtype
+        self._physics_step_dtype = physics_step_dtype
         self._specs = MappingProxyType(specs)
         self._observation = torch.empty(
             (*prefix, *observation_shape), dtype=observation_dtype, device=device
@@ -152,6 +164,13 @@ class DeviceTransitionBuffer:
         self._terminated = torch.empty(prefix, dtype=torch.bool, device=device)
         self._truncated = torch.empty(prefix, dtype=torch.bool, device=device)
         self._success = torch.empty(prefix, dtype=torch.bool, device=device)
+        self._event_mask = torch.empty(prefix, dtype=event_mask_dtype, device=device)
+        self._terminal_reason = torch.empty(
+            prefix,
+            dtype=terminal_reason_dtype,
+            device=device,
+        )
+        self._physics_step = torch.empty(prefix, dtype=physics_step_dtype, device=device)
         self._valid = torch.empty(prefix, dtype=torch.bool, device=device)
         self._extras = {
             name: torch.empty((*prefix, *spec.shape), dtype=spec.dtype, device=device)
@@ -209,6 +228,9 @@ class DeviceTransitionBuffer:
         terminated: Any,
         truncated: Any,
         success: Any,
+        event_mask: Any,
+        terminal_reason: Any,
+        physics_step: Any,
         extras: Mapping[str, Any] | None = None,
     ) -> None:
         """Copy one vector transition into preallocated storage on the same GPU."""
@@ -253,6 +275,17 @@ class DeviceTransitionBuffer:
                 )
             if not value.is_contiguous():
                 raise DeviceTransitionContractError(f"{name} must be contiguous")
+        for name, value, dtype in (
+            ("event_mask", event_mask, self._event_mask_dtype),
+            ("terminal_reason", terminal_reason, self._terminal_reason_dtype),
+            ("physics_step", physics_step, self._physics_step_dtype),
+        ):
+            self._require_tensor(
+                value,
+                name=name,
+                shape=vector_shape,
+                dtype=dtype,
+            )
         supplied_extras = {} if extras is None else dict(extras)
         if set(supplied_extras) != set(self._specs):
             raise DeviceTransitionContractError("extra field set does not match buffer schema")
@@ -273,6 +306,9 @@ class DeviceTransitionBuffer:
         self._terminated[row].copy_(terminated != 0)
         self._truncated[row].copy_(truncated != 0)
         self._success[row].copy_(success != 0)
+        self._event_mask[row].copy_(event_mask)
+        self._terminal_reason[row].copy_(terminal_reason)
+        self._physics_step[row].copy_(physics_step)
         for name, value in supplied_extras.items():
             self._extras[name][row].copy_(value)
         self._alive.logical_and_(~(self._terminated[row] | self._truncated[row]))
@@ -290,6 +326,9 @@ class DeviceTransitionBuffer:
             terminated=self._terminated[:stop],
             truncated=self._truncated[:stop],
             success=self._success[:stop],
+            event_mask=self._event_mask[:stop],
+            terminal_reason=self._terminal_reason[:stop],
+            physics_step=self._physics_step[:stop],
             valid=self._valid[:stop],
             extras={name: value[:stop] for name, value in self._extras.items()},
         )

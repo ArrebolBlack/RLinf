@@ -328,6 +328,14 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _append_jsonl_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -479,6 +487,7 @@ def main() -> int:
         raise FileExistsError(f"refusing non-empty output directory {args.output}")
     args.output.mkdir(parents=True, exist_ok=True)
     _atomic_json(args.output / "config.json", asdict(config))
+    ledger_path = args.output / "episode_ledger.jsonl"
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -521,6 +530,9 @@ def main() -> int:
             observation_dtype=observation.dtype,
             action_dtype=torch.float32,
             reward_dtype=torch.float32,
+            event_mask_dtype=torch.int32,
+            terminal_reason_dtype=torch.int32,
+            physics_step_dtype=torch.int64,
             extra_fields={
                 "raw_action": DeviceFieldSpec((7,), torch.float32),
                 "log_prob": DeviceFieldSpec((), torch.float32),
@@ -542,6 +554,7 @@ def main() -> int:
         total_allocated_steps = 0
         total_valid_steps = 0
         total_successes = 0
+        seen_episode_ids: set[str] = set()
         wall_started = time.perf_counter()
         for cohort in range(config.cohorts):
             reset = env.reset()
@@ -563,6 +576,9 @@ def main() -> int:
                     terminated=step.terminated,
                     truncated=step.truncated,
                     success=step.success,
+                    event_mask=step.event_mask,
+                    terminal_reason=step.terminal_reason,
+                    physics_step=step.physics_step,
                     extras={
                         "raw_action": raw_action,
                         "log_prob": log_prob,
@@ -588,6 +604,47 @@ def main() -> int:
             allocated_steps = env.cohort_horizon_steps * config.num_envs
             valid_steps = int(rollout.valid.sum())
             successes = int((rollout.success & rollout.done & rollout.valid).sum())
+            done_valid = rollout.done & rollout.valid
+            lane_valid_steps = rollout.valid.sum(dim=0).cpu().tolist()
+            lane_returns = (
+                rollout.reward * rollout.valid.to(rollout.reward.dtype)
+            ).sum(dim=0).cpu().tolist()
+            lane_terminated = (rollout.terminated & rollout.valid).any(dim=0).cpu().tolist()
+            lane_truncated = (rollout.truncated & rollout.valid).any(dim=0).cpu().tolist()
+            lane_success = (rollout.success & done_valid).any(dim=0).cpu().tolist()
+            lane_terminal_reason = torch.where(
+                done_valid,
+                rollout.terminal_reason,
+                torch.zeros_like(rollout.terminal_reason),
+            ).amax(dim=0).cpu().tolist()
+            lane_terminal_physics_step = torch.where(
+                done_valid,
+                rollout.physics_step,
+                torch.zeros_like(rollout.physics_step),
+            ).amax(dim=0).cpu().tolist()
+            ledger_rows = []
+            for lane, episode_id in enumerate(reset.episode_ids):
+                if episode_id in seen_episode_ids:
+                    raise RuntimeError(f"duplicate cohort episode id {episode_id}")
+                seen_episode_ids.add(episode_id)
+                ledger_rows.append(
+                    {
+                        "cohort": cohort,
+                        "lane": lane,
+                        "episode_id": episode_id,
+                        "task_id": config.task,
+                        "backend_id": env.provenance.backend_id,
+                        "physical_device_uuid": config.expected_gpu_uuid,
+                        "valid_steps": int(lane_valid_steps[lane]),
+                        "return": float(lane_returns[lane]),
+                        "terminated": bool(lane_terminated[lane]),
+                        "truncated": bool(lane_truncated[lane]),
+                        "success": bool(lane_success[lane]),
+                        "terminal_reason_code": int(lane_terminal_reason[lane]),
+                        "terminal_physics_step": int(lane_terminal_physics_step[lane]),
+                    }
+                )
+            _append_jsonl_rows(ledger_path, ledger_rows)
             total_allocated_steps += allocated_steps
             total_valid_steps += valid_steps
             total_successes += successes
@@ -669,6 +726,12 @@ def main() -> int:
             "checkpoint": {
                 "path": str(checkpoint_path),
                 "sha256": _file_sha256(checkpoint_path),
+            },
+            "episode_ledger": {
+                "path": str(ledger_path),
+                "sha256": _file_sha256(ledger_path),
+                "rows": len(seen_episode_ids),
+                "unique_episode_ids": len(seen_episode_ids),
             },
         }
         _atomic_json(args.output / "report.json", report)

@@ -102,6 +102,7 @@ def _zero_copy_torch_view(
 class GpuNativeTensorReset:
     observation: Any
     generation: int
+    episode_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -316,6 +317,7 @@ class GpuNativeTensorBackendEnv:
         return GpuNativeTensorReset(
             observation=self._view(result.observation, "observation"),
             generation=int(result.state.generation),
+            episode_ids=tuple(request.episode_id for request in requests),
         )
 
     def step(self, action: Any) -> GpuNativeTensorStep:
