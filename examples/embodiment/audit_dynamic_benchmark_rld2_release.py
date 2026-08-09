@@ -44,6 +44,13 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+try:
+    from examples.embodiment import (
+        audit_dynamic_benchmark_optimal_trajectories as _optimal_auditor,
+    )
+except ModuleNotFoundError:
+    import audit_dynamic_benchmark_optimal_trajectories as _optimal_auditor
+
 EXACT_TASKS = (
     "p0_grasp",
     "t1_xyz",
@@ -61,9 +68,18 @@ EXACT_TASKS = (
     "t5_replan",
 )
 
-RELEASE_INPUT_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-inputs-v0.1"
-RELEASE_MANIFEST_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-v0.1"
-RELEASE_AUDIT_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-audit-v0.1"
+LEGACY_RELEASE_INPUT_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-inputs-v0.1"
+RELEASE_INPUT_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-inputs-v0.2"
+HISTORICAL_RELEASE_MANIFEST_SCHEMAS = (
+    "rlinf-dynamic-benchmark-rld2-release-v0.1",
+    "rlinf-dynamic-benchmark-rld2-release-v0.2",
+)
+RELEASE_MANIFEST_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-v0.3"
+HISTORICAL_RELEASE_AUDIT_SCHEMAS = (
+    "rlinf-dynamic-benchmark-rld2-release-audit-v0.1",
+    "rlinf-dynamic-benchmark-rld2-release-audit-v0.2",
+)
+RELEASE_AUDIT_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-audit-v0.3"
 CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.2"
 CANDIDATE_RELEASE_SCHEMA = "rlinf-dynamic-benchmark-rld2-candidate-release-v0.2"
 EVALUATOR_IDENTITY_SCHEMA = "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
@@ -76,13 +92,16 @@ CALIBRATION_EVIDENCE_SCHEMA = (
 INPUT_INVENTORY_SCHEMA = "rlinf-dynamic-benchmark-rld2-input-inventory-v0.1"
 DATASET_CARD_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-v0.1"
 TASK_AUDIT_SCHEMA = "rlinf-dynamic-benchmark-optimal-audit-v0.1"
-PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
+PLANNER_DOMINANCE_SCHEMA = _optimal_auditor.PLANNER_DOMINANCE_SCHEMA
+ATTEMPT_SCHEMA = _optimal_auditor.ATTEMPT_SCHEMA
+QUALITY_V2_THRESHOLDS_SCHEMA = _optimal_auditor.QUALITY_V2_THRESHOLDS_SCHEMA
+QUALITY_V2_SUMMARY_SCHEMA = _optimal_auditor.QUALITY_V2_SUMMARY_SCHEMA
+QUALITY_V2_GATE_SCHEMA = _optimal_auditor.QUALITY_V2_GATE_SCHEMA
+QUALITY_V2_DOMINANCE_SCHEMA = _optimal_auditor.QUALITY_V2_DOMINANCE_SCHEMA
+T5_ACTION_HISTORY_SCHEMA = _optimal_auditor.T5_ACTION_HISTORY_SCHEMA
 FULL_POOL_SEARCH_MODE = "full-pool"
 PLANNER_PARETO_SELECTION_MODE = "planner-pareto"
-PLANNER_PARETO_SELECTION_CONTRACT = (
-    "success,safety,planner-pareto(trajectory_completion,task_quality.*,"
-    "-completion_time_s,-control_steps,-action_l2_sum);return=diagnostic-only"
-)
+PLANNER_PARETO_SELECTION_CONTRACT = _optimal_auditor.PLANNER_PARETO_SELECTION_CONTRACT
 ACCEPTED_PER_TASK = 100
 RELEASE_ID = "RLD2"
 
@@ -96,6 +115,8 @@ _TASK_INPUT_KEYS = {
     "audit_sha256",
     "input_inventory_path",
     "input_inventory_sha256",
+    "quality_v2_thresholds_path",
+    "quality_v2_thresholds_sha256",
 }
 _CANDIDATE_RELEASE_KEYS = {
     "schema_version",
@@ -121,6 +142,9 @@ _COMMON_METRICS = (
     "completion_time_s",
     "control_steps",
     "action_l2_sum",
+)
+_T5_CAUSAL_LATENCY_METRIC = (
+    "t5_replan.impact_end_to_first_qualifying_applied_correction_s"
 )
 
 
@@ -1413,6 +1437,8 @@ def _validate_task_audit(
     candidate_release_sha256: str,
     card: Mapping[str, Any],
     contract: Mapping[str, Any],
+    quality_v2_threshold_identity: Mapping[str, str],
+    quality_v2_calibration_receipt_identity: Mapping[str, str],
     evaluator_identity: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if _sha256(path) != expected_sha256:
@@ -1438,6 +1464,8 @@ def _validate_task_audit(
         or audit.get("checksums_sha256") != checksums_sha256
         or audit.get("candidate_manifest_sha256") != candidate_sha256
         or audited_release_sha256 != candidate_release_sha256
+        or audit.get("quality_v2_thresholds_sha256")
+        != quality_v2_threshold_identity["sha256"]
     ):
         raise ReleaseAuditError(f"{task} independent audit input identity mismatch")
     if audit.get("status") != "passed" or audit.get("training_eligible") is not True:
@@ -1455,6 +1483,10 @@ def _validate_task_audit(
         or summary.get("selection_mode") != PLANNER_PARETO_SELECTION_MODE
         or summary.get("source_identity") != card.get("source_identity")
         or summary.get("dataset_card_payload_sha256") != card.get("payload_sha256")
+        or summary.get("quality_v2_threshold_identity")
+        != dict(quality_v2_threshold_identity)
+        or summary.get("quality_v2_calibration_wave_receipt_identity")
+        != dict(quality_v2_calibration_receipt_identity)
     ):
         raise ReleaseAuditError(f"{task} independent audit summary contract mismatch")
     _contract_from_audit_summary(summary, contract, task=task)
@@ -1463,20 +1495,10 @@ def _validate_task_audit(
 
 
 def _eligible(record: Mapping[str, Any]) -> bool:
-    replay = record.get("replay_validation")
-    for key in ("success", "safety_failure", "finite_and_bounded"):
-        if not isinstance(record.get(key), bool):
-            raise ReleaseAuditError(f"attempt {key} must be a native JSON boolean")
-    if not isinstance(replay, Mapping) or not isinstance(replay.get("passed"), bool):
-        raise ReleaseAuditError(
-            "attempt replay-validation passed must be a native boolean"
-        )
-    return (
-        record["success"]
-        and not record["safety_failure"]
-        and record["finite_and_bounded"]
-        and replay["passed"]
-    )
+    try:
+        return _optimal_auditor._eligible(record)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
 
 
 def _metric_names(contract: Mapping[str, Any]) -> tuple[str, ...]:
@@ -1562,89 +1584,138 @@ def _metric_thresholds(
     return epsilon, strict_margin
 
 
+def _quality_v2_dominance_contract(
+    payload: Mapping[str, Any],
+    *,
+    task: str,
+    thresholds_sha256: str,
+) -> dict[str, Any]:
+    """Use the canonical per-task auditor to derive dynamic Qv3 dimensions.
+
+    The canonical helper intentionally derives the inventory from the frozen
+    threshold checks, so this release boundary neither assumes a fixed 10/11
+    count nor hard-codes task phases such as ``acquisition_window``.
+    """
+
+    try:
+        return _optimal_auditor._quality_v2_dominance_contract(
+            payload,
+            task=task,
+            thresholds_sha256=thresholds_sha256,
+            require_formal_freeze=True,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(
+            f"{task} quality-v2 threshold contract is invalid: {error}"
+        ) from error
+
+
+def _quality_v2_metric_value(
+    record: Mapping[str, Any], spec: Mapping[str, Any]
+) -> float:
+    try:
+        return _optimal_auditor._quality_v2_metric_value(record, spec)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
+
+
+def _validate_quality_v2_attempt(
+    record: Mapping[str, Any], contract: Mapping[str, Any]
+) -> dict[str, float]:
+    try:
+        return _optimal_auditor._validate_quality_v2_attempt(record, contract)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
+
+
+def _quality_v2_metric_thresholds(
+    reference_value: float, spec: Mapping[str, Any]
+) -> tuple[float, float]:
+    try:
+        return _optimal_auditor._quality_v2_metric_thresholds(reference_value, spec)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
+
+
+def _t5_causal_latency(record: Mapping[str, Any]) -> float | None:
+    helper = getattr(_optimal_auditor, "_t5_causal_latency", None)
+    if helper is None:
+        return None
+    try:
+        return helper(record)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
+
+
 def _validate_attempt_quality(
     record: Mapping[str, Any], contract: Mapping[str, Any]
 ) -> None:
-    summary = record.get("task_quality")
-    schema = contract["quality_schema"]
-    if not isinstance(summary, Mapping) or set(summary) != {
-        "schema_version",
-        "episode_id",
-        "task_id",
-        "evaluator_backend_id",
-        "schema_sha256",
-        "physics_sample_count",
-        "terminal",
-        "components",
-        "summary_sha256",
-    }:
-        raise ReleaseAuditError("task quality summary field inventory mismatch")
-    summary_payload = dict(summary)
-    summary_payload.pop("summary_sha256", None)
-    if (
-        summary.get("schema_version") != schema["schema_version"]
-        or summary.get("task_id") != contract["task"]
-        or summary.get("evaluator_backend_id") != contract["backend_id"]
-        or summary.get("schema_sha256") != schema["schema_sha256"]
-        or summary.get("episode_id") != record.get("episode_id")
-        or summary.get("terminal") is not True
-        or summary.get("summary_sha256") != _payload_sha256(summary_payload)
-    ):
-        raise ReleaseAuditError("task quality summary identity or hash mismatch")
-    sample_count = summary.get("physics_sample_count")
-    if (
-        isinstance(sample_count, bool)
-        or not isinstance(sample_count, int)
-        or sample_count < 1
-    ):
-        raise ReleaseAuditError("task quality physics sample count is invalid")
-    components = summary.get("components")
-    expected_names = [item["name"] for item in schema["components"]]
-    if not isinstance(components, Mapping) or set(components) != set(expected_names):
-        raise ReleaseAuditError("task quality component inventory mismatch")
-    for metadata in schema["components"]:
-        name = metadata["name"]
-        component = components[name]
-        if not isinstance(component, Mapping) or set(component) != {
-            "value",
-            "direction",
-            "unit",
-            "scientific_resolution",
-            "reducer",
-        }:
-            raise ReleaseAuditError(
-                f"task quality component {name!r} inventory mismatch"
-            )
-        for key in ("direction", "unit", "scientific_resolution", "reducer"):
-            if component.get(key) != metadata[key]:
-                raise ReleaseAuditError(
-                    f"task quality component {name!r} metadata mismatch"
-                )
-        _metric_value(record, f"task_quality.{name}")
+    try:
+        _optimal_auditor._validate_attempt_quality(record, contract)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
 
 
 def _planner_pareto_dominates(
     candidate: Mapping[str, Any],
     planner: Mapping[str, Any],
     contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
 ) -> bool:
-    _validate_attempt_quality(candidate, contract)
-    _validate_attempt_quality(planner, contract)
-    strictly_better = False
-    for name in _metric_names(contract):
-        candidate_value = _metric_value(candidate, name)
-        planner_value = _metric_value(planner, name)
-        spec = _metric_spec(contract, name)
-        epsilon, strict_margin = _metric_thresholds(name, planner_value, spec)
-        if spec["direction"] == "max":
-            if candidate_value < planner_value - epsilon:
-                return False
-            strictly_better |= candidate_value > planner_value + strict_margin
-        else:
-            if candidate_value > planner_value + epsilon:
-                return False
-            strictly_better |= candidate_value < planner_value - strict_margin
-    return strictly_better
+    """Reproduce the canonical same-reset task+Qv3 Pareto predicate."""
+
+    try:
+        return _optimal_auditor._planner_pareto_dominates(
+            candidate,
+            planner,
+            contract,
+            quality_v2_contract,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
+
+
+def _selected(
+    records: list[dict[str, Any]],
+    *,
+    contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Recompute the canonical full-pool winner, including planner-on-tie."""
+
+    try:
+        return _optimal_auditor._selected(
+            records,
+            selection_mode=PLANNER_PARETO_SELECTION_MODE,
+            planner_dominance=contract,
+            quality_v2_dominance=quality_v2_contract,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseAuditError(str(error)) from error
+
+
+def _audit_attempt_tape_binding(
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    task: str,
+    quality_v2_thresholds: Mapping[str, Any],
+    quality_v2_thresholds_sha256: str,
+) -> None:
+    """Reopen the lightweight tape and independently recompute Qv3 and hashes."""
+
+    try:
+        _optimal_auditor._audit_attempt_tape(
+            root,
+            record,
+            expected_task=task,
+            quality_v2_thresholds=quality_v2_thresholds,
+            quality_v2_thresholds_sha256=quality_v2_thresholds_sha256,
+        )
+    except Exception as error:
+        raise ReleaseAuditError(
+            f"{task}/{record.get('episode_id')} attempt tape mismatch: {error}"
+        ) from error
 
 
 def _number(value: Any, label: str) -> float:
@@ -1905,12 +1976,54 @@ def _audit_source_labels_and_deltas(
     task: str,
     candidates: Sequence[Mapping[str, Any]],
     contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
+    quality_v2_thresholds: Mapping[str, Any],
+    quality_v2_thresholds_sha256: str,
 ) -> tuple[dict[str, int], dict[str, dict[str, Any]], int]:
     attempts = _read_jsonl(root / "attempts.jsonl", f"{task} attempts")
     results = _read_jsonl(root / "reset_results.jsonl", f"{task} reset results")
+    referenced_tapes: set[str] = set()
+    for attempt in attempts:
+        candidate_index = attempt.get("candidate_index")
+        if (
+            attempt.get("schema_version") != ATTEMPT_SCHEMA
+            or isinstance(candidate_index, bool)
+            or not isinstance(candidate_index, int)
+            or not 0 <= candidate_index < len(candidates)
+            or attempt.get("candidate_id")
+            != candidates[candidate_index].get("candidate_id")
+            or attempt.get("candidate_kind") != candidates[candidate_index].get("kind")
+        ):
+            raise ReleaseAuditError(
+                f"{task} attempt candidate/schema identity mismatch"
+            )
+        tape = attempt.get("attempt_tape")
+        if not isinstance(tape, str) or not tape or tape in referenced_tapes:
+            raise ReleaseAuditError(
+                f"{task} attempt tape paths must be present and unique"
+            )
+        referenced_tapes.add(tape)
+        _validate_attempt_quality(attempt, contract)
+        _audit_attempt_tape_binding(
+            root,
+            attempt,
+            task=task,
+            quality_v2_thresholds=quality_v2_thresholds,
+            quality_v2_thresholds_sha256=quality_v2_thresholds_sha256,
+        )
+        eligible = attempt.get("eligible")
+        if not isinstance(eligible, bool) or eligible is not _eligible(attempt):
+            raise ReleaseAuditError(f"{task} attempt eligibility does not recompute")
     grouped = _attempt_index(attempts, task=task, pool_size=len(candidates))
     source_counts: Counter[str] = Counter()
-    deltas = {name: _DeltaAccumulator() for name in _metric_names(contract)}
+    delta_names = [
+        *_metric_names(contract),
+        *(str(spec["name"]) for spec in quality_v2_contract["metrics"]),
+    ]
+    causal_selection = "t5-replan-causal-timing" in PLANNER_PARETO_SELECTION_CONTRACT
+    if task == "t5_replan" and causal_selection:
+        delta_names.append(_T5_CAUSAL_LATENCY_METRIC)
+    deltas = {name: _DeltaAccumulator() for name in delta_names}
     accepted = 0
     seen_episodes: set[str] = set()
     for result_position, result in enumerate(results):
@@ -1947,15 +2060,13 @@ def _audit_source_labels_and_deltas(
         selection = result.get("selection_result")
         if not isinstance(selection, Mapping):
             raise ReleaseAuditError(f"{task}/{episode_id} selection result is missing")
-        selected_index = selection.get("winner_candidate_index")
-        if selected_index is not None and (
-            isinstance(selected_index, bool)
-            or not isinstance(selected_index, int)
-            or selected_index not in records
-        ):
-            raise ReleaseAuditError(
-                f"{task}/{episode_id} selected candidate index is invalid"
-            )
+        ordered_records = [dict(records[index]) for index in range(len(candidates))]
+        selected = _selected(
+            ordered_records,
+            contract=contract,
+            quality_v2_contract=quality_v2_contract,
+        )
+        selected_index = None if selected is None else int(selected["candidate_index"])
         expected_source = (
             "rejected"
             if selected_index is None
@@ -1963,30 +2074,24 @@ def _audit_source_labels_and_deltas(
             if selected_index == 0
             else "expert_dominant"
         )
-        if selection.get("source_kind") != expected_source:
+        expected_selection = {
+            "source_kind": expected_source,
+            "planner_eligible": _eligible(records[0]),
+            "winner_candidate_id": (
+                None if selected is None else selected["candidate_id"]
+            ),
+            "winner_candidate_index": selected_index,
+        }
+        if dict(selection) != expected_selection:
             raise ReleaseAuditError(
-                f"{task}/{episode_id} fallback/source_kind mislabel: "
-                f"expected {expected_source!r}, got {selection.get('source_kind')!r}"
+                f"{task}/{episode_id} selection result does not reproduce from "
+                "the full same-reset pool"
             )
         planner = records[0]
-        planner_eligible_label = selection.get("planner_eligible")
-        if not isinstance(planner_eligible_label, bool) or (
-            planner_eligible_label is not _eligible(planner)
-        ):
-            raise ReleaseAuditError(
-                f"{task}/{episode_id} planner eligibility is mislabeled"
-            )
         if selected_index is None:
-            if selection.get("winner_candidate_id") is not None:
-                raise ReleaseAuditError(
-                    f"{task}/{episode_id} rejected selection names a winner"
-                )
+            pass
         else:
             selected = records[selected_index]
-            if selection.get("winner_candidate_id") != selected.get("candidate_id"):
-                raise ReleaseAuditError(
-                    f"{task}/{episode_id} selected candidate ID mismatch"
-                )
             if not _eligible(selected):
                 raise ReleaseAuditError(
                     f"{task}/{episode_id} selected attempt is ineligible"
@@ -1998,7 +2103,12 @@ def _audit_source_labels_and_deltas(
             if (
                 selected_index > 0
                 and _eligible(planner)
-                and not _planner_pareto_dominates(selected, planner, contract)
+                and not _planner_pareto_dominates(
+                    selected,
+                    planner,
+                    contract,
+                    quality_v2_contract,
+                )
             ):
                 raise ReleaseAuditError(
                     f"{task}/{episode_id} expert_dominant winner does not dominate planner"
@@ -2024,17 +2134,11 @@ def _audit_source_labels_and_deltas(
             accepted += 1
             source_counts[expected_source] += 1
             selected = records[selected_index]
-            for name in deltas:
-                try:
-                    planner_value = _metric_value(planner, name)
-                    winner_value = _metric_value(selected, name)
-                    spec = _metric_spec(contract, name)
-                    epsilon, strict_margin = _metric_thresholds(
-                        name, planner_value, spec
-                    )
-                except (KeyError, TypeError, ValueError):
-                    deltas[name].unavailable()
-                    continue
+            for name in _metric_names(contract):
+                planner_value = _metric_value(planner, name)
+                winner_value = _metric_value(selected, name)
+                spec = _metric_spec(contract, name)
+                epsilon, strict_margin = _metric_thresholds(name, planner_value, spec)
                 improvement = (
                     winner_value - planner_value
                     if spec["direction"] == "max"
@@ -2045,6 +2149,33 @@ def _audit_source_labels_and_deltas(
                     epsilon=epsilon,
                     strict_margin=strict_margin,
                 )
+            for spec in quality_v2_contract["metrics"]:
+                name = str(spec["name"])
+                planner_value = _quality_v2_metric_value(planner, spec)
+                winner_value = _quality_v2_metric_value(selected, spec)
+                epsilon, strict_margin = _quality_v2_metric_thresholds(
+                    planner_value, spec
+                )
+                deltas[name].add(
+                    planner_value - winner_value,
+                    epsilon=epsilon,
+                    strict_margin=strict_margin,
+                )
+            if task == "t5_replan" and causal_selection:
+                if _eligible(planner):
+                    planner_latency = _t5_causal_latency(planner)
+                    winner_latency = _t5_causal_latency(selected)
+                    if planner_latency is None or winner_latency is None:
+                        raise ReleaseAuditError(
+                            f"{task}/{episode_id} is missing canonical causal latency"
+                        )
+                    deltas[_T5_CAUSAL_LATENCY_METRIC].add(
+                        planner_latency - winner_latency,
+                        epsilon=1.0e-9,
+                        strict_margin=1.0e-9,
+                    )
+                else:
+                    deltas[_T5_CAUSAL_LATENCY_METRIC].unavailable()
         else:
             if (
                 result.get("winner_candidate_id") is not None
@@ -2084,6 +2215,7 @@ def _validate_card(
     expected_candidate_release_sha256: str,
     candidates: Sequence[Mapping[str, Any]],
     contract: Mapping[str, Any],
+    quality_v2_threshold_identity: Mapping[str, str],
     evaluator_identity: Mapping[str, Any],
     policy_rlinf_commits: Sequence[str],
     policy_benchmark_commits: Sequence[str],
@@ -2120,6 +2252,8 @@ def _validate_card(
         or card.get("candidate_release_manifest_sha256")
         != expected_candidate_release_sha256
         or card.get("planner_dominance") != contract
+        or card.get("quality_v2_threshold_identity")
+        != dict(quality_v2_threshold_identity)
     ):
         raise ReleaseAuditError(f"{task} dataset-card release contract mismatch")
     source = card.get("source_identity")
@@ -2150,8 +2284,56 @@ def _validate_card(
     return card
 
 
+def _validate_quality_v2_thresholds(
+    path: Path,
+    *,
+    root: Path,
+    task: str,
+    expected_sha256: str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, str],
+    dict[str, str],
+]:
+    expected_path = root / "quality_v2_thresholds.json"
+    if path.resolve() != expected_path.resolve() or path.is_symlink():
+        raise ReleaseAuditError(
+            f"{task} threshold path must name dataset-local quality_v2_thresholds.json"
+        )
+    digest = _require_sha256(expected_sha256, f"{task} quality-v2 threshold")
+    if not path.is_file() or _sha256(path) != digest:
+        raise ReleaseAuditError(f"{task} quality-v2 threshold file hash mismatch")
+    payload = _load_json(path, f"{task} quality-v2 thresholds")
+    contract = _quality_v2_dominance_contract(
+        payload,
+        task=task,
+        thresholds_sha256=digest,
+    )
+    identity = {
+        "schema_version": QUALITY_V2_THRESHOLDS_SCHEMA,
+        "sha256": digest,
+    }
+    try:
+        calibration_receipt_identity = (
+            _optimal_auditor._audit_quality_v2_calibration_receipt_artifact(
+                root, payload
+            )
+        )
+    except Exception as error:
+        raise ReleaseAuditError(
+            f"{task} quality-v2 calibration receipt sidecar is invalid: {error}"
+        ) from error
+    return payload, contract, identity, calibration_receipt_identity
+
+
 def _load_release_inputs(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     payload = _load_json(path, "RLD2 release inputs")
+    if payload.get("schema_version") == LEGACY_RELEASE_INPUT_SCHEMA:
+        raise ReleaseAuditError(
+            "release-input schema v0.1 is historical and lacks authoritative "
+            "quality-v2 threshold identity"
+        )
     if set(payload) != {
         "schema_version",
         "release_id",
@@ -2208,6 +2390,7 @@ def _load_release_inputs(path: Path) -> tuple[dict[str, Any], list[dict[str, Any
             "candidate_manifest_sha256",
             "audit_sha256",
             "input_inventory_sha256",
+            "quality_v2_thresholds_sha256",
         ):
             row[key] = _require_sha256(row[key], f"{row['task']} {key}")
         normalized.append(row)
@@ -2252,6 +2435,8 @@ def _collect_release(
     aggregate_common = {name: _DeltaAccumulator() for name in _COMMON_METRICS}
     aggregate_accepted = 0
     aggregate_attempted = 0
+    common_quality_v2_threshold_identity: dict[str, str] | None = None
+    common_quality_v2_calibration_receipt_identity: dict[str, str] | None = None
 
     for row in inputs:
         task_value = row["task"]
@@ -2262,6 +2447,9 @@ def _collect_release(
         audit_path = _rld2_path(row["audit_path"], f"{task} audit")
         task_inventory_path = _rld2_path(
             row["input_inventory_path"], f"{task} input inventory"
+        )
+        quality_v2_thresholds_path = _rld2_path(
+            row["quality_v2_thresholds_path"], f"{task} quality-v2 thresholds"
         )
         if root in seen_roots or audit_path in seen_audits:
             raise ReleaseAuditError(
@@ -2278,6 +2466,34 @@ def _collect_release(
             )
 
         checksum_entries = _verify_root_checksums(root, row["checksums_sha256"])
+        (
+            quality_v2_thresholds,
+            quality_v2_contract,
+            quality_v2_threshold_identity,
+            quality_v2_calibration_receipt_identity,
+        ) = _validate_quality_v2_thresholds(
+            quality_v2_thresholds_path,
+            root=root,
+            task=task,
+            expected_sha256=row["quality_v2_thresholds_sha256"],
+        )
+        if common_quality_v2_threshold_identity is None:
+            common_quality_v2_threshold_identity = quality_v2_threshold_identity
+        elif quality_v2_threshold_identity != common_quality_v2_threshold_identity:
+            raise ReleaseAuditError(
+                f"{task} mixes a different quality-v2 threshold contract into RLD2"
+            )
+        if common_quality_v2_calibration_receipt_identity is None:
+            common_quality_v2_calibration_receipt_identity = (
+                quality_v2_calibration_receipt_identity
+            )
+        elif (
+            quality_v2_calibration_receipt_identity
+            != common_quality_v2_calibration_receipt_identity
+        ):
+            raise ReleaseAuditError(
+                f"{task} mixes a different quality-v2 calibration receipt into RLD2"
+            )
         candidate_path = root / "candidate_manifest.json"
         if row["candidate_manifest_sha256"] != candidate_release["task_hashes"][task]:
             raise ReleaseAuditError(
@@ -2324,6 +2540,7 @@ def _collect_release(
             expected_candidate_release_sha256=candidate_release_sha256,
             candidates=candidates,
             contract=contract,
+            quality_v2_threshold_identity=quality_v2_threshold_identity,
             evaluator_identity=evaluator_identity,
             policy_rlinf_commits=policy_rlinf_commits,
             policy_benchmark_commits=policy_benchmark_commits,
@@ -2339,6 +2556,10 @@ def _collect_release(
             candidate_release_sha256=candidate_release_sha256,
             card=card,
             contract=contract,
+            quality_v2_threshold_identity=quality_v2_threshold_identity,
+            quality_v2_calibration_receipt_identity=(
+                quality_v2_calibration_receipt_identity
+            ),
             evaluator_identity=candidate_payload["evaluator_identity"],
         )
         sources, paired_deltas, attempted_count = _audit_source_labels_and_deltas(
@@ -2346,6 +2567,9 @@ def _collect_release(
             task=task,
             candidates=candidates,
             contract=contract,
+            quality_v2_contract=quality_v2_contract,
+            quality_v2_thresholds=quality_v2_thresholds,
+            quality_v2_thresholds_sha256=quality_v2_threshold_identity["sha256"],
         )
         static_identity = {
             "evaluator_identity_schema_version": evaluator_identity["schema_version"],
@@ -2354,9 +2578,17 @@ def _collect_release(
                 "evaluator_benchmark_commit"
             ],
             "candidate_schema_version": candidate_payload["schema_version"],
+            "attempt_schema_version": ATTEMPT_SCHEMA,
+            "t5_action_history_schema_version": T5_ACTION_HISTORY_SCHEMA,
             "task_audit_schema_version": audit["schema_version"],
             "task_auditor_commit": audit["auditor_commit"],
             "planner_dominance_schema_version": contract["schema_version"],
+            "quality_v2_threshold_schema_version": quality_v2_threshold_identity[
+                "schema_version"
+            ],
+            "quality_v2_dominance_schema_version": quality_v2_contract[
+                "schema_version"
+            ],
             "quality_schema_version": contract["quality_schema"]["schema_version"],
             "backend_id": contract["backend_id"],
             "selection_contract": card["selection_contract"],
@@ -2391,11 +2623,21 @@ def _collect_release(
             "candidate_manifest_sha256": row["candidate_manifest_sha256"],
             "candidate_release_manifest_sha256": candidate_release_sha256,
             "candidate_pool_size": len(candidates),
+            "attempt_schema_version": ATTEMPT_SCHEMA,
             "input_records_sha256": input_subset_sha256,
             "audit_path": str(audit_path),
             "audit_sha256": row["audit_sha256"],
             "audit_payload_sha256": audit["payload_sha256"],
             "planner_dominance_payload_sha256": contract["payload_sha256"],
+            "quality_v2_thresholds_path": str(quality_v2_thresholds_path),
+            "quality_v2_thresholds_sha256": quality_v2_threshold_identity["sha256"],
+            "quality_v2_calibration_wave_receipt_identity": (
+                quality_v2_calibration_receipt_identity
+            ),
+            "quality_v2_dominance_payload_sha256": quality_v2_contract[
+                "payload_sha256"
+            ],
+            "quality_v2_check_count": len(quality_v2_contract["metrics"]),
             "quality_schema_sha256": contract["quality_schema"]["schema_sha256"],
             "calibration_evidence_sha256": contract["calibration"]["evidence_sha256"],
             "calibration_audit": calibration_audit,
@@ -2437,6 +2679,8 @@ def _collect_release(
 
     assert (
         common_static_identity is not None
+        and common_quality_v2_threshold_identity is not None
+        and common_quality_v2_calibration_receipt_identity is not None
         and inventory_path is not None
         and inventory_sha256 is not None
     )
@@ -2499,6 +2743,10 @@ def _collect_release(
         "candidate_release_payload_sha256": candidate_release["manifest"][
             "payload_sha256"
         ],
+        "quality_v2_threshold_identity": common_quality_v2_threshold_identity,
+        "quality_v2_calibration_wave_receipt_identity": (
+            common_quality_v2_calibration_receipt_identity
+        ),
         "release_auditor_commit": release_auditor_commit,
         "common_identity": {
             **common_static_identity,
@@ -2589,6 +2837,10 @@ def audit_release(
             expected_checksums_sha256=expected_checksums,
         )
         sealed = _load_json(release_root / "release_manifest.json", "release manifest")
+        if sealed.get("schema_version") in HISTORICAL_RELEASE_MANIFEST_SCHEMAS:
+            raise ReleaseAuditError(
+                "historical release-manifest schema lacks calibration receipt identity"
+            )
         if (
             sealed.get("schema_version") != RELEASE_MANIFEST_SCHEMA
             or sealed.get("release_id") != RELEASE_ID
@@ -2612,11 +2864,21 @@ def audit_release(
             status="passed",
             release_eligible=True,
             release_eligibility_reason="independent exact-14 release audit passed",
+            quality_v2_threshold_identity=sealed["quality_v2_threshold_identity"],
+            quality_v2_calibration_wave_receipt_identity=sealed[
+                "quality_v2_calibration_wave_receipt_identity"
+            ],
             summary={
                 "task_count": len(EXACT_TASKS),
                 "accepted_count": sealed["accepted_count"],
                 "attempted_reset_count": sealed["attempted_reset_count"],
                 "source_counts": sealed["aggregate"]["source_counts"],
+                "quality_v2_threshold_identity": sealed[
+                    "quality_v2_threshold_identity"
+                ],
+                "quality_v2_calibration_wave_receipt_identity": sealed[
+                    "quality_v2_calibration_wave_receipt_identity"
+                ],
                 "release_manifest_payload_sha256": sealed["payload_sha256"],
             },
         )

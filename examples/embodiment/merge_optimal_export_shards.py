@@ -32,6 +32,7 @@ import json
 import re
 import shutil
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -40,11 +41,15 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     FIRST_ELIGIBLE_SEARCH_MODE,
     LEGACY_SELECTION_MODE,
     PROGRESS_SCHEMA,
+    QUALITY_V2_THRESHOLDS_SCHEMA,
     _atomic_json,
+    _expected_sha256,
     _file_boundary,
     _payload_sha256,
+    _quality_v2_calibration_receipt_binding,
     _root_checksums,
     _selection_contract,
+    _validate_quality_v2_calibration_receipt_artifact,
 )
 
 
@@ -85,8 +90,16 @@ _SHARD_RECEIPT_KEYS = {
 def _load_shard_receipts(root: Path) -> tuple[list[Path], list[dict[str, Any]]]:
     """Load an exact, gap-free shard directory and completion inventory."""
 
-    shard_like = sorted(path for path in root.iterdir() if path.is_dir() and path.name.startswith("shard-"))
-    malformed = [path.name for path in shard_like if re.fullmatch(r"shard-\d{2}", path.name) is None]
+    shard_like = sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and path.name.startswith("shard-")
+    )
+    malformed = [
+        path.name
+        for path in shard_like
+        if re.fullmatch(r"shard-\d{2}", path.name) is None
+    ]
     if malformed:
         raise ValueError(f"malformed shard directories: {malformed}")
     if not shard_like:
@@ -103,10 +116,10 @@ def _load_shard_receipts(root: Path) -> tuple[list[Path], list[dict[str, Any]]]:
         receipts.append(receipt)
 
     raw_shard_counts = [receipt.get("shard_count") for receipt in receipts]
-    if (
-        any(isinstance(value, bool) or not isinstance(value, int) for value in raw_shard_counts)
-        or any(not 1 <= value <= 99 for value in raw_shard_counts)
-    ):
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in raw_shard_counts
+    ) or any(not 1 <= value <= 99 for value in raw_shard_counts):
         raise ValueError("shard_count must be an integer in [1, 99]")
     shard_counts = set(raw_shard_counts)
     if len(shard_counts) != 1:
@@ -166,7 +179,9 @@ def _validate_shard_records(
         or not isinstance(candidate_pool_size, int)
         or candidate_pool_size < 1
     ):
-        raise ValueError(f"{shard} export state has invalid reset or candidate dimensions")
+        raise ValueError(
+            f"{shard} export state has invalid reset or candidate dimensions"
+        )
     if len(reset_manifest) != max_resets:
         raise ValueError(f"{shard} reset manifest length differs from max_resets")
     expected_indices = _expected_shard_indices(
@@ -207,8 +222,13 @@ def _validate_shard_records(
     expected_winner_ids: list[str] = []
     for reset_index, result in zip(expected_indices, results, strict=True):
         expected_episode = reset_manifest[reset_index].get("episode_id")
-        if not isinstance(expected_episode, str) or result.get("episode_id") != expected_episode:
-            raise ValueError(f"{shard} reset result differs from the frozen reset manifest")
+        if (
+            not isinstance(expected_episode, str)
+            or result.get("episode_id") != expected_episode
+        ):
+            raise ValueError(
+                f"{shard} reset result differs from the frozen reset manifest"
+            )
         if (
             result.get("candidate_count") != candidate_pool_size
             or result.get("budget_used") != candidate_pool_size
@@ -227,7 +247,9 @@ def _validate_shard_records(
     if attempts_by_episode:
         raise ValueError(f"{shard} contains attempts outside its reset slice")
     if winner_ids != expected_winner_ids:
-        raise ValueError(f"{shard} winner inventory differs from accepted reset results")
+        raise ValueError(
+            f"{shard} winner inventory differs from accepted reset results"
+        )
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -292,6 +314,59 @@ def _tree_inventory(root: Path) -> dict[str, str]:
     }
 
 
+def _validate_quality_v2_shard_contract(
+    shard: Path,
+    export_state: Mapping[str, Any],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Reopen one shard's frozen Qv3 threshold and calibration receipt."""
+
+    raw_identity = export_state.get("quality_v2_threshold_identity")
+    if not isinstance(raw_identity, Mapping) or set(raw_identity) != {
+        "schema_version",
+        "sha256",
+    }:
+        raise ValueError(
+            f"{shard} export state has no exact quality-v2 threshold identity"
+        )
+    schema_version = raw_identity.get("schema_version")
+    if schema_version != QUALITY_V2_THRESHOLDS_SCHEMA:
+        raise ValueError(f"{shard} export state has a non-Qv3 threshold schema")
+    threshold_sha256 = _expected_sha256(
+        raw_identity.get("sha256"),
+        f"{shard} quality-v2 threshold SHA-256",
+    )
+    identity = {
+        "schema_version": schema_version,
+        "sha256": threshold_sha256,
+    }
+
+    threshold_path = shard / "quality_v2_thresholds.json"
+    if threshold_path.is_symlink() or not threshold_path.is_file():
+        raise ValueError(f"{shard} has no dataset-local quality-v2 threshold file")
+    threshold_bytes = threshold_path.read_bytes()
+    if hashlib.sha256(threshold_bytes).hexdigest() != threshold_sha256:
+        raise ValueError(f"{shard} quality-v2 threshold identity SHA-256 mismatch")
+    try:
+        threshold_payload = json.loads(threshold_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{shard} quality-v2 threshold is not UTF-8 JSON") from error
+    if not isinstance(threshold_payload, Mapping):
+        raise ValueError(f"{shard} quality-v2 threshold must be a mapping")
+    if (
+        threshold_payload.get("schema_version") != schema_version
+        or threshold_payload.get("formal_freeze_eligible") is not True
+    ):
+        raise ValueError(f"{shard} quality-v2 threshold contract identity mismatch")
+
+    receipt_binding = _quality_v2_calibration_receipt_binding(threshold_payload)
+    _validate_quality_v2_calibration_receipt_artifact(
+        threshold_payload,
+        shard / receipt_binding["relative_path"],
+        expected_sha256=receipt_binding["file_sha256"],
+    )
+    return identity, receipt_binding
+
+
 def main() -> None:
     args = _parser().parse_args()
     root = args.root.resolve()
@@ -309,6 +384,8 @@ def main() -> None:
     reference_candidate_sha256: str | None = None
     reference_reset_sha256: str | None = None
     reference_provenance: dict[str, str] | None = None
+    reference_quality_v2_threshold_identity: dict[str, str] | None = None
+    reference_quality_v2_receipt_binding: dict[str, str] | None = None
     reset_manifest: list[dict[str, Any]] | None = None
     for shard, receipt in zip(shard_dirs, shard_receipts, strict=True):
         shard_results = _read_jsonl(shard / "reset_results.jsonl")
@@ -320,11 +397,18 @@ def main() -> None:
             raise ValueError(f"{shard} progress has no recovery-event list")
         all_recovery_events.extend(recovery_events)
         resume_count += int(progress.get("resume_count", 0))
-        if started_unix_s is None or progress.get("started_unix_s", float("inf")) < started_unix_s:
+        if (
+            started_unix_s is None
+            or progress.get("started_unix_s", float("inf")) < started_unix_s
+        ):
             started_unix_s = progress.get("started_unix_s")
         shard_export_state = json.loads(
             (shard / "export_state.json").read_text(encoding="utf-8")
         )
+        (
+            shard_quality_v2_threshold_identity,
+            shard_quality_v2_receipt_binding,
+        ) = _validate_quality_v2_shard_contract(shard, shard_export_state)
         shard_candidate_sha256 = hashlib.sha256(
             (shard / "candidate_manifest.json").read_bytes()
         ).hexdigest()
@@ -338,7 +422,19 @@ def main() -> None:
             reference_candidate_sha256 = shard_candidate_sha256
             reference_reset_sha256 = shard_reset_sha256
             reference_provenance = shard_provenance
+            reference_quality_v2_threshold_identity = (
+                shard_quality_v2_threshold_identity
+            )
+            reference_quality_v2_receipt_binding = shard_quality_v2_receipt_binding
             reset_manifest = shard_reset_manifest
+        elif (
+            shard_quality_v2_threshold_identity
+            != reference_quality_v2_threshold_identity
+            or shard_quality_v2_receipt_binding != reference_quality_v2_receipt_binding
+        ):
+            raise ValueError(
+                f"{shard} has a different quality-v2 threshold or receipt identity"
+            )
         elif (
             shard_export_state != reference_export_state
             or shard_candidate_sha256 != reference_candidate_sha256
@@ -362,6 +458,8 @@ def main() -> None:
     if started_unix_s is None:
         raise ValueError("no shard start time found")
     assert reference_export_state is not None
+    assert reference_quality_v2_threshold_identity is not None
+    assert reference_quality_v2_receipt_binding is not None
     expected_global_indices = list(range(int(reference_export_state["max_resets"])))
     if [row["reset_index"] for row in all_results] != expected_global_indices:
         raise ValueError("merged reset coverage is not exact, ordered, and gap-free")
@@ -381,7 +479,9 @@ def main() -> None:
     recovery_events = _kept_recovery_events(all_recovery_events, max_reset=max_reset)
     kept_episodes = {row["episode_id"] for row in kept_results}
     kept_attempts = [row for row in all_attempts if row["episode_id"] in kept_episodes]
-    kept_attempts.sort(key=lambda row: (_episode_number(row["episode_id"]), row["candidate_index"]))
+    kept_attempts.sort(
+        key=lambda row: (_episode_number(row["episode_id"]), row["candidate_index"])
+    )
     kept_winners.sort(key=lambda row: reset_index_by_episode[_winner_episode_id(row)])
 
     budget_histogram: dict[str, int] = {}
@@ -404,11 +504,29 @@ def main() -> None:
     if output.exists():
         raise FileExistsError(f"refusing to overwrite {output}")
     output.mkdir(parents=True)
-    shutil.copyfile(reference / "candidate_manifest.json", output / "candidate_manifest.json")
+    shutil.copyfile(
+        reference / "candidate_manifest.json", output / "candidate_manifest.json"
+    )
+    shutil.copyfile(
+        reference / "quality_v2_thresholds.json",
+        output / "quality_v2_thresholds.json",
+    )
     shutil.copyfile(reference / "export_state.json", output / "export_state.json")
     shutil.copyfile(reference / "reset_manifest.jsonl", output / "reset_manifest.jsonl")
     if (reference / "provenance").is_dir():
         shutil.copytree(reference / "provenance", output / "provenance")
+    (
+        merged_quality_v2_threshold_identity,
+        merged_quality_v2_receipt_binding,
+    ) = _validate_quality_v2_shard_contract(
+        output,
+        export_state,
+    )
+    if (
+        merged_quality_v2_threshold_identity != reference_quality_v2_threshold_identity
+        or merged_quality_v2_receipt_binding != reference_quality_v2_receipt_binding
+    ):
+        raise RuntimeError("merged quality-v2 threshold or receipt identity changed")
 
     _write_jsonl(output / "attempts.jsonl", kept_attempts)
     _write_jsonl(output / "reset_results.jsonl", kept_results)
@@ -417,18 +535,24 @@ def main() -> None:
     for winner in kept_winners:
         episode_id = _winner_episode_id(winner)
         relative = winner.get("relative_episode_dir")
-        target_rel = relative if isinstance(relative, str) else (
-            f"episodes/{task}/{split}/{episode_id}"
+        target_rel = (
+            relative
+            if isinstance(relative, str)
+            else (f"episodes/{task}/{split}/{episode_id}")
         )
         for shard in shard_dirs:
-            source = shard / target_rel if isinstance(relative, str) else (
-                shard / "episodes" / task / split / episode_id
+            source = (
+                shard / target_rel
+                if isinstance(relative, str)
+                else (shard / "episodes" / task / split / episode_id)
             )
             if source.exists():
                 shutil.copytree(source, output / target_rel)
                 break
         else:
-            raise FileNotFoundError(f"winner episode {episode_id} not found in any shard")
+            raise FileNotFoundError(
+                f"winner episode {episode_id} not found in any shard"
+            )
     for episode_id in kept_episodes:
         for shard in shard_dirs:
             source = shard / "lightweight" / episode_id
@@ -436,7 +560,9 @@ def main() -> None:
                 shutil.copytree(source, output / "lightweight" / episode_id)
                 break
         else:
-            raise FileNotFoundError(f"lightweight tape {episode_id} not found in any shard")
+            raise FileNotFoundError(
+                f"lightweight tape {episode_id} not found in any shard"
+            )
 
     attempts_path = output / "attempts.jsonl"
     results_path = output / "reset_results.jsonl"
@@ -446,7 +572,9 @@ def main() -> None:
     progress_path = output / "progress.json"
     progress = {
         "schema_version": PROGRESS_SCHEMA,
-        "export_state_sha256": hashlib.sha256(export_state_path.read_bytes()).hexdigest(),
+        "export_state_sha256": hashlib.sha256(
+            export_state_path.read_bytes()
+        ).hexdigest(),
         "started_unix_s": started_unix_s,
         "next_reset_index": max_reset + 1,
         "accepted_count": len(kept_winners),
@@ -487,7 +615,9 @@ def main() -> None:
         "selection_mode": export_state.get("selection_mode", LEGACY_SELECTION_MODE),
         "selection_contract": export_state.get(
             "selection_contract",
-            _selection_contract(export_state.get("selection_mode", LEGACY_SELECTION_MODE)),
+            _selection_contract(
+                export_state.get("selection_mode", LEGACY_SELECTION_MODE)
+            ),
         ),
         "planner_dominance": export_state.get("planner_dominance"),
         "candidate_schema_version": export_state.get("candidate_schema_version"),
@@ -501,12 +631,15 @@ def main() -> None:
             "candidate_release_provenance"
         ),
         "candidate_manifest_sha256": candidate_manifest_sha256,
-        "reset_manifest_sha256": hashlib.sha256(reset_manifest_path.read_bytes()).hexdigest(),
+        "reset_manifest_sha256": hashlib.sha256(
+            reset_manifest_path.read_bytes()
+        ).hexdigest(),
         "export_state_sha256": progress["export_state_sha256"],
         "progress_sha256": hashlib.sha256(progress_path.read_bytes()).hexdigest(),
         "resume_count": resume_count,
         "recovery_events": recovery_events,
         "source_identity": source_identity,
+        "quality_v2_threshold_identity": reference_quality_v2_threshold_identity,
         "image_size": image_size,
         "device": device,
         "started_unix_s": started_unix_s,

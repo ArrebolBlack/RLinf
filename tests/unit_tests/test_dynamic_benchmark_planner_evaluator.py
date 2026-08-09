@@ -14,11 +14,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from examples.embodiment.evaluate_dynamic_benchmark_planner import (
+    EVALUATION_SCHEMA,
+    FORMAL_EVALUATION_SCHEMA,
     _ArmedResetReplayEnv,
+    _evaluation_checksums,
+    _evaluation_schema,
     _parser,
     _planner_action_values,
     _replay_actions_on_fresh_env,
@@ -49,6 +55,45 @@ def test_planner_evaluator_accepts_validation_without_test_access() -> None:
     assert args.split == "validation"
     assert args.task == "t1_xyz"
     assert args.episodes == 20
+    assert args.quality_v2_thresholds is None
+    assert args.expected_quality_v2_thresholds_sha256 is None
+    assert _evaluation_schema(formal_attempts=False) == EVALUATION_SCHEMA
+    assert _evaluation_schema(formal_attempts=True) == FORMAL_EVALUATION_SCHEMA
+    assert EVALUATION_SCHEMA == "rlinf-dynamic-benchmark-planner-evaluation-v0.1"
+    assert FORMAL_EVALUATION_SCHEMA == "rlinf-dynamic-benchmark-planner-evaluation-v0.2"
+
+
+def test_metric_calibration_keeps_v01_two_file_negative_contract(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "planner-eval"
+    output.mkdir()
+    result = output / "evaluation.json"
+    reset_manifest = output / "reset_manifest.jsonl"
+    result.write_text("{}\n", encoding="utf-8")
+    reset_manifest.write_text("{}\n", encoding="utf-8")
+
+    checksums = _evaluation_checksums(
+        output,
+        result_path=result,
+        reset_manifest_path=reset_manifest,
+        formal_attempts=False,
+    )
+
+    assert [line.split("  ", 1)[1] for line in checksums.splitlines()] == [
+        "evaluation.json",
+        "reset_manifest.jsonl",
+    ]
+    tape = output / "lightweight" / "unexpected.npz"
+    tape.parent.mkdir()
+    tape.write_bytes(b"not-a-calibration-artifact")
+    with pytest.raises(ValueError, match="exactly its two data files"):
+        _evaluation_checksums(
+            output,
+            result_path=result,
+            reset_manifest_path=reset_manifest,
+            formal_attempts=False,
+        )
 
 
 def test_planner_evaluator_rejects_unknown_split() -> None:
