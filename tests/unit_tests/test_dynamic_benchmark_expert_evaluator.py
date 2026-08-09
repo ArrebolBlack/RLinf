@@ -62,6 +62,13 @@ from examples.embodiment.evaluate_dynamic_benchmark_expert import (
 )
 
 
+@pytest.fixture
+def tmp_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep two-full-commit outcome paths below Windows MAX_PATH in tests."""
+
+    return tmp_path_factory.mktemp("e")
+
+
 def _payload(algorithm: str = "rlpd") -> dict:
     return {
         "schema_version": "rlinf-dynamic-benchmark-expert-policy-v0.1",
@@ -88,6 +95,7 @@ def _trainer_selection_artifacts(
         **outcome_fixtures._write_kwargs(run)
     )
     return SimpleNamespace(
+        run_root=run.run_root,
         policy_path=run.best_policy_path,
         initial_policy_path=run.initial_policy_path,
         summary_path=run.summary_path,
@@ -112,6 +120,7 @@ def _reseal_trainer_json(path: Path, payload: dict) -> None:
 
 def _outcome_admission_kwargs(artifacts: SimpleNamespace) -> dict:
     return {
+        "trainer_run_root": artifacts.run_root,
         "checkpoint_selection_outcome_path": artifacts.outcome_path,
         "policy_rlinf_source_root": artifacts.policy_root,
         "verifier_rlinf_source_root": artifacts.verifier_root,

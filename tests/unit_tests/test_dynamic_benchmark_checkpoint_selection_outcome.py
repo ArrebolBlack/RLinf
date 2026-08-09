@@ -36,6 +36,7 @@ from examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome im
 )
 from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
     CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+    checkpoint_selection_outcome_versioned_path,
     validate_selected_learned_policy,
 )
 
@@ -318,9 +319,16 @@ def _trainer_run(
     )
 
 
+def _outcome_path(run: SimpleNamespace) -> Path:
+    return checkpoint_selection_outcome_versioned_path(
+        run.run_root, run.verifier_commit, run.evaluator_commit
+    )
+
+
 def _write_kwargs(run: SimpleNamespace) -> dict:
     return {
         "run_root": run.run_root,
+        "output_path": _outcome_path(run),
         "policy_rlinf_source_root": run.policy_root,
         "verifier_rlinf_source_root": run.verifier_root,
         "evaluator_rlinf_source_root": run.evaluator_root,
@@ -341,11 +349,41 @@ def _write_kwargs(run: SimpleNamespace) -> dict:
     }
 
 
+def _admission_kwargs(
+    run: SimpleNamespace, outcome_path: Path | None = None
+) -> dict[str, Any]:
+    selected_outcome = outcome_path or _outcome_path(run)
+    return {
+        "trainer_run_root": run.run_root,
+        "policy_path": run.best_policy_path,
+        "trainer_summary_path": run.summary_path,
+        "checkpoint_selection_path": run.selection_path,
+        "checkpoint_selection_outcome_path": selected_outcome,
+        "policy_rlinf_source_root": run.policy_root,
+        "verifier_rlinf_source_root": run.verifier_root,
+        "evaluator_rlinf_source_root": run.evaluator_root,
+        "expected_checkpoint_selection_outcome_sha256": trainer._file_sha256(
+            selected_outcome
+        ),
+        "expected_policy_sha256": trainer._file_sha256(run.best_policy_path),
+        "expected_trainer_summary_sha256": trainer._file_sha256(run.summary_path),
+        "expected_checkpoint_selection_sha256": trainer._file_sha256(
+            run.selection_path
+        ),
+        "expected_rlinf_commit": run.policy_commit,
+        "expected_benchmark_commit": BENCHMARK_COMMIT,
+        "expected_verifier_rlinf_commit": run.verifier_commit,
+        "expected_evaluator_rlinf_commit": run.evaluator_commit,
+    }
+
+
 def _cli_args(run: SimpleNamespace) -> list[str]:
     kwargs = _write_kwargs(run)
     arguments = [
         "--run-root",
         str(kwargs["run_root"]),
+        "--output",
+        str(kwargs["output_path"]),
         "--policy-rlinf-source-root",
         str(kwargs["policy_rlinf_source_root"]),
         "--verifier-rlinf-source-root",
@@ -400,7 +438,7 @@ def test_outcome_builder_seals_real_selected_trainer_chain_and_is_exclusive(
     output = write_checkpoint_selection_outcome(**kwargs)
     outcome = _load_outcome(output)
 
-    assert output == run.run_root / "checkpoint_selection_outcome.json"
+    assert output == kwargs["output_path"]
     assert set(outcome) == {
         "schema_version",
         "source_identity",
@@ -654,6 +692,57 @@ def test_outcome_builder_seals_real_selected_trainer_chain_and_is_exclusive(
         write_checkpoint_selection_outcome(**kwargs)
 
 
+def test_outcome_builder_preserves_legacy_evidence_and_writes_versioned_path(
+    tmp_path: Path,
+) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    legacy = run.run_root / "checkpoint_selection_outcome.json"
+    historical_bytes = b'{"historical":"b04"}\n'
+    legacy.write_bytes(historical_bytes)
+
+    output = write_checkpoint_selection_outcome(**_write_kwargs(run))
+
+    assert output == _outcome_path(run)
+    assert output.is_file()
+    assert legacy.read_bytes() == historical_bytes
+
+
+@pytest.mark.parametrize("case", ["legacy", "traversal", "cross-commit"])
+def test_outcome_builder_rejects_nonversioned_or_wrong_commit_output(
+    tmp_path: Path, case: str
+) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    kwargs = _write_kwargs(run)
+    if case == "legacy":
+        rejected = run.run_root / "checkpoint_selection_outcome.json"
+    elif case == "traversal":
+        rejected = run.run_root / ".." / "checkpoint_selection_outcome.json"
+    else:
+        rejected = checkpoint_selection_outcome_versioned_path(
+            run.run_root, "a" * 40, run.evaluator_commit
+        )
+    kwargs["output_path"] = rejected
+
+    with pytest.raises(ValueError, match="checkpoint outcome output must"):
+        write_checkpoint_selection_outcome(**kwargs)
+    assert not Path(os.path.abspath(rejected)).exists()
+
+
+def test_outcome_builder_rejects_symlinked_versioned_parent(tmp_path: Path) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    external = tmp_path / "external-provenance"
+    external.mkdir()
+    provenance = run.run_root / "provenance"
+    try:
+        provenance.symlink_to(external, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_checkpoint_selection_outcome(**_write_kwargs(run))
+    assert not _outcome_path(run).exists()
+
+
 def test_real_outcome_producer_feeds_formal_learned_admission(tmp_path: Path) -> None:
     run = _trainer_run(tmp_path, eligible=True)
     executing_evaluator = (
@@ -671,23 +760,7 @@ def test_real_outcome_producer_feeds_formal_learned_admission(tmp_path: Path) ->
     run.evaluator_commit = _git(run.evaluator_root, "rev-parse", "HEAD")
 
     outcome_path = write_checkpoint_selection_outcome(**_write_kwargs(run))
-    admission = validate_selected_learned_policy(
-        policy_path=run.best_policy_path,
-        trainer_summary_path=run.summary_path,
-        checkpoint_selection_path=run.selection_path,
-        checkpoint_selection_outcome_path=outcome_path,
-        policy_rlinf_source_root=run.policy_root,
-        verifier_rlinf_source_root=run.verifier_root,
-        evaluator_rlinf_source_root=run.evaluator_root,
-        expected_checkpoint_selection_outcome_sha256=trainer._file_sha256(outcome_path),
-        expected_policy_sha256=trainer._file_sha256(run.best_policy_path),
-        expected_trainer_summary_sha256=trainer._file_sha256(run.summary_path),
-        expected_checkpoint_selection_sha256=trainer._file_sha256(run.selection_path),
-        expected_rlinf_commit=run.policy_commit,
-        expected_benchmark_commit=BENCHMARK_COMMIT,
-        expected_verifier_rlinf_commit=run.verifier_commit,
-        expected_evaluator_rlinf_commit=run.evaluator_commit,
-    )
+    admission = validate_selected_learned_policy(**_admission_kwargs(run, outcome_path))
 
     assert admission["checkpoint_role"] == "best"
     assert admission["checkpoint_selection_outcome"] == {
@@ -700,13 +773,57 @@ def test_real_outcome_producer_feeds_formal_learned_admission(tmp_path: Path) ->
     }
 
 
+def test_admission_reads_explicit_legacy_outcome_without_path_fallback(
+    tmp_path: Path,
+) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    versioned = write_checkpoint_selection_outcome(**_write_kwargs(run))
+    legacy = run.run_root / "checkpoint_selection_outcome.json"
+    shutil.copyfile(versioned, legacy)
+
+    admission = validate_selected_learned_policy(**_admission_kwargs(run, legacy))
+
+    assert admission["checkpoint_selection_outcome"]["path"] == str(legacy.resolve())
+    assert admission["checkpoint_selection_outcome"]["sha256"] == trainer._file_sha256(
+        legacy
+    )
+
+
+def test_admission_rejects_cross_commit_version_directory(tmp_path: Path) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    versioned = write_checkpoint_selection_outcome(**_write_kwargs(run))
+    wrong = checkpoint_selection_outcome_versioned_path(
+        run.run_root, "a" * 40, run.evaluator_commit
+    )
+    wrong.parent.mkdir(parents=True)
+    shutil.copyfile(versioned, wrong)
+
+    with pytest.raises(ValueError, match="canonical legacy or source-versioned"):
+        validate_selected_learned_policy(**_admission_kwargs(run, wrong))
+
+
+def test_admission_rejects_symlinked_versioned_directory(tmp_path: Path) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    versioned = write_checkpoint_selection_outcome(**_write_kwargs(run))
+    version_directory = versioned.parent
+    external = tmp_path / "external-version"
+    version_directory.rename(external)
+    try:
+        version_directory.symlink_to(external, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_selected_learned_policy(**_admission_kwargs(run, versioned))
+
+
 def test_outcome_builder_seals_real_no_eligible_planner_fallback(
     tmp_path: Path,
 ) -> None:
     run = _trainer_run(tmp_path, eligible=False)
 
     outcome_builder_main(_cli_args(run))
-    output = run.run_root / "checkpoint_selection_outcome.json"
+    output = _write_kwargs(run)["output_path"]
     outcome = _load_outcome(output)
 
     assert outcome["selection"] == {
@@ -766,7 +883,7 @@ def test_outcome_builder_rejects_resealed_or_byte_tampering_before_write(
 
     with pytest.raises((ValueError, RuntimeError)):
         write_checkpoint_selection_outcome(**kwargs)
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_env0_only_fallback_before_write(
@@ -776,7 +893,7 @@ def test_outcome_builder_rejects_env0_only_fallback_before_write(
 
     with pytest.raises(ValueError, match="env_steps"):
         write_checkpoint_selection_outcome(**_write_kwargs(run))
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_best_policy_masquerade_in_fallback(
@@ -787,7 +904,7 @@ def test_outcome_builder_rejects_best_policy_masquerade_in_fallback(
 
     with pytest.raises(ValueError, match="must be absent"):
         write_checkpoint_selection_outcome(**_write_kwargs(run))
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_requires_expected_selected_best_sha256(tmp_path: Path) -> None:
@@ -797,7 +914,7 @@ def test_outcome_builder_requires_expected_selected_best_sha256(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="requires expected best_policy"):
         write_checkpoint_selection_outcome(**kwargs)
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_nonfinite_metrics_before_write(tmp_path: Path) -> None:
@@ -810,7 +927,7 @@ def test_outcome_builder_rejects_nonfinite_metrics_before_write(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="finite canonical JSON"):
         write_checkpoint_selection_outcome(**kwargs)
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_policy_source_commit_mismatch(tmp_path: Path) -> None:
@@ -820,7 +937,7 @@ def test_outcome_builder_rejects_policy_source_commit_mismatch(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="HEAD does not match"):
         write_checkpoint_selection_outcome(**kwargs)
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_dirty_verifier_source_root(tmp_path: Path) -> None:
@@ -836,7 +953,7 @@ def test_outcome_builder_rejects_dirty_verifier_source_root(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="source root must be clean"):
         write_checkpoint_selection_outcome(**_write_kwargs(run))
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_evaluator_source_commit_mismatch(
@@ -845,10 +962,13 @@ def test_outcome_builder_rejects_evaluator_source_commit_mismatch(
     run = _trainer_run(tmp_path, eligible=True)
     kwargs = _write_kwargs(run)
     kwargs["expected_evaluator_rlinf_commit"] = "a" * 40
+    kwargs["output_path"] = checkpoint_selection_outcome_versioned_path(
+        run.run_root, run.verifier_commit, "a" * 40
+    )
 
     with pytest.raises(ValueError, match="HEAD does not match"):
         write_checkpoint_selection_outcome(**kwargs)
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_missing_validation_evidence(tmp_path: Path) -> None:
@@ -860,7 +980,7 @@ def test_outcome_builder_rejects_missing_validation_evidence(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="inventory is incomplete"):
         write_checkpoint_selection_outcome(**kwargs)
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_absolute_paths_in_portable_payload(
@@ -874,7 +994,7 @@ def test_outcome_builder_rejects_absolute_paths_in_portable_payload(
 
     with pytest.raises(ValueError, match="contains an absolute path"):
         write_checkpoint_selection_outcome(**_write_kwargs(run))
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 @pytest.mark.parametrize(
@@ -897,7 +1017,7 @@ def test_outcome_builder_rejects_unsafe_paths_in_mapping_keys(
 
     with pytest.raises(ValueError, match="(?:absolute|unsafe) path"):
         write_checkpoint_selection_outcome(**_write_kwargs(run))
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()
 
 
 def test_outcome_builder_rejects_symlinked_trainer_artifact(tmp_path: Path) -> None:
@@ -912,4 +1032,4 @@ def test_outcome_builder_rejects_symlinked_trainer_artifact(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="symlink"):
         write_checkpoint_selection_outcome(**_write_kwargs(run))
-    assert not (run.run_root / "checkpoint_selection_outcome.json").exists()
+    assert not _outcome_path(run).exists()

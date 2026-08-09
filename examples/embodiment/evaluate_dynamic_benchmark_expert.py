@@ -63,6 +63,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--expected-policy-sha256", required=True)
+    parser.add_argument("--trainer-run-root", type=Path)
     parser.add_argument("--trainer-summary", type=Path)
     parser.add_argument("--checkpoint-selection", type=Path)
     parser.add_argument("--checkpoint-selection-outcome", type=Path)
@@ -1152,6 +1153,7 @@ def main() -> None:
     if policy_sha256 != expected_policy_sha256:
         raise ValueError("policy SHA-256 does not match the expected identity")
     admission_arguments = (
+        args.trainer_run_root,
         args.trainer_summary,
         args.checkpoint_selection,
         args.checkpoint_selection_outcome,
@@ -1164,8 +1166,8 @@ def main() -> None:
     ):
         raise ValueError(
             "trainer summary, checkpoint-selection manifest, checkpoint-selection "
-            "outcome, expected outcome SHA-256, policy source root, and evaluator "
-            "source root must be supplied together"
+            "outcome, expected outcome SHA-256, explicit trainer run root, policy "
+            "source root, and evaluator source root must be supplied together"
         )
     if args.quality_v2_thresholds is not None and args.trainer_summary is None:
         raise ValueError(
@@ -1238,8 +1240,10 @@ def main() -> None:
     learned_policy_admission: dict[str, Any] | None = None
     evaluator_source_identity: dict[str, str] | None = None
     if args.trainer_summary is not None:
+        assert args.trainer_run_root is not None
         assert args.checkpoint_selection is not None
         learned_policy_admission = validate_selected_learned_policy(
+            trainer_run_root=args.trainer_run_root,
             policy_path=args.policy,
             trainer_summary_path=args.trainer_summary,
             checkpoint_selection_path=args.checkpoint_selection,
@@ -1449,6 +1453,7 @@ def main() -> None:
         if learned_policy_admission is not None:
             try:
                 observed_admission = validate_selected_learned_policy(
+                    trainer_run_root=args.trainer_run_root,
                     policy_path=args.policy,
                     trainer_summary_path=args.trainer_summary,
                     checkpoint_selection_path=args.checkpoint_selection,

@@ -37,6 +37,7 @@ from examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome im
 )
 from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
     CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+    checkpoint_selection_outcome_versioned_path,
     validate_selected_learned_policy,
 )
 from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
@@ -50,6 +51,13 @@ EVALUATOR_COMMIT = "3" * 40
 IMAGE_SHA256 = "4" * 64
 FORMAL_POLICY_VALIDATION_MANIFEST_SEED = 20261150
 CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED = 20261450
+
+
+@pytest.fixture
+def tmp_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep two-full-commit outcome paths below Windows MAX_PATH in tests."""
+
+    return tmp_path_factory.mktemp("p")
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -732,6 +740,9 @@ class Fixture:
         expert_trainer._atomic_json(self.metadata_path, summary)
         self.checkpoint_selection_outcome_path = write_checkpoint_selection_outcome(
             run_root=root,
+            output_path=checkpoint_selection_outcome_versioned_path(
+                root, self.evaluator_commit, self.evaluator_commit
+            ),
             policy_rlinf_source_root=self.policy_source_root,
             verifier_rlinf_source_root=self.evaluator_source_root,
             evaluator_rlinf_source_root=self.evaluator_source_root,
@@ -752,6 +763,7 @@ class Fixture:
             self.checkpoint_selection_outcome_path
         )
         self.learned_policy_admission = validate_selected_learned_policy(
+            trainer_run_root=root,
             policy_path=self.policy_path,
             trainer_summary_path=self.metadata_path,
             checkpoint_selection_path=self.checkpoint_selection_path,
@@ -1078,6 +1090,7 @@ class Fixture:
         return promotion.build_selection_evidence(
             candidate_id="learned-s7",
             run_tag="cycle1-s7",
+            trainer_run_root=self.root,
             policy_path=self.policy_path,
             policy_metadata_path=self.metadata_path,
             checkpoint_selection_path=self.checkpoint_selection_path,
@@ -1954,6 +1967,7 @@ def test_missing_or_tampered_evidence_evaluation_reset_and_sha_fail_closed(
         promotion.build_selection_evidence(
             candidate_id="learned-s7",
             run_tag="cycle1-s7",
+            trainer_run_root=fixture.root,
             policy_path=fixture.policy_path,
             policy_metadata_path=fixture.metadata_path,
             checkpoint_selection_path=fixture.checkpoint_selection_path,

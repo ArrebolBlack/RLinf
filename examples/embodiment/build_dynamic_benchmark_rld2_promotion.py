@@ -1308,6 +1308,7 @@ def build_selection_evidence(
     *,
     candidate_id: str,
     run_tag: str,
+    trainer_run_root: Path,
     policy_path: Path,
     policy_metadata_path: Path,
     checkpoint_selection_path: Path,
@@ -1394,6 +1395,7 @@ def build_selection_evidence(
     )
     evaluator_source_root = policy_evaluator_source_path.resolve(strict=True).parents[2]
     learned_policy_admission = validate_selected_learned_policy(
+        trainer_run_root=trainer_run_root,
         policy_path=policy_path,
         trainer_summary_path=policy_metadata_path,
         checkpoint_selection_path=checkpoint_selection_path,
@@ -2053,6 +2055,7 @@ def build_selection_evidence(
         },
     }
     final_admission = validate_selected_learned_policy(
+        trainer_run_root=trainer_run_root,
         policy_path=policy_path,
         trainer_summary_path=policy_metadata_path,
         checkpoint_selection_path=checkpoint_selection_path,
@@ -2246,6 +2249,7 @@ def validate_selection_evidence_artifacts(
     recomputed = build_selection_evidence(
         candidate_id=str(evidence.get("candidate_id")),
         run_tag=str(policy.get("run_tag")),
+        trainer_run_root=_input_path(evidence, "policy").parent,
         policy_path=_input_path(evidence, "policy"),
         policy_metadata_path=_input_path(evidence, "policy_metadata"),
         checkpoint_selection_path=_input_path(evidence, "checkpoint_selection"),
@@ -2510,6 +2514,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-id", required=True)
     parser.add_argument("--run-tag", required=True)
+    parser.add_argument("--trainer-run-root", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--expected-policy-sha256", required=True)
     parser.add_argument("--policy-metadata", type=Path, required=True)
@@ -2559,6 +2564,7 @@ def main() -> None:
     evidence = build_selection_evidence(
         candidate_id=args.candidate_id,
         run_tag=args.run_tag,
+        trainer_run_root=args.trainer_run_root,
         policy_path=args.policy,
         policy_metadata_path=args.policy_metadata,
         checkpoint_selection_path=args.checkpoint_selection,

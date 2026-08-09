@@ -42,6 +42,9 @@ CHECKPOINT_SELECTION_OUTCOME_SCHEMA = (
     "rlinf-dynamic-benchmark-checkpoint-selection-outcome-v0.1"
 )
 CHECKPOINT_SELECTION_OUTCOME_FILENAME = "checkpoint_selection_outcome.json"
+CHECKPOINT_SELECTION_OUTCOME_PROVENANCE_DIRECTORY = (
+    "provenance/checkpoint-selection-outcomes"
+)
 SOURCE_SNAPSHOT_SCHEMA = "rld2-qa-source-snapshot-v0.1"
 SOURCE_SNAPSHOT_MANIFEST_FILENAME = "source_manifest.json"
 
@@ -268,6 +271,32 @@ def _canonical_run_root(path: Path) -> Path:
     if not candidate.is_dir():
         raise FileNotFoundError(candidate)
     return candidate.resolve(strict=True)
+
+
+def checkpoint_selection_outcome_relative_path(
+    verifier_commit: str, evaluator_commit: str
+) -> str:
+    """Return the only writable, source-versioned outcome location."""
+
+    verifier = _require_commit(verifier_commit, "outcome verifier commit")
+    evaluator = _require_commit(evaluator_commit, "outcome evaluator commit")
+    version = f"{verifier}-{evaluator}"
+    return PurePosixPath(
+        CHECKPOINT_SELECTION_OUTCOME_PROVENANCE_DIRECTORY,
+        version,
+        CHECKPOINT_SELECTION_OUTCOME_FILENAME,
+    ).as_posix()
+
+
+def checkpoint_selection_outcome_versioned_path(
+    run_root: Path, verifier_commit: str, evaluator_commit: str
+) -> Path:
+    """Join the canonical versioned outcome path below an explicit run root."""
+
+    relative = checkpoint_selection_outcome_relative_path(
+        verifier_commit, evaluator_commit
+    )
+    return Path(run_root).joinpath(*PurePosixPath(relative).parts)
 
 
 def _safe_posix_parts(value: Any, label: str) -> tuple[str, ...]:
@@ -1806,6 +1835,7 @@ def build_checkpoint_selection_outcome_payload(
 
 def validate_selected_learned_policy(
     *,
+    trainer_run_root: Path,
     policy_path: Path,
     trainer_summary_path: Path,
     checkpoint_selection_path: Path,
@@ -1895,6 +1925,7 @@ def validate_selected_learned_policy(
         trainer_source.content, source_path=trainer_source.path
     )
 
+    run_root = _canonical_run_root(trainer_run_root)
     summary_path = _canonical_artifact(
         trainer_summary_path, "summary.json", "trainer summary"
     )
@@ -1903,21 +1934,36 @@ def validate_selected_learned_policy(
         "checkpoint_selection.json",
         "checkpoint-selection manifest",
     )
-    output = summary_path.parent
-    if selection_path.parent != output:
+    if summary_path != run_root / "summary.json" or selection_path != run_root / (
+        "checkpoint_selection.json"
+    ):
         raise ValueError(
-            "trainer summary and checkpoint-selection manifest must be siblings"
+            "trainer summary and checkpoint-selection manifest must be canonical "
+            "artifacts of the explicit trainer run root"
         )
+    output = run_root
     raw_outcome_path = Path(checkpoint_selection_outcome_path)
-    if raw_outcome_path.is_symlink():
-        raise ValueError("checkpoint-selection outcome must not be a symlink")
-    if not raw_outcome_path.is_file():
-        raise FileNotFoundError(raw_outcome_path)
-    outcome_path = raw_outcome_path.resolve(strict=True)
-    if outcome_path != output / CHECKPOINT_SELECTION_OUTCOME_FILENAME:
+    absolute_outcome_path = Path(os.path.abspath(raw_outcome_path))
+    if raw_outcome_path != absolute_outcome_path or ".." in raw_outcome_path.parts:
         raise ValueError(
-            "checkpoint-selection outcome must be the canonical trainer-run sibling"
+            "checkpoint-selection outcome path must be absolute and canonical without "
+            "traversal"
         )
+    allowed_outcome_paths = {
+        output / CHECKPOINT_SELECTION_OUTCOME_FILENAME,
+        checkpoint_selection_outcome_versioned_path(
+            output, verifier_commit, evaluator_commit
+        ),
+    }
+    if absolute_outcome_path not in allowed_outcome_paths:
+        raise ValueError(
+            "checkpoint-selection outcome path is not the canonical legacy or "
+            "source-versioned artifact of the explicit trainer run root"
+        )
+    _reject_symlink_chain(output, absolute_outcome_path, "checkpoint-selection outcome")
+    if not absolute_outcome_path.is_file():
+        raise FileNotFoundError(absolute_outcome_path)
+    outcome_path = absolute_outcome_path.resolve(strict=True)
     outcome_file_sha256 = _match_expected_sha256(
         outcome_path,
         expected_checkpoint_selection_outcome_sha256,
