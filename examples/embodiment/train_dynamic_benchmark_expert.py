@@ -883,7 +883,15 @@ def _config_artifact_identity(
 ) -> dict[str, str]:
     """Bind both the canonical config contract and its rendered local artifact."""
 
-    if json.loads(config_path.read_text(encoding="utf-8")) != dict(config_payload):
+    # ``asdict(TrainConfig)`` intentionally preserves tuple-valued runtime fields,
+    # while JSON renders those sequences as arrays and loads them back as lists.
+    # Compare the file with the JSON-domain value of the resolved payload so this
+    # lossless representation change is accepted without weakening semantic
+    # equality for any actual config field.
+    expected_payload = json.loads(
+        json.dumps(config_payload, allow_nan=False, sort_keys=True)
+    )
+    if json.loads(config_path.read_text(encoding="utf-8")) != expected_payload:
         raise ValueError("rendered training config does not match the resolved payload")
     return {
         # Promotion recomputes this identity from the policy's embedded config.

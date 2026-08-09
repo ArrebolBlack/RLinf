@@ -72,6 +72,60 @@ def test_config_artifact_identity_matches_promotion_canonical_payload(tmp_path) 
     assert identity["config_sha256"] != identity["config_file_sha256"]
 
 
+def test_config_artifact_identity_accepts_json_array_for_runtime_tuple(
+    tmp_path,
+) -> None:
+    payload = {
+        "seed": 1,
+        "task": "t2_se3",
+        "state_derived_features": ("goal_planar_error", "eef_speed"),
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    identity = _config_artifact_identity(config_path, payload)
+
+    assert (
+        identity["config_sha256"]
+        == hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "rendered_features",
+    [
+        ["eef_speed", "goal_planar_error"],
+        ["goal_planar_error"],
+        ["goal_planar_error", "eef_speed", "unexpected"],
+    ],
+)
+def test_config_artifact_identity_rejects_semantic_sequence_tampering(
+    tmp_path, rendered_features
+) -> None:
+    payload = {
+        "seed": 1,
+        "task": "t2_se3",
+        "state_derived_features": ("goal_planar_error", "eef_speed"),
+    }
+    rendered = dict(payload)
+    rendered["state_derived_features"] = rendered_features
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(rendered, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="rendered training config does not match the resolved payload"
+    ):
+        _config_artifact_identity(config_path, payload)
+
+
 def test_running_normalizer_standardizes_values_but_preserves_mask() -> None:
     normalizer = RunningNormalizer(dimension=4, mask_dim=2)
     normalizer.update(
