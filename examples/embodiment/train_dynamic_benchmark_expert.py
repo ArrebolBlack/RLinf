@@ -751,6 +751,9 @@ def _env_cfg(
     process_start_method: str = "spawn",
     process_residual_planner: bool = False,
 ) -> dict[str, Any]:
+    from se3_wam.benchmark.task_quality import task_quality_schema_manifest
+
+    quality_schema = task_quality_schema_manifest(config.task)
     return {
         "task_id": config.task,
         "split": split,
@@ -761,6 +764,8 @@ def _env_cfg(
         "auto_reset": False,
         "ignore_terminations": False,
         "group_size": 1,
+        "task_quality_schema_version": quality_schema["schema_version"],
+        "task_quality_evaluator_backend_id": "mujoco311-rs140-v1-rld2-quality",
         "worker_threads": worker_threads,
         "worker_processes": worker_processes,
         "process_start_method": process_start_method,
@@ -2388,14 +2393,17 @@ def main() -> None:
         initial_validation = evaluate_policy()
         last_validation = initial_validation
         last_validation_env_steps = 0
-        best_score = _score(initial_validation)
-        best_metrics = initial_validation
+        # The zero-residual residual-RLPD policy is exactly the frozen planner.
+        # Keep it as an explicit baseline, but never let an env_steps=0 policy
+        # masquerade as the learned checkpoint selected for review.
+        best_score = _score(initial_validation) if config.algorithm == "bc" else None
+        best_metrics = initial_validation if config.algorithm == "bc" else None
         _append_jsonl(
             metrics_path,
             {"event": "validation", "env_steps": 0, **initial_validation},
         )
         _save_policy(
-            args.output / "best_policy.pt",
+            args.output / ("best_policy.pt" if config.algorithm == "bc" else "initial_policy.pt"),
             config,
             model,
             normalizer,
@@ -2668,7 +2676,7 @@ def main() -> None:
                         **validation,
                     },
                 )
-                if best_score is None or score > tuple(best_score):
+                if global_env_steps > 0 and (best_score is None or score > tuple(best_score)):
                     best_score = score
                     best_metrics = validation
                     _save_policy(
@@ -2706,7 +2714,10 @@ def main() -> None:
             last_validation = final_validation
             last_validation_env_steps = global_env_steps
         final_score = _score(final_validation)
-        if best_score is None or final_score > tuple(best_score):
+        # A residual-RLPD initial policy is the frozen planner.  It is kept as
+        # `initial_policy.pt`, but must never re-enter the learned-checkpoint
+        # selector through the final validation path when no env step ran.
+        if global_env_steps > 0 and (best_score is None or final_score > tuple(best_score)):
             best_score = final_score
             best_metrics = final_validation
             _save_policy(

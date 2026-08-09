@@ -1271,6 +1271,19 @@ class DynamicBenchmarkEnv(gym.Env):
             )
             registry_inputs = {
                 "action_l2": float(np.square(action.values).sum()),
+                "action_delta_l2": (
+                    float(
+                        np.linalg.norm(
+                            np.asarray(action.values[:6], dtype=np.float64)
+                            - np.asarray(
+                                self._action_histories[index][-1][:6],
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                    if self._action_histories[index]
+                    else None
+                ),
                 "completion": self.reward_trackers[index].potential(
                     event_names=event_names,
                     active_stage_progress=result.active_stage_progress,
