@@ -51,6 +51,9 @@ class TensorPPOConfig:
     export_dir: str
     expected_gpu_uuid: str
     seed: int
+    split: str
+    manifest_seed: int
+    manifest_size: int
     num_envs: int
     cohorts: int
     warmup_steps: int
@@ -110,6 +113,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-gpu-uuid", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--manifest-seed", type=int, default=20261050)
+    parser.add_argument("--manifest-size", type=int, default=4096)
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--cohorts", type=int, default=2)
     parser.add_argument("--warmup-steps", type=int, default=4)
@@ -143,6 +149,9 @@ def _config(args: argparse.Namespace) -> TensorPPOConfig:
         export_dir=str(args.export_dir),
         expected_gpu_uuid=args.expected_gpu_uuid,
         seed=args.seed,
+        split=args.split,
+        manifest_seed=args.manifest_seed,
+        manifest_size=args.manifest_size,
         num_envs=args.num_envs,
         cohorts=args.cohorts,
         warmup_steps=args.warmup_steps,
@@ -168,9 +177,20 @@ def _config(args: argparse.Namespace) -> TensorPPOConfig:
         runtime_manifest_sha256=args.runtime_manifest_sha256,
         expected_cpuset=args.expected_cpuset,
     )
-    for name in ("num_envs", "cohorts", "hidden_size", "ppo_epochs", "minibatch_size"):
+    for name in (
+        "num_envs",
+        "cohorts",
+        "hidden_size",
+        "ppo_epochs",
+        "minibatch_size",
+        "manifest_size",
+    ):
         if getattr(config, name) < 1:
             raise ValueError(f"{name} must be positive")
+    if config.manifest_seed < 0:
+        raise ValueError("manifest_seed must be non-negative")
+    if config.manifest_size < config.num_envs:
+        raise ValueError("manifest_size must be at least num_envs")
     if config.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
     if not 0.0 <= config.gamma <= 1.0 or not 0.0 <= config.gae_lambda <= 1.0:
@@ -500,6 +520,9 @@ def main() -> int:
         expected_gpu_uuid=config.expected_gpu_uuid,
         device_ordinal=config.device_ordinal,
         image_size=config.image_size,
+        split=config.split,
+        manifest_seed=config.manifest_seed,
+        manifest_size=config.manifest_size,
     )
     try:
         _validate_runtime_versions(
@@ -530,6 +553,7 @@ def main() -> int:
             observation_dtype=observation.dtype,
             action_dtype=torch.float32,
             reward_dtype=torch.float32,
+            terminal_signal_dtype=torch.int32,
             event_mask_dtype=torch.int32,
             terminal_reason_dtype=torch.int32,
             physics_step_dtype=torch.int64,
@@ -537,16 +561,14 @@ def main() -> int:
                 "raw_action": DeviceFieldSpec((7,), torch.float32),
                 "log_prob": DeviceFieldSpec((), torch.float32),
                 "value": DeviceFieldSpec((), torch.float32),
-                "next_value": DeviceFieldSpec((), torch.float32),
+                "next_value": DeviceFieldSpec((), torch.float32, phase="commit"),
             },
         )
 
         model.eval()
         for _step in range(config.warmup_steps):
             with torch.inference_mode():
-                action, _raw, _log_prob, _value = _sample(model, observation)
-                warm = env.step(action.contiguous())
-            observation = warm.observation
+                _sample(model, observation)
         torch.cuda.synchronize(env.device)
 
         cohort_rows = []
@@ -557,7 +579,7 @@ def main() -> int:
         seen_episode_ids: set[str] = set()
         wall_started = time.perf_counter()
         for cohort in range(config.cohorts):
-            reset = env.reset()
+            reset = initial if cohort == 0 else env.reset()
             observation = reset.observation
             buffer.reset_cohort()
             model.eval()
@@ -566,26 +588,37 @@ def main() -> int:
             for _step in range(env.cohort_horizon_steps):
                 with torch.inference_mode():
                     action, raw_action, log_prob, value = _sample(model, observation)
-                    step = env.step(action.contiguous())
-                    _next_distribution, next_value = model.distribution_and_value(step.observation)
-                buffer.append(
+                    action = action.contiguous()
+                buffer.begin_step(
                     observation=observation,
                     action=action,
-                    reward=step.reward,
-                    next_observation=step.observation,
-                    terminated=step.terminated,
-                    truncated=step.truncated,
-                    success=step.success,
-                    event_mask=step.event_mask,
-                    terminal_reason=step.terminal_reason,
-                    physics_step=step.physics_step,
                     extras={
                         "raw_action": raw_action,
                         "log_prob": log_prob,
                         "value": value,
-                        "next_value": next_value,
                     },
                 )
+                try:
+                    with torch.inference_mode():
+                        step = env.step(action)
+                        _next_distribution, next_value = model.distribution_and_value(
+                            step.observation
+                        )
+                    buffer.commit_step(
+                        reward=step.reward,
+                        next_observation=step.observation,
+                        terminated=step.terminated,
+                        truncated=step.truncated,
+                        success=step.success,
+                        event_mask=step.event_mask,
+                        terminal_reason=step.terminal_reason,
+                        physics_step=step.physics_step,
+                        extras={"next_value": next_value},
+                    )
+                except BaseException:
+                    if buffer.pending:
+                        buffer.abort_step()
+                    raise
                 observation = step.observation
             torch.cuda.synchronize(env.device)
             rollout_seconds = time.perf_counter() - rollout_started
@@ -632,6 +665,9 @@ def main() -> int:
                         "cohort": cohort,
                         "lane": lane,
                         "episode_id": episode_id,
+                        "seed": reset.seeds[lane],
+                        "manifest_ordinal": reset.manifest_ordinals[lane],
+                        "manifest_sha256": reset.manifest_sha256,
                         "task_id": config.task,
                         "backend_id": env.provenance.backend_id,
                         "physical_device_uuid": config.expected_gpu_uuid,
@@ -674,12 +710,16 @@ def main() -> int:
                 "observation_dim": observation_dim,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "manifest_cursor": dict(env.manifest_state_dict()),
                 "completed_cohorts": config.cohorts,
                 "update_steps": update_steps,
             },
             checkpoint_path,
         )
         provenance = env.provenance
+        transport_receipt = env.last_transport_receipt
+        if transport_receipt is None or env.transport_checks < 1:
+            raise RuntimeError("tensor PPO produced no validated transport receipt")
         source_provenance = {
             "sources": provenance_bundle["sources"],
             "runtime": {
@@ -701,6 +741,11 @@ def main() -> int:
                 "device_name": provenance.device_name,
                 "device_ordinal": provenance.device_ordinal,
                 "physical_device_uuid": provenance.physical_device_uuid,
+                "physical_device_pci_bus_id": provenance.physical_device_pci_bus_id,
+                "physical_device_identity_source": (
+                    provenance.physical_device_identity_source
+                ),
+                "cross_runtime_device_identity": asdict(env.device_identity),
                 "runtime_versions": dict(provenance.runtime_versions),
                 "model_sha256": provenance.model_sha256,
                 "config_sha256": provenance.config_sha256,
@@ -708,10 +753,25 @@ def main() -> int:
             "data_plane": {
                 "action_transport": "torch_cuda_tensor_direct_to_warp",
                 "output_transport": "pointer_identical_warp_to_torch_views",
+                "action_pointer_identity_verified": True,
+                "output_pointer_identity_verified": True,
+                "torch_warp_stream_identity_verified": True,
+                "transport_checks": env.transport_checks,
+                "last_transport_receipt": {
+                    "action_input_ptr": transport_receipt["action_input_ptr"],
+                    "action_engine_ptr": transport_receipt["action_engine_ptr"],
+                    "torch_stream_ptr": transport_receipt["torch_stream_ptr"],
+                    "warp_stream_ptr": transport_receipt["warp_stream_ptr"],
+                    "output_ptrs": dict(transport_receipt["output_ptrs"]),
+                },
                 "reset_policy": "canonical_fixed_horizon_full_cohort",
-                "post_terminal_policy": "device_valid_mask",
+                "post_terminal_policy": (
+                    "device_semantic_inactive_mask_plus_replay_validity_mask; "
+                    "physical_world_allocation_not_compacted"
+                ),
                 "hot_path_host_materializations": 0,
                 "cohort_horizon_steps": env.cohort_horizon_steps,
+                "warmup_policy_only_steps": config.warmup_steps,
             },
             "train": {
                 "cohorts": cohort_rows,
@@ -732,6 +792,8 @@ def main() -> int:
                 "sha256": _file_sha256(ledger_path),
                 "rows": len(seen_episode_ids),
                 "unique_episode_ids": len(seen_episode_ids),
+                "manifest_sha256": env.manifest_sha256,
+                "manifest_cursor": dict(env.manifest_state_dict()),
             },
         }
         _atomic_json(args.output / "report.json", report)

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -110,34 +111,55 @@ def _buffer() -> Any:
         observation_dtype="float32",
         action_dtype="float32",
         reward_dtype="float32",
+        terminal_signal_dtype="int32",
         event_mask_dtype="int32",
         terminal_reason_dtype="int32",
         physics_step_dtype="int64",
-        extra_fields={"value": DeviceFieldSpec(shape=(), dtype="float32")},
+        extra_fields={
+            "raw_action": DeviceFieldSpec(shape=(1,), dtype="float32"),
+            "log_prob": DeviceFieldSpec(shape=(), dtype="float32"),
+            "value": DeviceFieldSpec(shape=(), dtype="float32"),
+            "next_value": DeviceFieldSpec(
+                shape=(),
+                dtype="float32",
+                phase="commit",
+            ),
+        },
         torch_module=_Torch,
     )
 
 
-def _append(buffer: Any, *, terminated: tuple[int, int]) -> None:
-    buffer.append(
+def _begin_extras() -> dict[str, _Tensor]:
+    return {
+        "raw_action": _tensor([[0.1], [0.2]]),
+        "log_prob": _tensor([-0.1, -0.2]),
+        "value": _tensor([0.5, 0.6]),
+    }
+
+
+def _transition(buffer: Any, *, terminated: tuple[int, int]) -> None:
+    buffer.begin_step(
         observation=_tensor([[1, 2], [3, 4]]),
         action=_tensor([[0], [1]]),
+        extras=_begin_extras(),
+    )
+    buffer.commit_step(
         reward=_tensor([1, 2]),
         next_observation=_tensor([[2, 3], [4, 5]]),
-        terminated=_tensor(terminated),
-        truncated=_tensor([0, 0]),
-        success=_tensor(terminated),
+        terminated=_tensor(terminated, dtype="int32"),
+        truncated=_tensor([0, 0], dtype="int32"),
+        success=_tensor(terminated, dtype="int32"),
         event_mask=_tensor([1, 2], dtype="int32"),
         terminal_reason=_tensor(terminated, dtype="int32"),
         physics_step=_tensor([25, 25], dtype="int64"),
-        extras={"value": _tensor([0.5, 0.6])},
+        extras={"next_value": _tensor([0.7, 0.8])},
     )
 
 
 def test_post_terminal_rows_are_masked_until_full_cohort_reset() -> None:
     buffer = _buffer()
-    _append(buffer, terminated=(1, 0))
-    _append(buffer, terminated=(0, 0))
+    _transition(buffer, terminated=(1, 0))
+    _transition(buffer, terminated=(0, 0))
     view = buffer.view()
 
     np.testing.assert_array_equal(view.valid.values, [[True, True], [False, True]])
@@ -146,39 +168,165 @@ def test_post_terminal_rows_are_masked_until_full_cohort_reset() -> None:
     assert view.num_envs == 2
 
     buffer.reset_cohort()
-    _append(buffer, terminated=(0, 0))
+    _transition(buffer, terminated=(0, 0))
     np.testing.assert_array_equal(buffer.view().valid.values, [[True, True]])
 
 
 def test_buffer_rejects_cross_device_and_schema_drift() -> None:
     buffer = _buffer()
-    with pytest.raises(DeviceTransitionContractError, match="extra field set"):
-        buffer.append(
+    with pytest.raises(DeviceTransitionContractError, match="begin extra field set"):
+        buffer.begin_step(
             observation=_tensor([[1, 2], [3, 4]]),
             action=_tensor([[0], [1]]),
-            reward=_tensor([1, 2]),
-            next_observation=_tensor([[2, 3], [4, 5]]),
-            terminated=_tensor([0, 0]),
-            truncated=_tensor([0, 0]),
-            success=_tensor([0, 0]),
-            event_mask=_tensor([0, 0], dtype="int32"),
-            terminal_reason=_tensor([0, 0], dtype="int32"),
-            physics_step=_tensor([25, 25], dtype="int64"),
         )
 
     wrong_device = _tensor([[1, 2], [3, 4]])
     wrong_device.device = "cuda:1"
     with pytest.raises(DeviceTransitionContractError, match="observation is not"):
-        buffer.append(
+        buffer.begin_step(
             observation=wrong_device,
             action=_tensor([[0], [1]]),
-            reward=_tensor([1, 2]),
-            next_observation=_tensor([[2, 3], [4, 5]]),
-            terminated=_tensor([0, 0]),
-            truncated=_tensor([0, 0]),
-            success=_tensor([0, 0]),
-            event_mask=_tensor([0, 0], dtype="int32"),
-            terminal_reason=_tensor([0, 0], dtype="int32"),
-            physics_step=_tensor([25, 25], dtype="int64"),
-            extras={"value": _tensor([0.5, 0.6])},
+            extras=_begin_extras(),
         )
+
+
+def test_two_phase_write_preserves_pre_step_observation_under_aliasing() -> None:
+    buffer = _buffer()
+    engine_observation = _tensor([[1, 2], [3, 4]])
+    policy_fields = _begin_extras()
+    buffer.begin_step(
+        observation=engine_observation,
+        action=_tensor([[0], [1]]),
+        extras=policy_fields,
+    )
+
+    # Model the engine reusing the exact same device storage for s[t + 1].
+    engine_observation.values[...] = [[11, 12], [13, 14]]
+    policy_fields["raw_action"].values[...] = [[9.1], [9.2]]
+    policy_fields["log_prob"].values[...] = [-9.1, -9.2]
+    policy_fields["value"].values[...] = [9.5, 9.6]
+    buffer.commit_step(
+        reward=_tensor([1, 2]),
+        next_observation=engine_observation,
+        terminated=_tensor([0, 0], dtype="int32"),
+        truncated=_tensor([0, 0], dtype="int32"),
+        success=_tensor([0, 0], dtype="int32"),
+        event_mask=_tensor([1, 2], dtype="int32"),
+        terminal_reason=_tensor([0, 0], dtype="int32"),
+        physics_step=_tensor([25, 25], dtype="int64"),
+        extras={"next_value": _tensor([0.7, 0.8])},
+    )
+
+    view = buffer.view()
+    np.testing.assert_array_equal(view.observation.values[0], [[1, 2], [3, 4]])
+    np.testing.assert_array_equal(
+        view.next_observation.values[0],
+        [[11, 12], [13, 14]],
+    )
+    np.testing.assert_allclose(view.extras["raw_action"].values[0], [[0.1], [0.2]])
+    np.testing.assert_allclose(view.extras["log_prob"].values[0], [-0.1, -0.2])
+    np.testing.assert_allclose(view.extras["value"].values[0], [0.5, 0.6])
+
+
+def test_pending_transition_is_fail_closed_and_abort_is_reusable() -> None:
+    buffer = _buffer()
+    buffer.begin_step(
+        observation=_tensor([[1, 2], [3, 4]]),
+        action=_tensor([[0], [1]]),
+        extras=_begin_extras(),
+    )
+    assert buffer.pending is True
+    assert buffer.cursor == 0
+
+    with pytest.raises(DeviceTransitionContractError, match="already pending"):
+        buffer.begin_step(
+            observation=_tensor([[1, 2], [3, 4]]),
+            action=_tensor([[0], [1]]),
+            extras=_begin_extras(),
+        )
+    with pytest.raises(DeviceTransitionContractError, match="cannot reset"):
+        buffer.reset_cohort()
+    with pytest.raises(DeviceTransitionContractError, match="cannot view"):
+        buffer.view()
+
+    buffer.abort_step()
+    assert buffer.pending is False
+    assert buffer.cursor == 0
+    _transition(buffer, terminated=(0, 0))
+    assert buffer.cursor == 1
+
+
+def test_commit_requires_pending_row_and_validates_boolean_dtype() -> None:
+    buffer = _buffer()
+    commit = {
+        "reward": _tensor([1, 2]),
+        "next_observation": _tensor([[2, 3], [4, 5]]),
+        "terminated": _tensor([0, 0], dtype="int32"),
+        "truncated": _tensor([0, 0], dtype="int32"),
+        "success": _tensor([0, 0], dtype="int32"),
+        "event_mask": _tensor([1, 2], dtype="int32"),
+        "terminal_reason": _tensor([0, 0], dtype="int32"),
+        "physics_step": _tensor([25, 25], dtype="int64"),
+        "extras": {"next_value": _tensor([0.7, 0.8])},
+    }
+    with pytest.raises(DeviceTransitionContractError, match="no pending"):
+        buffer.commit_step(**commit)
+
+    buffer.begin_step(
+        observation=_tensor([[1, 2], [3, 4]]),
+        action=_tensor([[0], [1]]),
+        extras=_begin_extras(),
+    )
+    commit["terminated"] = _tensor([0, 0])
+    with pytest.raises(DeviceTransitionContractError, match="wrong dtype"):
+        buffer.commit_step(**commit)
+    assert buffer.pending is True
+    buffer.abort_step()
+
+
+def test_field_phase_is_validated() -> None:
+    with pytest.raises(ValueError, match="phase"):
+        DeviceFieldSpec(shape=(), dtype="float32", phase="later")
+
+
+def test_tensor_ppo_rollout_uses_two_phase_order_without_host_materialization() -> None:
+    script = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "embodiment"
+        / "train_dynamic_benchmark_tensor_ppo_smoke.py"
+    )
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    rollout_loop = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "_step"
+        and "cohort_horizon_steps" in ast.unparse(node.iter)
+    )
+    calls = [node for node in ast.walk(rollout_loop) if isinstance(node, ast.Call)]
+
+    def method_calls(name: str) -> list[ast.Call]:
+        return [
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute) and call.func.attr == name
+        ]
+
+    begin = method_calls("begin_step")
+    environment_step = [
+        call
+        for call in method_calls("step")
+        if isinstance(call.func.value, ast.Name) and call.func.value.id == "env"
+    ]
+    commit = method_calls("commit_step")
+    assert len(begin) == len(environment_step) == len(commit) == 1
+    assert begin[0].lineno < environment_step[0].lineno < commit[0].lineno
+
+    forbidden = {"clone", "cpu", "numpy", "item", "tolist"}
+    assert not [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute) and call.func.attr in forbidden
+    ]

@@ -18,7 +18,9 @@ The buffer is deliberately algorithm-neutral.  It stores the environment data
 plane plus caller-defined policy fields, while a device-local ``alive`` mask
 marks the first terminal transition valid and masks all post-terminal steps
 until the entire cohort is reset.  No tensor is materialized on the host in
-``append`` or ``view``.
+``begin_step``, ``commit_step``, or ``view``.  The split write is required
+because a GPU environment may reuse and overwrite its observation storage in
+place during ``step``.
 """
 
 from __future__ import annotations
@@ -39,12 +41,15 @@ class DeviceFieldSpec:
 
     shape: tuple[int, ...]
     dtype: Any
+    phase: str = "begin"
 
     def __post_init__(self) -> None:
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in self.shape):
             raise ValueError("device field dimensions must be positive integers")
         if self.dtype is None:
             raise ValueError("device field dtype must not be None")
+        if self.phase not in {"begin", "commit"}:
+            raise ValueError("device field phase must be 'begin' or 'commit'")
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,7 @@ class DeviceTransitionBuffer:
         observation_dtype: Any,
         action_dtype: Any,
         reward_dtype: Any,
+        terminal_signal_dtype: Any,
         event_mask_dtype: Any,
         terminal_reason_dtype: Any,
         physics_step_dtype: Any,
@@ -149,10 +155,17 @@ class DeviceTransitionBuffer:
         self._observation_dtype = observation_dtype
         self._action_dtype = action_dtype
         self._reward_dtype = reward_dtype
+        self._terminal_signal_dtype = terminal_signal_dtype
         self._event_mask_dtype = event_mask_dtype
         self._terminal_reason_dtype = terminal_reason_dtype
         self._physics_step_dtype = physics_step_dtype
         self._specs = MappingProxyType(specs)
+        self._begin_specs = MappingProxyType(
+            {name: spec for name, spec in specs.items() if spec.phase == "begin"}
+        )
+        self._commit_specs = MappingProxyType(
+            {name: spec for name, spec in specs.items() if spec.phase == "commit"}
+        )
         self._observation = torch.empty(
             (*prefix, *observation_shape), dtype=observation_dtype, device=device
         )
@@ -178,6 +191,7 @@ class DeviceTransitionBuffer:
         }
         self._alive = torch.ones((num_envs,), dtype=torch.bool, device=device)
         self._cursor = 0
+        self._pending = False
 
     @property
     def capacity(self) -> int:
@@ -194,6 +208,12 @@ class DeviceTransitionBuffer:
     @property
     def full(self) -> bool:
         return self._cursor == self._capacity
+
+    @property
+    def pending(self) -> bool:
+        """Whether a pre-step row is waiting for its environment result."""
+
+        return self._pending
 
     def _require_tensor(
         self,
@@ -215,14 +235,81 @@ class DeviceTransitionBuffer:
     def reset_cohort(self) -> None:
         """Start a new cohort without reallocating storage or reading the GPU."""
 
+        if self._pending:
+            raise DeviceTransitionContractError(
+                "cannot reset a cohort while a transition is pending"
+            )
         self._cursor = 0
         self._alive.fill_(True)
 
-    def append(
+    def _require_extras(
+        self,
+        extras: Mapping[str, Any] | None,
+        *,
+        specs: Mapping[str, DeviceFieldSpec],
+        phase: str,
+    ) -> dict[str, Any]:
+        supplied = {} if extras is None else dict(extras)
+        if set(supplied) != set(specs):
+            raise DeviceTransitionContractError(
+                f"{phase} extra field set does not match buffer schema"
+            )
+        for name, spec in specs.items():
+            self._require_tensor(
+                supplied[name],
+                name=name,
+                shape=(self._num_envs, *spec.shape),
+                dtype=spec.dtype,
+            )
+        return supplied
+
+    def begin_step(
         self,
         *,
         observation: Any,
         action: Any,
+        extras: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Save policy inputs before an in-place environment step can overwrite them.
+
+        This method copies only into an already allocated row and does not advance
+        the cursor or mutate the cohort's alive mask.  Call :meth:`commit_step`
+        after the environment returns, or :meth:`abort_step` if it raises.
+        """
+
+        if self._pending:
+            raise DeviceTransitionContractError("a device transition is already pending")
+        if self.full:
+            raise DeviceTransitionContractError("device transition buffer is full")
+        self._require_tensor(
+            observation,
+            name="observation",
+            shape=(self._num_envs, *self._observation_shape),
+            dtype=self._observation_dtype,
+        )
+        self._require_tensor(
+            action,
+            name="action",
+            shape=(self._num_envs, *self._action_shape),
+            dtype=self._action_dtype,
+        )
+        supplied_extras = self._require_extras(
+            extras,
+            specs=self._begin_specs,
+            phase="begin",
+        )
+
+        row = self._cursor
+        self._observation[row].copy_(observation)
+        self._action[row].copy_(action)
+        self._valid[row].copy_(self._alive)
+        for name, value in supplied_extras.items():
+            self._extras[name][row].copy_(value)
+        self._pending = True
+
+    def commit_step(
+        self,
+        *,
         reward: Any,
         next_observation: Any,
         terminated: Any,
@@ -233,25 +320,12 @@ class DeviceTransitionBuffer:
         physics_step: Any,
         extras: Mapping[str, Any] | None = None,
     ) -> None:
-        """Copy one vector transition into preallocated storage on the same GPU."""
+        """Complete the pending row with post-step tensors on the same GPU."""
 
-        if self.full:
-            raise DeviceTransitionContractError("device transition buffer is full")
+        if not self._pending:
+            raise DeviceTransitionContractError("no pending device transition to commit")
         vector_observation_shape = (self._num_envs, *self._observation_shape)
-        vector_action_shape = (self._num_envs, *self._action_shape)
         vector_shape = (self._num_envs,)
-        self._require_tensor(
-            observation,
-            name="observation",
-            shape=vector_observation_shape,
-            dtype=self._observation_dtype,
-        )
-        self._require_tensor(
-            action,
-            name="action",
-            shape=vector_action_shape,
-            dtype=self._action_dtype,
-        )
         self._require_tensor(
             reward,
             name="reward",
@@ -269,12 +343,12 @@ class DeviceTransitionBuffer:
             ("truncated", truncated),
             ("success", success),
         ):
-            if tuple(value.shape) != vector_shape or value.device != self._device:
-                raise DeviceTransitionContractError(
-                    f"{name} must have shape {vector_shape} on {self._device}"
-                )
-            if not value.is_contiguous():
-                raise DeviceTransitionContractError(f"{name} must be contiguous")
+            self._require_tensor(
+                value,
+                name=name,
+                shape=vector_shape,
+                dtype=self._terminal_signal_dtype,
+            )
         for name, value, dtype in (
             ("event_mask", event_mask, self._event_mask_dtype),
             ("terminal_reason", terminal_reason, self._terminal_reason_dtype),
@@ -286,23 +360,15 @@ class DeviceTransitionBuffer:
                 shape=vector_shape,
                 dtype=dtype,
             )
-        supplied_extras = {} if extras is None else dict(extras)
-        if set(supplied_extras) != set(self._specs):
-            raise DeviceTransitionContractError("extra field set does not match buffer schema")
-        for name, spec in self._specs.items():
-            self._require_tensor(
-                supplied_extras[name],
-                name=name,
-                shape=(self._num_envs, *spec.shape),
-                dtype=spec.dtype,
-            )
+        supplied_extras = self._require_extras(
+            extras,
+            specs=self._commit_specs,
+            phase="commit",
+        )
 
         row = self._cursor
-        self._observation[row].copy_(observation)
-        self._action[row].copy_(action)
         self._reward[row].copy_(reward)
         self._next_observation[row].copy_(next_observation)
-        self._valid[row].copy_(self._alive)
         self._terminated[row].copy_(terminated != 0)
         self._truncated[row].copy_(truncated != 0)
         self._success[row].copy_(success != 0)
@@ -313,10 +379,22 @@ class DeviceTransitionBuffer:
             self._extras[name][row].copy_(value)
         self._alive.logical_and_(~(self._terminated[row] | self._truncated[row]))
         self._cursor += 1
+        self._pending = False
+
+    def abort_step(self) -> None:
+        """Discard a pending row after a failed environment or policy operation."""
+
+        if not self._pending:
+            raise DeviceTransitionContractError("no pending device transition to abort")
+        self._pending = False
 
     def view(self) -> DeviceTransitionView:
         """Return a zero-copy view of the populated prefix."""
 
+        if self._pending:
+            raise DeviceTransitionContractError(
+                "cannot view the buffer while a transition is pending"
+            )
         stop = self._cursor
         return DeviceTransitionView(
             observation=self._observation[:stop],
