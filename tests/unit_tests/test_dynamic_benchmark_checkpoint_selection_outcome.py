@@ -36,6 +36,7 @@ from examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome im
 )
 from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
     CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+    validate_selected_learned_policy,
 )
 
 BENCHMARK_COMMIT = "b" * 40
@@ -651,6 +652,52 @@ def test_outcome_builder_seals_real_selected_trainer_chain_and_is_exclusive(
 
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         write_checkpoint_selection_outcome(**kwargs)
+
+
+def test_real_outcome_producer_feeds_formal_learned_admission(tmp_path: Path) -> None:
+    run = _trainer_run(tmp_path, eligible=True)
+    executing_evaluator = (
+        Path(trainer.__file__).resolve().parent / "evaluate_dynamic_benchmark_expert.py"
+    )
+    evaluator_source = (
+        run.evaluator_root
+        / "examples"
+        / "embodiment"
+        / "evaluate_dynamic_benchmark_expert.py"
+    )
+    shutil.copyfile(executing_evaluator, evaluator_source)
+    _git(run.evaluator_root, "add", "--all")
+    _git(run.evaluator_root, "commit", "-q", "-m", "formal evaluator source")
+    run.evaluator_commit = _git(run.evaluator_root, "rev-parse", "HEAD")
+
+    outcome_path = write_checkpoint_selection_outcome(**_write_kwargs(run))
+    admission = validate_selected_learned_policy(
+        policy_path=run.best_policy_path,
+        trainer_summary_path=run.summary_path,
+        checkpoint_selection_path=run.selection_path,
+        checkpoint_selection_outcome_path=outcome_path,
+        policy_rlinf_source_root=run.policy_root,
+        verifier_rlinf_source_root=run.verifier_root,
+        evaluator_rlinf_source_root=run.evaluator_root,
+        expected_checkpoint_selection_outcome_sha256=trainer._file_sha256(outcome_path),
+        expected_policy_sha256=trainer._file_sha256(run.best_policy_path),
+        expected_trainer_summary_sha256=trainer._file_sha256(run.summary_path),
+        expected_checkpoint_selection_sha256=trainer._file_sha256(run.selection_path),
+        expected_rlinf_commit=run.policy_commit,
+        expected_benchmark_commit=BENCHMARK_COMMIT,
+        expected_verifier_rlinf_commit=run.verifier_commit,
+        expected_evaluator_rlinf_commit=run.evaluator_commit,
+    )
+
+    assert admission["checkpoint_role"] == "best"
+    assert admission["checkpoint_selection_outcome"] == {
+        "path": str(outcome_path.resolve()),
+        "sha256": trainer._file_sha256(outcome_path),
+        "schema_version": CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+        "payload_sha256": json.loads(outcome_path.read_text(encoding="utf-8"))[
+            "payload_sha256"
+        ],
+    }
 
 
 def test_outcome_builder_seals_real_no_eligible_planner_fallback(

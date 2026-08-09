@@ -21,11 +21,14 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 import subprocess
 import sys
 import types
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -39,6 +42,8 @@ CHECKPOINT_SELECTION_OUTCOME_SCHEMA = (
     "rlinf-dynamic-benchmark-checkpoint-selection-outcome-v0.1"
 )
 CHECKPOINT_SELECTION_OUTCOME_FILENAME = "checkpoint_selection_outcome.json"
+SOURCE_SNAPSHOT_SCHEMA = "rld2-qa-source-snapshot-v0.1"
+SOURCE_SNAPSHOT_MANIFEST_FILENAME = "source_manifest.json"
 
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -52,12 +57,34 @@ _SELECTION_METRIC_NAMES = (
 )
 
 
+@dataclass(frozen=True)
+class _AuthenticatedSource:
+    path: Path
+    module: str
+    repository_path: str
+    sha256: str
+    git_blob_sha1: str
+    content: bytes
+
+    def public_identity(self) -> dict[str, str]:
+        return {
+            "module": self.module,
+            "repository_path": self.repository_path,
+            "sha256": self.sha256,
+        }
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _git_blob_sha1(content: bytes) -> str:
+    header = f"blob {len(content)}\0".encode("ascii")
+    return hashlib.sha1(header + content, usedforsecurity=False).hexdigest()
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -298,6 +325,310 @@ def _match_expected_sha256(path: Path, expected: Any, label: str) -> str:
     return observed
 
 
+def _require_image_id(value: Any, label: str) -> str:
+    rendered = _require_string(value, label)
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", rendered) is None:
+        raise ValueError(f"{label} must be an immutable Docker image ID")
+    return rendered
+
+
+def _snapshot_source_rows(
+    source: Mapping[str, Any], label: str
+) -> tuple[Path, str, str, dict[str, Mapping[str, Any]]]:
+    _require_exact_keys(
+        source,
+        {"root", "commit", "tree", "files", "inventory_sha256"},
+        label,
+    )
+    root_text = _require_string(source.get("root"), f"{label} root")
+    root = Path(root_text)
+    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+        raise ValueError(f"{label} root must be an absolute regular directory")
+    root = root.resolve(strict=True)
+    if str(root) != root_text:
+        raise ValueError(f"{label} root path is not canonical")
+    commit = _require_commit(source.get("commit"), f"{label} commit")
+    tree = _require_commit(source.get("tree"), f"{label} tree")
+    rows = _require_sequence(source.get("files"), f"{label} files")
+    indexed: dict[str, Mapping[str, Any]] = {}
+    canonical_rows: list[dict[str, str]] = []
+    previous = ""
+    for index, raw_row in enumerate(rows):
+        row = _require_mapping(raw_row, f"{label} file row {index}")
+        _require_exact_keys(
+            row,
+            {"path", "mode", "git_blob_sha1", "sha256"},
+            f"{label} file row {index}",
+        )
+        path = _require_string(row.get("path"), f"{label} file path")
+        _safe_posix_parts(path, f"{label} file path")
+        if path <= previous or path in indexed:
+            raise ValueError(f"{label} file inventory is not strictly sorted")
+        previous = path
+        mode = _require_string(row.get("mode"), f"{label} file mode")
+        if mode not in {"100644", "100755"}:
+            raise ValueError(f"{label} contains an unsupported Git file mode")
+        git_blob_sha1 = _require_commit(
+            row.get("git_blob_sha1"), f"{label} file Git blob"
+        )
+        sha256 = _require_sha256(row.get("sha256"), f"{label} file SHA-256")
+        canonical_row = {
+            "path": path,
+            "mode": mode,
+            "git_blob_sha1": git_blob_sha1,
+            "sha256": sha256,
+        }
+        canonical_rows.append(canonical_row)
+        indexed[path] = canonical_row
+    if _require_sha256(
+        source.get("inventory_sha256"), f"{label} inventory SHA-256"
+    ) != _canonical_json_sha256(canonical_rows):
+        raise ValueError(f"{label} inventory SHA-256 does not recompute")
+    return root, commit, tree, indexed
+
+
+def _snapshot_runtime_rows(
+    dependency: Mapping[str, Any], label: str
+) -> tuple[Path, str]:
+    _require_exact_keys(
+        dependency,
+        {"root", "inventory_sha256"},
+        label,
+    )
+    root_text = _require_string(dependency.get("root"), f"{label} root")
+    root = Path(root_text)
+    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+        raise ValueError(f"{label} root must be an absolute regular directory")
+    root = root.resolve(strict=True)
+    if str(root) != root_text:
+        raise ValueError(f"{label} root path is not canonical")
+    inventory_sha256 = _require_sha256(
+        dependency.get("inventory_sha256"), f"{label} inventory SHA-256"
+    )
+    return root, inventory_sha256
+
+
+def validate_source_snapshot_manifest(
+    manifest_path: Path,
+    *,
+    expected_sha256: str,
+    expected_base_image_id: str | None = None,
+    expected_sources: Mapping[str, tuple[Path, str, str | None]] | None = None,
+    verify_inventory: bool = True,
+) -> dict[str, Any]:
+    """Validate the immutable image's exact source-tree inventory."""
+
+    raw_path = Path(manifest_path)
+    if raw_path.is_symlink() or not raw_path.is_file():
+        raise ValueError("source snapshot manifest must be a regular non-symlink file")
+    manifest = raw_path.resolve(strict=True)
+    if manifest.name != SOURCE_SNAPSHOT_MANIFEST_FILENAME:
+        raise ValueError("source snapshot manifest filename is not canonical")
+    manifest_sha256 = _match_expected_sha256(
+        manifest, expected_sha256, "source snapshot manifest"
+    )
+    payload = _read_json(manifest, "source snapshot manifest")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "base_image_id",
+            "sources",
+            "runtime_dependencies",
+            "payload_sha256",
+        },
+        "source snapshot manifest",
+    )
+    if payload.get("schema_version") != SOURCE_SNAPSHOT_SCHEMA:
+        raise ValueError("source snapshot manifest schema mismatch")
+    _verify_payload_hash(
+        payload,
+        label="source snapshot manifest",
+        canonical_sha256=_canonical_json_sha256,
+    )
+    base_image_id = _require_image_id(
+        payload.get("base_image_id"), "source snapshot base image ID"
+    )
+    if expected_base_image_id is not None and base_image_id != _require_image_id(
+        expected_base_image_id, "expected base image ID"
+    ):
+        raise ValueError("source snapshot base image ID mismatch")
+    sources = _require_mapping(payload.get("sources"), "source snapshot sources")
+    required_roles = {"policy_rlinf", "evaluator_rlinf", "benchmark"}
+    _require_exact_keys(sources, required_roles, "source snapshot sources")
+    if expected_sources is not None and set(expected_sources) != required_roles:
+        raise ValueError("expected source snapshot roles do not match")
+
+    for role in sorted(required_roles):
+        source = _require_mapping(sources.get(role), f"source snapshot {role}")
+        root, commit, tree, indexed = _snapshot_source_rows(
+            source, f"source snapshot {role}"
+        )
+        if expected_sources is not None:
+            expected_root, expected_commit, expected_tree = expected_sources[role]
+            if (
+                root != Path(expected_root).resolve(strict=True)
+                or commit
+                != _require_commit(
+                    expected_commit, f"expected source snapshot {role} commit"
+                )
+                or (
+                    expected_tree is not None
+                    and tree
+                    != _require_commit(
+                        expected_tree, f"expected source snapshot {role} tree"
+                    )
+                )
+            ):
+                raise ValueError(f"source snapshot {role} identity mismatch")
+        if not verify_inventory:
+            continue
+        observed_paths: set[str] = set()
+        for candidate in root.rglob("*"):
+            if candidate.is_symlink():
+                raise ValueError(f"source snapshot {role} contains a symlink")
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
+                raise ValueError(
+                    f"source snapshot {role} contains a non-regular artifact"
+                )
+            relative = candidate.relative_to(root).as_posix()
+            observed_paths.add(relative)
+            expected = indexed.get(relative)
+            if expected is None:
+                raise ValueError(f"source snapshot {role} contains an extra file")
+            observed_mode = (
+                "100755" if candidate.stat().st_mode & stat.S_IXUSR else "100644"
+            )
+            content = candidate.read_bytes()
+            if (
+                observed_mode != expected["mode"]
+                or hashlib.sha256(content).hexdigest() != expected["sha256"]
+                or _git_blob_sha1(content) != expected["git_blob_sha1"]
+            ):
+                raise ValueError(f"source snapshot {role} file identity mismatch")
+        if observed_paths != set(indexed):
+            raise ValueError(f"source snapshot {role} file inventory mismatch")
+    dependencies = _require_mapping(
+        payload.get("runtime_dependencies"), "source snapshot runtime dependencies"
+    )
+    _require_exact_keys(
+        dependencies,
+        {"portable", "a800_core"},
+        "source snapshot runtime dependencies",
+    )
+    for name in ("portable", "a800_core"):
+        dependency = _require_mapping(
+            dependencies.get(name), f"source snapshot runtime {name}"
+        )
+        root, expected_inventory_sha256 = _snapshot_runtime_rows(
+            dependency, f"source snapshot runtime {name}"
+        )
+        if not verify_inventory:
+            continue
+        observed_rows: list[dict[str, str]] = []
+        for candidate in root.rglob("*"):
+            if candidate.is_symlink():
+                raise ValueError(f"source snapshot runtime {name} contains a symlink")
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
+                raise ValueError(
+                    f"source snapshot runtime {name} contains a non-regular artifact"
+                )
+            relative = candidate.relative_to(root).as_posix()
+            _safe_posix_parts(relative, f"source snapshot runtime {name} file path")
+            observed_mode = (
+                "100755" if candidate.stat().st_mode & stat.S_IXUSR else "100644"
+            )
+            observed_rows.append(
+                {
+                    "path": relative,
+                    "mode": observed_mode,
+                    "sha256": _sha256(candidate),
+                }
+            )
+        observed_rows.sort(key=lambda row: row["path"])
+        if _canonical_json_sha256(observed_rows) != expected_inventory_sha256:
+            raise ValueError(f"source snapshot runtime {name} inventory mismatch")
+    if _sha256(manifest) != manifest_sha256:
+        raise RuntimeError("source snapshot manifest changed during validation")
+    return copy.deepcopy(payload)
+
+
+def _source_snapshot_from_environment() -> tuple[Path, str] | None:
+    manifest = os.environ.get("RLD2_SOURCE_SNAPSHOT_MANIFEST")
+    expected_sha256 = os.environ.get("RLD2_SOURCE_SNAPSHOT_MANIFEST_SHA256")
+    if manifest is None and expected_sha256 is None:
+        return None
+    if not manifest or not expected_sha256:
+        raise ValueError("source snapshot environment identity is incomplete")
+    return Path(manifest), _require_sha256(
+        expected_sha256, "source snapshot environment SHA-256"
+    )
+
+
+def _verify_snapshot_source_checkout(
+    *,
+    root: Path,
+    expected_commit: str,
+    sources: Mapping[str, tuple[str, str]],
+    label: str,
+    manifest_path: Path,
+    manifest_sha256: str,
+) -> tuple[str, dict[str, _AuthenticatedSource]]:
+    payload = validate_source_snapshot_manifest(
+        manifest_path,
+        expected_sha256=manifest_sha256,
+        verify_inventory=False,
+    )
+    snapshot_sources = _require_mapping(
+        payload.get("sources"), "source snapshot sources"
+    )
+    resolved_root = Path(root).resolve(strict=True)
+    declared_commit = _require_commit(expected_commit, f"expected {label} commit")
+    matched: tuple[str, Mapping[str, Any], dict[str, Mapping[str, Any]]] | None = None
+    for role, raw_source in snapshot_sources.items():
+        source = _require_mapping(raw_source, f"source snapshot {role}")
+        snapshot_root, commit, _, indexed = _snapshot_source_rows(
+            source, f"source snapshot {role}"
+        )
+        if snapshot_root == resolved_root:
+            matched = (str(role), source, indexed)
+            if commit != declared_commit:
+                raise ValueError(f"{label} snapshot commit mismatch")
+            break
+    if matched is None:
+        raise ValueError(f"{label} root is absent from the source snapshot")
+    _, _, indexed = matched
+    authenticated: dict[str, _AuthenticatedSource] = {}
+    for name, (module, repository_path) in sources.items():
+        parts = _safe_posix_parts(repository_path, f"{label} {name} repository path")
+        expected = indexed.get(repository_path)
+        if expected is None:
+            raise ValueError(f"{label} {name} is absent from the source snapshot")
+        source_path = resolved_root.joinpath(*parts)
+        _reject_symlink_chain(resolved_root, source_path, f"{label} {name} source")
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        content = source_path.read_bytes()
+        if (
+            hashlib.sha256(content).hexdigest() != expected["sha256"]
+            or _git_blob_sha1(content) != expected["git_blob_sha1"]
+        ):
+            raise ValueError(f"{label} {name} differs from its snapshot blob")
+        authenticated[name] = _AuthenticatedSource(
+            path=source_path,
+            module=module,
+            repository_path=repository_path,
+            sha256=str(expected["sha256"]),
+            git_blob_sha1=str(expected["git_blob_sha1"]),
+            content=content,
+        )
+    return declared_commit, authenticated
+
+
 def _run_git(
     root: Path,
     arguments: Sequence[str],
@@ -329,7 +660,7 @@ def _verify_source_checkout(
     expected_commit: str,
     sources: Mapping[str, tuple[str, str]],
     label: str,
-) -> tuple[str, dict[str, dict[str, str]], dict[str, Path]]:
+) -> tuple[str, dict[str, _AuthenticatedSource]]:
     candidate = Path(root)
     if candidate.is_symlink():
         raise ValueError(f"{label} source root must not be a symlink")
@@ -337,6 +668,17 @@ def _verify_source_checkout(
         raise FileNotFoundError(candidate)
     resolved_root = candidate.resolve(strict=True)
     declared_commit = _require_commit(expected_commit, f"expected {label} commit")
+    snapshot_environment = _source_snapshot_from_environment()
+    if snapshot_environment is not None:
+        manifest_path, manifest_sha256 = snapshot_environment
+        return _verify_snapshot_source_checkout(
+            root=resolved_root,
+            expected_commit=declared_commit,
+            sources=sources,
+            label=label,
+            manifest_path=manifest_path,
+            manifest_sha256=manifest_sha256,
+        )
     top_level = str(
         _run_git(
             resolved_root,
@@ -368,8 +710,7 @@ def _verify_source_checkout(
     if status.strip():
         raise ValueError(f"{label} source root must be clean")
 
-    identities: dict[str, dict[str, str]] = {}
-    paths: dict[str, Path] = {}
+    authenticated: dict[str, _AuthenticatedSource] = {}
     for name, (module, repository_path) in sources.items():
         parts = _safe_posix_parts(repository_path, f"{label} {name} repository path")
         source_path = resolved_root.joinpath(*parts)
@@ -386,26 +727,39 @@ def _verify_source_checkout(
         ).strip()
         if tracked != repository_path:
             raise ValueError(f"{label} {name} source path is not canonical")
+        git_blob_sha1 = str(
+            _run_git(
+                resolved_root,
+                ["rev-parse", f"{observed_commit}:{repository_path}"],
+                label=label,
+                text=True,
+            )
+        ).strip()
+        if _HEX_40.fullmatch(git_blob_sha1) is None:
+            raise ValueError(f"{label} {name} source Git blob identity is invalid")
         committed_bytes = _run_git(
             resolved_root,
             ["show", f"{observed_commit}:{repository_path}"],
             label=label,
             text=False,
         )
+        if _git_blob_sha1(committed_bytes) != git_blob_sha1:
+            raise ValueError(f"{label} {name} committed Git blob identity mismatch")
         observed_bytes = source_path.read_bytes()
         if observed_bytes != committed_bytes:
             raise ValueError(f"{label} {name} source differs from its committed blob")
-        identities[name] = {
-            "module": module,
-            "repository_path": repository_path,
-            "sha256": hashlib.sha256(observed_bytes).hexdigest(),
-        }
-        paths[name] = source_path
-    return observed_commit, identities, paths
+        authenticated[name] = _AuthenticatedSource(
+            path=source_path,
+            module=module,
+            repository_path=repository_path,
+            sha256=hashlib.sha256(observed_bytes).hexdigest(),
+            git_blob_sha1=git_blob_sha1,
+            content=observed_bytes,
+        )
+    return observed_commit, authenticated
 
 
-def _load_authoritative_trainer(source_path: Path) -> Any:
-    source_bytes = source_path.read_bytes()
+def _load_authoritative_trainer(source_bytes: bytes, *, source_path: Path) -> Any:
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
     module_name = f"_rlinf_policy_trainer_{source_sha256}"
     module = types.ModuleType(module_name)
@@ -678,27 +1032,39 @@ def build_checkpoint_selection_outcome_payload(
             "examples/embodiment/evaluate_dynamic_benchmark_expert.py",
         ),
     }
-    policy_commit, policy_sources, policy_source_paths = _verify_source_checkout(
+    policy_commit, policy_authenticated = _verify_source_checkout(
         root=policy_rlinf_source_root,
         expected_commit=expected_policy_rlinf_commit,
         sources=policy_source_specs,
         label="policy RLinf",
     )
-    verifier_commit, verifier_sources, verifier_source_paths = _verify_source_checkout(
+    verifier_commit, verifier_authenticated = _verify_source_checkout(
         root=verifier_rlinf_source_root,
         expected_commit=expected_verifier_rlinf_commit,
         sources=verifier_source_specs,
         label="verifier RLinf",
     )
-    evaluator_commit, evaluator_sources, evaluator_source_paths = (
-        _verify_source_checkout(
-            root=evaluator_rlinf_source_root,
-            expected_commit=expected_evaluator_rlinf_commit,
-            sources=evaluator_source_specs,
-            label="evaluator RLinf",
-        )
+    evaluator_commit, evaluator_authenticated = _verify_source_checkout(
+        root=evaluator_rlinf_source_root,
+        expected_commit=expected_evaluator_rlinf_commit,
+        sources=evaluator_source_specs,
+        label="evaluator RLinf",
     )
-    trainer = _load_authoritative_trainer(policy_source_paths["trainer_source"])
+    policy_sources = {
+        name: source.public_identity() for name, source in policy_authenticated.items()
+    }
+    verifier_sources = {
+        name: source.public_identity()
+        for name, source in verifier_authenticated.items()
+    }
+    evaluator_sources = {
+        name: source.public_identity()
+        for name, source in evaluator_authenticated.items()
+    }
+    trainer_source = policy_authenticated["trainer_source"]
+    trainer = _load_authoritative_trainer(
+        trainer_source.content, source_path=trainer_source.path
+    )
     raw_executing_sources = {
         "verifier_source": Path(__file__),
         "builder_source": Path(__file__).with_name(
@@ -710,13 +1076,13 @@ def build_checkpoint_selection_outcome_payload(
         if raw_path.is_symlink():
             raise ValueError(f"executing {name} must not be a symlink")
         executing_sources[name] = raw_path.resolve(strict=True)
-    declared_source_paths = {
-        **policy_source_paths,
-        **verifier_source_paths,
-        **evaluator_source_paths,
+    declared_sources = {
+        **policy_authenticated,
+        **verifier_authenticated,
+        **evaluator_authenticated,
     }
     for name, executing_path in executing_sources.items():
-        if executing_path.read_bytes() != declared_source_paths[name].read_bytes():
+        if executing_path.read_bytes() != declared_sources[name].content:
             raise ValueError(
                 f"executing {name} does not match the declared clean source root"
             )
@@ -1406,21 +1772,21 @@ def build_checkpoint_selection_outcome_payload(
             "policy snapshot directory changed during outcome verification"
         )
     for name, executing_path in executing_sources.items():
-        if executing_path.read_bytes() != declared_source_paths[name].read_bytes():
+        if executing_path.read_bytes() != declared_sources[name].content:
             raise RuntimeError("source artifacts changed during outcome verification")
-    final_policy_commit, final_policy_sources, _ = _verify_source_checkout(
+    final_policy_commit, final_policy_authenticated = _verify_source_checkout(
         root=policy_rlinf_source_root,
         expected_commit=expected_policy_rlinf_commit,
         sources=policy_source_specs,
         label="policy RLinf",
     )
-    final_verifier_commit, final_verifier_sources, _ = _verify_source_checkout(
+    final_verifier_commit, final_verifier_authenticated = _verify_source_checkout(
         root=verifier_rlinf_source_root,
         expected_commit=expected_verifier_rlinf_commit,
         sources=verifier_source_specs,
         label="verifier RLinf",
     )
-    final_evaluator_commit, final_evaluator_sources, _ = _verify_source_checkout(
+    final_evaluator_commit, final_evaluator_authenticated = _verify_source_checkout(
         root=evaluator_rlinf_source_root,
         expected_commit=expected_evaluator_rlinf_commit,
         sources=evaluator_source_specs,
@@ -1430,9 +1796,9 @@ def build_checkpoint_selection_outcome_payload(
         final_policy_commit != policy_commit
         or final_verifier_commit != verifier_commit
         or final_evaluator_commit != evaluator_commit
-        or final_policy_sources != policy_sources
-        or final_verifier_sources != verifier_sources
-        or final_evaluator_sources != evaluator_sources
+        or final_policy_authenticated != policy_authenticated
+        or final_verifier_authenticated != verifier_authenticated
+        or final_evaluator_authenticated != evaluator_authenticated
     ):
         raise RuntimeError("source checkouts changed during outcome verification")
     return outcome
@@ -1443,11 +1809,18 @@ def validate_selected_learned_policy(
     policy_path: Path,
     trainer_summary_path: Path,
     checkpoint_selection_path: Path,
+    checkpoint_selection_outcome_path: Path,
+    policy_rlinf_source_root: Path,
+    verifier_rlinf_source_root: Path,
+    evaluator_rlinf_source_root: Path,
+    expected_checkpoint_selection_outcome_sha256: str,
     expected_policy_sha256: str | None = None,
     expected_trainer_summary_sha256: str | None = None,
     expected_checkpoint_selection_sha256: str | None = None,
     expected_rlinf_commit: str | None = None,
     expected_benchmark_commit: str | None = None,
+    expected_verifier_rlinf_commit: str | None = None,
+    expected_evaluator_rlinf_commit: str | None = None,
 ) -> dict[str, Any]:
     """Reopen a trainer run and admit only its selected eligible snapshot.
 
@@ -1457,7 +1830,70 @@ def validate_selected_learned_policy(
     artifact without treating the planner fallback as a learned checkpoint.
     """
 
-    from examples.embodiment import train_dynamic_benchmark_expert as trainer
+    policy_commit = _require_commit(
+        expected_rlinf_commit, "expected policy RLinf commit"
+    )
+    verifier_commit = _require_commit(
+        expected_verifier_rlinf_commit, "expected verifier RLinf commit"
+    )
+    evaluator_commit = _require_commit(
+        expected_evaluator_rlinf_commit, "expected evaluator RLinf commit"
+    )
+    policy_source_specs = {
+        "trainer_source": (
+            "examples.embodiment.train_dynamic_benchmark_expert",
+            "examples/embodiment/train_dynamic_benchmark_expert.py",
+        )
+    }
+    verifier_source_specs = {
+        "verifier_source": (
+            "examples.embodiment.dynamic_benchmark_checkpoint_admission",
+            "examples/embodiment/dynamic_benchmark_checkpoint_admission.py",
+        ),
+        "builder_source": (
+            "examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome",
+            "examples/embodiment/build_dynamic_benchmark_checkpoint_selection_outcome.py",
+        ),
+    }
+    evaluator_source_specs = {
+        "evaluator_source": (
+            "examples.embodiment.evaluate_dynamic_benchmark_expert",
+            "examples/embodiment/evaluate_dynamic_benchmark_expert.py",
+        ),
+    }
+    observed_policy_commit, policy_authenticated = _verify_source_checkout(
+        root=policy_rlinf_source_root,
+        expected_commit=policy_commit,
+        sources=policy_source_specs,
+        label="policy RLinf",
+    )
+    observed_verifier_commit, verifier_authenticated = _verify_source_checkout(
+        root=verifier_rlinf_source_root,
+        expected_commit=verifier_commit,
+        sources=verifier_source_specs,
+        label="verifier RLinf",
+    )
+    observed_evaluator_commit, evaluator_authenticated = _verify_source_checkout(
+        root=evaluator_rlinf_source_root,
+        expected_commit=evaluator_commit,
+        sources=evaluator_source_specs,
+        label="evaluator RLinf",
+    )
+    policy_sources = {
+        name: source.public_identity() for name, source in policy_authenticated.items()
+    }
+    verifier_sources = {
+        name: source.public_identity()
+        for name, source in verifier_authenticated.items()
+    }
+    evaluator_sources = {
+        name: source.public_identity()
+        for name, source in evaluator_authenticated.items()
+    }
+    trainer_source = policy_authenticated["trainer_source"]
+    trainer = _load_authoritative_trainer(
+        trainer_source.content, source_path=trainer_source.path
+    )
 
     summary_path = _canonical_artifact(
         trainer_summary_path, "summary.json", "trainer summary"
@@ -1471,6 +1907,77 @@ def validate_selected_learned_policy(
     if selection_path.parent != output:
         raise ValueError(
             "trainer summary and checkpoint-selection manifest must be siblings"
+        )
+    raw_outcome_path = Path(checkpoint_selection_outcome_path)
+    if raw_outcome_path.is_symlink():
+        raise ValueError("checkpoint-selection outcome must not be a symlink")
+    if not raw_outcome_path.is_file():
+        raise FileNotFoundError(raw_outcome_path)
+    outcome_path = raw_outcome_path.resolve(strict=True)
+    if outcome_path != output / CHECKPOINT_SELECTION_OUTCOME_FILENAME:
+        raise ValueError(
+            "checkpoint-selection outcome must be the canonical trainer-run sibling"
+        )
+    outcome_file_sha256 = _match_expected_sha256(
+        outcome_path,
+        expected_checkpoint_selection_outcome_sha256,
+        "checkpoint-selection outcome",
+    )
+    outcome = _read_json(outcome_path, "checkpoint-selection outcome")
+    if outcome.get("schema_version") != CHECKPOINT_SELECTION_OUTCOME_SCHEMA:
+        raise ValueError("checkpoint-selection outcome schema does not match")
+    _require_exact_keys(
+        outcome,
+        {
+            "schema_version",
+            "source_identity",
+            "run_identity",
+            "trainer_artifacts",
+            "selector",
+            "matched_planner_baseline",
+            "evaluated_snapshots",
+            "selection",
+            "payload_sha256",
+        },
+        "checkpoint-selection outcome",
+    )
+    outcome_payload_sha256 = _verify_payload_hash(
+        outcome,
+        label="checkpoint-selection outcome",
+        canonical_sha256=_canonical_json_sha256,
+    )
+
+    # Replay the complete canonical producer from clean, commit-pinned policy and
+    # evaluator source roots.  Comparing the full payload validates metrics.jsonl,
+    # every validation-evidence row, selector projections, and source blobs without
+    # maintaining a second weaker interpretation of the outcome schema here.
+    config_candidate = output / "config.json"
+    metrics_candidate = output / "metrics.jsonl"
+    initial_policy_candidate = output / "initial_policy.pt"
+    best_policy_candidate = output / "best_policy.pt"
+    authoritative_outcome = build_checkpoint_selection_outcome_payload(
+        run_root=output,
+        policy_rlinf_source_root=policy_rlinf_source_root,
+        verifier_rlinf_source_root=verifier_rlinf_source_root,
+        evaluator_rlinf_source_root=evaluator_rlinf_source_root,
+        expected_policy_rlinf_commit=observed_policy_commit,
+        expected_verifier_rlinf_commit=observed_verifier_commit,
+        expected_evaluator_rlinf_commit=observed_evaluator_commit,
+        expected_benchmark_commit=_require_commit(
+            expected_benchmark_commit, "expected benchmark commit"
+        ),
+        expected_summary_sha256=_sha256(summary_path),
+        expected_checkpoint_selection_sha256=_sha256(selection_path),
+        expected_config_sha256=_sha256(config_candidate),
+        expected_metrics_sha256=_sha256(metrics_candidate),
+        expected_initial_policy_sha256=_sha256(initial_policy_candidate),
+        expected_best_policy_sha256=(
+            _sha256(best_policy_candidate) if best_policy_candidate.is_file() else None
+        ),
+    )
+    if outcome != authoritative_outcome:
+        raise ValueError(
+            "checkpoint-selection outcome differs from authoritative producer replay"
         )
 
     # Resolve without requiring existence so the no-eligible fallback produces an
@@ -1773,11 +2280,351 @@ def validate_selected_learned_policy(
     except Exception as error:
         raise ValueError("checkpoint-selection ledger verification failed") from error
 
+    # The portable outcome is the canonical authority that joins the complete
+    # trainer ledger to the verifier/evaluator source identities.  Reopen it only
+    # after the trainer artifacts themselves have passed their independent replay,
+    # then require exact (not subset) joins at every boundary used downstream.
+    verifier_rlinf_commit = verifier_commit
+    evaluator_rlinf_commit = evaluator_commit
+    if outcome.get("run_identity") != expected_run_identity:
+        raise ValueError("checkpoint-selection outcome run identity mismatch")
+
+    outcome_source = _require_mapping(
+        outcome.get("source_identity"), "checkpoint-selection outcome source identity"
+    )
+    _require_exact_keys(
+        outcome_source,
+        {
+            "task",
+            "algorithm",
+            "training_seed",
+            "validation_manifest_seed",
+            "eval_episodes",
+            "eval_num_envs",
+            "policy_rlinf_commit",
+            "verifier_rlinf_commit",
+            "evaluator_rlinf_commit",
+            "benchmark_commit",
+            "infra_identity_sha256",
+            "trainer_source",
+            "verifier_source",
+            "builder_source",
+            "evaluator_source",
+        },
+        "checkpoint-selection outcome source identity",
+    )
+    expected_source_scalars = {
+        "task": task,
+        "algorithm": algorithm,
+        "training_seed": training_seed,
+        "validation_manifest_seed": validation_manifest_seed,
+        "eval_episodes": expected_run_identity["eval_episodes"],
+        "eval_num_envs": expected_run_identity["eval_num_envs"],
+        "policy_rlinf_commit": rlinf_commit,
+        "verifier_rlinf_commit": verifier_rlinf_commit,
+        "evaluator_rlinf_commit": evaluator_rlinf_commit,
+        "benchmark_commit": benchmark_commit,
+        "infra_identity_sha256": trainer._canonical_json_sha256(infra_identity),
+    }
+    for field, expected_value in expected_source_scalars.items():
+        if outcome_source.get(field) != expected_value:
+            raise ValueError(
+                f"checkpoint-selection outcome source identity {field} mismatch"
+            )
+    expected_source_descriptors = {
+        **policy_sources,
+        **verifier_sources,
+        **evaluator_sources,
+    }
+    for name, expected_identity in expected_source_descriptors.items():
+        if outcome_source.get(name) != expected_identity:
+            raise ValueError(
+                f"checkpoint-selection outcome {name} does not match clean source blob"
+            )
+
+    source_contracts = {
+        "trainer_source": (
+            "examples.embodiment.train_dynamic_benchmark_expert",
+            "examples/embodiment/train_dynamic_benchmark_expert.py",
+            policy_authenticated["trainer_source"].path,
+        ),
+        "verifier_source": (
+            "examples.embodiment.dynamic_benchmark_checkpoint_admission",
+            "examples/embodiment/dynamic_benchmark_checkpoint_admission.py",
+            verifier_authenticated["verifier_source"].path,
+        ),
+        "builder_source": (
+            "examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome",
+            "examples/embodiment/build_dynamic_benchmark_checkpoint_selection_outcome.py",
+            verifier_authenticated["builder_source"].path,
+        ),
+        "evaluator_source": (
+            "examples.embodiment.evaluate_dynamic_benchmark_expert",
+            "examples/embodiment/evaluate_dynamic_benchmark_expert.py",
+            evaluator_authenticated["evaluator_source"].path,
+        ),
+    }
+    for name, (module, repository_path, executing_path) in source_contracts.items():
+        identity = _require_mapping(
+            outcome_source.get(name), f"checkpoint-selection outcome {name}"
+        )
+        _require_exact_keys(
+            identity,
+            {"module", "repository_path", "sha256"},
+            f"checkpoint-selection outcome {name}",
+        )
+        if (
+            identity.get("module") != module
+            or identity.get("repository_path") != repository_path
+        ):
+            raise ValueError(f"checkpoint-selection outcome {name} identity mismatch")
+        _require_sha256(identity.get("sha256"), f"checkpoint-selection outcome {name}")
+        if executing_path is not None:
+            if executing_path.is_symlink() or not executing_path.is_file():
+                raise ValueError(f"executing {name} is missing or symlinked")
+            if _sha256(executing_path.resolve(strict=True)) != identity["sha256"]:
+                raise ValueError(
+                    f"checkpoint-selection outcome {name} does not match executing source"
+                )
+
+    trainer_artifacts = _require_mapping(
+        outcome.get("trainer_artifacts"),
+        "checkpoint-selection outcome trainer artifacts",
+    )
+    _require_exact_keys(
+        trainer_artifacts,
+        {"summary", "checkpoint_selection", "config", "metrics"},
+        "checkpoint-selection outcome trainer artifacts",
+    )
+    outcome_summary = _require_mapping(
+        trainer_artifacts.get("summary"), "checkpoint-selection outcome summary"
+    )
+    expected_outcome_summary = {
+        "path": "summary.json",
+        "sha256": summary_file_sha256,
+        "schema_version": TRAINER_SUMMARY_SCHEMA,
+        "payload_sha256": summary_payload_sha256,
+        "status": "complete",
+        "env_steps": summary_env_steps,
+        "update_steps": _require_int(
+            summary.get("update_steps"), "trainer summary update_steps"
+        ),
+        "best_validation_metrics_sha256": trainer._canonical_json_sha256(validation),
+        "best_selection_score": _json_safe_copy(
+            list(summary_best_score), "trainer summary best selection score"
+        ),
+        "final_validation_metrics_sha256": trainer._canonical_json_sha256(
+            _json_safe_copy(
+                _require_mapping(summary.get("final_validation"), "final validation"),
+                "final validation",
+            )
+        ),
+    }
+    if dict(outcome_summary) != expected_outcome_summary:
+        raise ValueError("checkpoint-selection outcome summary identity mismatch")
+    outcome_selection_artifact = _require_mapping(
+        trainer_artifacts.get("checkpoint_selection"),
+        "checkpoint-selection outcome manifest artifact",
+    )
+    if dict(outcome_selection_artifact) != {
+        "path": "checkpoint_selection.json",
+        "sha256": selection_file_sha256,
+        "schema_version": CHECKPOINT_SELECTION_SCHEMA,
+        "payload_sha256": selection_payload_sha256,
+    }:
+        raise ValueError("checkpoint-selection outcome manifest identity mismatch")
+    outcome_config = _require_mapping(
+        trainer_artifacts.get("config"), "checkpoint-selection outcome config"
+    )
+    if dict(outcome_config) != {
+        "path": "config.json",
+        "sha256": config_file_sha256,
+        "payload_sha256": config_payload_sha256,
+    }:
+        raise ValueError("checkpoint-selection outcome config identity mismatch")
+    outcome_metrics = _require_mapping(
+        trainer_artifacts.get("metrics"), "checkpoint-selection outcome metrics"
+    )
+    _require_exact_keys(
+        outcome_metrics,
+        {
+            "path",
+            "sha256",
+            "format",
+            "validation_event_count",
+            "validation_event_inventory_sha256",
+        },
+        "checkpoint-selection outcome metrics",
+    )
+    if (
+        outcome_metrics.get("path") != "metrics.jsonl"
+        or outcome_metrics.get("format") != "jsonl"
+        or outcome_metrics.get("validation_event_count") != len(rows) + 1
+    ):
+        raise ValueError("checkpoint-selection outcome metrics identity mismatch")
+    _require_sha256(
+        outcome_metrics.get("sha256"), "checkpoint-selection outcome metrics SHA-256"
+    )
+    _require_sha256(
+        outcome_metrics.get("validation_event_inventory_sha256"),
+        "checkpoint-selection outcome validation inventory SHA-256",
+    )
+
+    if outcome.get("selector") != manifest.get("selector"):
+        raise ValueError("checkpoint-selection outcome selector identity mismatch")
+    outcome_baseline = _require_mapping(
+        outcome.get("matched_planner_baseline"),
+        "checkpoint-selection outcome matched planner baseline",
+    )
+    baseline_manifest = _require_mapping(
+        manifest.get("matched_planner_baseline"), "matched planner baseline"
+    )
+    baseline_policy_manifest = _require_mapping(
+        baseline_manifest.get("policy"), "matched planner policy"
+    )
+    expected_baseline_policy = {
+        **dict(baseline_policy_manifest),
+        "schema_version": POLICY_SCHEMA,
+        "infra_identity_sha256": trainer._canonical_json_sha256(infra_identity),
+    }
+    if (
+        outcome_baseline.get("source") != baseline_manifest.get("source")
+        or outcome_baseline.get("safety_failure_rate_ceiling")
+        != baseline_manifest.get("safety_failure_rate_ceiling")
+        or outcome_baseline.get("validation_metrics")
+        != baseline_manifest.get("validation_metrics")
+        or outcome_baseline.get("validation_metrics_sha256")
+        != baseline_manifest.get("validation_metrics_sha256")
+        or outcome_baseline.get("policy") != expected_baseline_policy
+    ):
+        raise ValueError("checkpoint-selection outcome planner baseline mismatch")
+
+    outcome_rows_raw = outcome.get("evaluated_snapshots")
+    if not isinstance(outcome_rows_raw, list) or len(outcome_rows_raw) != len(rows):
+        raise ValueError("checkpoint-selection outcome snapshot inventory mismatch")
+    for index, (outcome_row_raw, manifest_row) in enumerate(
+        zip(outcome_rows_raw, rows, strict=True)
+    ):
+        outcome_row = _require_mapping(
+            outcome_row_raw, f"checkpoint-selection outcome row {index}"
+        )
+        manifest_policy = _require_mapping(
+            manifest_row.get("policy"),
+            f"checkpoint-selection manifest row {index} policy",
+        )
+        expected_outcome_policy = {
+            **dict(manifest_policy),
+            "schema_version": POLICY_SCHEMA,
+            "infra_identity_sha256": trainer._canonical_json_sha256(infra_identity),
+        }
+        for field in (
+            "env_steps",
+            "validation_metrics",
+            "validation_metrics_sha256",
+            "eligible",
+            "eligibility_reason",
+            "selection_score",
+            "selected",
+        ):
+            if outcome_row.get(field) != manifest_row.get(field):
+                raise ValueError(
+                    f"checkpoint-selection outcome row {index} {field} mismatch"
+                )
+        if outcome_row.get("policy") != expected_outcome_policy:
+            raise ValueError(
+                f"checkpoint-selection outcome row {index} policy mismatch"
+            )
+        selector_metrics = _selector_metrics_projection(
+            _require_mapping(
+                manifest_row.get("validation_metrics"),
+                f"checkpoint-selection manifest row {index} validation",
+            ),
+            f"checkpoint-selection manifest row {index}",
+        )
+        if outcome_row.get("selector_metrics") != selector_metrics or outcome_row.get(
+            "selector_metrics_sha256"
+        ) != trainer._canonical_json_sha256(selector_metrics):
+            raise ValueError(
+                f"checkpoint-selection outcome row {index} selector metrics mismatch"
+            )
+
+    outcome_decision = _require_mapping(
+        outcome.get("selection"), "checkpoint-selection outcome decision"
+    )
+    _require_exact_keys(
+        outcome_decision,
+        {
+            "status",
+            "eligible_snapshot_count",
+            "selected_snapshot_identity",
+            "best_policy",
+            "planner_fallback_policy",
+        },
+        "checkpoint-selection outcome decision",
+    )
+    if outcome_decision.get("status") != "selected_eligible_snapshot":
+        raise ValueError(
+            "checkpoint-selection outcome is not a selected eligible snapshot"
+        )
+    expected_outcome_best_policy = {
+        **dict(best_policy),
+        "schema_version": POLICY_SCHEMA,
+        "infra_identity_sha256": trainer._canonical_json_sha256(infra_identity),
+    }
+    planner_fallback_manifest = _require_mapping(
+        selection.get("planner_fallback_policy"), "planner fallback policy"
+    )
+    expected_outcome_planner_fallback = {
+        **dict(planner_fallback_manifest),
+        "schema_version": POLICY_SCHEMA,
+        "infra_identity_sha256": trainer._canonical_json_sha256(infra_identity),
+    }
+    if (
+        outcome_decision.get("eligible_snapshot_count") != eligible_count
+        or outcome_decision.get("selected_snapshot_identity") != dict(selected_identity)
+        or outcome_decision.get("best_policy") != expected_outcome_best_policy
+        or outcome_decision.get("planner_fallback_policy")
+        != expected_outcome_planner_fallback
+    ):
+        raise ValueError(
+            "checkpoint-selection outcome selected policy identity mismatch"
+        )
+    _reject_unsafe_path_strings(outcome, "checkpoint-selection outcome")
+
+    final_policy_commit, final_policy_authenticated = _verify_source_checkout(
+        root=policy_rlinf_source_root,
+        expected_commit=policy_commit,
+        sources=policy_source_specs,
+        label="policy RLinf",
+    )
+    final_verifier_commit, final_verifier_authenticated = _verify_source_checkout(
+        root=verifier_rlinf_source_root,
+        expected_commit=verifier_commit,
+        sources=verifier_source_specs,
+        label="verifier RLinf",
+    )
+    final_evaluator_commit, final_evaluator_authenticated = _verify_source_checkout(
+        root=evaluator_rlinf_source_root,
+        expected_commit=evaluator_commit,
+        sources=evaluator_source_specs,
+        label="evaluator RLinf",
+    )
+    if (
+        final_policy_commit != observed_policy_commit
+        or final_verifier_commit != observed_verifier_commit
+        or final_evaluator_commit != observed_evaluator_commit
+        or final_policy_authenticated != policy_authenticated
+        or final_verifier_authenticated != verifier_authenticated
+        or final_evaluator_authenticated != evaluator_authenticated
+    ):
+        raise RuntimeError("admission source roots changed during validation")
+
     if (
         _sha256(resolved_policy) != policy_sha256
         or _sha256(summary_path) != summary_file_sha256
         or _sha256(selection_path) != selection_file_sha256
         or _sha256(config_path) != config_file_sha256
+        or _sha256(outcome_path) != outcome_file_sha256
     ):
         raise RuntimeError("trainer admission artifacts changed during validation")
 
@@ -1806,6 +2653,12 @@ def validate_selected_learned_policy(
             "status": "selected_eligible_snapshot",
             "eligible_snapshot_count": eligible_count,
             "selected_snapshot_identity": copy.deepcopy(dict(selected_identity)),
+        },
+        "checkpoint_selection_outcome": {
+            "path": str(outcome_path),
+            "sha256": outcome_file_sha256,
+            "schema_version": CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+            "payload_sha256": outcome_payload_sha256,
         },
         "config": {
             "path": str(config_path),

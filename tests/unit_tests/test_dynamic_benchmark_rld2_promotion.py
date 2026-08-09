@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import test_dynamic_benchmark_checkpoint_selection_outcome as outcome_fixtures
 import torch
 
 from examples.embodiment import (
@@ -31,8 +32,15 @@ from examples.embodiment import build_dynamic_benchmark_rld2_promotion as promot
 from examples.embodiment import export_dynamic_benchmark_optimal_trajectories as optimal
 from examples.embodiment import export_dynamic_benchmark_rld2_review as review_exporter
 from examples.embodiment import train_dynamic_benchmark_expert as expert_trainer
+from examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome import (
+    write_checkpoint_selection_outcome,
+)
 from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+    CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
     validate_selected_learned_policy,
+)
+from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+    recursive_output_checksums,
 )
 
 TASK = "t1_xyz"
@@ -53,6 +61,166 @@ def _write_json(path: Path, value: dict) -> None:
 def _seal(value: dict) -> dict:
     value["payload_sha256"] = promotion._payload_sha256(value)
     return value
+
+
+def _write_checkpoint_selection_outcome(
+    root: Path,
+    *,
+    config: dict,
+    run_identity: dict,
+    summary: dict,
+    manifest: dict,
+) -> Path:
+    infra_identity_sha256 = expert_trainer._canonical_json_sha256(
+        summary["infra_identity"]
+    )
+
+    def outcome_policy(identity: dict) -> dict:
+        return {
+            **identity,
+            "schema_version": promotion.POLICY_SCHEMA,
+            "infra_identity_sha256": infra_identity_sha256,
+        }
+
+    def source_identity(module: str, filename: str) -> dict:
+        source_path = (
+            Path(__file__).resolve().parents[2] / "examples" / "embodiment" / filename
+        )
+        return {
+            "module": module,
+            "repository_path": f"examples/embodiment/{filename}",
+            "sha256": promotion._sha256(source_path),
+        }
+
+    metric_names = (
+        "success_rate",
+        "safety_failure_rate",
+        "mean_completion",
+        "mean_return",
+        "mean_duration_steps",
+        "mean_action_l2_sum",
+    )
+    enriched_rows = []
+    for row in manifest["evaluated_snapshots"]:
+        selector_metrics = {
+            name: row["validation_metrics"][name] for name in metric_names
+        }
+        enriched_rows.append(
+            {
+                **row,
+                "policy": outcome_policy(row["policy"]),
+                "selector_metrics": selector_metrics,
+                "selector_metrics_sha256": promotion._value_sha256(selector_metrics),
+                "validation_evidence": {
+                    "metrics_path": "metrics.jsonl",
+                    "line_number": 2,
+                    "event_payload_sha256": "5" * 64,
+                    "validation_metrics_sha256": row["validation_metrics_sha256"],
+                    "role": "final",
+                    "checkpoint_selection_manifest_payload_sha256": None,
+                    "checkpoint_snapshot_identity": manifest["selection"][
+                        "selected_snapshot_identity"
+                    ],
+                },
+            }
+        )
+    baseline = manifest["matched_planner_baseline"]
+    baseline_metrics = baseline["validation_metrics"]
+    selection = manifest["selection"]
+    outcome = {
+        "schema_version": CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+        "source_identity": {
+            "task": config["task"],
+            "algorithm": config["algorithm"],
+            "training_seed": config["seed"],
+            "validation_manifest_seed": config["validation_manifest_seed"],
+            "eval_episodes": config["eval_episodes"],
+            "eval_num_envs": config["eval_num_envs"],
+            "policy_rlinf_commit": config["rlinf_commit"],
+            "verifier_rlinf_commit": EVALUATOR_COMMIT,
+            "evaluator_rlinf_commit": EVALUATOR_COMMIT,
+            "benchmark_commit": config["benchmark_commit"],
+            "infra_identity_sha256": infra_identity_sha256,
+            "trainer_source": source_identity(
+                "examples.embodiment.train_dynamic_benchmark_expert",
+                "train_dynamic_benchmark_expert.py",
+            ),
+            "verifier_source": source_identity(
+                "examples.embodiment.dynamic_benchmark_checkpoint_admission",
+                "dynamic_benchmark_checkpoint_admission.py",
+            ),
+            "builder_source": source_identity(
+                "examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome",
+                "build_dynamic_benchmark_checkpoint_selection_outcome.py",
+            ),
+            "evaluator_source": source_identity(
+                "examples.embodiment.evaluate_dynamic_benchmark_expert",
+                "evaluate_dynamic_benchmark_expert.py",
+            ),
+        },
+        "run_identity": run_identity,
+        "trainer_artifacts": {
+            "summary": {
+                "path": "summary.json",
+                "sha256": promotion._sha256(root / "summary.json"),
+                "schema_version": summary["schema_version"],
+                "payload_sha256": summary["payload_sha256"],
+                "status": "complete",
+                "env_steps": summary["env_steps"],
+                "update_steps": summary["update_steps"],
+                "best_validation_metrics_sha256": promotion._value_sha256(
+                    summary["best_validation"]
+                ),
+                "best_selection_score": summary["best_score"],
+                "final_validation_metrics_sha256": promotion._value_sha256(
+                    summary["final_validation"]
+                ),
+            },
+            "checkpoint_selection": {
+                "path": "checkpoint_selection.json",
+                "sha256": promotion._sha256(root / "checkpoint_selection.json"),
+                "schema_version": manifest["schema_version"],
+                "payload_sha256": manifest["payload_sha256"],
+            },
+            "config": {
+                "path": "config.json",
+                "sha256": promotion._sha256(root / "config.json"),
+                "payload_sha256": promotion._value_sha256(config),
+            },
+            "metrics": {
+                "path": "metrics.jsonl",
+                "sha256": "6" * 64,
+                "format": "jsonl",
+                "validation_event_count": len(enriched_rows) + 1,
+                "validation_event_inventory_sha256": "7" * 64,
+            },
+        },
+        "selector": manifest["selector"],
+        "matched_planner_baseline": {
+            "source": baseline["source"],
+            "safety_failure_rate_ceiling": baseline["safety_failure_rate_ceiling"],
+            "validation_metrics": baseline_metrics,
+            "validation_metrics_sha256": baseline["validation_metrics_sha256"],
+            "selector_metrics": {name: baseline_metrics[name] for name in metric_names},
+            "selector_metrics_sha256": promotion._value_sha256(
+                {name: baseline_metrics[name] for name in metric_names}
+            ),
+            "policy": outcome_policy(baseline["policy"]),
+            "validation_evidence": {"metrics_path": "metrics.jsonl"},
+        },
+        "evaluated_snapshots": enriched_rows,
+        "selection": {
+            **selection,
+            "best_policy": outcome_policy(selection["best_policy"]),
+            "planner_fallback_policy": outcome_policy(
+                selection["planner_fallback_policy"]
+            ),
+        },
+    }
+    outcome["payload_sha256"] = promotion._payload_sha256(outcome)
+    path = root / "checkpoint_selection_outcome.json"
+    _write_json(path, outcome)
+    return path
 
 
 def _task_quality(
@@ -351,6 +519,39 @@ class Fixture:
         self.root = root
         self.task = task
         self.root.mkdir(parents=True, exist_ok=True)
+        source_base = root.parent / f"{root.name}-source-roots"
+        embodiment = Path(expert_trainer.__file__).resolve().parent
+        self.policy_source_root, self.rlinf_commit = outcome_fixtures._source_checkout(
+            source_base / "policy",
+            {
+                embodiment / "train_dynamic_benchmark_expert.py": (
+                    "examples/embodiment/train_dynamic_benchmark_expert.py"
+                )
+            },
+            message="promotion policy source",
+        )
+        self.evaluator_source_root, self.evaluator_commit = (
+            outcome_fixtures._source_checkout(
+                source_base / "evaluator",
+                {
+                    embodiment / "dynamic_benchmark_checkpoint_admission.py": (
+                        "examples/embodiment/dynamic_benchmark_checkpoint_admission.py"
+                    ),
+                    embodiment
+                    / "build_dynamic_benchmark_checkpoint_selection_outcome.py": (
+                        "examples/embodiment/"
+                        "build_dynamic_benchmark_checkpoint_selection_outcome.py"
+                    ),
+                    embodiment / "evaluate_dynamic_benchmark_expert.py": (
+                        "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+                    ),
+                    embodiment / "evaluate_dynamic_benchmark_planner.py": (
+                        "examples/embodiment/evaluate_dynamic_benchmark_planner.py"
+                    ),
+                },
+                message="promotion evaluator source",
+            )
+        )
         self.schema = task_quality_schema_manifest(task)
         self.thresholds = _thresholds(task=task)
         self.calibration_receipt_path = root / "wave_receipt.json"
@@ -412,7 +613,7 @@ class Fixture:
                     "--validation-manifest-seed",
                     str(CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED),
                     "--rlinf-commit",
-                    RLINF_COMMIT,
+                    self.rlinf_commit,
                     "--benchmark-commit",
                     BENCHMARK_COMMIT,
                     "--output",
@@ -464,6 +665,22 @@ class Fixture:
             planner_validation,
             initial_policy,
         )
+        self.metrics_path = root / "metrics.jsonl"
+        expert_trainer._append_jsonl(
+            self.metrics_path,
+            {
+                "event": "validation",
+                "env_steps": 0,
+                "checkpoint_selection_role": "matched_planner_safety_ceiling",
+                "validation_metrics_sha256": expert_trainer._canonical_json_sha256(
+                    planner_validation
+                ),
+                "checkpoint_selection_manifest_payload_sha256": ledger.manifest[
+                    "payload_sha256"
+                ],
+                **planner_validation,
+            },
+        )
         snapshot_path = root / "policy_snapshots" / "policy_step_000000000100.pt"
         snapshot_path.parent.mkdir()
         expert_trainer._save_policy(
@@ -475,7 +692,23 @@ class Fixture:
             self.validation,
             100,
         )
-        ledger.record_existing_snapshot(snapshot_path, self.validation, 100)
+        selected_row = ledger.record_existing_snapshot(
+            snapshot_path, self.validation, 100
+        )
+        expert_trainer._append_jsonl(
+            self.metrics_path,
+            {
+                "event": "validation",
+                "env_steps": 100,
+                "checkpoint_snapshot_identity": (
+                    expert_trainer._CheckpointSelectionLedger._snapshot_identity(
+                        selected_row
+                    )
+                ),
+                "validation_role": "final",
+                **self.validation,
+            },
+        )
         self.policy_path = root / "best_policy.pt"
         self.policy_sha = promotion._sha256(self.policy_path)
         self.checkpoint_selection_path = ledger.manifest_path
@@ -489,7 +722,7 @@ class Fixture:
             "best_validation": ledger.best_metrics,
             "best_score": ledger.best_score,
             "final_validation": self.validation,
-            "env_steps": 200,
+            "env_steps": 100,
             "update_steps": 1,
             "config_sha256": config_payload_sha256,
             "config_file_sha256": config_file_sha256,
@@ -497,10 +730,42 @@ class Fixture:
         }
         summary["payload_sha256"] = expert_trainer._canonical_json_sha256(summary)
         expert_trainer._atomic_json(self.metadata_path, summary)
+        self.checkpoint_selection_outcome_path = write_checkpoint_selection_outcome(
+            run_root=root,
+            policy_rlinf_source_root=self.policy_source_root,
+            verifier_rlinf_source_root=self.evaluator_source_root,
+            evaluator_rlinf_source_root=self.evaluator_source_root,
+            expected_policy_rlinf_commit=self.rlinf_commit,
+            expected_verifier_rlinf_commit=self.evaluator_commit,
+            expected_evaluator_rlinf_commit=self.evaluator_commit,
+            expected_benchmark_commit=BENCHMARK_COMMIT,
+            expected_summary_sha256=promotion._sha256(self.metadata_path),
+            expected_checkpoint_selection_sha256=promotion._sha256(
+                self.checkpoint_selection_path
+            ),
+            expected_config_sha256=promotion._sha256(config_path),
+            expected_metrics_sha256=promotion._sha256(self.metrics_path),
+            expected_initial_policy_sha256=promotion._sha256(initial_policy),
+            expected_best_policy_sha256=self.policy_sha,
+        )
+        self.checkpoint_selection_outcome_sha = promotion._sha256(
+            self.checkpoint_selection_outcome_path
+        )
         self.learned_policy_admission = validate_selected_learned_policy(
             policy_path=self.policy_path,
             trainer_summary_path=self.metadata_path,
             checkpoint_selection_path=self.checkpoint_selection_path,
+            checkpoint_selection_outcome_path=(self.checkpoint_selection_outcome_path),
+            policy_rlinf_source_root=self.policy_source_root,
+            verifier_rlinf_source_root=self.evaluator_source_root,
+            evaluator_rlinf_source_root=self.evaluator_source_root,
+            expected_checkpoint_selection_outcome_sha256=(
+                self.checkpoint_selection_outcome_sha
+            ),
+            expected_rlinf_commit=self.rlinf_commit,
+            expected_benchmark_commit=BENCHMARK_COMMIT,
+            expected_verifier_rlinf_commit=self.evaluator_commit,
+            expected_evaluator_rlinf_commit=self.evaluator_commit,
         )
         improved = (
             {}
@@ -530,18 +795,21 @@ class Fixture:
             self._bind_attempt_tape(record, role="policy", index=index)
         for index, record in enumerate(self.planner_records):
             self._bind_attempt_tape(record, role="planner", index=index)
-        self.policy_evaluation_path = root / "policy_evaluation.json"
-        self.planner_evaluation_path = root / "planner_evaluation.json"
+        self.policy_evaluation_path = root / "policy_evaluation" / "evaluation.json"
+        self.planner_evaluation_path = root / "planner_evaluation" / "evaluation.json"
+        self.policy_evaluation_path.parent.mkdir(exist_ok=True)
+        self.planner_evaluation_path.parent.mkdir(exist_ok=True)
         self._write_evaluations()
-        examples = Path(__file__).resolve().parents[2] / "examples" / "embodiment"
+        examples = self.evaluator_source_root / "examples" / "embodiment"
         self.policy_evaluator_source = examples / "evaluate_dynamic_benchmark_expert.py"
         self.planner_evaluator_source = (
             examples / "evaluate_dynamic_benchmark_planner.py"
         )
 
     def _bind_attempt_tape(self, record: dict, *, role: str, index: int) -> None:
-        tape_dir = self.root / "tapes"
-        tape_dir.mkdir(exist_ok=True)
+        bundle_root = self.root / f"{role}_evaluation"
+        tape_dir = bundle_root / "tapes"
+        tape_dir.mkdir(parents=True, exist_ok=True)
         actions = np.asarray(record["actions"], dtype=np.float64)
         steps = len(actions)
         arrays = {
@@ -561,7 +829,7 @@ class Fixture:
         record.update(
             {
                 "attempt_schema_version": optimal_auditor.ATTEMPT_SCHEMA,
-                "attempt_tape": tape_path.relative_to(self.root).as_posix(),
+                "attempt_tape": tape_path.relative_to(bundle_root).as_posix(),
                 "attempt_tape_sha256": promotion._sha256(tape_path),
                 "finite_and_bounded": True,
                 "state_sha256": hashlib.sha256(
@@ -607,9 +875,21 @@ class Fixture:
                 },
                 "learned_policy_admission": self.learned_policy_admission,
                 "source_identity": {
-                    "evaluator_rlinf_commit": EVALUATOR_COMMIT,
-                    "policy_rlinf_commit": RLINF_COMMIT,
+                    "evaluator_rlinf_commit": self.evaluator_commit,
+                    "policy_rlinf_commit": self.rlinf_commit,
                     "benchmark_commit": BENCHMARK_COMMIT,
+                    "evaluator_source": {
+                        "module": (
+                            "examples.embodiment.evaluate_dynamic_benchmark_expert"
+                        ),
+                        "repository_path": (
+                            "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+                        ),
+                        "sha256": promotion._sha256(
+                            self.evaluator_source_root
+                            / "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+                        ),
+                    },
                 },
                 "task_quality_identity": {
                     "evaluator_backend_id": "mujoco311-rs140-v1-rld2-quality",
@@ -646,7 +926,7 @@ class Fixture:
                     "kind": "privileged_teacher",
                 },
                 "source_identity": {
-                    "evaluator_rlinf_commit": EVALUATOR_COMMIT,
+                    "evaluator_rlinf_commit": self.evaluator_commit,
                     "benchmark_commit": BENCHMARK_COMMIT,
                 },
                 "split": "validation",
@@ -663,6 +943,136 @@ class Fixture:
         )
         _write_json(self.policy_evaluation_path, policy)
         _write_json(self.planner_evaluation_path, planner)
+        self._write_source_snapshot_receipt(
+            policy["source_identity"]["evaluator_source"]
+        )
+        self._write_evaluation_sha256sums()
+
+    def _write_source_snapshot_receipt(self, evaluator_source: dict[str, str]) -> None:
+        source_rows = {
+            "policy_rlinf": [
+                {
+                    "path": "examples/embodiment/train_dynamic_benchmark_expert.py",
+                    "mode": "100644",
+                    "git_blob_sha1": "4" * 40,
+                    "sha256": "4" * 64,
+                }
+            ],
+            "evaluator_rlinf": [
+                {
+                    "path": evaluator_source["repository_path"],
+                    "mode": "100644",
+                    "git_blob_sha1": "5" * 40,
+                    "sha256": evaluator_source["sha256"],
+                }
+            ],
+            "benchmark": [
+                {
+                    "path": "src/se3_wam/benchmark/contracts.py",
+                    "mode": "100644",
+                    "git_blob_sha1": "6" * 40,
+                    "sha256": "6" * 64,
+                }
+            ],
+        }
+        source_identities = {
+            "policy_rlinf": {
+                "root": "/opt/rld2-source-snapshot/source/policy_rlinf",
+                "commit": self.rlinf_commit,
+                "tree": "1" * 40,
+                "inventory_sha256": promotion._value_sha256(
+                    source_rows["policy_rlinf"]
+                ),
+            },
+            "evaluator_rlinf": {
+                "root": "/opt/rld2-source-snapshot/source/evaluator_rlinf",
+                "commit": self.evaluator_commit,
+                "tree": "2" * 40,
+                "inventory_sha256": promotion._value_sha256(
+                    source_rows["evaluator_rlinf"]
+                ),
+            },
+            "benchmark": {
+                "root": "/opt/rld2-source-snapshot/source/benchmark",
+                "commit": BENCHMARK_COMMIT,
+                "tree": "3" * 40,
+                "inventory_sha256": promotion._value_sha256(source_rows["benchmark"]),
+            },
+        }
+        manifest = _seal(
+            {
+                "schema_version": promotion.SOURCE_SNAPSHOT_SCHEMA,
+                "base_image_id": "sha256:" + IMAGE_SHA256,
+                "sources": {
+                    role: {**identity, "files": source_rows[role]}
+                    for role, identity in source_identities.items()
+                },
+                "runtime_dependencies": {
+                    "portable": {
+                        "root": "/opt/rld2-source-snapshot/runtime/pydeps-portable-v1",
+                        "inventory_sha256": "7" * 64,
+                    },
+                    "a800_core": {
+                        "root": "/opt/rld2-source-snapshot/runtime/pydeps-a800-core-v1",
+                        "inventory_sha256": "8" * 64,
+                    },
+                },
+            }
+        )
+        manifest_path = self.policy_evaluation_path.parent / "source_manifest.json"
+        _write_json(manifest_path, manifest)
+        receipt = _seal(
+            {
+                "schema_version": promotion.SOURCE_SNAPSHOT_RECEIPT_SCHEMA,
+                "base_image_id": "sha256:" + IMAGE_SHA256,
+                "source_snapshot_image_id": "sha256:" + "9" * 64,
+                "source_manifest": {
+                    "path": "source_manifest.json",
+                    "sha256": promotion._sha256(manifest_path),
+                    "schema_version": promotion.SOURCE_SNAPSHOT_SCHEMA,
+                    "payload_sha256": manifest["payload_sha256"],
+                },
+                "sources": source_identities,
+                "evaluator_source": evaluator_source,
+            }
+        )
+        _write_json(
+            self.policy_evaluation_path.parent / "source_snapshot.json", receipt
+        )
+
+    def _write_evaluation_sha256sums(self) -> None:
+        self.policy_evaluation_sha256sums_path = (
+            self.policy_evaluation_path.parent / "SHA256SUMS"
+        )
+        self.planner_evaluation_sha256sums_path = (
+            self.planner_evaluation_path.parent / "SHA256SUMS"
+        )
+        admission_external = tuple(
+            (
+                self.learned_policy_admission[name]["sha256"],
+                self.learned_policy_admission[name]["path"],
+            )
+            for name in (
+                "policy",
+                "trainer_summary",
+                "checkpoint_selection",
+                "checkpoint_selection_outcome",
+                "config",
+            )
+        )
+        self.policy_evaluation_sha256sums_path.write_text(
+            recursive_output_checksums(
+                self.policy_evaluation_path.parent,
+                extra_entries=admission_external,
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        self.planner_evaluation_sha256sums_path.write_text(
+            recursive_output_checksums(self.planner_evaluation_path.parent),
+            encoding="utf-8",
+            newline="\n",
+        )
 
     def build(self) -> dict:
         return promotion.build_selection_evidence(
@@ -671,8 +1081,14 @@ class Fixture:
             policy_path=self.policy_path,
             policy_metadata_path=self.metadata_path,
             checkpoint_selection_path=self.checkpoint_selection_path,
+            checkpoint_selection_outcome_path=(self.checkpoint_selection_outcome_path),
+            policy_rlinf_source_root=self.policy_source_root,
             policy_evaluation_path=self.policy_evaluation_path,
+            policy_evaluation_sha256sums_path=(self.policy_evaluation_sha256sums_path),
             planner_evaluation_path=self.planner_evaluation_path,
+            planner_evaluation_sha256sums_path=(
+                self.planner_evaluation_sha256sums_path
+            ),
             reset_manifest_path=self.reset_path,
             quality_v2_thresholds_path=self.threshold_path,
             quality_v2_calibration_wave_receipt_path=(self.calibration_receipt_path),
@@ -804,7 +1220,7 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
             policy_path=str(fixture.policy_path.resolve()),
             policy_sha256=fixture.policy_sha,
             residual_scale=float(fixture.config["residual_scale"]),
-            rlinf_commit=RLINF_COMMIT,
+            rlinf_commit=fixture.rlinf_commit,
             benchmark_commit=BENCHMARK_COMMIT,
             threshold_schema=promotion.QUALITY_V2_THRESHOLD_SCHEMA,
             threshold_sha256=fixture.threshold_sha,
@@ -813,7 +1229,7 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
                 "file_sha256": fixture.calibration_receipt_sha,
                 "payload_sha256": fixture.calibration_receipt_sha,
             },
-            evaluator_rlinf_commit=EVALUATOR_COMMIT,
+            evaluator_rlinf_commit=fixture.evaluator_commit,
             evaluator_source_sha256=promotion._sha256(fixture.policy_evaluator_source),
         )
         == receipt
@@ -826,6 +1242,24 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
         evidence["inputs"]["policy_metadata"]
         == (fixture.learned_policy_admission["trainer_summary"])
     )
+    assert (
+        evidence["inputs"]["checkpoint_selection_outcome"]
+        == (fixture.learned_policy_admission["checkpoint_selection_outcome"])
+    )
+    assert set(evidence["inputs"]["policy_rlinf_source"]) == {
+        "path",
+        "commit",
+        "trainer_source_sha256",
+    }
+    assert set(evidence["inputs"]["policy_evaluation_sha256sums"]) == {
+        "path",
+        "sha256",
+    }
+    assert set(evidence["inputs"]["planner_evaluation_sha256sums"]) == {
+        "path",
+        "sha256",
+    }
+    assert "checkpoint_selection_outcome" not in receipt
     tape = evidence["per_reset"][0]["policy"]["attempt_tape"]
     assert tape["path"] == "tapes/policy-00.npz"
     assert len(tape["sha256"]) == 64
@@ -867,6 +1301,7 @@ def test_promotion_rejects_checkpoint_selection_manifest_reuse(
         evaluation["manifest_seed"] = fixture.config["validation_manifest_seed"]
         evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
         _write_json(evaluation_path, evaluation)
+    fixture._write_evaluation_sha256sums()
 
     with pytest.raises(ValueError, match="checkpoint-selection validation manifest"):
         fixture.build()
@@ -899,9 +1334,186 @@ def test_promotion_requires_evaluator_admission_identity(tmp_path: Path) -> None
     evaluation["learned_policy_admission"]["policy"]["env_steps"] = 0
     evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
     _write_json(fixture.policy_evaluation_path, evaluation)
+    fixture._write_evaluation_sha256sums()
 
     with pytest.raises(ValueError, match="learned-policy admission identity mismatch"):
         fixture.build()
+
+
+@pytest.mark.parametrize(
+    "bundle, mutation",
+    [
+        ("policy", "missing"),
+        ("policy", "tampered"),
+        ("planner", "missing"),
+        ("planner", "tampered"),
+    ],
+)
+def test_promotion_requires_exact_evaluation_sha256sums(
+    tmp_path: Path, bundle: str, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    sums_path = getattr(fixture, f"{bundle}_evaluation_sha256sums_path")
+    if mutation == "missing":
+        sums_path.unlink()
+    else:
+        sums_path.write_bytes(sums_path.read_bytes() + b"f" * 64 + b"  forged\n")
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        fixture.build()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "unsealed",
+        "image_drift",
+        "same_as_base",
+        "root_drift",
+        "manifest_drift",
+    ],
+)
+def test_promotion_requires_bound_source_snapshot_receipt(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    receipt_path = fixture.policy_evaluation_path.parent / "source_snapshot.json"
+    if mutation == "missing":
+        receipt_path.unlink()
+    else:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if mutation == "unsealed":
+            receipt["sources"]["policy_rlinf"]["tree"] = "f" * 40
+        elif mutation == "image_drift":
+            receipt["source_snapshot_image_id"] = "mutable:latest"
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        elif mutation == "same_as_base":
+            receipt["source_snapshot_image_id"] = receipt["base_image_id"]
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        elif mutation == "root_drift":
+            receipt["sources"]["policy_rlinf"]["root"] = "/tmp/forged-policy"
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        else:
+            receipt["source_manifest"]["schema_version"] = "forged-v9"
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        _write_json(receipt_path, receipt)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises(ValueError, match="source snapshot"):
+        fixture.build()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "tampered", "resealed_evaluator_blob", "resealed_base_image"],
+)
+def test_promotion_reopens_bound_source_snapshot_manifest(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    manifest_path = fixture.policy_evaluation_path.parent / "source_manifest.json"
+    receipt_path = fixture.policy_evaluation_path.parent / "source_snapshot.json"
+    if mutation == "missing":
+        manifest_path.unlink()
+    elif mutation == "tampered":
+        manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if mutation == "resealed_evaluator_blob":
+            rows = manifest["sources"]["evaluator_rlinf"]["files"]
+            rows[0]["sha256"] = "f" * 64
+            manifest["sources"]["evaluator_rlinf"]["inventory_sha256"] = (
+                promotion._value_sha256(rows)
+            )
+            receipt["sources"]["evaluator_rlinf"]["inventory_sha256"] = manifest[
+                "sources"
+            ]["evaluator_rlinf"]["inventory_sha256"]
+        else:
+            manifest["base_image_id"] = "sha256:" + "f" * 64
+            receipt["base_image_id"] = manifest["base_image_id"]
+        manifest["payload_sha256"] = promotion._payload_sha256(manifest)
+        _write_json(manifest_path, manifest)
+        receipt["source_manifest"]["sha256"] = promotion._sha256(manifest_path)
+        receipt["source_manifest"]["payload_sha256"] = manifest["payload_sha256"]
+        receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        _write_json(receipt_path, receipt)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises((FileNotFoundError, ValueError), match="source snapshot"):
+        fixture.build()
+
+
+def test_promotion_rejects_formal_evaluator_source_mismatch(tmp_path: Path) -> None:
+    fixture = Fixture(tmp_path)
+    evaluation = json.loads(fixture.policy_evaluation_path.read_text(encoding="utf-8"))
+    evaluation["source_identity"]["evaluator_source"]["sha256"] = "f" * 64
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(fixture.policy_evaluation_path, evaluation)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises(ValueError, match="does not match outcome and evaluation"):
+        fixture.build()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "mutated"])
+def test_promotion_recomputation_rejects_missing_or_mutated_outcome(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    evidence = fixture.build()
+    if mutation == "missing":
+        fixture.checkpoint_selection_outcome_path.unlink()
+    else:
+        fixture.checkpoint_selection_outcome_path.write_bytes(
+            fixture.checkpoint_selection_outcome_path.read_bytes() + b"\n"
+        )
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        promotion.validate_selection_evidence_artifacts(evidence)
+
+
+@pytest.mark.parametrize(
+    "input_name",
+    [
+        "policy_rlinf_source",
+        "policy_evaluation_sha256sums",
+        "planner_evaluation_sha256sums",
+    ],
+)
+def test_promotion_recomputation_rejects_extra_identity_keys(
+    tmp_path: Path, input_name: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    evidence = fixture.build()
+    evidence["inputs"][input_name]["extra"] = True
+    evidence["payload_sha256"] = promotion._payload_sha256(evidence)
+
+    with pytest.raises(ValueError, match="keys do not match its canonical schema"):
+        promotion.validate_selection_evidence_artifacts(evidence)
+
+
+def test_promotion_rejects_resealed_cross_run_or_source_drift_outcome(
+    tmp_path: Path,
+) -> None:
+    first = Fixture(tmp_path / "first")
+    second = Fixture(tmp_path / "second")
+    first.checkpoint_selection_outcome_path.write_bytes(
+        second.checkpoint_selection_outcome_path.read_bytes()
+    )
+    with pytest.raises(ValueError, match="authoritative producer replay"):
+        first.build()
+
+    drift = Fixture(tmp_path / "drift")
+    outcome = json.loads(
+        drift.checkpoint_selection_outcome_path.read_text(encoding="utf-8")
+    )
+    outcome["source_identity"]["verifier_source"]["sha256"] = "f" * 64
+    outcome["payload_sha256"] = promotion._payload_sha256(outcome)
+    _write_json(drift.checkpoint_selection_outcome_path, outcome)
+    with pytest.raises(ValueError, match="authoritative producer replay"):
+        drift.build()
 
 
 def test_every_evaluator_tape_is_sent_to_the_canonical_auditor(
@@ -917,8 +1529,20 @@ def test_every_evaluator_tape_is_sent_to_the_canonical_auditor(
     fixture.build()
 
     assert calls == [
-        (tmp_path.resolve(), optimal_auditor.ATTEMPT_SCHEMA, TASK)
-        for _ in range(2 * promotion.RESET_COUNT)
+        call
+        for _ in range(promotion.RESET_COUNT)
+        for call in (
+            (
+                fixture.policy_evaluation_path.parent.resolve(),
+                optimal_auditor.ATTEMPT_SCHEMA,
+                TASK,
+            ),
+            (
+                fixture.planner_evaluation_path.parent.resolve(),
+                optimal_auditor.ATTEMPT_SCHEMA,
+                TASK,
+            ),
+        )
     ]
 
 
@@ -996,10 +1620,13 @@ def test_t5_causal_latency_can_supply_the_required_strict_improvement(
 
 def test_tampered_attempt_tape_fails_before_selection(tmp_path: Path) -> None:
     fixture = Fixture(tmp_path)
-    tape_path = fixture.root / fixture.policy_records[0]["attempt_tape"]
+    tape_path = (
+        fixture.policy_evaluation_path.parent
+        / fixture.policy_records[0]["attempt_tape"]
+    )
     tape_path.write_bytes(tape_path.read_bytes() + b"tamper")
 
-    with pytest.raises(ValueError, match="attempt tape.*SHA-256 mismatch"):
+    with pytest.raises(ValueError, match="SHA256SUMS exact inventory mismatch"):
         fixture.build()
 
 
@@ -1134,7 +1761,7 @@ def test_safety_and_success_regressions_seal_keep_planner_decisions(
             policy_path=str(regression.policy_path.resolve()),
             policy_sha256=regression.policy_sha,
             residual_scale=float(regression.config["residual_scale"]),
-            rlinf_commit=RLINF_COMMIT,
+            rlinf_commit=regression.rlinf_commit,
             benchmark_commit=BENCHMARK_COMMIT,
             threshold_schema=promotion.QUALITY_V2_THRESHOLD_SCHEMA,
             threshold_sha256=regression.threshold_sha,
@@ -1143,7 +1770,7 @@ def test_safety_and_success_regressions_seal_keep_planner_decisions(
                 "file_sha256": regression.calibration_receipt_sha,
                 "payload_sha256": regression.calibration_receipt_sha,
             },
-            evaluator_rlinf_commit=EVALUATOR_COMMIT,
+            evaluator_rlinf_commit=regression.evaluator_commit,
             evaluator_source_sha256=promotion._sha256(
                 regression.policy_evaluator_source
             ),
@@ -1209,6 +1836,7 @@ def test_malformed_nonfinite_and_replay_evidence_still_throws(
     evaluation["all_successful_quality_v2_gates_passed"] = False
     evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
     _write_json(aggregate.policy_evaluation_path, evaluation)
+    aggregate._write_evaluation_sha256sums()
     with pytest.raises(ValueError, match="aggregate disagrees"):
         aggregate.build()
 
@@ -1329,8 +1957,18 @@ def test_missing_or_tampered_evidence_evaluation_reset_and_sha_fail_closed(
             policy_path=fixture.policy_path,
             policy_metadata_path=fixture.metadata_path,
             checkpoint_selection_path=fixture.checkpoint_selection_path,
+            checkpoint_selection_outcome_path=(
+                fixture.checkpoint_selection_outcome_path
+            ),
+            policy_rlinf_source_root=fixture.policy_source_root,
             policy_evaluation_path=fixture.policy_evaluation_path,
+            policy_evaluation_sha256sums_path=(
+                fixture.policy_evaluation_sha256sums_path
+            ),
             planner_evaluation_path=fixture.planner_evaluation_path,
+            planner_evaluation_sha256sums_path=(
+                fixture.planner_evaluation_sha256sums_path
+            ),
             reset_manifest_path=fixture.reset_path,
             quality_v2_thresholds_path=fixture.threshold_path,
             quality_v2_calibration_wave_receipt_path=(fixture.calibration_receipt_path),
@@ -1403,6 +2041,7 @@ def test_zero_step_final_and_test_exposure_are_rejected(tmp_path: Path) -> None:
     evaluation["split"] = "test_id"
     evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
     _write_json(exposed.policy_evaluation_path, evaluation)
+    exposed._write_evaluation_sha256sums()
     with pytest.raises(ValueError, match="validation split"):
         exposed.build()
 
@@ -1413,6 +2052,7 @@ def test_zero_step_final_and_test_exposure_are_rejected(tmp_path: Path) -> None:
     evaluation["manifest_seed"] = promotion.CALIBRATION_MANIFEST_SEED
     evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
     _write_json(calibration.policy_evaluation_path, evaluation)
+    calibration._write_evaluation_sha256sums()
     with pytest.raises(ValueError, match="review/calibration/test manifest seed"):
         calibration.build()
 
