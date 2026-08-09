@@ -109,7 +109,14 @@ def _canonical_gpu_uuid(value: str) -> str:
 def _torch_device_identity(torch: Any, device: Any) -> tuple[str, str]:
     properties = torch.cuda.get_device_properties(device)
     try:
-        uuid = _canonical_gpu_uuid(str(properties.uuid))
+        raw_uuid = str(properties.uuid)
+        # PyTorch 2.12 exposes ``_CUuuid`` as the RFC-4122 payload without
+        # NVIDIA's ``GPU-`` prefix, while CUDA_VISIBLE_DEVICES and NVML use the
+        # prefixed spelling.  Add only that fixed namespace prefix, then pass
+        # through the same strict canonical parser used for every other source.
+        if not raw_uuid.startswith("GPU-"):
+            raw_uuid = f"GPU-{raw_uuid}"
+        uuid = _canonical_gpu_uuid(raw_uuid)
         pci_bus_id = _canonical_pci_bus_id(
             f"{int(properties.pci_domain_id):08x}:"
             f"{int(properties.pci_bus_id):02x}:"

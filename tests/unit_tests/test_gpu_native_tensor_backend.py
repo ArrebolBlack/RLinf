@@ -180,7 +180,8 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, _FakeEnv, _Dev
             device=selected,
         ),
         get_device_properties=lambda selected: SimpleNamespace(
-            uuid=_GPU_UUID,
+            # PyTorch 2.12 ``str(_CUuuid)`` omits NVML's ``GPU-`` prefix.
+            uuid=_GPU_UUID.removeprefix("GPU-"),
             pci_domain_id=0,
             pci_bus_id=0x17,
             pci_device_id=0,
