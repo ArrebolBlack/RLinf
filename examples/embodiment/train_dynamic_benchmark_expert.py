@@ -29,6 +29,7 @@ import json
 import math
 import os
 import random
+import shutil
 import signal
 import sys
 import time
@@ -45,6 +46,16 @@ from torch.distributions import Normal
 
 if TYPE_CHECKING:
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+
+
+_CHECKPOINT_SELECTION_SCHEMA = "rlinf-dynamic-benchmark-checkpoint-selection-v0.1"
+_CHECKPOINT_SELECTION_STATE_SCHEMA = (
+    "rlinf-dynamic-benchmark-checkpoint-selection-state-v0.1"
+)
+_SAFETY_CEILING_TOLERANCE = 1e-12
+_MATCHED_PLANNER_BASELINE_SOURCE = (
+    "initial_exact_zero_residual_policy_on_validation_resets"
+)
 
 
 @dataclass(frozen=True)
@@ -857,6 +868,31 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_json_sha256(payload: Any) -> str:
+    rendered = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _config_artifact_identity(
+    config_path: Path, config_payload: Mapping[str, Any]
+) -> dict[str, str]:
+    """Bind both the canonical config contract and its rendered local artifact."""
+
+    if json.loads(config_path.read_text(encoding="utf-8")) != dict(config_payload):
+        raise ValueError("rendered training config does not match the resolved payload")
+    return {
+        # Promotion recomputes this identity from the policy's embedded config.
+        "config_sha256": _canonical_json_sha256(config_payload),
+        # Keep the pretty JSON file identity separately for local artifact audits.
+        "config_file_sha256": _file_sha256(config_path),
+    }
+
+
 class PhaseTimings:
     """Accumulate phase wall times without making logging cadence part of training."""
 
@@ -1343,8 +1379,7 @@ def _build_evaluation_environment(
     )
     teachers = (
         _make_planner_teachers(config.task, env)
-        if config.algorithm == "residual_rlpd"
-        and not config.eval_planner_in_processes
+        if config.algorithm == "residual_rlpd" and not config.eval_planner_in_processes
         else None
     )
     return env, teachers
@@ -1380,9 +1415,9 @@ def _rewind_evaluation_environment(
     if checkpoint_identity != expected_identity:
         raise ValueError("evaluation rewind checkpoint identity does not match env")
     identity_sha256 = hashlib.sha256(
-        json.dumps(
-            checkpoint_identity, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        json.dumps(checkpoint_identity, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     ).hexdigest()
     if identity_sha256 != initial_checkpoint["identity_sha256"]:
         raise ValueError("evaluation rewind checkpoint identity hash mismatch")
@@ -1513,7 +1548,9 @@ class _BorrowedEvaluationRuntime:
         if restored is None or self.training_observation is None:
             raise RuntimeError("borrowed evaluation lost the training observation")
         if not torch.equal(restored["states"], self.training_observation):
-            raise RuntimeError("borrowed evaluation training observation restore diverged")
+            raise RuntimeError(
+                "borrowed evaluation training observation restore diverged"
+            )
         if self.training_teachers is not None:
             if self.training_teacher_snapshot is None:
                 raise RuntimeError("borrowed evaluation lost training planner state")
@@ -1540,7 +1577,9 @@ class _BorrowedEvaluationRuntime:
         if current is None:
             self.training_checkpoint = None
             self.training_manifest_cache = None
-            raise RuntimeError("borrowed evaluation requires initialized training state")
+            raise RuntimeError(
+                "borrowed evaluation requires initialized training state"
+            )
         self.training_observation = current["states"].clone()
         self.training_teacher_snapshot = (
             copy.deepcopy(self.training_teachers)
@@ -1554,7 +1593,9 @@ class _BorrowedEvaluationRuntime:
                 config.validation_manifest_seed + self.env.seed_offset * 1_000_003
             )
             manifest_context_start = time.perf_counter()
-            self.validation_manifest_cache_hit = self.validation_manifest_cache is not None
+            self.validation_manifest_cache_hit = (
+                self.validation_manifest_cache is not None
+            )
             if self.validation_manifest_cache is None:
                 self.env.set_manifest_context(
                     split_name="validation",
@@ -1836,6 +1877,17 @@ def _score(metrics: dict[str, Any]) -> tuple[float, ...]:
     )
 
 
+def _make_exact_zero_residual_policy(model: MLPPolicy) -> None:
+    """Project the deterministic residual actor to the exact planner policy."""
+
+    parameters = list(model.actor_mean.parameters())
+    if not parameters:
+        raise RuntimeError("residual actor mean has no trainable parameters")
+    with torch.no_grad():
+        for parameter in parameters:
+            parameter.zero_()
+
+
 def _parameter_groups(
     model: MLPPolicy,
 ) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -2089,6 +2141,560 @@ def _save_policy(
     os.replace(temporary, path)
 
 
+def _checkpoint_selection_run_identity(
+    config: TrainConfig,
+    state_schema: dict[str, Any],
+    config_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "rlinf-dynamic-benchmark-checkpoint-selection-run-v0.1",
+        "task": config.task,
+        "algorithm": config.algorithm,
+        "rlinf_commit": config.rlinf_commit,
+        "benchmark_commit": config.benchmark_commit,
+        "seed": config.seed,
+        "validation_manifest_seed": config.validation_manifest_seed,
+        "eval_episodes": config.eval_episodes,
+        "eval_num_envs": config.eval_num_envs,
+        "config_sha256": config_sha256,
+        "config_payload_sha256": _canonical_json_sha256(asdict(config)),
+        "state_schema_sha256": _canonical_json_sha256(state_schema),
+    }
+
+
+def _checkpoint_selector_contract() -> dict[str, Any]:
+    return {
+        "name": "matched_planner_safety_first_lexicographic",
+        "safety_ceiling_tolerance": _SAFETY_CEILING_TOLERANCE,
+        "eligible_order": [
+            "higher_success_rate",
+            "lower_safety_failure_rate",
+            "higher_mean_completion",
+            "higher_mean_return",
+            "lower_mean_duration_steps",
+            "lower_mean_action_l2_sum",
+            "earlier_evaluation_on_exact_tie",
+        ],
+        "env_steps_zero_is_learned_candidate": False,
+    }
+
+
+def _validate_checkpoint_selection_metrics(metrics: Mapping[str, Any]) -> None:
+    required = (
+        "success_rate",
+        "safety_failure_rate",
+        "mean_completion",
+        "mean_return",
+        "mean_duration_steps",
+        "mean_action_l2_sum",
+    )
+    for name in required:
+        if name not in metrics:
+            raise ValueError(f"checkpoint-selection metrics are missing {name}")
+        value = float(metrics[name])
+        if not math.isfinite(value):
+            raise ValueError(f"checkpoint-selection metric {name} must be finite")
+    for name in ("success_rate", "safety_failure_rate", "mean_completion"):
+        value = float(metrics[name])
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"checkpoint-selection metric {name} must be in [0, 1]")
+    # This also rejects non-JSON values and NaNs elsewhere in the evidence payload.
+    _canonical_json_sha256(metrics)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    shutil.copyfile(source, temporary)
+    if _file_sha256(temporary) != _file_sha256(source):
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("atomic policy copy changed artifact bytes")
+    os.replace(temporary, destination)
+
+
+class _CheckpointSelectionLedger:
+    """Fail-closed, safety-first selection over immutable policy snapshots."""
+
+    def __init__(
+        self,
+        output: Path,
+        run_identity: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> None:
+        self.output = output.resolve()
+        self.run_identity = copy.deepcopy(run_identity)
+        self.manifest_path = self.output / "checkpoint_selection.json"
+        self.manifest = manifest
+
+    @staticmethod
+    def _relative_path(output: Path, path: Path) -> str:
+        resolved_output = output.resolve()
+        resolved_path = path.resolve()
+        try:
+            relative = resolved_path.relative_to(resolved_output)
+        except ValueError as exc:
+            raise ValueError(
+                "checkpoint-selection artifact escapes output directory"
+            ) from exc
+        rendered = relative.as_posix()
+        if not rendered or rendered.startswith("../"):
+            raise ValueError("checkpoint-selection artifact path is not canonical")
+        return rendered
+
+    def _resolve_path(self, relative_path: str) -> Path:
+        if not isinstance(relative_path, str) or "\\" in relative_path:
+            raise ValueError("checkpoint-selection artifact path is not canonical")
+        relative = Path(relative_path)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() != relative_path
+        ):
+            raise ValueError("checkpoint-selection artifact path is not canonical")
+        resolved = (self.output / relative).resolve()
+        try:
+            resolved.relative_to(self.output)
+        except ValueError as exc:
+            raise ValueError(
+                "checkpoint-selection artifact escapes output directory"
+            ) from exc
+        return resolved
+
+    def _policy_identity(
+        self,
+        path: Path,
+        *,
+        expected_env_steps: int,
+        expected_metrics: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not path.is_file():
+            raise ValueError(f"checkpoint-selection policy is missing: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if (
+            payload.get("schema_version")
+            != "rlinf-dynamic-benchmark-expert-policy-v0.1"
+        ):
+            raise ValueError("checkpoint-selection policy schema does not match")
+        if int(payload.get("env_steps", -1)) != expected_env_steps:
+            raise ValueError("checkpoint-selection policy env_steps do not match")
+        metrics_sha256 = _canonical_json_sha256(expected_metrics)
+        if _canonical_json_sha256(payload.get("validation")) != metrics_sha256:
+            raise ValueError(
+                "checkpoint-selection policy validation metrics do not match"
+            )
+        if (
+            _canonical_json_sha256(payload.get("config"))
+            != self.run_identity["config_payload_sha256"]
+        ):
+            raise ValueError(
+                "checkpoint-selection policy config identity does not match"
+            )
+        if (
+            _canonical_json_sha256(payload.get("state_schema"))
+            != self.run_identity["state_schema_sha256"]
+        ):
+            raise ValueError("checkpoint-selection policy state schema does not match")
+        return {
+            "path": self._relative_path(self.output, path),
+            "sha256": _file_sha256(path),
+            "env_steps": expected_env_steps,
+            "validation_metrics_sha256": metrics_sha256,
+            "config_payload_sha256": self.run_identity["config_payload_sha256"],
+            "state_schema_sha256": self.run_identity["state_schema_sha256"],
+        }
+
+    @staticmethod
+    def _snapshot_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+        policy = row["policy"]
+        return {
+            "env_steps": int(row["env_steps"]),
+            "policy_path": policy["path"],
+            "policy_sha256": policy["sha256"],
+            "validation_metrics_sha256": row["validation_metrics_sha256"],
+        }
+
+    @staticmethod
+    def _selected_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        selected = None
+        for row in rows:
+            if not row["eligible"]:
+                continue
+            if selected is None or tuple(row["selection_score"]) > tuple(
+                selected["selection_score"]
+            ):
+                selected = row
+        return selected
+
+    @classmethod
+    def create(
+        cls,
+        output: Path,
+        run_identity: dict[str, Any],
+        planner_metrics: dict[str, Any],
+        initial_policy_path: Path,
+    ) -> _CheckpointSelectionLedger:
+        if run_identity.get("algorithm") != "residual_rlpd":
+            raise ValueError("matched-planner selection requires residual_rlpd")
+        _validate_checkpoint_selection_metrics(planner_metrics)
+        output = output.resolve()
+        manifest_path = output / "checkpoint_selection.json"
+        if manifest_path.exists():
+            raise FileExistsError("checkpoint-selection manifest already exists")
+        ledger = cls(output, run_identity, {})
+        baseline_policy = ledger._policy_identity(
+            initial_policy_path,
+            expected_env_steps=0,
+            expected_metrics=planner_metrics,
+        )
+        safety_ceiling = float(planner_metrics["safety_failure_rate"])
+        ledger.manifest = {
+            "schema_version": _CHECKPOINT_SELECTION_SCHEMA,
+            "selector": _checkpoint_selector_contract(),
+            "run_identity": copy.deepcopy(run_identity),
+            "matched_planner_baseline": {
+                "source": _MATCHED_PLANNER_BASELINE_SOURCE,
+                "safety_failure_rate_ceiling": safety_ceiling,
+                "validation_metrics": copy.deepcopy(planner_metrics),
+                "validation_metrics_sha256": _canonical_json_sha256(planner_metrics),
+                "policy": baseline_policy,
+            },
+            "evaluated_snapshots": [],
+            "selection": {
+                "status": "planner_fallback_no_eligible",
+                "eligible_snapshot_count": 0,
+                "selected_snapshot_identity": None,
+                "best_policy": None,
+                "planner_fallback_policy": baseline_policy,
+            },
+        }
+        best_path = output / "best_policy.pt"
+        if best_path.exists():
+            raise ValueError("best_policy.pt exists before any eligible snapshot")
+        ledger._write_manifest()
+        return ledger
+
+    @classmethod
+    def resume(
+        cls,
+        output: Path,
+        expected_run_identity: dict[str, Any],
+        checkpoint_state: Mapping[str, Any],
+    ) -> _CheckpointSelectionLedger:
+        manifest_path = output.resolve() / "checkpoint_selection.json"
+        if not manifest_path.is_file():
+            raise ValueError("residual resume is missing checkpoint-selection manifest")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        ledger = cls(output, expected_run_identity, manifest)
+        ledger._verify_manifest()
+        if checkpoint_state != ledger.checkpoint_state():
+            raise ValueError(
+                "trainer checkpoint and checkpoint-selection manifest identities diverged"
+            )
+        return ledger
+
+    def _write_manifest(self) -> None:
+        payload = copy.deepcopy(self.manifest)
+        payload.pop("payload_sha256", None)
+        payload["payload_sha256"] = _canonical_json_sha256(payload)
+        _atomic_json(self.manifest_path, payload)
+        self.manifest = payload
+
+    def _expected_selection(self) -> dict[str, Any]:
+        rows = self.manifest["evaluated_snapshots"]
+        eligible_count = sum(bool(row["eligible"]) for row in rows)
+        selected = self._selected_row(rows)
+        fallback = self.manifest["matched_planner_baseline"]["policy"]
+        if selected is None:
+            return {
+                "status": "planner_fallback_no_eligible",
+                "eligible_snapshot_count": eligible_count,
+                "selected_snapshot_identity": None,
+                "best_policy": None,
+                "planner_fallback_policy": fallback,
+            }
+        snapshot_identity = self._snapshot_identity(selected)
+        return {
+            "status": "selected_eligible_snapshot",
+            "eligible_snapshot_count": eligible_count,
+            "selected_snapshot_identity": snapshot_identity,
+            "best_policy": {
+                **selected["policy"],
+                "path": "best_policy.pt",
+            },
+            "planner_fallback_policy": fallback,
+        }
+
+    def _refresh_selection_and_write(self) -> None:
+        selected = self._selected_row(self.manifest["evaluated_snapshots"])
+        for row in self.manifest["evaluated_snapshots"]:
+            row["selected"] = row is selected
+        expected_selection = self._expected_selection()
+        if selected is None:
+            if (self.output / "best_policy.pt").exists():
+                raise ValueError("best_policy.pt exists without an eligible snapshot")
+        else:
+            source = self._resolve_path(selected["policy"]["path"])
+            _atomic_copy(source, self.output / "best_policy.pt")
+            if (
+                _file_sha256(self.output / "best_policy.pt")
+                != selected["policy"]["sha256"]
+            ):
+                raise RuntimeError("best_policy.pt does not match selected snapshot")
+        self.manifest["selection"] = expected_selection
+        self._write_manifest()
+
+    def capture(
+        self,
+        config: TrainConfig,
+        model: MLPPolicy,
+        normalizer: RunningNormalizer,
+        state_schema: dict[str, Any],
+        metrics: dict[str, Any],
+        env_steps: int,
+    ) -> dict[str, Any]:
+        if env_steps <= 0:
+            raise ValueError("learned checkpoint snapshots require env_steps > 0")
+        _validate_checkpoint_selection_metrics(metrics)
+        existing = [
+            row
+            for row in self.manifest["evaluated_snapshots"]
+            if int(row["env_steps"]) == env_steps
+        ]
+        if existing:
+            row = existing[0]
+            if row["validation_metrics_sha256"] != _canonical_json_sha256(metrics):
+                raise ValueError(
+                    "repeated evaluation step changed its metrics identity"
+                )
+            self._verify_snapshot_row(row)
+            return copy.deepcopy(row)
+        snapshots_dir = self.output / "policy_snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshots_dir / f"policy_step_{env_steps:012d}.pt"
+        if snapshot_path.exists():
+            raise ValueError("untracked policy snapshot already exists for env_steps")
+        _save_policy(
+            snapshot_path,
+            config,
+            model,
+            normalizer,
+            state_schema,
+            metrics,
+            env_steps,
+        )
+        return self.record_existing_snapshot(snapshot_path, metrics, env_steps)
+
+    def record_existing_snapshot(
+        self,
+        snapshot_path: Path,
+        metrics: dict[str, Any],
+        env_steps: int,
+    ) -> dict[str, Any]:
+        if env_steps <= 0:
+            raise ValueError("learned checkpoint snapshots require env_steps > 0")
+        if any(
+            int(row["env_steps"]) == env_steps
+            for row in self.manifest["evaluated_snapshots"]
+        ):
+            raise ValueError("checkpoint-selection env_steps must be unique")
+        _validate_checkpoint_selection_metrics(metrics)
+        expected_name = f"policy_snapshots/policy_step_{env_steps:012d}.pt"
+        if self._relative_path(self.output, snapshot_path) != expected_name:
+            raise ValueError("policy snapshot path is not canonical for env_steps")
+        policy = self._policy_identity(
+            snapshot_path,
+            expected_env_steps=env_steps,
+            expected_metrics=metrics,
+        )
+        ceiling = float(
+            self.manifest["matched_planner_baseline"]["safety_failure_rate_ceiling"]
+        )
+        safety_rate = float(metrics["safety_failure_rate"])
+        eligible = safety_rate <= ceiling + _SAFETY_CEILING_TOLERANCE
+        row = {
+            "env_steps": env_steps,
+            "policy": policy,
+            "validation_metrics": copy.deepcopy(metrics),
+            "validation_metrics_sha256": _canonical_json_sha256(metrics),
+            "eligible": eligible,
+            "eligibility_reason": (
+                "safety_within_matched_planner_ceiling"
+                if eligible
+                else "safety_failure_rate_exceeds_matched_planner_ceiling"
+            ),
+            "selection_score": list(_score(metrics)),
+            "selected": False,
+        }
+        rows = self.manifest["evaluated_snapshots"]
+        if rows and env_steps <= int(rows[-1]["env_steps"]):
+            raise ValueError(
+                "checkpoint-selection env_steps must increase monotonically"
+            )
+        rows.append(row)
+        self._refresh_selection_and_write()
+        return copy.deepcopy(row)
+
+    def _verify_snapshot_row(self, row: Mapping[str, Any]) -> None:
+        env_steps = int(row["env_steps"])
+        if env_steps <= 0:
+            raise ValueError("checkpoint-selection contains an env_steps=0 candidate")
+        metrics = row["validation_metrics"]
+        _validate_checkpoint_selection_metrics(metrics)
+        if row["validation_metrics_sha256"] != _canonical_json_sha256(metrics):
+            raise ValueError("checkpoint-selection metrics identity was tampered")
+        expected_path = f"policy_snapshots/policy_step_{env_steps:012d}.pt"
+        if row["policy"].get("path") != expected_path:
+            raise ValueError("checkpoint-selection snapshot path is not canonical")
+        observed_policy = self._policy_identity(
+            self._resolve_path(expected_path),
+            expected_env_steps=env_steps,
+            expected_metrics=metrics,
+        )
+        if row["policy"] != observed_policy:
+            raise ValueError("checkpoint-selection snapshot identity was tampered")
+        ceiling = float(
+            self.manifest["matched_planner_baseline"]["safety_failure_rate_ceiling"]
+        )
+        eligible = (
+            float(metrics["safety_failure_rate"]) <= ceiling + _SAFETY_CEILING_TOLERANCE
+        )
+        if bool(row["eligible"]) != eligible:
+            raise ValueError("checkpoint-selection eligibility was tampered")
+        expected_reason = (
+            "safety_within_matched_planner_ceiling"
+            if eligible
+            else "safety_failure_rate_exceeds_matched_planner_ceiling"
+        )
+        if row["eligibility_reason"] != expected_reason:
+            raise ValueError("checkpoint-selection eligibility reason was tampered")
+        if list(row["selection_score"]) != list(_score(metrics)):
+            raise ValueError("checkpoint-selection score was tampered")
+
+    def _verify_manifest(self) -> None:
+        payload = copy.deepcopy(self.manifest)
+        payload_sha256 = payload.pop("payload_sha256", None)
+        if payload_sha256 != _canonical_json_sha256(payload):
+            raise ValueError("checkpoint-selection manifest payload hash mismatch")
+        if self.manifest.get("schema_version") != _CHECKPOINT_SELECTION_SCHEMA:
+            raise ValueError("checkpoint-selection manifest schema does not match")
+        if self.manifest.get("run_identity") != self.run_identity:
+            raise ValueError("checkpoint-selection run identity does not match")
+        if self.manifest.get("selector") != _checkpoint_selector_contract():
+            raise ValueError("checkpoint-selection selector contract does not match")
+        baseline = self.manifest.get("matched_planner_baseline")
+        if not isinstance(baseline, dict):
+            raise ValueError("checkpoint-selection planner baseline is missing")
+        if baseline.get("source") != _MATCHED_PLANNER_BASELINE_SOURCE:
+            raise ValueError("checkpoint-selection planner source does not match")
+        metrics = baseline.get("validation_metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError("checkpoint-selection planner metrics are missing")
+        _validate_checkpoint_selection_metrics(metrics)
+        metrics_sha256 = _canonical_json_sha256(metrics)
+        if baseline.get("validation_metrics_sha256") != metrics_sha256:
+            raise ValueError("checkpoint-selection planner metrics were tampered")
+        if float(baseline.get("safety_failure_rate_ceiling", -1.0)) != float(
+            metrics["safety_failure_rate"]
+        ):
+            raise ValueError("checkpoint-selection planner ceiling was tampered")
+        baseline_policy = self._policy_identity(
+            self._resolve_path(baseline["policy"]["path"]),
+            expected_env_steps=0,
+            expected_metrics=metrics,
+        )
+        if baseline.get("policy") != baseline_policy:
+            raise ValueError("checkpoint-selection planner policy was tampered")
+        rows = self.manifest.get("evaluated_snapshots")
+        if not isinstance(rows, list):
+            raise ValueError("checkpoint-selection snapshot ledger is missing")
+        prior_step = 0
+        expected_paths = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("checkpoint-selection snapshot row is invalid")
+            env_steps = int(row["env_steps"])
+            if env_steps <= prior_step:
+                raise ValueError(
+                    "checkpoint-selection steps are not strictly increasing"
+                )
+            prior_step = env_steps
+            self._verify_snapshot_row(row)
+            expected_paths.add(row["policy"]["path"])
+        snapshots_dir = self.output / "policy_snapshots"
+        observed_paths = (
+            {
+                self._relative_path(self.output, path)
+                for path in snapshots_dir.glob("*.pt")
+                if path.is_file()
+            }
+            if snapshots_dir.is_dir()
+            else set()
+        )
+        if observed_paths != expected_paths:
+            raise ValueError(
+                "checkpoint-selection snapshot directory has untracked artifacts"
+            )
+        selected = self._selected_row(rows)
+        for row in rows:
+            if bool(row.get("selected")) != (row is selected):
+                raise ValueError("checkpoint-selection selected marker was tampered")
+        expected_selection = self._expected_selection()
+        if self.manifest.get("selection") != expected_selection:
+            raise ValueError("checkpoint-selection result was tampered")
+        best_path = self.output / "best_policy.pt"
+        if selected is None:
+            if best_path.exists():
+                raise ValueError("best_policy.pt exists without an eligible snapshot")
+        else:
+            best_identity = self._policy_identity(
+                best_path,
+                expected_env_steps=int(selected["env_steps"]),
+                expected_metrics=selected["validation_metrics"],
+            )
+            if best_identity != expected_selection["best_policy"]:
+                raise ValueError("best_policy.pt does not match selected snapshot")
+
+    @property
+    def best_score(self) -> tuple[float, ...] | None:
+        selected = self._selected_row(self.manifest["evaluated_snapshots"])
+        return None if selected is None else tuple(selected["selection_score"])
+
+    @property
+    def best_metrics(self) -> dict[str, Any] | None:
+        selected = self._selected_row(self.manifest["evaluated_snapshots"])
+        return (
+            None if selected is None else copy.deepcopy(selected["validation_metrics"])
+        )
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        return {
+            "schema_version": _CHECKPOINT_SELECTION_STATE_SCHEMA,
+            "manifest_payload_sha256": self.manifest["payload_sha256"],
+            "evaluated_snapshot_identities": [
+                self._snapshot_identity(row)
+                for row in self.manifest["evaluated_snapshots"]
+            ],
+            "selected_snapshot_identity": self.manifest["selection"][
+                "selected_snapshot_identity"
+            ],
+        }
+
+    def summary_reference(self) -> dict[str, Any]:
+        return {
+            "manifest_path": "checkpoint_selection.json",
+            "manifest_payload_sha256": self.manifest["payload_sha256"],
+            "status": self.manifest["selection"]["status"],
+            "eligible_snapshot_count": self.manifest["selection"][
+                "eligible_snapshot_count"
+            ],
+            "selected_snapshot_identity": self.manifest["selection"][
+                "selected_snapshot_identity"
+            ],
+            "planner_fallback_policy": self.manifest["selection"][
+                "planner_fallback_policy"
+            ],
+        }
+
+
 def main() -> None:
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
@@ -2121,7 +2727,9 @@ def main() -> None:
     heartbeat_path = args.output / "heartbeat.json"
     config_path = args.output / "config.json"
     _atomic_json(config_path, asdict(config))
-    config_sha256 = _file_sha256(config_path)
+    config_identity = _config_artifact_identity(config_path, asdict(config))
+    config_file_sha256 = config_identity["config_file_sha256"]
+    config_payload_sha256 = config_identity["config_sha256"]
     sampler_contract = {
         "mode": "overlap" if config.sampler_learner_overlap else "synchronous",
         "max_inflight_vector_steps": 1 if config.sampler_learner_overlap else 0,
@@ -2135,7 +2743,8 @@ def main() -> None:
         metrics_path,
         {
             "event": "run_start",
-            "config_sha256": config_sha256,
+            "config_sha256": config_payload_sha256,
+            "config_file_sha256": config_file_sha256,
             "pid": os.getpid(),
             "replay_storage": config.replay_storage,
             "non_blocking_copy": config.non_blocking_copy,
@@ -2185,6 +2794,11 @@ def main() -> None:
         raise RuntimeError("training environment did not initialize its state")
     state_schema = env.state_schema
     state_dim = int(state_schema["state_dim"])
+    checkpoint_selection_run_identity = _checkpoint_selection_run_identity(
+        config,
+        state_schema,
+        config_file_sha256,
+    )
     normalizer = RunningNormalizer(state_dim, int(state_schema["mask_dim"]))
     demos = TransitionReplay(
         config.replay_capacity,
@@ -2241,6 +2855,7 @@ def main() -> None:
     last_validation: dict[str, Any] | None = None
     last_validation_env_steps = -1
     training_teachers: list[Any] | None = None
+    checkpoint_selection: _CheckpointSelectionLedger | None = None
     phase_timings = PhaseTimings()
     start_time = time.monotonic()
     evaluation_runtime: _EvaluationRuntime | _BorrowedEvaluationRuntime | None
@@ -2264,7 +2879,7 @@ def main() -> None:
 
     def checkpoint(path: Path) -> None:
         state = {
-            "schema_version": "rlinf-dynamic-benchmark-trainer-checkpoint-v0.1",
+            "schema_version": "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2",
             "config": asdict(config),
             "state_schema": state_schema,
             "model": model.state_dict(),
@@ -2290,6 +2905,11 @@ def main() -> None:
             "last_validation_env_steps": last_validation_env_steps,
             "planner_teachers": training_teachers,
             "phase_timings": phase_timings.state_dict(),
+            "checkpoint_selection": (
+                checkpoint_selection.checkpoint_state()
+                if checkpoint_selection is not None
+                else None
+            ),
             "rng": _rng_state(),
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -2298,9 +2918,23 @@ def main() -> None:
 
     if args.resume is not None:
         restored = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if not _configs_equal(restored["config"], asdict(config)) or restored[
-            "state_schema"
-        ] != state_schema:
+        if restored.get("schema_version") not in {
+            "rlinf-dynamic-benchmark-trainer-checkpoint-v0.1",
+            "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2",
+        }:
+            raise ValueError("resume trainer checkpoint schema does not match")
+        if (
+            config.algorithm == "residual_rlpd"
+            and restored.get("schema_version")
+            != "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2"
+        ):
+            raise ValueError(
+                "residual resume predates fail-closed checkpoint selection"
+            )
+        if (
+            not _configs_equal(restored["config"], asdict(config))
+            or restored["state_schema"] != state_schema
+        ):
             raise ValueError("resume config/state schema does not match current run")
         model.load_state_dict(restored["model"])
         target_q.load_state_dict(restored["target_q"])
@@ -2336,6 +2970,37 @@ def main() -> None:
                 "non-residual checkpoint unexpectedly contains planner state"
             )
         _restore_rng(restored["rng"])
+        restored_selection = restored.get("checkpoint_selection")
+        if config.algorithm == "residual_rlpd":
+            if not isinstance(restored_selection, dict):
+                raise ValueError(
+                    "residual resume is missing checkpoint-selection identity"
+                )
+            checkpoint_selection = _CheckpointSelectionLedger.resume(
+                args.output,
+                checkpoint_selection_run_identity,
+                restored_selection,
+            )
+            selected_score = checkpoint_selection.best_score
+            restored_score = (
+                None
+                if best_score is None
+                else tuple(float(value) for value in best_score)
+            )
+            if restored_score != selected_score:
+                raise ValueError(
+                    "resume best_score diverges from checkpoint-selection manifest"
+                )
+            if best_metrics != checkpoint_selection.best_metrics:
+                raise ValueError(
+                    "resume best_metrics diverge from checkpoint-selection manifest"
+                )
+            best_score = selected_score
+            best_metrics = checkpoint_selection.best_metrics
+        elif restored_selection is not None:
+            raise ValueError(
+                "non-residual resume unexpectedly contains checkpoint selection"
+            )
         _append_jsonl(metrics_path, {"event": "resume", "env_steps": global_env_steps})
     else:
         demo_summary = None
@@ -2381,6 +3046,11 @@ def main() -> None:
                 # the residual MDP treats the same planner transitions as action zero.
                 demos.actions[: demos.size].zero_()
         normalizer.update(obs["states"])
+        if config.algorithm == "residual_rlpd":
+            # Start BC from the exact residual target. The residual BC loss is then
+            # identically zero, leaving a coherent zero-moment optimizer state and
+            # an actor whose deterministic action is exactly the planner policy.
+            _make_exact_zero_residual_policy(model)
         _bc_warm_start(
             config,
             model,
@@ -2398,12 +3068,11 @@ def main() -> None:
         # masquerade as the learned checkpoint selected for review.
         best_score = _score(initial_validation) if config.algorithm == "bc" else None
         best_metrics = initial_validation if config.algorithm == "bc" else None
-        _append_jsonl(
-            metrics_path,
-            {"event": "validation", "env_steps": 0, **initial_validation},
+        initial_policy_path = args.output / (
+            "best_policy.pt" if config.algorithm == "bc" else "initial_policy.pt"
         )
         _save_policy(
-            args.output / ("best_policy.pt" if config.algorithm == "bc" else "initial_policy.pt"),
+            initial_policy_path,
             config,
             model,
             normalizer,
@@ -2411,6 +3080,26 @@ def main() -> None:
             initial_validation,
             0,
         )
+        validation_event = {
+            "event": "validation",
+            "env_steps": 0,
+            **initial_validation,
+        }
+        if config.algorithm == "residual_rlpd":
+            checkpoint_selection = _CheckpointSelectionLedger.create(
+                args.output,
+                checkpoint_selection_run_identity,
+                initial_validation,
+                initial_policy_path,
+            )
+            validation_event.update(
+                checkpoint_selection_role="matched_planner_safety_ceiling",
+                validation_metrics_sha256=_canonical_json_sha256(initial_validation),
+                checkpoint_selection_manifest_payload_sha256=(
+                    checkpoint_selection.manifest["payload_sha256"]
+                ),
+            )
+        _append_jsonl(metrics_path, validation_event)
         if config.algorithm == "bc":
             summary = {
                 "schema_version": "rlinf-dynamic-benchmark-expert-summary-v0.1",
@@ -2423,7 +3112,8 @@ def main() -> None:
                 "best_score": best_score,
                 "env_steps": 0,
                 "update_steps": 0,
-                "config_sha256": config_sha256,
+                "config_sha256": config_payload_sha256,
+                "config_file_sha256": config_file_sha256,
             }
             _atomic_json(args.output / "summary.json", summary)
             if evaluation_runtime is not None:
@@ -2450,7 +3140,9 @@ def main() -> None:
     last_log_env_steps = global_env_steps
     last_log_update_steps = update_steps
     sampler_executor = (
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="dynamic-benchmark-sampler")
+        ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dynamic-benchmark-sampler"
+        )
         if config.sampler_learner_overlap
         else None
     )
@@ -2473,9 +3165,7 @@ def main() -> None:
                 online,
                 demos,
                 device,
-                profile_timing=(
-                    update_steps % config.timing_sample_interval == 0
-                ),
+                profile_timing=(update_steps % config.timing_sample_interval == 0),
             )
             for name, seconds in update_timing.items():
                 phase_timings.add(name, seconds)
@@ -2511,9 +3201,8 @@ def main() -> None:
             )
             updates_overlapped = False
             update_metrics = None
-            if (
-                sampler_executor is not None
-                and online.size >= max(config.batch_size, config.random_env_steps)
+            if sampler_executor is not None and online.size >= max(
+                config.batch_size, config.random_env_steps
             ):
                 sample_result, update_metrics, overlap_timing = (
                     _overlap_sample_and_update(
@@ -2667,20 +3356,13 @@ def main() -> None:
                 validation = evaluate_policy()
                 last_validation = validation
                 last_validation_env_steps = global_env_steps
-                score = _score(validation)
-                _append_jsonl(
-                    metrics_path,
-                    {
-                        "event": "validation",
-                        "env_steps": global_env_steps,
-                        **validation,
-                    },
-                )
-                if global_env_steps > 0 and (best_score is None or score > tuple(best_score)):
-                    best_score = score
-                    best_metrics = validation
-                    _save_policy(
-                        args.output / "best_policy.pt",
+                snapshot_identity = None
+                if config.algorithm == "residual_rlpd":
+                    if checkpoint_selection is None:
+                        raise RuntimeError(
+                            "residual checkpoint selector is unavailable"
+                        )
+                    snapshot_row = checkpoint_selection.capture(
                         config,
                         model,
                         normalizer,
@@ -2688,6 +3370,34 @@ def main() -> None:
                         validation,
                         global_env_steps,
                     )
+                    snapshot_identity = checkpoint_selection._snapshot_identity(
+                        snapshot_row
+                    )
+                    best_score = checkpoint_selection.best_score
+                    best_metrics = checkpoint_selection.best_metrics
+                else:
+                    score = _score(validation)
+                    if best_score is None or score > tuple(best_score):
+                        best_score = score
+                        best_metrics = validation
+                        _save_policy(
+                            args.output / "best_policy.pt",
+                            config,
+                            model,
+                            normalizer,
+                            state_schema,
+                            validation,
+                            global_env_steps,
+                        )
+                _append_jsonl(
+                    metrics_path,
+                    {
+                        "event": "validation",
+                        "env_steps": global_env_steps,
+                        "checkpoint_snapshot_identity": snapshot_identity,
+                        **validation,
+                    },
+                )
                 next_eval += config.eval_interval
 
             if global_env_steps >= next_checkpoint:
@@ -2713,22 +3423,55 @@ def main() -> None:
             final_validation = evaluate_policy()
             last_validation = final_validation
             last_validation_env_steps = global_env_steps
-        final_score = _score(final_validation)
-        # A residual-RLPD initial policy is the frozen planner.  It is kept as
-        # `initial_policy.pt`, but must never re-enter the learned-checkpoint
-        # selector through the final validation path when no env step ran.
-        if global_env_steps > 0 and (best_score is None or final_score > tuple(best_score)):
-            best_score = final_score
-            best_metrics = final_validation
-            _save_policy(
-                args.output / "best_policy.pt",
-                config,
-                model,
-                normalizer,
-                state_schema,
-                final_validation,
-                global_env_steps,
+            final_snapshot_identity = None
+            if config.algorithm == "residual_rlpd" and global_env_steps > 0:
+                if checkpoint_selection is None:
+                    raise RuntimeError("residual checkpoint selector is unavailable")
+                final_snapshot_row = checkpoint_selection.capture(
+                    config,
+                    model,
+                    normalizer,
+                    state_schema,
+                    final_validation,
+                    global_env_steps,
+                )
+                final_snapshot_identity = checkpoint_selection._snapshot_identity(
+                    final_snapshot_row
+                )
+                best_score = checkpoint_selection.best_score
+                best_metrics = checkpoint_selection.best_metrics
+            _append_jsonl(
+                metrics_path,
+                {
+                    "event": "validation",
+                    "env_steps": global_env_steps,
+                    "checkpoint_snapshot_identity": final_snapshot_identity,
+                    "validation_role": "final",
+                    **final_validation,
+                },
             )
+        if config.algorithm != "residual_rlpd":
+            final_score = _score(final_validation)
+            if global_env_steps > 0 and (
+                best_score is None or final_score > tuple(best_score)
+            ):
+                best_score = final_score
+                best_metrics = final_validation
+                _save_policy(
+                    args.output / "best_policy.pt",
+                    config,
+                    model,
+                    normalizer,
+                    state_schema,
+                    final_validation,
+                    global_env_steps,
+                )
+        elif checkpoint_selection is None:
+            raise RuntimeError("residual checkpoint selector is unavailable")
+        # Persist the selector receipt together with the exact model state used by
+        # the final evaluation; an older trainer checkpoint must not authorize a
+        # newer selection manifest on resume.
+        checkpoint(args.output / "checkpoint_latest.pt")
         _save_policy(
             args.output / "final_policy.pt",
             config,
@@ -2759,7 +3502,13 @@ def main() -> None:
             / max(training_end_time - training_start_time, 1e-6),
             "phase_timings": phase_timings.snapshot(reset_interval=False),
             "sampler_contract": sampler_contract,
-            "config_sha256": config_sha256,
+            "config_sha256": config_payload_sha256,
+            "config_file_sha256": config_file_sha256,
+            "checkpoint_selection": (
+                checkpoint_selection.summary_reference()
+                if checkpoint_selection is not None
+                else None
+            ),
         }
         rendered = json.dumps(summary, sort_keys=True, separators=(",", ":"))
         summary["payload_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
