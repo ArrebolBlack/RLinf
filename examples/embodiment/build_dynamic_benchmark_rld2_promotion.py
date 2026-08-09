@@ -1069,6 +1069,10 @@ def build_selection_evidence(
         task=task,
         reset_manifest_sha256=hashes["reset_manifest"],
     )
+    if policy_manifest_seed == training_validation_seed:
+        raise ValueError(
+            "policy evaluation reused the checkpoint-selection validation manifest seed"
+        )
     planner_manifest_seed, planner_records = _validate_evaluation(
         planner_evaluation,
         label="planner evaluation",

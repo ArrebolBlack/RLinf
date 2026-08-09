@@ -21,6 +21,7 @@ initial_alpha: 0.01
 eval_interval: 2000
 eval_episodes: 8
 checkpoint_interval: 2000
+validation_manifest_seed: 20261450
 residual_scale: 0.125
 reward_safety_penalty: -30.0
 

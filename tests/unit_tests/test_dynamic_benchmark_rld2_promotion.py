@@ -34,6 +34,8 @@ RLINF_COMMIT = "1" * 40
 BENCHMARK_COMMIT = "2" * 40
 EVALUATOR_COMMIT = "3" * 40
 IMAGE_SHA256 = "4" * 64
+FORMAL_POLICY_VALIDATION_MANIFEST_SEED = 20261150
+CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED = 20261450
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -394,7 +396,7 @@ class Fixture:
             "task": task,
             "seed": 7,
             "algorithm": "rlpd",
-            "validation_manifest_seed": 20261150,
+            "validation_manifest_seed": CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED,
             "rlinf_commit": RLINF_COMMIT,
             "benchmark_commit": BENCHMARK_COMMIT,
         }
@@ -548,7 +550,7 @@ class Fixture:
                     "sha256": self.threshold_sha,
                 },
                 "split": "validation",
-                "manifest_seed": 20261300,
+                "manifest_seed": FORMAL_POLICY_VALIDATION_MANIFEST_SEED,
                 "reset_manifest_sha256": self.reset_sha,
                 "episodes": promotion.RESET_COUNT,
                 "device": "cpu",
@@ -574,7 +576,7 @@ class Fixture:
                     "benchmark_commit": BENCHMARK_COMMIT,
                 },
                 "split": "validation",
-                "manifest_seed": 20261300,
+                "manifest_seed": FORMAL_POLICY_VALIDATION_MANIFEST_SEED,
                 "reset_manifest_sha256": self.reset_sha,
                 "episodes": promotion.RESET_COUNT,
                 "records": self.planner_records,
@@ -700,6 +702,39 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
             receipt_path=receipt_path,
             require_promote=True,
         )
+
+
+def test_formal_policy_validation_is_independent_from_checkpoint_selection(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+
+    evidence = fixture.build()
+
+    assert (
+        fixture.config["validation_manifest_seed"]
+        == CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED
+    )
+    assert evidence["inputs"]["reset_manifest"]["manifest_seed"] == (
+        FORMAL_POLICY_VALIDATION_MANIFEST_SEED
+    )
+
+
+def test_promotion_rejects_checkpoint_selection_manifest_reuse(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    for evaluation_path in (
+        fixture.policy_evaluation_path,
+        fixture.planner_evaluation_path,
+    ):
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        evaluation["manifest_seed"] = fixture.config["validation_manifest_seed"]
+        evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+        _write_json(evaluation_path, evaluation)
+
+    with pytest.raises(ValueError, match="checkpoint-selection validation manifest"):
+        fixture.build()
 
 
 def test_every_evaluator_tape_is_sent_to_the_canonical_auditor(

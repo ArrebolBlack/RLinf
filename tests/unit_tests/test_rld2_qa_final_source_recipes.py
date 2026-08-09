@@ -46,6 +46,7 @@ FROZEN_CORE = {
     "eval_interval": 2_000,
     "eval_episodes": 8,
     "checkpoint_interval": 2_000,
+    "validation_manifest_seed": 20_261_450,
 }
 
 
