@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,11 @@ from examples.embodiment import (
 )
 from examples.embodiment import build_dynamic_benchmark_rld2_promotion as promotion
 from examples.embodiment import export_dynamic_benchmark_optimal_trajectories as optimal
+from examples.embodiment import export_dynamic_benchmark_rld2_review as review_exporter
+from examples.embodiment import train_dynamic_benchmark_expert as expert_trainer
+from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+    validate_selected_learned_policy,
+)
 
 TASK = "t1_xyz"
 RLINF_COMMIT = "1" * 40
@@ -392,46 +398,107 @@ class Fixture:
             encoding="utf-8",
         )
         self.reset_sha = promotion._sha256(self.reset_path)
-        self.config = {
-            "task": task,
-            "seed": 7,
-            "algorithm": "rlpd",
-            "validation_manifest_seed": CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED,
-            "rlinf_commit": RLINF_COMMIT,
-            "benchmark_commit": BENCHMARK_COMMIT,
-        }
-        self.validation = {"episodes": 8, "success_rate": 1.0}
-        self.policy_path = root / "best_policy.pt"
-        torch.save(
-            {
-                "schema_version": promotion.POLICY_SCHEMA,
-                "config": self.config,
-                "model": {"fixture": torch.tensor([1.0])},
-                "normalizer": {"fixture": torch.tensor([1.0])},
-                "state_schema": {"state_dim": 2, "mask_dim": 0},
-                "infra_identity": {"image": "fixture"},
-                "validation": self.validation,
-                "env_steps": 100,
-            },
-            self.policy_path,
+        config = expert_trainer._config(
+            expert_trainer._parse_args(
+                [
+                    "--task",
+                    task,
+                    "--algorithm",
+                    "residual_rlpd",
+                    "--seed",
+                    "7",
+                    "--validation-manifest-seed",
+                    str(CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED),
+                    "--rlinf-commit",
+                    RLINF_COMMIT,
+                    "--benchmark-commit",
+                    BENCHMARK_COMMIT,
+                    "--output",
+                    str(root),
+                ]
+            )
         )
+        self.config = asdict(config)
+        config_path = root / "config.json"
+        expert_trainer._atomic_json(config_path, self.config)
+        config_file_sha256 = expert_trainer._file_sha256(config_path)
+        config_payload_sha256 = expert_trainer._canonical_json_sha256(self.config)
+        self.state_schema = {"state_dim": 2, "mask_dim": 0}
+        planner_validation = {
+            "episodes": config.eval_episodes,
+            "success_rate": 0.5,
+            "safety_failure_rate": 0.0,
+            "mean_completion": 0.5,
+            "mean_return": 0.5,
+            "mean_duration_steps": 20.0,
+            "mean_action_l2_sum": 5.0,
+        }
+        self.validation = {
+            **planner_validation,
+            "success_rate": 1.0,
+            "mean_completion": 1.0,
+            "mean_return": 1.0,
+        }
+        model = torch.nn.Linear(2, 7)
+        normalizer = expert_trainer.RunningNormalizer(2, 0)
+        initial_policy = root / "initial_policy.pt"
+        expert_trainer._save_policy(
+            initial_policy,
+            config,
+            model,
+            normalizer,
+            self.state_schema,
+            planner_validation,
+            0,
+        )
+        run_identity = expert_trainer._checkpoint_selection_run_identity(
+            config,
+            self.state_schema,
+            config_file_sha256,
+        )
+        ledger = expert_trainer._CheckpointSelectionLedger.create(
+            root,
+            run_identity,
+            planner_validation,
+            initial_policy,
+        )
+        snapshot_path = root / "policy_snapshots" / "policy_step_000000000100.pt"
+        snapshot_path.parent.mkdir()
+        expert_trainer._save_policy(
+            snapshot_path,
+            config,
+            model,
+            normalizer,
+            self.state_schema,
+            self.validation,
+            100,
+        )
+        ledger.record_existing_snapshot(snapshot_path, self.validation, 100)
+        self.policy_path = root / "best_policy.pt"
         self.policy_sha = promotion._sha256(self.policy_path)
+        self.checkpoint_selection_path = ledger.manifest_path
         self.metadata_path = root / "summary.json"
-        _write_json(
-            self.metadata_path,
-            _seal(
-                {
-                    "schema_version": promotion.POLICY_METADATA_SCHEMA,
-                    "status": "complete",
-                    "config": self.config,
-                    "infra_identity": {"image": "fixture"},
-                    "best_validation": self.validation,
-                    "best_score": [1.0],
-                    "final_validation": self.validation,
-                    "env_steps": 200,
-                    "config_sha256": promotion._value_sha256(self.config),
-                }
-            ),
+        summary = {
+            "schema_version": promotion.POLICY_METADATA_SCHEMA,
+            "status": "complete",
+            "config": self.config,
+            "infra_identity": expert_trainer._infra_identity(config),
+            "demo_source": {"fixture": True},
+            "best_validation": ledger.best_metrics,
+            "best_score": ledger.best_score,
+            "final_validation": self.validation,
+            "env_steps": 200,
+            "update_steps": 1,
+            "config_sha256": config_payload_sha256,
+            "config_file_sha256": config_file_sha256,
+            "checkpoint_selection": ledger.summary_reference(),
+        }
+        summary["payload_sha256"] = expert_trainer._canonical_json_sha256(summary)
+        expert_trainer._atomic_json(self.metadata_path, summary)
+        self.learned_policy_admission = validate_selected_learned_policy(
+            policy_path=self.policy_path,
+            trainer_summary_path=self.metadata_path,
+            checkpoint_selection_path=self.checkpoint_selection_path,
         )
         improved = (
             {}
@@ -534,7 +601,9 @@ class Fixture:
                     "training_seed": self.config["seed"],
                     "training_env_steps": 100,
                     "validation": self.validation,
+                    "checkpoint_role": "best",
                 },
+                "learned_policy_admission": self.learned_policy_admission,
                 "source_identity": {
                     "evaluator_rlinf_commit": EVALUATOR_COMMIT,
                     "policy_rlinf_commit": RLINF_COMMIT,
@@ -554,12 +623,15 @@ class Fixture:
                 "reset_manifest_sha256": self.reset_sha,
                 "episodes": promotion.RESET_COUNT,
                 "device": "cpu",
-                "state_schema": {"state_dim": 2, "mask_dim": 0},
+                "state_schema": self.state_schema,
                 "records": self.policy_records,
                 "task_summary": {self.task: {}},
                 "decision_latency": {"p95_meets_20hz": True},
                 "all_replays_passed": True,
-                "all_successful_quality_v2_gates_passed": True,
+                "all_successful_quality_v2_gates_passed": all(
+                    not record["success"] or record["quality_v2_gate"]["passed"]
+                    for record in self.policy_records
+                ),
                 "started_unix_s": 1.0,
                 "finished_unix_s": 2.0,
             }
@@ -596,6 +668,7 @@ class Fixture:
             run_tag="cycle1-s7",
             policy_path=self.policy_path,
             policy_metadata_path=self.metadata_path,
+            checkpoint_selection_path=self.checkpoint_selection_path,
             policy_evaluation_path=self.policy_evaluation_path,
             planner_evaluation_path=self.planner_evaluation_path,
             reset_manifest_path=self.reset_path,
@@ -606,6 +679,7 @@ class Fixture:
             planner_evaluator_source_path=self.planner_evaluator_source,
             image_reference="runtime:test",
             image_sha256=IMAGE_SHA256,
+            expected_residual_scale=float(self.config["residual_scale"]),
         )
 
 
@@ -672,9 +746,29 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
     )
 
     assert evidence["selection"]["decision"] == "promote"
+    assert evidence["selection"]["reason"] == (
+        "strict_planner_nonworse_improvement"
+    )
+    assert evidence["selection"]["rejection_reasons"] == []
     assert evidence["aggregate"]["counts"]["both_success"] == 20
     assert evidence["aggregate"]["success"]["policy"]["wilson_95"]["low"] > 0.8
     assert receipt["schema_version"] == promotion.PROMOTION_SCHEMA
+    assert set(receipt["selection"]) == {
+        "decision",
+        "reason",
+        "planner_nonworse_all_dimensions",
+        "strict_improvement_dimensions",
+        "rejection_reasons",
+        "selector_contract_path",
+        "selector_contract_sha256",
+        "planner_evaluation_path",
+        "planner_evaluation_sha256",
+        "planner_evaluation_payload_sha256",
+        "attempt_artifacts_payload_sha256",
+        "evidence_path",
+        "evidence_sha256",
+        "evidence_payload_sha256",
+    }
     assert receipt["selection"]["evidence_sha256"] == promotion._sha256(evidence_path)
     assert (
         receipt["validation_receipt"]["attempt_schema_version"]
@@ -691,6 +785,38 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
         == "provenance/calibration_wave/wave_receipt.json"
     )
     assert promotion.validate_selection_evidence_artifacts(evidence) == evidence
+    assert (
+        review_exporter._validate_promotion_receipt_payload(
+            receipt,
+            task=TASK,
+            candidate_id="learned-s7",
+            policy_path=str(fixture.policy_path.resolve()),
+            policy_sha256=fixture.policy_sha,
+            residual_scale=float(fixture.config["residual_scale"]),
+            rlinf_commit=RLINF_COMMIT,
+            benchmark_commit=BENCHMARK_COMMIT,
+            threshold_schema=promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+            threshold_sha256=fixture.threshold_sha,
+            calibration_receipt_identity={
+                "relative_path": "provenance/calibration_wave/wave_receipt.json",
+                "file_sha256": fixture.calibration_receipt_sha,
+                "payload_sha256": fixture.calibration_receipt_sha,
+            },
+            evaluator_rlinf_commit=EVALUATOR_COMMIT,
+            evaluator_source_sha256=promotion._sha256(
+                fixture.policy_evaluator_source
+            ),
+        )
+        == receipt
+    )
+    assert (
+        evidence["inputs"]["checkpoint_selection"]
+        == (fixture.learned_policy_admission["checkpoint_selection"])
+    )
+    assert (
+        evidence["inputs"]["policy_metadata"]
+        == (fixture.learned_policy_admission["trainer_summary"])
+    )
     tape = evidence["per_reset"][0]["policy"]["attempt_tape"]
     assert tape["path"] == "tapes/policy-00.npz"
     assert len(tape["sha256"]) == 64
@@ -737,6 +863,38 @@ def test_promotion_rejects_checkpoint_selection_manifest_reuse(
         fixture.build()
 
 
+def test_promotion_rejects_resealed_checkpoint_selection_tampering(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    manifest = json.loads(fixture.checkpoint_selection_path.read_text(encoding="utf-8"))
+    manifest["evaluated_snapshots"][0]["eligible"] = False
+    manifest.pop("payload_sha256")
+    manifest["payload_sha256"] = expert_trainer._canonical_json_sha256(manifest)
+    expert_trainer._atomic_json(fixture.checkpoint_selection_path, manifest)
+    summary = json.loads(fixture.metadata_path.read_text(encoding="utf-8"))
+    summary["checkpoint_selection"]["manifest_payload_sha256"] = manifest[
+        "payload_sha256"
+    ]
+    summary.pop("payload_sha256")
+    summary["payload_sha256"] = expert_trainer._canonical_json_sha256(summary)
+    expert_trainer._atomic_json(fixture.metadata_path, summary)
+
+    with pytest.raises(ValueError, match="eligible snapshot count|select exactly"):
+        fixture.build()
+
+
+def test_promotion_requires_evaluator_admission_identity(tmp_path: Path) -> None:
+    fixture = Fixture(tmp_path)
+    evaluation = json.loads(fixture.policy_evaluation_path.read_text(encoding="utf-8"))
+    evaluation["learned_policy_admission"]["policy"]["env_steps"] = 0
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(fixture.policy_evaluation_path, evaluation)
+
+    with pytest.raises(ValueError, match="learned-policy admission identity mismatch"):
+        fixture.build()
+
+
 def test_every_evaluator_tape_is_sent_to_the_canonical_auditor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -755,7 +913,7 @@ def test_every_evaluator_tape_is_sent_to_the_canonical_auditor(
     ]
 
 
-def test_t5_causal_gate_issued_history_and_latency_are_hard_requirements(
+def test_t5_scientific_regressions_are_sealed_but_malformed_history_throws(
     tmp_path: Path,
 ) -> None:
     false_gate = Fixture(tmp_path / "false-gate", task="t5_replan")
@@ -764,8 +922,22 @@ def test_t5_causal_gate_issued_history_and_latency_are_hard_requirements(
         "impact_end_to_first_qualifying_applied_correction_s"
     ] = None
     false_gate._write_evaluations()
-    with pytest.raises(ValueError, match="T5 causal gate"):
-        false_gate.build()
+    gate_evidence = false_gate.build()
+    assert gate_evidence["selection"]["decision"] == "keep_planner"
+    assert gate_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert gate_evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    assert gate_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "successful_policy_gate_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_gates": ["t5_causal_timing"],
+        }
+    ]
+    assert gate_evidence["per_reset"][0]["rejection_reasons"] == (
+        gate_evidence["selection"]["rejection_reasons"]
+    )
 
     wrong_history = Fixture(tmp_path / "issued", task="t5_replan")
     wrong_history.policy_records[0]["issued_equals_applied"] = True
@@ -778,8 +950,20 @@ def test_t5_causal_gate_issued_history_and_latency_are_hard_requirements(
         "impact_end_to_first_qualifying_applied_correction_s"
     ] = 0.06
     latency_regression._write_evaluations()
-    with pytest.raises(ValueError, match="degradation"):
-        latency_regression.build()
+    latency_evidence = latency_regression.build()
+    assert latency_evidence["selection"]["decision"] == "keep_planner"
+    assert latency_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert latency_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "both_success_metric_nonworse_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_dimensions": [
+                "causal.impact_end_to_first_qualifying_applied_correction_s"
+            ],
+        }
+    ]
 
 
 def test_t5_causal_latency_can_supply_the_required_strict_improvement(
@@ -830,8 +1014,10 @@ def test_exact_tie_keeps_planner_and_require_promote_writes_nothing(
 
     assert evidence["selection"] == {
         "decision": "keep_planner",
+        "reason": "no_strict_improvement",
         "planner_nonworse_all_dimensions": True,
         "strict_improvement_dimensions": [],
+        "rejection_reasons": [],
         "exact_aggregate_tie": True,
         "rule": evidence["selection"]["rule"],
     }
@@ -846,24 +1032,180 @@ def test_exact_tie_keeps_planner_and_require_promote_writes_nothing(
     assert not receipt_path.exists()
 
 
-def test_safety_and_success_regressions_fail_closed(tmp_path: Path) -> None:
+def test_safety_and_success_regressions_seal_keep_planner_decisions(
+    tmp_path: Path,
+) -> None:
     safety = Fixture(tmp_path / "safety")
-    safety.root.mkdir(exist_ok=True)
     safety.policy_records[0]["success"] = False
     safety.policy_records[0]["safety_failure"] = True
     safety.policy_records[0]["completion_time_s"] = None
     safety.planner_records[0]["success"] = False
     safety.planner_records[0]["completion_time_s"] = None
     safety._write_evaluations()
-    with pytest.raises(ValueError, match="safety failures exceed"):
-        safety.build()
+    safety_evidence = safety.build()
+    assert safety_evidence["selection"]["decision"] == "keep_planner"
+    assert safety_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert safety_evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    assert safety_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "aggregate_policy_safety_count_worse",
+            "scope": "aggregate",
+            "policy_failure_count": 1,
+            "planner_failure_count": 0,
+        }
+    ]
+    assert safety_evidence["per_reset"][0]["rejection_reasons"] == []
 
     regression = Fixture(tmp_path / "success")
     regression.policy_records[0]["success"] = False
     regression.policy_records[0]["completion_time_s"] = None
     regression._write_evaluations()
-    with pytest.raises(ValueError, match="planner-success to policy-failure"):
-        regression.build()
+    regression_evidence = regression.build()
+    expected_reason = {
+        "code": "planner_success_policy_failure",
+        "scope": "reset",
+        "reset_index": 0,
+        "episode_id": "validation-00",
+    }
+    assert regression_evidence["selection"]["decision"] == "keep_planner"
+    assert regression_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert regression_evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    assert regression_evidence["selection"]["rejection_reasons"] == [expected_reason]
+    assert regression_evidence["per_reset"][0]["rejection_reasons"] == [
+        expected_reason
+    ]
+
+    evidence_path = regression.root / "selection_evidence.json"
+    receipt_path = regression.root / "promotion_receipt.json"
+    with pytest.raises(RuntimeError, match="formal_gate_rejection"):
+        promotion.write_promotion_artifacts(
+            evidence=regression_evidence,
+            evidence_path=evidence_path,
+            receipt_path=receipt_path,
+            require_promote=True,
+        )
+    assert not evidence_path.exists()
+    assert not receipt_path.exists()
+
+    receipt = promotion.write_promotion_artifacts(
+        evidence=regression_evidence,
+        evidence_path=evidence_path,
+        receipt_path=receipt_path,
+        require_promote=False,
+    )
+    assert receipt["selection"]["decision"] == "keep_planner"
+    assert receipt["selection"]["reason"] == "formal_gate_rejection"
+    assert receipt["selection"]["rejection_reasons"] == [expected_reason]
+    with pytest.raises(ValueError, match="no promote decision"):
+        review_exporter._validate_promotion_receipt_payload(
+            receipt,
+            task=TASK,
+            candidate_id="learned-s7",
+            policy_path=str(regression.policy_path.resolve()),
+            policy_sha256=regression.policy_sha,
+            residual_scale=float(regression.config["residual_scale"]),
+            rlinf_commit=RLINF_COMMIT,
+            benchmark_commit=BENCHMARK_COMMIT,
+            threshold_schema=promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+            threshold_sha256=regression.threshold_sha,
+            calibration_receipt_identity={
+                "relative_path": "provenance/calibration_wave/wave_receipt.json",
+                "file_sha256": regression.calibration_receipt_sha,
+                "payload_sha256": regression.calibration_receipt_sha,
+            },
+            evaluator_rlinf_commit=EVALUATOR_COMMIT,
+            evaluator_source_sha256=promotion._sha256(
+                regression.policy_evaluator_source
+            ),
+        )
+    assert promotion.validate_selection_evidence_artifacts(regression_evidence) == (
+        regression_evidence
+    )
+
+
+def test_successful_policy_safety_and_qv3_gate_failures_are_structured(
+    tmp_path: Path,
+) -> None:
+    safety = Fixture(tmp_path / "successful-safety")
+    safety.policy_records[0]["safety_failure"] = True
+    safety.planner_records[0]["safety_failure"] = True
+    safety._write_evaluations()
+
+    safety_evidence = safety.build()
+    assert safety_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "successful_policy_gate_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_gates": ["safety"],
+        }
+    ]
+    assert safety_evidence["selection"]["reason"] == "formal_gate_rejection"
+
+    qv3 = Fixture(tmp_path / "successful-qv3")
+    phase, metric, _ = Q_METRICS[0]
+    for record in (qv3.policy_records[0], qv3.planner_records[0]):
+        quality = record["quality_v2"]
+        target = quality if phase == "full_episode" else quality["phases"][phase]
+        _set_nested(target, metric, 3.0)
+        record["quality_v2_sha256"] = promotion._payload_sha256(quality)
+        record["quality_v2_gate"] = _gate(
+            quality, qv3.checks, qv3.threshold_sha
+        )
+    qv3._write_evaluations()
+
+    qv3_evidence = qv3.build()
+    assert qv3_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "successful_policy_gate_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_gates": ["quality_v3"],
+        }
+    ]
+    assert qv3_evidence["aggregate"][
+        "all_successful_policy_quality_v3_gates_passed"
+    ] is False
+
+
+def test_malformed_nonfinite_and_replay_evidence_still_throws(
+    tmp_path: Path,
+) -> None:
+    aggregate = Fixture(tmp_path / "aggregate")
+    evaluation = json.loads(
+        aggregate.policy_evaluation_path.read_text(encoding="utf-8")
+    )
+    evaluation["all_successful_quality_v2_gates_passed"] = False
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(aggregate.policy_evaluation_path, evaluation)
+    with pytest.raises(ValueError, match="aggregate disagrees"):
+        aggregate.build()
+
+    gate = Fixture(tmp_path / "gate")
+    gate.policy_records[0]["quality_v2_gate"]["passed"] = False
+    gate._write_evaluations()
+    with pytest.raises(ValueError, match="recorded Qv3 gate does not recompute"):
+        gate.build()
+
+    nonfinite = Fixture(tmp_path / "nonfinite")
+    evaluation = json.loads(
+        nonfinite.policy_evaluation_path.read_text(encoding="utf-8")
+    )
+    evaluation["records"][0]["completion_time_s"] = float("inf")
+    _write_json(nonfinite.policy_evaluation_path, evaluation)
+    with pytest.raises(ValueError, match="Out of range float values|finite"):
+        nonfinite.build()
+
+    replay = Fixture(tmp_path / "replay")
+    replay.policy_records[0]["replay_validation"]["passed"] = False
+    replay.policy_records[0]["replay_validation_sha256"] = optimal._payload_sha256(
+        replay.policy_records[0]["replay_validation"]
+    )
+    replay._write_evaluations()
+    with pytest.raises(ValueError, match="replay did not pass"):
+        replay.build()
 
 
 @pytest.mark.parametrize(
@@ -875,7 +1217,7 @@ def test_safety_and_success_regressions_fail_closed(tmp_path: Path) -> None:
         ("full_episode", "eef_motion.eef_linear_jerk_max_m_s3"),
     ],
 )
-def test_qv3_tv_path_orientation_and_jerk_degradation_fail_closed(
+def test_qv3_tv_path_orientation_and_jerk_degradation_seals_formal_rejection(
     tmp_path: Path, identity: tuple[str, str]
 ) -> None:
     fixture = Fixture(tmp_path)
@@ -889,8 +1231,20 @@ def test_qv3_tv_path_orientation_and_jerk_degradation_fail_closed(
     policy["quality_v2_gate"] = _gate(quality, fixture.checks, fixture.threshold_sha)
     fixture._write_evaluations()
 
-    with pytest.raises(ValueError, match="degradation"):
-        fixture.build()
+    evidence = fixture.build()
+
+    assert evidence["selection"]["decision"] == "keep_planner"
+    assert evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    expected_reason = {
+        "code": "both_success_metric_nonworse_failure",
+        "scope": "reset",
+        "reset_index": 0,
+        "episode_id": "validation-00",
+        "failed_dimensions": [f"quality_v3.{identity[0]}.{identity[1]}"],
+    }
+    assert evidence["selection"]["rejection_reasons"] == [expected_reason]
+    assert evidence["per_reset"][0]["rejection_reasons"] == [expected_reason]
 
 
 def test_missing_or_tampered_evidence_evaluation_reset_and_sha_fail_closed(
@@ -907,6 +1261,25 @@ def test_missing_or_tampered_evidence_evaluation_reset_and_sha_fail_closed(
         require_promote=True,
     )
     assert receipt["selection"]["evidence_sha256"] == promotion._sha256(evidence_path)
+
+    resealed_selection_tamper = deepcopy(evidence)
+    resealed_selection_tamper["selection"]["reason"] = "formal_gate_rejection"
+    resealed_selection_tamper["payload_sha256"] = promotion._payload_sha256(
+        resealed_selection_tamper
+    )
+    with pytest.raises(ValueError, match="artifact-level recomputation"):
+        promotion.validate_selection_evidence_artifacts(resealed_selection_tamper)
+    tampered_evidence_path = tmp_path / "tampered_selection_evidence.json"
+    tampered_receipt_path = tmp_path / "tampered_promotion_receipt.json"
+    with pytest.raises(ValueError, match="artifact-level recomputation"):
+        promotion.write_promotion_artifacts(
+            evidence=resealed_selection_tamper,
+            evidence_path=tampered_evidence_path,
+            receipt_path=tampered_receipt_path,
+            require_promote=False,
+        )
+    assert not tampered_evidence_path.exists()
+    assert not tampered_receipt_path.exists()
 
     fixture.policy_evaluation_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
@@ -926,6 +1299,7 @@ def test_missing_or_tampered_evidence_evaluation_reset_and_sha_fail_closed(
             run_tag="cycle1-s7",
             policy_path=fixture.policy_path,
             policy_metadata_path=fixture.metadata_path,
+            checkpoint_selection_path=fixture.checkpoint_selection_path,
             policy_evaluation_path=fixture.policy_evaluation_path,
             planner_evaluation_path=fixture.planner_evaluation_path,
             reset_manifest_path=fixture.reset_path,

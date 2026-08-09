@@ -30,6 +30,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+    validate_selected_learned_policy,
+)
 from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
     materialize_evaluation_attempt,
     recursive_output_checksums,
@@ -53,6 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--expected-policy-sha256", required=True)
+    parser.add_argument("--trainer-summary", type=Path)
+    parser.add_argument("--checkpoint-selection", type=Path)
     parser.add_argument("--evaluator-commit", required=True)
     parser.add_argument("--rlinf-commit", required=True)
     parser.add_argument("--benchmark-commit", required=True)
@@ -1050,6 +1055,26 @@ def main() -> None:
     policy_sha256 = _sha256(args.policy)
     if policy_sha256 != expected_policy_sha256:
         raise ValueError("policy SHA-256 does not match the expected identity")
+    if (args.trainer_summary is None) != (args.checkpoint_selection is None):
+        raise ValueError(
+            "trainer summary and checkpoint-selection manifest must be supplied together"
+        )
+    if args.quality_v2_thresholds is not None and args.trainer_summary is None:
+        raise ValueError(
+            "formal learned-policy evaluation requires the trainer summary and "
+            "checkpoint-selection manifest"
+        )
+    learned_policy_admission: dict[str, Any] | None = None
+    if args.trainer_summary is not None:
+        assert args.checkpoint_selection is not None
+        learned_policy_admission = validate_selected_learned_policy(
+            policy_path=args.policy,
+            trainer_summary_path=args.trainer_summary,
+            checkpoint_selection_path=args.checkpoint_selection,
+            expected_policy_sha256=policy_sha256,
+            expected_rlinf_commit=rlinf_commit,
+            expected_benchmark_commit=benchmark_commit,
+        )
     payload = torch.load(args.policy, map_location="cpu", weights_only=False)
     config, state_schema = _validate_policy_payload(
         payload,
@@ -1161,20 +1186,25 @@ def main() -> None:
             quality_v2_enabled=quality_v2_thresholds is not None,
         )
         latency = _latency_summary(latencies_s)
+        policy_identity = {
+            "path": str(args.policy.resolve()),
+            "sha256": policy_sha256,
+            "schema_version": payload["schema_version"],
+            "task": task_id,
+            "algorithm": config["algorithm"],
+            "training_seed": config["seed"],
+            "training_env_steps": payload["env_steps"],
+            "validation": payload["validation"],
+        }
+        if learned_policy_admission is not None:
+            policy_identity["checkpoint_role"] = learned_policy_admission[
+                "checkpoint_role"
+            ]
         result = {
             "schema_version": _evaluation_schema(
                 formal_attempts=quality_v2_thresholds is not None
             ),
-            "policy_identity": {
-                "path": str(args.policy.resolve()),
-                "sha256": policy_sha256,
-                "schema_version": payload["schema_version"],
-                "task": task_id,
-                "algorithm": config["algorithm"],
-                "training_seed": config["seed"],
-                "training_env_steps": payload["env_steps"],
-                "validation": payload["validation"],
-            },
+            "policy_identity": policy_identity,
             "source_identity": {
                 "evaluator_rlinf_commit": evaluator_commit,
                 "policy_rlinf_commit": rlinf_commit,
@@ -1213,8 +1243,34 @@ def main() -> None:
             "started_unix_s": started,
             "finished_unix_s": time.time(),
         }
+        if learned_policy_admission is not None:
+            result["learned_policy_admission"] = learned_policy_admission
         if _sha256(args.policy) != policy_sha256:
             raise RuntimeError("policy file changed during evaluation")
+        if learned_policy_admission is not None:
+            try:
+                observed_admission = validate_selected_learned_policy(
+                    policy_path=args.policy,
+                    trainer_summary_path=args.trainer_summary,
+                    checkpoint_selection_path=args.checkpoint_selection,
+                    expected_policy_sha256=policy_sha256,
+                    expected_trainer_summary_sha256=learned_policy_admission[
+                        "trainer_summary"
+                    ]["sha256"],
+                    expected_checkpoint_selection_sha256=learned_policy_admission[
+                        "checkpoint_selection"
+                    ]["sha256"],
+                    expected_rlinf_commit=rlinf_commit,
+                    expected_benchmark_commit=benchmark_commit,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise RuntimeError(
+                    "learned-policy admission artifacts changed during evaluation"
+                ) from error
+            if observed_admission != learned_policy_admission:
+                raise RuntimeError(
+                    "learned-policy admission identity changed during evaluation"
+                )
         if (
             args.quality_v2_thresholds is not None
             and _sha256(args.quality_v2_thresholds) != quality_v2_thresholds_sha256
@@ -1223,16 +1279,31 @@ def main() -> None:
         result["payload_sha256"] = _payload_sha256(result)
         result_path = args.output / "evaluation.json"
         _atomic_json(result_path, result)
+        admission_checksums = (
+            ()
+            if learned_policy_admission is None
+            else tuple(
+                (
+                    learned_policy_admission[name]["sha256"],
+                    learned_policy_admission[name]["path"],
+                )
+                for name in ("trainer_summary", "checkpoint_selection", "config")
+            )
+        )
         checksums = (
             recursive_output_checksums(
                 args.output,
-                extra_entries=((policy_sha256, str(args.policy.resolve())),),
+                extra_entries=(
+                    (policy_sha256, str(args.policy.resolve())),
+                    *admission_checksums,
+                ),
             )
             if quality_v2_thresholds is not None
             else (
                 f"{_sha256(result_path)}  evaluation.json\n"
                 f"{_sha256(reset_manifest_path)}  reset_manifest.jsonl\n"
                 f"{policy_sha256}  {args.policy.resolve()}\n"
+                + "".join(f"{sha256}  {path}\n" for sha256, path in admission_checksums)
             )
         )
         (args.output / "SHA256SUMS").write_text(checksums, encoding="utf-8")

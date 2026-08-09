@@ -128,8 +128,10 @@ _VALIDATION_KEYS = {
 }
 _SELECTION_KEYS = {
     "decision",
+    "reason",
     "planner_nonworse_all_dimensions",
     "strict_improvement_dimensions",
+    "rejection_reasons",
     "selector_contract_sha256",
     "selector_contract_path",
     "planner_evaluation_path",
@@ -506,8 +508,18 @@ def _validate_promotion_receipt_payload(
             receipt.get("selection"), "promotion selection", _SELECTION_KEYS
         )
     )
+    if set(selection) != _SELECTION_KEYS:
+        raise ValueError("promotion selection field inventory mismatch")
+    reason = _require_string(selection.get("reason"), "promotion selection reason")
+    rejection_reasons = selection.get("rejection_reasons")
+    if not isinstance(rejection_reasons, list):
+        raise ValueError("promotion selection rejection_reasons must be a list")
     if selection.get("decision") != "promote":
         raise ValueError("candidate has no promote decision")
+    if reason != "strict_planner_nonworse_improvement":
+        raise ValueError("promote decision has noncanonical selection reason")
+    if rejection_reasons:
+        raise ValueError("promoted candidate cannot carry formal rejection reasons")
     if (
         _require_bool(
             selection.get("planner_nonworse_all_dimensions"),

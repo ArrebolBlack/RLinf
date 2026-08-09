@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 
+from examples.embodiment import train_dynamic_benchmark_expert as expert_trainer
 from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
     attempt_schema_version,
     materialize_evaluation_attempt,
@@ -48,6 +51,7 @@ from examples.embodiment.evaluate_dynamic_benchmark_expert import (
     _task_quality_identity,
     _task_summary,
     _validate_policy_payload,
+    validate_selected_learned_policy,
 )
 
 
@@ -65,6 +69,197 @@ def _payload(algorithm: str = "rlpd") -> dict:
         "model": {"fixture": 1},
         "normalizer": {"fixture": 2},
     }
+
+
+def _selection_metrics(*, safety_failure_rate: float) -> dict[str, float | int]:
+    return {
+        "episodes": 20,
+        "success_rate": 0.75,
+        "safety_failure_rate": safety_failure_rate,
+        "mean_completion": 0.8,
+        "mean_return": 1.0,
+        "mean_duration_steps": 20.0,
+        "mean_action_l2_sum": 5.0,
+    }
+
+
+def _trainer_selection_artifacts(
+    root: Path, *, eligible: bool = True
+) -> SimpleNamespace:
+    """Materialize the exact trainer summary/ledger/policy artifact chain."""
+
+    root.mkdir(parents=True)
+    config = expert_trainer._config(
+        expert_trainer._parse_args(
+            [
+                "--task",
+                "t1_xyz",
+                "--algorithm",
+                "residual_rlpd",
+                "--rlinf-commit",
+                "a" * 40,
+                "--benchmark-commit",
+                "b" * 40,
+                "--output",
+                str(root),
+            ]
+        )
+    )
+    config_payload = asdict(config)
+    config_path = root / "config.json"
+    expert_trainer._atomic_json(config_path, config_payload)
+    config_file_sha256 = expert_trainer._file_sha256(config_path)
+    config_payload_sha256 = expert_trainer._canonical_json_sha256(config_payload)
+    state_schema = {"state_dim": 3, "mask_dim": 0, "fields": ["fixture"]}
+    planner_metrics = _selection_metrics(safety_failure_rate=0.0)
+    candidate_metrics = _selection_metrics(safety_failure_rate=0.0 if eligible else 0.1)
+    model = torch.nn.Linear(3, 7)
+    normalizer = expert_trainer.RunningNormalizer(3, 0)
+    initial_policy = root / "initial_policy.pt"
+    expert_trainer._save_policy(
+        initial_policy,
+        config,
+        model,
+        normalizer,
+        state_schema,
+        planner_metrics,
+        0,
+    )
+    run_identity = expert_trainer._checkpoint_selection_run_identity(
+        config,
+        state_schema,
+        config_file_sha256,
+    )
+    ledger = expert_trainer._CheckpointSelectionLedger.create(
+        root,
+        run_identity,
+        planner_metrics,
+        initial_policy,
+    )
+    snapshot = root / "policy_snapshots" / "policy_step_000000000100.pt"
+    snapshot.parent.mkdir()
+    expert_trainer._save_policy(
+        snapshot,
+        config,
+        model,
+        normalizer,
+        state_schema,
+        candidate_metrics,
+        100,
+    )
+    ledger.record_existing_snapshot(snapshot, candidate_metrics, 100)
+    summary = {
+        "schema_version": "rlinf-dynamic-benchmark-expert-summary-v0.1",
+        "status": "complete",
+        "config": config_payload,
+        "infra_identity": expert_trainer._infra_identity(config),
+        "demo_source": {"fixture": True},
+        "best_validation": ledger.best_metrics,
+        "best_score": ledger.best_score,
+        "final_validation": candidate_metrics,
+        "env_steps": 100,
+        "update_steps": 1,
+        "config_sha256": config_payload_sha256,
+        "config_file_sha256": config_file_sha256,
+        "checkpoint_selection": ledger.summary_reference(),
+    }
+    summary["payload_sha256"] = expert_trainer._canonical_json_sha256(summary)
+    summary_path = root / "summary.json"
+    expert_trainer._atomic_json(summary_path, summary)
+    return SimpleNamespace(
+        root=root,
+        policy_path=root / "best_policy.pt",
+        initial_policy_path=initial_policy,
+        summary_path=summary_path,
+        selection_path=ledger.manifest_path,
+        ledger=ledger,
+    )
+
+
+def _reseal_trainer_json(path: Path, payload: dict) -> None:
+    payload.pop("payload_sha256", None)
+    payload["payload_sha256"] = expert_trainer._canonical_json_sha256(payload)
+    expert_trainer._atomic_json(path, payload)
+
+
+def test_evaluator_admits_real_trainer_selected_snapshot(tmp_path: Path) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "run")
+
+    admission = validate_selected_learned_policy(
+        policy_path=artifacts.policy_path,
+        trainer_summary_path=artifacts.summary_path,
+        checkpoint_selection_path=artifacts.selection_path,
+        expected_policy_sha256=expert_trainer._file_sha256(artifacts.policy_path),
+        expected_rlinf_commit="a" * 40,
+        expected_benchmark_commit="b" * 40,
+    )
+
+    assert admission["checkpoint_role"] == "best"
+    assert admission["policy"]["env_steps"] == 100
+    assert admission["checkpoint_selection"]["status"] == ("selected_eligible_snapshot")
+    assert admission["source_identity"]["algorithm"] == "residual_rlpd"
+
+
+def test_evaluator_rejects_planner_fallback_and_initial_env0(tmp_path: Path) -> None:
+    fallback = _trainer_selection_artifacts(tmp_path / "fallback", eligible=False)
+    with pytest.raises(ValueError, match="planner_fallback_no_eligible"):
+        validate_selected_learned_policy(
+            policy_path=fallback.policy_path,
+            trainer_summary_path=fallback.summary_path,
+            checkpoint_selection_path=fallback.selection_path,
+        )
+
+    selected = _trainer_selection_artifacts(tmp_path / "selected")
+    with pytest.raises(ValueError, match="checkpoint_role=best"):
+        validate_selected_learned_policy(
+            policy_path=selected.initial_policy_path,
+            trainer_summary_path=selected.summary_path,
+            checkpoint_selection_path=selected.selection_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "field, message",
+    [
+        ("selected_snapshot_identity", "selected snapshot is null"),
+        ("best_policy", "best policy is null"),
+    ],
+)
+def test_evaluator_rejects_null_selected_or_best_identity(
+    tmp_path: Path, field: str, message: str
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / field)
+    manifest = json.loads(artifacts.selection_path.read_text(encoding="utf-8"))
+    manifest["selection"][field] = None
+    _reseal_trainer_json(artifacts.selection_path, manifest)
+
+    with pytest.raises(ValueError, match=message):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+        )
+
+
+def test_evaluator_rejects_resealed_checkpoint_selection_tampering(
+    tmp_path: Path,
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "run")
+    manifest = json.loads(artifacts.selection_path.read_text(encoding="utf-8"))
+    manifest["evaluated_snapshots"][0]["eligible"] = False
+    _reseal_trainer_json(artifacts.selection_path, manifest)
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    summary["checkpoint_selection"]["manifest_payload_sha256"] = manifest[
+        "payload_sha256"
+    ]
+    _reseal_trainer_json(artifacts.summary_path, summary)
+
+    with pytest.raises(ValueError, match="eligible snapshot count|select exactly"):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+        )
 
 
 def _quality_summary(

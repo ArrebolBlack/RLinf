@@ -268,10 +268,12 @@ def _policy_checkpoint_metadata(path: Path) -> dict[str, Any]:
         _require_mapping(checkpoint.get("validation"), "policy validation metadata"),
         "policy validation metadata",
     )
-    infra_identity = _json_safe_copy(
-        _require_mapping(checkpoint.get("infra_identity"), "policy infra identity"),
-        "policy infra identity",
-    )
+    if "infra_identity" not in checkpoint:
+        raise ValueError("policy infra identity is missing")
+    raw_infra_identity = checkpoint["infra_identity"]
+    if raw_infra_identity is not None and not isinstance(raw_infra_identity, Mapping):
+        raise ValueError("policy infra identity must be a mapping or null")
+    infra_identity = _json_safe_copy(raw_infra_identity, "policy infra identity")
     env_steps = _require_int(checkpoint.get("env_steps"), "policy env_steps", minimum=1)
     metadata = {
         "schema_version": POLICY_SCHEMA,
@@ -441,14 +443,10 @@ def _validate_evaluation(
     ):
         raise ValueError(f"{label} did not pass every exact replay")
     if label == "policy evaluation":
-        if (
-            _require_bool(
-                payload.get("all_successful_quality_v2_gates_passed"),
-                "policy successful quality gates",
-            )
-            is not True
-        ):
-            raise ValueError("policy evaluation did not pass all successful Qv3 gates")
+        _require_bool(
+            payload.get("all_successful_quality_v2_gates_passed"),
+            "policy successful quality gates",
+        )
         identity = _require_mapping(payload.get("policy_identity"), "policy identity")
         if identity.get("task") != task:
             raise ValueError("policy evaluation task identity mismatch")
@@ -795,6 +793,8 @@ def _compare_both_success(
     planner_quality_values: Mapping[str, float],
     policy_gate: bool,
     planner_gate: bool,
+    policy_causal_timing: Mapping[str, Any],
+    planner_causal_timing: Mapping[str, Any],
 ) -> dict[str, Any]:
     from examples.embodiment import (
         export_dynamic_benchmark_optimal_trajectories as optimal,
@@ -872,11 +872,44 @@ def _compare_both_success(
             }
         )
 
-    policy_causal_latency = optimal._t5_causal_latency(policy)
-    planner_causal_latency = optimal._t5_causal_latency(planner)
-    if policy_causal_latency is not None:
-        if planner_causal_latency is None:
-            raise ValueError("T5 policy/planner causal-latency identity mismatch")
+    if policy["task_id"] == "t5_replan":
+        policy_causal_gate = bool(
+            policy_causal_timing["t5_replan_causal_timing_passed"]
+        )
+        planner_causal_gate = bool(
+            planner_causal_timing["t5_replan_causal_timing_passed"]
+        )
+        gate_dimension = "causal.t5_replan_causal_timing_gate"
+        gate_nonworse = policy_causal_gate
+        gate_strict = policy_causal_gate and not planner_causal_gate
+        nonworse &= gate_nonworse
+        if gate_strict:
+            strict.append(gate_dimension)
+        dimensions.append(
+            {
+                "name": gate_dimension,
+                "direction": "pass",
+                "planner": planner_causal_gate,
+                "policy": policy_causal_gate,
+                "nonworse": gate_nonworse,
+                "strictly_better": gate_strict,
+            }
+        )
+
+    if (
+        policy_causal_timing["t5_replan_causal_timing_passed"] is True
+        and planner_causal_timing["t5_replan_causal_timing_passed"] is True
+    ):
+        policy_causal_latency = float(
+            policy_causal_timing[
+                "impact_end_to_first_qualifying_applied_correction_s"
+            ]
+        )
+        planner_causal_latency = float(
+            planner_causal_timing[
+                "impact_end_to_first_qualifying_applied_correction_s"
+            ]
+        )
         dimension_name = "causal.impact_end_to_first_qualifying_applied_correction_s"
         dimension_nonworse = (
             policy_causal_latency
@@ -961,6 +994,7 @@ def build_selection_evidence(
     run_tag: str,
     policy_path: Path,
     policy_metadata_path: Path,
+    checkpoint_selection_path: Path,
     policy_evaluation_path: Path,
     planner_evaluation_path: Path,
     reset_manifest_path: Path,
@@ -976,6 +1010,10 @@ def build_selection_evidence(
 ) -> dict[str, Any]:
     """Reopen exact artifacts and return deterministic promotion evidence."""
 
+    from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+        validate_selected_learned_policy,
+    )
+
     candidate_id = _require_string(candidate_id, "candidate_id")
     run_tag = _require_string(run_tag, "run_tag")
     image_reference = _require_string(image_reference, "image reference")
@@ -983,6 +1021,7 @@ def build_selection_evidence(
     paths = {
         "policy": policy_path,
         "policy_metadata": policy_metadata_path,
+        "checkpoint_selection": checkpoint_selection_path,
         "policy_evaluation": policy_evaluation_path,
         "planner_evaluation": planner_evaluation_path,
         "reset_manifest": reset_manifest_path,
@@ -1007,7 +1046,7 @@ def build_selection_evidence(
         )
 
     checkpoint = _policy_checkpoint_metadata(policy_path)
-    metadata = _validate_training_metadata(
+    _validate_training_metadata(
         _read_json(policy_metadata_path, "policy metadata"), checkpoint=checkpoint
     )
     config = _require_mapping(checkpoint["config"], "policy config")
@@ -1021,6 +1060,14 @@ def build_selection_evidence(
         raise ValueError(
             "policy checkpoint selection reused a review/calibration/test manifest seed"
         )
+    learned_policy_admission = validate_selected_learned_policy(
+        policy_path=policy_path,
+        trainer_summary_path=policy_metadata_path,
+        checkpoint_selection_path=checkpoint_selection_path,
+        expected_policy_sha256=hashes["policy"],
+        expected_trainer_summary_sha256=hashes["policy_metadata"],
+        expected_checkpoint_selection_sha256=hashes["checkpoint_selection"],
+    )
     env_steps = _require_int(checkpoint.get("env_steps"), "policy env_steps", minimum=1)
     rlinf_commit = _require_commit(config.get("rlinf_commit"), "policy RLinf commit")
     benchmark_commit = _require_commit(
@@ -1108,9 +1155,12 @@ def build_selection_evidence(
         or policy_identity.get("training_seed") != training_seed
         or policy_identity.get("training_env_steps") != env_steps
         or policy_identity.get("validation") != checkpoint["validation"]
+        or policy_identity.get("checkpoint_role") != "best"
         or policy_evaluation.get("state_schema") != checkpoint["state_schema"]
     ):
         raise ValueError("policy evaluation/checkpoint metadata identity mismatch")
+    if policy_evaluation.get("learned_policy_admission") != learned_policy_admission:
+        raise ValueError("policy evaluation learned-policy admission identity mismatch")
     threshold_identity = _require_mapping(
         policy_evaluation.get("quality_v2_threshold_identity"),
         "policy evaluation Qv3 threshold identity",
@@ -1144,6 +1194,8 @@ def build_selection_evidence(
 
     per_reset: list[dict[str, Any]] = []
     strict_dimensions: set[str] = set()
+    rejection_reasons: list[dict[str, Any]] = []
+    planner_nonworse_all_both_success = True
     counts = {
         "both_success": 0,
         "policy_only_success": 0,
@@ -1223,16 +1275,35 @@ def build_selection_evidence(
         counts["planner_t5_causal_timing_passed"] += int(
             planner_causal["t5_replan_causal_timing_passed"] is True
         )
-        if policy_success and (
-            policy_safety or not policy_gate or policy_causal_gate is False
-        ):
-            raise ValueError(
-                "successful policy reset failed safety, Qv3, or the T5 causal gate"
-            )
+        per_reset_rejections: list[dict[str, Any]] = []
+        if policy_success:
+            failed_gates = [
+                gate_name
+                for gate_name, failed in (
+                    ("safety", policy_safety),
+                    ("quality_v3", not policy_gate),
+                    ("t5_causal_timing", policy_causal_gate is False),
+                )
+                if failed
+            ]
+            if failed_gates:
+                per_reset_rejections.append(
+                    {
+                        "code": "successful_policy_gate_failure",
+                        "scope": "reset",
+                        "reset_index": index,
+                        "episode_id": episode_id,
+                        "failed_gates": failed_gates,
+                    }
+                )
         if planner_success and not policy_success:
-            counts["planner_only_success"] += 1
-            raise ValueError(
-                "planner-success to policy-failure regression is forbidden"
+            per_reset_rejections.append(
+                {
+                    "code": "planner_success_policy_failure",
+                    "scope": "reset",
+                    "reset_index": index,
+                    "episode_id": episode_id,
+                }
             )
         if policy_success and planner_success:
             counts["both_success"] += 1
@@ -1245,32 +1316,64 @@ def build_selection_evidence(
                 planner_quality_values=planner_quality,
                 policy_gate=policy_gate,
                 planner_gate=planner_gate,
+                policy_causal_timing=policy_causal,
+                planner_causal_timing=planner_causal,
             )
+            planner_nonworse_all_both_success &= comparison[
+                "planner_nonworse_all_dimensions"
+            ]
             if comparison["planner_nonworse_all_dimensions"] is not True:
-                failed = [
+                failed_dimensions = sorted(
                     row["name"]
                     for row in comparison["dimensions"]
                     if row.get("nonworse") is False
-                ]
-                raise ValueError(
-                    "policy Qv3/task-quality degradation versus planner: "
-                    + ", ".join(failed)
+                    and row["name"]
+                    not in {
+                        "quality_v3.absolute_gate",
+                        "causal.t5_replan_causal_timing_gate",
+                    }
                 )
+                if failed_dimensions:
+                    per_reset_rejections.append(
+                        {
+                            "code": "both_success_metric_nonworse_failure",
+                            "scope": "reset",
+                            "reset_index": index,
+                            "episode_id": episode_id,
+                            "failed_dimensions": failed_dimensions,
+                        }
+                    )
             strict_dimensions.update(comparison["strict_improvement_dimensions"])
             outcome = "both_success"
         elif policy_success:
             counts["policy_only_success"] += 1
-            if policy_safety:
-                raise ValueError("planner-fail rescue is not safe")
-            rescue = f"success.safe_planner_failure_rescue.reset_{index:02d}"
-            strict_dimensions.add(rescue)
+            if per_reset_rejections:
+                comparison = {
+                    "planner_nonworse_all_dimensions": False,
+                    "strict_improvement_dimensions": [],
+                    "exact_tie": False,
+                    "dimensions": [],
+                }
+                outcome = "policy_only_success_formal_gate_rejection"
+            else:
+                rescue = f"success.safe_planner_failure_rescue.reset_{index:02d}"
+                strict_dimensions.add(rescue)
+                comparison = {
+                    "planner_nonworse_all_dimensions": True,
+                    "strict_improvement_dimensions": [rescue],
+                    "exact_tie": False,
+                    "dimensions": [],
+                }
+                outcome = "safe_policy_rescue"
+        elif planner_success:
+            counts["planner_only_success"] += 1
             comparison = {
-                "planner_nonworse_all_dimensions": True,
-                "strict_improvement_dimensions": [rescue],
+                "planner_nonworse_all_dimensions": False,
+                "strict_improvement_dimensions": [],
                 "exact_tie": False,
                 "dimensions": [],
             }
-            outcome = "safe_policy_rescue"
+            outcome = "planner_only_success"
         else:
             counts["neither_success"] += 1
             comparison = {
@@ -1303,17 +1406,49 @@ def build_selection_evidence(
                     "attempt_tape": planner_tape,
                 },
                 "comparison": comparison,
+                "rejection_reasons": per_reset_rejections,
             }
         )
+        rejection_reasons.extend(per_reset_rejections)
 
+    all_successful_policy_quality_v3_gates_passed = all(
+        row["policy"]["quality_v3_gate"]["passed"] is True
+        for row in per_reset
+        if row["policy"]["success"]
+    )
+    if (
+        policy_evaluation.get("all_successful_quality_v2_gates_passed")
+        is not all_successful_policy_quality_v3_gates_passed
+    ):
+        raise ValueError(
+            "policy evaluation successful-Qv3 aggregate disagrees with audited records"
+        )
     if counts["policy_safety_failure"] > counts["planner_safety_failure"]:
-        raise ValueError("policy safety failures exceed the matched planner")
+        rejection_reasons.append(
+            {
+                "code": "aggregate_policy_safety_count_worse",
+                "scope": "aggregate",
+                "policy_failure_count": counts["policy_safety_failure"],
+                "planner_failure_count": counts["planner_safety_failure"],
+            }
+        )
     if counts["policy_safety_failure"] < counts["planner_safety_failure"]:
         strict_dimensions.add("safety.failure_count")
-    if counts["planner_only_success"]:
-        raise AssertionError("success regression escaped the per-reset validator")
-    decision = "promote" if strict_dimensions else "keep_planner"
-    exact_tie = decision != "promote"
+    if rejection_reasons:
+        decision = "keep_planner"
+        selection_reason = "formal_gate_rejection"
+        planner_nonworse_all_dimensions = False
+        exact_tie = False
+    elif strict_dimensions:
+        decision = "promote"
+        selection_reason = "strict_planner_nonworse_improvement"
+        planner_nonworse_all_dimensions = True
+        exact_tie = False
+    else:
+        decision = "keep_planner"
+        selection_reason = "no_strict_improvement"
+        planner_nonworse_all_dimensions = True
+        exact_tie = True
 
     from examples.embodiment import (
         audit_dynamic_benchmark_optimal_trajectories as optimal_auditor,
@@ -1371,11 +1506,9 @@ def build_selection_evidence(
                 "env_steps": env_steps,
                 "run_tag": run_tag,
             },
-            "policy_metadata": _artifact_identity(
-                policy_metadata_path,
-                sha256=hashes["policy_metadata"],
-                schema_version=POLICY_METADATA_SCHEMA,
-                payload_sha256=metadata["payload_sha256"],
+            "policy_metadata": dict(learned_policy_admission["trainer_summary"]),
+            "checkpoint_selection": dict(
+                learned_policy_admission["checkpoint_selection"]
             ),
             "policy_evaluation": _artifact_identity(
                 policy_evaluation_path,
@@ -1447,8 +1580,12 @@ def build_selection_evidence(
                     counts["planner_safety_failure"], RESET_COUNT
                 ),
             },
-            "planner_nonworse_all_both_success": True,
-            "all_successful_policy_quality_v3_gates_passed": True,
+            "planner_nonworse_all_both_success": (
+                planner_nonworse_all_both_success
+            ),
+            "all_successful_policy_quality_v3_gates_passed": (
+                all_successful_policy_quality_v3_gates_passed
+            ),
             "all_successful_policy_t5_causal_gates_passed": all(
                 row["policy"]["action_application"]["t5_replan_causal_timing_passed"]
                 is not False
@@ -1459,13 +1596,15 @@ def build_selection_evidence(
         },
         "selection": {
             "decision": decision,
-            "planner_nonworse_all_dimensions": True,
+            "reason": selection_reason,
+            "planner_nonworse_all_dimensions": planner_nonworse_all_dimensions,
             "strict_improvement_dimensions": sorted(strict_dimensions),
+            "rejection_reasons": rejection_reasons,
             "exact_aggregate_tie": exact_tie,
             "rule": (
-                "no safety or planner-success regression; successful policy Qv3 and T5 causal "
-                "gates pass; each both-success reset is nonworse under frozen selector/Qv3/"
-                "causal tolerances; at least one strict improvement is required"
+                "all integrity evidence must validate; any formal safety, success, Qv3, T5 "
+                "causal, or paired nonworse regression keeps the planner; otherwise at least "
+                "one strict planner-nonworse improvement is required for promotion"
             ),
         },
     }
@@ -1497,6 +1636,13 @@ def _input_hashes(evidence: Mapping[str, Any]) -> dict[str, str]:
                 inputs.get("policy_metadata"), "evidence policy metadata"
             ).get("sha256"),
             "evidence policy metadata SHA-256",
+        ),
+        "checkpoint_selection": _require_sha256(
+            _require_mapping(
+                inputs.get("checkpoint_selection"),
+                "evidence checkpoint-selection manifest",
+            ).get("sha256"),
+            "evidence checkpoint-selection SHA-256",
         ),
         "policy_evaluation": _require_sha256(
             _require_mapping(
@@ -1586,6 +1732,7 @@ def validate_selection_evidence_artifacts(
         run_tag=str(policy.get("run_tag")),
         policy_path=_input_path(evidence, "policy"),
         policy_metadata_path=_input_path(evidence, "policy_metadata"),
+        checkpoint_selection_path=_input_path(evidence, "checkpoint_selection"),
         policy_evaluation_path=_input_path(evidence, "policy_evaluation"),
         planner_evaluation_path=_input_path(evidence, "planner_evaluation"),
         reset_manifest_path=_input_path(evidence, "reset_manifest"),
@@ -1749,10 +1896,12 @@ def build_promotion_receipt(
         "quality_v2_calibration_wave_receipt": dict(calibration_receipt),
         "selection": {
             "decision": selection["decision"],
+            "reason": selection["reason"],
             "planner_nonworse_all_dimensions": selection[
                 "planner_nonworse_all_dimensions"
             ],
             "strict_improvement_dimensions": selection["strict_improvement_dimensions"],
+            "rejection_reasons": selection["rejection_reasons"],
             "selector_contract_path": selector["path"],
             "selector_contract_sha256": selector["sha256"],
             "planner_evaluation_path": planner_evaluation["path"],
@@ -1807,13 +1956,6 @@ def write_promotion_artifacts(
         raise ValueError("evidence and receipt paths must be different")
     if evidence_path.exists() or receipt_path.exists():
         raise FileExistsError("refusing to overwrite promotion artifacts")
-    decision = _require_mapping(evidence.get("selection"), "selection evidence").get(
-        "decision"
-    )
-    if require_promote and decision != "promote":
-        raise RuntimeError(
-            "--require-promote was requested but the planner wins an exact tie"
-        )
     evidence_body = _json_bytes(evidence)
     evidence_file_sha = hashlib.sha256(evidence_body).hexdigest()
     receipt = build_promotion_receipt(
@@ -1821,6 +1963,12 @@ def write_promotion_artifacts(
         evidence_path=evidence_path,
         evidence_file_sha256=evidence_file_sha,
     )
+    selection = _require_mapping(receipt.get("selection"), "promotion selection")
+    if require_promote and selection.get("decision") != "promote":
+        raise RuntimeError(
+            "--require-promote was requested but selection keeps the planner: "
+            + str(selection.get("reason"))
+        )
     receipt_body = _json_bytes(receipt)
     _write_new(evidence_path, evidence_body)
     try:
@@ -1840,6 +1988,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-policy-sha256", required=True)
     parser.add_argument("--policy-metadata", type=Path, required=True)
     parser.add_argument("--expected-policy-metadata-sha256", required=True)
+    parser.add_argument("--checkpoint-selection", type=Path, required=True)
+    parser.add_argument("--expected-checkpoint-selection-sha256", required=True)
     parser.add_argument("--policy-evaluation", type=Path, required=True)
     parser.add_argument("--expected-policy-evaluation-sha256", required=True)
     parser.add_argument("--planner-evaluation", type=Path, required=True)
@@ -1876,6 +2026,7 @@ def main() -> None:
         run_tag=args.run_tag,
         policy_path=args.policy,
         policy_metadata_path=args.policy_metadata,
+        checkpoint_selection_path=args.checkpoint_selection,
         policy_evaluation_path=args.policy_evaluation,
         planner_evaluation_path=args.planner_evaluation,
         reset_manifest_path=args.reset_manifest,
@@ -1891,6 +2042,7 @@ def main() -> None:
         expected_sha256={
             "policy": args.expected_policy_sha256,
             "policy_metadata": args.expected_policy_metadata_sha256,
+            "checkpoint_selection": args.expected_checkpoint_selection_sha256,
             "policy_evaluation": args.expected_policy_evaluation_sha256,
             "planner_evaluation": args.expected_planner_evaluation_sha256,
             "reset_manifest": args.expected_reset_manifest_sha256,
