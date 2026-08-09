@@ -327,6 +327,7 @@ def _thresholds(*, task: str = TASK) -> dict:
             "file_sha256": "c" * 64,
             "payload_sha256": "c" * 64,
             "relative_path": "provenance/calibration_wave/wave_receipt.json",
+            "source_identity": {"benchmark_commit": BENCHMARK_COMMIT},
         },
         "tasks": {
             task: {
@@ -360,6 +361,7 @@ class Fixture:
                     "task_count": 14,
                     "episodes_per_task": 20,
                     "total_reset_count": 280,
+                    "source_identity": {"benchmark_commit": BENCHMARK_COMMIT},
                 }
             ).encode("utf-8")
         )
@@ -710,15 +712,26 @@ def _canonical_attempt_auditor_stub(monkeypatch: pytest.MonkeyPatch) -> None:
         receipt_path: Path,
         *,
         expected_sha256: str | None = None,
+        expected_benchmark_commit: str | None = None,
     ) -> optimal.ProvenanceFile:
         actual = promotion._sha256(receipt_path)
         binding = thresholds["calibration_wave_receipt"]
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         if (
             expected_sha256 != actual
             or binding["file_sha256"] != actual
             or binding["payload_sha256"] != actual
         ):
             raise ValueError("calibration wave receipt SHA-256 mismatch")
+        if (
+            expected_benchmark_commit != BENCHMARK_COMMIT
+            or binding.get("source_identity") != receipt.get("source_identity")
+            or receipt.get("source_identity", {}).get("benchmark_commit")
+            != expected_benchmark_commit
+        ):
+            raise ValueError(
+                "calibration receipt benchmark commit differs from authenticated commit"
+            )
         return optimal.ProvenanceFile(
             source_path=receipt_path.resolve(),
             relative_path=binding["relative_path"],
@@ -746,9 +759,7 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
     )
 
     assert evidence["selection"]["decision"] == "promote"
-    assert evidence["selection"]["reason"] == (
-        "strict_planner_nonworse_improvement"
-    )
+    assert evidence["selection"]["reason"] == ("strict_planner_nonworse_improvement")
     assert evidence["selection"]["rejection_reasons"] == []
     assert evidence["aggregate"]["counts"]["both_success"] == 20
     assert evidence["aggregate"]["success"]["policy"]["wilson_95"]["low"] > 0.8
@@ -803,9 +814,7 @@ def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
                 "payload_sha256": fixture.calibration_receipt_sha,
             },
             evaluator_rlinf_commit=EVALUATOR_COMMIT,
-            evaluator_source_sha256=promotion._sha256(
-                fixture.policy_evaluator_source
-            ),
+            evaluator_source_sha256=promotion._sha256(fixture.policy_evaluator_source),
         )
         == receipt
     )
@@ -935,8 +944,9 @@ def test_t5_scientific_regressions_are_sealed_but_malformed_history_throws(
             "failed_gates": ["t5_causal_timing"],
         }
     ]
-    assert gate_evidence["per_reset"][0]["rejection_reasons"] == (
-        gate_evidence["selection"]["rejection_reasons"]
+    assert (
+        gate_evidence["per_reset"][0]["rejection_reasons"]
+        == (gate_evidence["selection"]["rejection_reasons"])
     )
 
     wrong_history = Fixture(tmp_path / "issued", task="t5_replan")
@@ -1002,6 +1012,28 @@ def test_tampered_calibration_wave_receipt_fails_before_selection(
     )
 
     with pytest.raises(ValueError, match="calibration wave receipt SHA-256 mismatch"):
+        fixture.build()
+
+
+def test_calibration_wave_receipt_benchmark_mismatch_fails_before_selection(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    wrong_commit = "f" * 40
+    receipt = json.loads(fixture.calibration_receipt_path.read_text(encoding="utf-8"))
+    receipt["source_identity"]["benchmark_commit"] = wrong_commit
+    fixture.calibration_receipt_path.write_bytes(
+        promotion._canonical_json(receipt).encode("utf-8")
+    )
+    receipt_sha = promotion._sha256(fixture.calibration_receipt_path)
+    fixture.thresholds["calibration_wave_receipt"]["source_identity"] = receipt[
+        "source_identity"
+    ]
+    for key in ("sha256", "file_sha256", "payload_sha256"):
+        fixture.thresholds["calibration_wave_receipt"][key] = receipt_sha
+    _write_json(fixture.threshold_path, fixture.thresholds)
+
+    with pytest.raises(ValueError, match="benchmark commit differs"):
         fixture.build()
 
 
@@ -1071,9 +1103,7 @@ def test_safety_and_success_regressions_seal_keep_planner_decisions(
     assert regression_evidence["selection"]["reason"] == "formal_gate_rejection"
     assert regression_evidence["selection"]["planner_nonworse_all_dimensions"] is False
     assert regression_evidence["selection"]["rejection_reasons"] == [expected_reason]
-    assert regression_evidence["per_reset"][0]["rejection_reasons"] == [
-        expected_reason
-    ]
+    assert regression_evidence["per_reset"][0]["rejection_reasons"] == [expected_reason]
 
     evidence_path = regression.root / "selection_evidence.json"
     receipt_path = regression.root / "promotion_receipt.json"
@@ -1150,9 +1180,7 @@ def test_successful_policy_safety_and_qv3_gate_failures_are_structured(
         target = quality if phase == "full_episode" else quality["phases"][phase]
         _set_nested(target, metric, 3.0)
         record["quality_v2_sha256"] = promotion._payload_sha256(quality)
-        record["quality_v2_gate"] = _gate(
-            quality, qv3.checks, qv3.threshold_sha
-        )
+        record["quality_v2_gate"] = _gate(quality, qv3.checks, qv3.threshold_sha)
     qv3._write_evaluations()
 
     qv3_evidence = qv3.build()
@@ -1165,9 +1193,10 @@ def test_successful_policy_safety_and_qv3_gate_failures_are_structured(
             "failed_gates": ["quality_v3"],
         }
     ]
-    assert qv3_evidence["aggregate"][
-        "all_successful_policy_quality_v3_gates_passed"
-    ] is False
+    assert (
+        qv3_evidence["aggregate"]["all_successful_policy_quality_v3_gates_passed"]
+        is False
+    )
 
 
 def test_malformed_nonfinite_and_replay_evidence_still_throws(

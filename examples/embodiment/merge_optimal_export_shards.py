@@ -45,6 +45,7 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _atomic_json,
     _expected_sha256,
     _file_boundary,
+    _full_commit,
     _payload_sha256,
     _quality_v2_calibration_receipt_binding,
     _root_checksums,
@@ -359,10 +360,23 @@ def _validate_quality_v2_shard_contract(
         raise ValueError(f"{shard} quality-v2 threshold contract identity mismatch")
 
     receipt_binding = _quality_v2_calibration_receipt_binding(threshold_payload)
+    source_identity = export_state.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        raise ValueError(f"{shard} export state has no source identity")
+    benchmark_key = (
+        "evaluator_benchmark_commit"
+        if "evaluator_benchmark_commit" in source_identity
+        else "benchmark_commit"
+    )
+    expected_benchmark_commit = _full_commit(
+        f"{shard} authenticated benchmark commit",
+        source_identity.get(benchmark_key),
+    )
     _validate_quality_v2_calibration_receipt_artifact(
         threshold_payload,
         shard / receipt_binding["relative_path"],
         expected_sha256=receipt_binding["file_sha256"],
+        expected_benchmark_commit=expected_benchmark_commit,
     )
     return identity, receipt_binding
 

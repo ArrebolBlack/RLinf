@@ -1896,6 +1896,8 @@ def _validate_quality_v2_calibration_wave_receipt(
     thresholds: Mapping[str, Any],
     receipt_path: Path,
     expected_sha256: str,
+    *,
+    expected_benchmark_commit: str,
 ) -> tuple[Any, dict[str, str]]:
     """Delegate the frozen exact-14 receipt contract to the optimal exporter."""
 
@@ -1907,6 +1909,7 @@ def _validate_quality_v2_calibration_wave_receipt(
         thresholds,
         receipt_path,
         expected_sha256=expected_sha256,
+        expected_benchmark_commit=expected_benchmark_commit,
     )
     binding = optimal._quality_v2_calibration_receipt_binding(thresholds)
     if (
@@ -2364,14 +2367,6 @@ def main() -> None:
     threshold_contract, threshold_schema, threshold_sha256 = _load_thresholds(
         args.quality_v2_thresholds, args.expected_quality_v2_thresholds_sha256
     )
-    (
-        quality_v2_calibration_receipt,
-        quality_v2_calibration_receipt_identity,
-    ) = _validate_quality_v2_calibration_wave_receipt(
-        threshold_contract,
-        args.quality_v2_calibration_wave_receipt,
-        args.expected_quality_v2_calibration_wave_receipt_sha256,
-    )
     evaluator_commit = _require_commit(args.evaluator_commit, "evaluator commit")
     evaluator_benchmark_commit = _require_commit(
         args.evaluator_benchmark_commit, "evaluator benchmark commit"
@@ -2396,6 +2391,15 @@ def main() -> None:
         threshold_sha256=threshold_sha256,
         evaluator_commit=evaluator_commit,
         evaluator_benchmark_commit=evaluator_benchmark_commit,
+    )
+    (
+        quality_v2_calibration_receipt,
+        quality_v2_calibration_receipt_identity,
+    ) = _validate_quality_v2_calibration_wave_receipt(
+        threshold_contract,
+        args.quality_v2_calibration_wave_receipt,
+        args.expected_quality_v2_calibration_wave_receipt_sha256,
+        expected_benchmark_commit=evaluator_benchmark_commit,
     )
     task = _require_string(candidate_payload.get("task"), "candidate task")
     threshold_tasks = _require_mapping(

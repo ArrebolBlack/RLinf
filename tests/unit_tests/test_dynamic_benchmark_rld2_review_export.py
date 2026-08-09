@@ -52,6 +52,8 @@ from examples.embodiment.export_dynamic_benchmark_rld2_review import (
     _validate_quality_v2_calibration_wave_receipt,
 )
 
+_CALIBRATION_BENCHMARK_COMMIT = "4" * 40
+
 
 def _gate(smooth: float, orientation: float) -> dict:
     checks = [
@@ -755,9 +757,7 @@ def test_promotion_receipt_rejects_zero_step_final_unpromoted_and_test_exposure(
 def test_promotion_v02_selection_is_exact_and_keep_planner_never_enters_pool() -> None:
     validated = _validate_receipt(_promotion_receipt())
     assert set(validated["selection"]) == review_exporter._SELECTION_KEYS
-    assert validated["selection"]["reason"] == (
-        "strict_planner_nonworse_improvement"
-    )
+    assert validated["selection"]["reason"] == ("strict_planner_nonworse_improvement")
     assert validated["selection"]["rejection_reasons"] == []
 
     for field_inventory_mutation in ("missing", "extra"):
@@ -1007,7 +1007,10 @@ def _calibration_receipt_fixture(tmp_path: Path) -> tuple[dict, Path, str]:
         "task_order": task_order,
         "wave_contract_sha256": "a" * 64,
         "predeclaration_receipt_sha256": "b" * 64,
-        "source_identity": {"wave_id": "review-unit-test"},
+        "source_identity": {
+            "wave_id": "review-unit-test",
+            "benchmark_commit": _CALIBRATION_BENCHMARK_COMMIT,
+        },
         "disjointness": {"verified": True},
         "tasks": receipt_tasks,
     }
@@ -1039,7 +1042,10 @@ def test_review_calibration_receipt_is_copied_bound_and_root_checksummed(
     thresholds, receipt_path, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
 
     provenance, identity = _validate_quality_v2_calibration_wave_receipt(
-        thresholds, receipt_path, receipt_sha256
+        thresholds,
+        receipt_path,
+        receipt_sha256,
+        expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
     )
     output = tmp_path / "review"
     output.mkdir()
@@ -1067,12 +1073,29 @@ def test_review_calibration_receipt_is_copied_bound_and_root_checksummed(
     ).read_text(encoding="utf-8")
 
 
+def test_review_calibration_receipt_binds_evaluator_benchmark_commit(
+    tmp_path: Path,
+) -> None:
+    thresholds, receipt_path, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="authenticated evaluator benchmark commit"):
+        _validate_quality_v2_calibration_wave_receipt(
+            thresholds,
+            receipt_path,
+            receipt_sha256,
+            expected_benchmark_commit="5" * 40,
+        )
+
+
 def test_review_calibration_receipt_missing_fails_closed(tmp_path: Path) -> None:
     thresholds, _, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
 
     with pytest.raises(ValueError, match="missing or symlinked"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, tmp_path / "missing.json", receipt_sha256
+            thresholds,
+            tmp_path / "missing.json",
+            receipt_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 
@@ -1088,7 +1111,10 @@ def test_review_calibration_receipt_noncanonical_tamper_fails_closed(
 
     with pytest.raises(ValueError, match="not canonical JSON"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, tampered_path, tampered_sha256
+            thresholds,
+            tampered_path,
+            tampered_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 
@@ -1106,7 +1132,10 @@ def test_review_calibration_receipt_task_hash_tamper_fails_closed(
 
     with pytest.raises(ValueError, match="task .* task_contract_sha256 mismatch"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, tampered_path, tampered_sha256
+            thresholds,
+            tampered_path,
+            tampered_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 
@@ -1118,7 +1147,10 @@ def test_review_calibration_receipt_path_traversal_fails_closed(
 
     with pytest.raises(ValueError, match="unsafe .*calibration receipt path"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, receipt_path, receipt_sha256
+            thresholds,
+            receipt_path,
+            receipt_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 

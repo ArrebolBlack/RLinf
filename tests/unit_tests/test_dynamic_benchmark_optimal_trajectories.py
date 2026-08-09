@@ -118,6 +118,7 @@ _DYNAMIC_QUALITY_METRICS = (
     "eef_motion.eef_linear_jerk_rms_m_s3",
 )
 _QUALITY_V2_THRESHOLD_SHA256 = "c" * 64
+_CALIBRATION_BENCHMARK_COMMIT = "d" * 40
 _CALIBRATION_TASKS = (
     "p0_grasp",
     "t1_xyz",
@@ -254,7 +255,10 @@ def _calibration_receipt_fixture(tmp_path: Path) -> tuple[dict, Path, str]:
         "task_order": list(_CALIBRATION_TASKS),
         "wave_contract_sha256": "a" * 64,
         "predeclaration_receipt_sha256": "b" * 64,
-        "source_identity": {"wave_id": "synthetic-wave"},
+        "source_identity": {
+            "wave_id": "synthetic-wave",
+            "benchmark_commit": _CALIBRATION_BENCHMARK_COMMIT,
+        },
         "disjointness": {"verified": True},
         "tasks": receipt_tasks,
     }
@@ -955,6 +959,7 @@ def test_quality_v2_calibration_receipt_artifact_round_trip(tmp_path: Path) -> N
         thresholds,
         receipt_path,
         expected_sha256=receipt_sha256,
+        expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
     )
     assert provenance.relative_path == ("provenance/calibration_wave/wave_receipt.json")
     assert provenance.sha256 == receipt_sha256
@@ -970,11 +975,39 @@ def test_quality_v2_calibration_receipt_artifact_round_trip(tmp_path: Path) -> N
     assert _audit_quality_v2_calibration_receipt_artifact(
         dataset_root,
         thresholds,
+        expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
     ) == {
         "relative_path": provenance.relative_path,
         "file_sha256": receipt_sha256,
         "payload_sha256": receipt_sha256,
     }
+
+
+def test_quality_v2_calibration_receipt_binds_evaluator_benchmark_commit(
+    tmp_path: Path,
+) -> None:
+    thresholds, receipt_path, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
+    dataset_root = tmp_path / "dataset"
+    dataset_receipt = (
+        dataset_root / thresholds["calibration_wave_receipt"]["relative_path"]
+    )
+    dataset_receipt.parent.mkdir(parents=True)
+    dataset_receipt.write_bytes(receipt_path.read_bytes())
+    wrong_commit = "e" * 40
+
+    with pytest.raises(ValueError, match="authenticated evaluator benchmark commit"):
+        _validate_quality_v2_calibration_receipt_artifact(
+            thresholds,
+            receipt_path,
+            expected_sha256=receipt_sha256,
+            expected_benchmark_commit=wrong_commit,
+        )
+    with pytest.raises(ValueError, match="authenticated evaluator benchmark commit"):
+        _audit_quality_v2_calibration_receipt_artifact(
+            dataset_root,
+            thresholds,
+            expected_benchmark_commit=wrong_commit,
+        )
 
 
 def test_quality_v2_calibration_receipt_artifact_is_required(tmp_path: Path) -> None:
@@ -1289,7 +1322,10 @@ def _write_sharded_quality_merge_fixture(
             "device": "cpu",
             "candidate_manifest_sha256": candidate_sha256,
             "reset_manifest_sha256": reset_sha256,
-            "source_identity": {"fixture": "shard-merge"},
+            "source_identity": {
+                "fixture": "shard-merge",
+                "benchmark_commit": _CALIBRATION_BENCHMARK_COMMIT,
+            },
             "quality_v2_threshold_identity": quality_identity,
             "state_schema": {"fixture": True},
             "candidates": [{"candidate_id": "planner"}],

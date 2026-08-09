@@ -901,14 +901,10 @@ def _compare_both_success(
         and planner_causal_timing["t5_replan_causal_timing_passed"] is True
     ):
         policy_causal_latency = float(
-            policy_causal_timing[
-                "impact_end_to_first_qualifying_applied_correction_s"
-            ]
+            policy_causal_timing["impact_end_to_first_qualifying_applied_correction_s"]
         )
         planner_causal_latency = float(
-            planner_causal_timing[
-                "impact_end_to_first_qualifying_applied_correction_s"
-            ]
+            planner_causal_timing["impact_end_to_first_qualifying_applied_correction_s"]
         )
         dimension_name = "causal.impact_end_to_first_qualifying_applied_correction_s"
         dimension_nonworse = (
@@ -1093,6 +1089,7 @@ def build_selection_evidence(
         threshold_payload,
         quality_v2_calibration_wave_receipt_path,
         expected_sha256=hashes["quality_v2_calibration_wave_receipt"],
+        expected_benchmark_commit=benchmark_commit,
     )
     if calibration_receipt.sha256 != hashes["quality_v2_calibration_wave_receipt"]:
         raise ValueError(
@@ -1580,9 +1577,7 @@ def build_selection_evidence(
                     counts["planner_safety_failure"], RESET_COUNT
                 ),
             },
-            "planner_nonworse_all_both_success": (
-                planner_nonworse_all_both_success
-            ),
+            "planner_nonworse_all_both_success": (planner_nonworse_all_both_success),
             "all_successful_policy_quality_v3_gates_passed": (
                 all_successful_policy_quality_v3_gates_passed
             ),
