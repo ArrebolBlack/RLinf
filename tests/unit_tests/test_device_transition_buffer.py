@@ -23,8 +23,12 @@ from typing import Any
 import numpy as np
 import pytest
 
-_MODULE_PATH = Path(__file__).parents[2] / "rlinf" / "data" / "device_transition_buffer.py"
-_SPEC = importlib.util.spec_from_file_location("_device_transition_buffer_under_test", _MODULE_PATH)
+_MODULE_PATH = (
+    Path(__file__).parents[2] / "rlinf" / "data" / "device_transition_buffer.py"
+)
+_SPEC = importlib.util.spec_from_file_location(
+    "_device_transition_buffer_under_test", _MODULE_PATH
+)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
@@ -90,11 +94,17 @@ class _Torch:
 
     @staticmethod
     def empty(shape: tuple[int, ...], *, dtype: Any, device: str) -> _Tensor:
-        return _Tensor(np.empty(shape, dtype=_Torch._numpy_dtype(dtype)), dtype=dtype, device=device)
+        return _Tensor(
+            np.empty(shape, dtype=_Torch._numpy_dtype(dtype)),
+            dtype=dtype,
+            device=device,
+        )
 
     @staticmethod
     def ones(shape: tuple[int, ...], *, dtype: Any, device: str) -> _Tensor:
-        return _Tensor(np.ones(shape, dtype=_Torch._numpy_dtype(dtype)), dtype=dtype, device=device)
+        return _Tensor(
+            np.ones(shape, dtype=_Torch._numpy_dtype(dtype)), dtype=dtype, device=device
+        )
 
 
 def _tensor(values: Any, *, dtype: Any = "float32") -> _Tensor:
@@ -330,3 +340,43 @@ def test_tensor_ppo_rollout_uses_two_phase_order_without_host_materialization() 
         for call in calls
         if isinstance(call.func, ast.Attribute) and call.func.attr in forbidden
     ]
+
+
+def test_tensor_ppo_checkpoint_captures_exact_cross_process_resume_state() -> None:
+    script = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "embodiment"
+        / "train_dynamic_benchmark_tensor_ppo_smoke.py"
+    )
+    source = script.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    main = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
+
+    manifest_restore = next(
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == "load_manifest_state_dict"
+    )
+    initial_reset = min(
+        call.lineno
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == "reset"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "env"
+    )
+    assert manifest_restore.lineno < initial_reset
+    assert 'parser.add_argument("--resume-from", type=Path)' in source
+    assert '"schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-v0.2"' in source
+    assert '"rng_state": _capture_rng_state()' in source
+    assert '"manifest_cursor": dict(env.manifest_state_dict())' in source
+    assert '"parameter_sha256": parameter_sha256_end' in source
+    assert '_restore_rng_state(restored["rng_state"])' in source
+    assert "_atomic_torch_save(checkpoint_path, checkpoint_payload)" in source

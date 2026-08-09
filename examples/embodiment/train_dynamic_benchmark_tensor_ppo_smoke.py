@@ -20,6 +20,9 @@ data plane.  Policy actions are consumed in place by Warp, environment outputs
 remain CUDA views, transition storage is preallocated on the same GPU, and each
 cohort resets only at the task's canonical fixed horizon.  Early terminal lanes
 remain physically allocated but post-terminal transitions are masked on device.
+Checkpoints are written only at cohort boundaries and contain the model,
+optimizer, RNG streams, and manifest cursor required for strict cross-process
+continuation.
 """
 
 from __future__ import annotations
@@ -101,9 +104,13 @@ class TensorActorCritic(nn.Module):
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
 
-    def distribution_and_value(self, observation: torch.Tensor) -> tuple[Normal, torch.Tensor]:
+    def distribution_and_value(
+        self, observation: torch.Tensor
+    ) -> tuple[Normal, torch.Tensor]:
         hidden = self.backbone(observation)
-        return Normal(self.actor(hidden), self.log_std.exp()), self.critic(hidden).squeeze(-1)
+        return Normal(self.actor(hidden), self.log_std.exp()), self.critic(
+            hidden
+        ).squeeze(-1)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -112,6 +119,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--export-dir", type=Path, required=True)
     parser.add_argument("--expected-gpu-uuid", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--split", default="train")
     parser.add_argument("--manifest-seed", type=int, default=20261050)
@@ -199,7 +207,9 @@ def _config(args: argparse.Namespace) -> TensorPPOConfig:
         raise ValueError("clip_coef must be in (0, 1)")
     for name in ("se3_commit", "se3_tree", "rlinf_commit", "rlinf_tree"):
         value = getattr(config, name)
-        if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        if len(value) != 40 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
             raise ValueError(f"{name} must be a full lowercase Git object id")
     if len(config.runtime_manifest_sha256) != 64 or any(
         character not in "0123456789abcdef"
@@ -246,11 +256,7 @@ def _masked_gae(
             - value[step]
         )
         accumulator = (
-            delta
-            + gamma
-            * gae_lambda
-            * (~done[step]).to(reward.dtype)
-            * accumulator
+            delta + gamma * gae_lambda * (~done[step]).to(reward.dtype) * accumulator
         ) * row_valid
         advantage[step] = accumulator
     return advantage, advantage + value
@@ -297,7 +303,9 @@ def _ppo_update(
             selected_observation = observation.index_select(0, indices)
             selected_action = action.index_select(0, indices)
             selected_raw_action = raw_action.index_select(0, indices)
-            distribution, predicted_value = model.distribution_and_value(selected_observation)
+            distribution, predicted_value = model.distribution_and_value(
+                selected_observation
+            )
             new_log_prob = (
                 distribution.log_prob(selected_raw_action)
                 - torch.log(1.0 - selected_action.square() + 1e-6)
@@ -310,14 +318,21 @@ def _ppo_update(
                 -batch_advantage
                 * ratio.clamp(1.0 - config.clip_coef, 1.0 + config.clip_coef),
             ).mean()
-            value_loss = 0.5 * (
-                predicted_value - returns.index_select(0, indices)
-            ).square().mean()
+            value_loss = (
+                0.5
+                * (predicted_value - returns.index_select(0, indices)).square().mean()
+            )
             entropy = distribution.entropy().sum(dim=-1).mean()
-            loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
+            loss = (
+                policy_loss
+                + config.value_coef * value_loss
+                - config.entropy_coef * entropy
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(
+                model.parameters(), config.max_grad_norm
+            )
             optimizer.step()
             metric_rows.append(
                 torch.stack(
@@ -344,7 +359,9 @@ def _ppo_update(
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -362,6 +379,90 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _state_dict_sha256(state: dict[str, torch.Tensor]) -> str:
+    """Return a stable digest of tensor names, schemas, and values."""
+
+    digest = hashlib.sha256()
+    for name, tensor in sorted(state.items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(
+            json.dumps(list(value.shape), separators=(",", ":")).encode("ascii")
+        )
+        digest.update(b"\0")
+        digest.update(value.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _model_sha256(model: nn.Module) -> str:
+    return _state_dict_sha256(model.state_dict())
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda_all": torch.cuda.get_rng_state_all(),
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    expected = {"python", "numpy", "torch_cpu", "torch_cuda_all"}
+    if set(state) != expected:
+        raise ValueError(f"resume RNG state fields drifted: {sorted(state)}")
+    cuda_states = state["torch_cuda_all"]
+    if len(cuda_states) != torch.cuda.device_count():
+        raise ValueError(
+            "resume CUDA RNG device count mismatch: "
+            f"checkpoint={len(cuda_states)}, runtime={torch.cuda.device_count()}"
+        )
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _atomic_torch_save(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _load_resume_checkpoint(
+    path: Path, config: TensorPPOConfig
+) -> tuple[Path, str, dict[str, Any]]:
+    resolved = path.resolve(strict=True)
+    sha256 = _file_sha256(resolved)
+    restored = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(restored, dict):
+        raise ValueError("resume checkpoint payload is not a mapping")
+    if restored.get("schema_version") != "rlinf-gpuenv0-tensor-ppo-smoke-v0.2":
+        raise ValueError("resume checkpoint schema mismatch")
+    if restored.get("config") != asdict(config):
+        raise ValueError("resume checkpoint config identity does not match current run")
+    required = {
+        "cohort_horizon_steps",
+        "observation_dim",
+        "model",
+        "optimizer",
+        "manifest_cursor",
+        "completed_cohorts",
+        "update_steps",
+        "rng_state",
+        "parameter_sha256",
+    }
+    missing = sorted(required - set(restored))
+    if missing:
+        raise ValueError(f"resume checkpoint is missing required fields: {missing}")
+    if int(restored["completed_cohorts"]) < 1 or int(restored["update_steps"]) < 1:
+        raise ValueError("resume checkpoint does not contain completed training")
+    return resolved, sha256, restored
 
 
 def _git_output(root: Path, *arguments: str) -> str:
@@ -472,7 +573,9 @@ def _preflight(config: TensorPPOConfig) -> tuple[dict[str, Any], dict[str, Any]]
     return {"sources": sources, "runtime": runtime}, inventory
 
 
-def _validate_runtime_versions(provenance: Any, runtime_payload: dict[str, Any]) -> None:
+def _validate_runtime_versions(
+    provenance: Any, runtime_payload: dict[str, Any]
+) -> None:
     expected = runtime_payload.get("versions")
     if not isinstance(expected, dict):
         raise RuntimeError("runtime manifest does not contain a versions mapping")
@@ -494,7 +597,9 @@ def _validate_runtime_versions(provenance: Any, runtime_payload: dict[str, Any])
                 "expected": expected_value,
             }
     if mismatches:
-        raise RuntimeError(f"runtime manifest/provenance version mismatch: {mismatches}")
+        raise RuntimeError(
+            f"runtime manifest/provenance version mismatch: {mismatches}"
+        )
 
 
 def main() -> int:
@@ -512,6 +617,14 @@ def main() -> int:
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
+    resume_path: Path | None = None
+    resume_sha256: str | None = None
+    restored: dict[str, Any] | None = None
+    if args.resume_from is not None:
+        resume_path, resume_sha256, restored = _load_resume_checkpoint(
+            args.resume_from,
+            config,
+        )
 
     env = GpuNativeTensorBackendEnv(
         task_id=config.task,
@@ -539,11 +652,38 @@ def main() -> int:
                 "gpu_free_memory_bytes_at_start": int(free_memory),
             }
         )
+        completed_cohorts_before = 0
+        update_steps_before = 0
+        restored_manifest_cursor: dict[str, Any] | None = None
+        if restored is not None:
+            if int(restored["cohort_horizon_steps"]) != env.cohort_horizon_steps:
+                raise ValueError(
+                    "resume cohort horizon does not match the live environment"
+                )
+            restored_manifest_cursor = dict(restored["manifest_cursor"])
+            env.load_manifest_state_dict(restored_manifest_cursor)
+            completed_cohorts_before = int(restored["completed_cohorts"])
+            update_steps_before = int(restored["update_steps"])
         initial = env.reset()
         observation = initial.observation
         observation_dim = int(observation.shape[1])
+        if restored is not None and int(restored["observation_dim"]) != observation_dim:
+            raise ValueError(
+                "resume observation dimension does not match the live environment"
+            )
         model = TensorActorCritic(observation_dim, config.hidden_size).to(env.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+        if restored is not None:
+            model.load_state_dict(restored["model"], strict=True)
+            optimizer.load_state_dict(restored["optimizer"])
+            parameter_sha256_start = _model_sha256(model)
+            if parameter_sha256_start != restored["parameter_sha256"]:
+                raise ValueError(
+                    "resume model parameter SHA-256 does not match checkpoint"
+                )
+            _restore_rng_state(restored["rng_state"])
+        else:
+            parameter_sha256_start = _model_sha256(model)
         buffer = DeviceTransitionBuffer(
             capacity=env.cohort_horizon_steps,
             num_envs=config.num_envs,
@@ -568,18 +708,21 @@ def main() -> int:
         model.eval()
         for _step in range(config.warmup_steps):
             with torch.inference_mode():
-                _sample(model, observation)
+                distribution, _value = model.distribution_and_value(observation)
+                torch.tanh(distribution.mean)
         torch.cuda.synchronize(env.device)
 
         cohort_rows = []
-        update_steps = 0
+        update_steps = update_steps_before
+        invocation_update_steps = 0
         total_allocated_steps = 0
         total_valid_steps = 0
         total_successes = 0
         seen_episode_ids: set[str] = set()
         wall_started = time.perf_counter()
-        for cohort in range(config.cohorts):
-            reset = initial if cohort == 0 else env.reset()
+        for local_cohort in range(config.cohorts):
+            cohort = completed_cohorts_before + local_cohort
+            reset = initial if local_cohort == 0 else env.reset()
             observation = reset.observation
             buffer.reset_cohort()
             model.eval()
@@ -634,27 +777,45 @@ def main() -> int:
             )
             update_seconds = time.perf_counter() - update_started
             update_steps += updates
+            invocation_update_steps += updates
             allocated_steps = env.cohort_horizon_steps * config.num_envs
             valid_steps = int(rollout.valid.sum())
             successes = int((rollout.success & rollout.done & rollout.valid).sum())
             done_valid = rollout.done & rollout.valid
             lane_valid_steps = rollout.valid.sum(dim=0).cpu().tolist()
             lane_returns = (
-                rollout.reward * rollout.valid.to(rollout.reward.dtype)
-            ).sum(dim=0).cpu().tolist()
-            lane_terminated = (rollout.terminated & rollout.valid).any(dim=0).cpu().tolist()
-            lane_truncated = (rollout.truncated & rollout.valid).any(dim=0).cpu().tolist()
+                (rollout.reward * rollout.valid.to(rollout.reward.dtype))
+                .sum(dim=0)
+                .cpu()
+                .tolist()
+            )
+            lane_terminated = (
+                (rollout.terminated & rollout.valid).any(dim=0).cpu().tolist()
+            )
+            lane_truncated = (
+                (rollout.truncated & rollout.valid).any(dim=0).cpu().tolist()
+            )
             lane_success = (rollout.success & done_valid).any(dim=0).cpu().tolist()
-            lane_terminal_reason = torch.where(
-                done_valid,
-                rollout.terminal_reason,
-                torch.zeros_like(rollout.terminal_reason),
-            ).amax(dim=0).cpu().tolist()
-            lane_terminal_physics_step = torch.where(
-                done_valid,
-                rollout.physics_step,
-                torch.zeros_like(rollout.physics_step),
-            ).amax(dim=0).cpu().tolist()
+            lane_terminal_reason = (
+                torch.where(
+                    done_valid,
+                    rollout.terminal_reason,
+                    torch.zeros_like(rollout.terminal_reason),
+                )
+                .amax(dim=0)
+                .cpu()
+                .tolist()
+            )
+            lane_terminal_physics_step = (
+                torch.where(
+                    done_valid,
+                    rollout.physics_step,
+                    torch.zeros_like(rollout.physics_step),
+                )
+                .amax(dim=0)
+                .cpu()
+                .tolist()
+            )
             ledger_rows = []
             for lane, episode_id in enumerate(reset.episode_ids):
                 if episode_id in seen_episode_ids:
@@ -700,22 +861,46 @@ def main() -> int:
             )
         torch.cuda.synchronize(env.device)
         wall_seconds = time.perf_counter() - wall_started
+        parameter_sha256_end = _model_sha256(model)
+        if invocation_update_steps < 1:
+            raise RuntimeError("PPO smoke completed no optimizer updates")
+        if parameter_sha256_end == parameter_sha256_start:
+            raise RuntimeError("PPO optimizer updates did not change model parameters")
 
         checkpoint_path = args.output / "checkpoint_latest.pt"
-        torch.save(
-            {
-                "schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-v0.1",
-                "config": asdict(config),
-                "cohort_horizon_steps": env.cohort_horizon_steps,
-                "observation_dim": observation_dim,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "manifest_cursor": dict(env.manifest_state_dict()),
-                "completed_cohorts": config.cohorts,
-                "update_steps": update_steps,
-            },
-            checkpoint_path,
-        )
+        completed_cohorts_after = completed_cohorts_before + config.cohorts
+        checkpoint_payload = {
+            "schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-v0.2",
+            "config": asdict(config),
+            "cohort_horizon_steps": env.cohort_horizon_steps,
+            "observation_dim": observation_dim,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "manifest_cursor": dict(env.manifest_state_dict()),
+            "completed_cohorts": completed_cohorts_after,
+            "update_steps": update_steps,
+            "rng_state": _capture_rng_state(),
+            "parameter_sha256": parameter_sha256_end,
+        }
+        _atomic_torch_save(checkpoint_path, checkpoint_payload)
+        reloaded = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_reload_checks = {
+            "schema_match": reloaded.get("schema_version")
+            == "rlinf-gpuenv0-tensor-ppo-smoke-v0.2",
+            "completed_cohorts_match": int(reloaded.get("completed_cohorts", -1))
+            == completed_cohorts_after,
+            "update_steps_match": int(reloaded.get("update_steps", -1)) == update_steps,
+            "manifest_cursor_match": reloaded.get("manifest_cursor")
+            == checkpoint_payload["manifest_cursor"],
+            "parameter_sha256_match": reloaded.get("parameter_sha256")
+            == parameter_sha256_end,
+            "model_payload_sha256_match": _state_dict_sha256(reloaded["model"])
+            == parameter_sha256_end,
+        }
+        if not all(checkpoint_reload_checks.values()):
+            raise RuntimeError(
+                f"checkpoint reload validation failed: {checkpoint_reload_checks}"
+            )
         provenance = env.provenance
         transport_receipt = env.last_transport_receipt
         if transport_receipt is None or env.transport_checks < 1:
@@ -729,7 +914,7 @@ def main() -> int:
             },
         }
         report = {
-            "schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-report-v0.1",
+            "schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-report-v0.2",
             "status": "passed",
             "config": asdict(config),
             "source_provenance": source_provenance,
@@ -775,17 +960,37 @@ def main() -> int:
             },
             "train": {
                 "cohorts": cohort_rows,
+                "completed_cohorts_before": completed_cohorts_before,
+                "completed_cohorts_after": completed_cohorts_after,
                 "total_allocated_steps": total_allocated_steps,
                 "total_valid_steps": total_valid_steps,
                 "terminal_successes": total_successes,
-                "optimizer_updates": update_steps,
+                "optimizer_updates_before": update_steps_before,
+                "optimizer_updates_this_invocation": invocation_update_steps,
+                "optimizer_updates_after": update_steps,
+                "parameter_sha256_start": parameter_sha256_start,
+                "parameter_sha256_end": parameter_sha256_end,
+                "parameters_changed": parameter_sha256_start != parameter_sha256_end,
                 "wall_seconds": wall_seconds,
                 "allocated_env_steps_per_s": total_allocated_steps / wall_seconds,
                 "valid_env_steps_per_s": total_valid_steps / wall_seconds,
             },
+            "resume": {
+                "resumed": restored is not None,
+                "source_path": str(resume_path) if resume_path is not None else None,
+                "source_sha256": resume_sha256,
+                "restored_manifest_cursor": restored_manifest_cursor,
+                "parameter_sha256_matches_source": (
+                    parameter_sha256_start == restored["parameter_sha256"]
+                    if restored is not None
+                    else None
+                ),
+            },
             "checkpoint": {
                 "path": str(checkpoint_path),
                 "sha256": _file_sha256(checkpoint_path),
+                "schema_version": checkpoint_payload["schema_version"],
+                "reload_checks": checkpoint_reload_checks,
             },
             "episode_ledger": {
                 "path": str(ledger_path),
