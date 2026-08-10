@@ -1813,9 +1813,12 @@ class DynamicBenchmarkEnv(gym.Env):
             )
         if not self.infra_is_default:
             identity["infra_identity"] = self.infra_identity
-        if self.task_quality_schema_version is not None:
+        task_quality_schema_version = getattr(
+            self, "task_quality_schema_version", None
+        )
+        if task_quality_schema_version is not None:
             identity["task_quality"] = {
-                "schema_version": self.task_quality_schema_version,
+                "schema_version": task_quality_schema_version,
                 "evaluator_backend_id": self.task_quality_evaluator_backend_id,
             }
         return identity
