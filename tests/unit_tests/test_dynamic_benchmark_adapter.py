@@ -22,6 +22,7 @@ import pytest
 from rlinf.envs import SupportedEnvType
 from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
     DynamicBenchmarkEnv,
+    _resolve_candidate_manifest_factories,
     _task_quality_make_kwargs,
 )
 from rlinf.envs.dynamic_benchmark.reward import DynamicBenchmarkReward
@@ -141,6 +142,60 @@ def test_manifest_refresh_requests_only_the_runtime_task() -> None:
         }
     ]
     assert len(env._manifest_rows) == 8
+    assert env._manifest_cursor == 0
+
+
+def test_manifest_factory_resolution_supports_current_and_legacy_benchmarks() -> None:
+    def current(**_kwargs):
+        return ()
+
+    def legacy(**_kwargs):
+        return ()
+
+    assert _resolve_candidate_manifest_factories(
+        SimpleNamespace(make_task_candidate_manifest=current)
+    ) == (current, None)
+    assert _resolve_candidate_manifest_factories(
+        SimpleNamespace(make_dataset_candidate_manifest=legacy)
+    ) == (None, legacy)
+    with pytest.raises(ImportError, match="no supported"):
+        _resolve_candidate_manifest_factories(SimpleNamespace())
+
+
+def test_manifest_refresh_falls_back_to_legacy_dataset_manifest() -> None:
+    calls = []
+
+    def make_dataset_manifest(**kwargs):
+        calls.append(kwargs)
+        return tuple(
+            SimpleNamespace(request=SimpleNamespace(task_id=task))
+            for task in kwargs["tasks"]
+            for _ in range(kwargs["attempts_per_task"])
+        )
+
+    env = object.__new__(DynamicBenchmarkEnv)
+    env.task_id = "t4_slider"
+    env._split = SimpleNamespace(value="validation")
+    env.base_manifest_seed = 20261450
+    env.manifest_size = 3
+    env._manifest_generation = 2
+    env._manifest_cursor = 99
+    env._active_task_ids = ("t1_xyz", "t4_slider")
+    env._make_task_candidate_manifest = None
+    env._make_dataset_candidate_manifest = make_dataset_manifest
+
+    env._refresh_manifest()
+
+    assert calls == [
+        {
+            "split": env._split,
+            "attempts_per_task": 3,
+            "manifest_seed": 20261450 + 2 * 10_000_019,
+            "tasks": ("t1_xyz", "t4_slider"),
+        }
+    ]
+    assert len(env._manifest_rows) == 3
+    assert {row.request.task_id for row in env._manifest_rows} == {"t4_slider"}
     assert env._manifest_cursor == 0
 
 
