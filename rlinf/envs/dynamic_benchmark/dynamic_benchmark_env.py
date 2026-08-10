@@ -85,6 +85,22 @@ def _task_quality_make_kwargs(
     }
 
 
+def _resolve_candidate_manifest_factories(
+    dataset_manifest: Any,
+) -> tuple[Any | None, Any | None]:
+    """Support both task-local and legacy all-task benchmark manifests."""
+
+    make_task = getattr(dataset_manifest, "make_task_candidate_manifest", None)
+    make_dataset = getattr(dataset_manifest, "make_dataset_candidate_manifest", None)
+    if make_task is not None and not callable(make_task):
+        raise ImportError("benchmark task manifest factory is not callable")
+    if make_dataset is not None and not callable(make_dataset):
+        raise ImportError("benchmark dataset manifest factory is not callable")
+    if make_task is None and make_dataset is None:
+        raise ImportError("benchmark exposes no supported candidate manifest factory")
+    return make_task, make_dataset
+
+
 def _torch_clone(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.clone()
@@ -709,6 +725,7 @@ class DynamicBenchmarkEnv(gym.Env):
 
     def _load_benchmark_contracts(self) -> None:
         try:
+            from se3_wam.benchmark import dataset_manifest
             from se3_wam.benchmark.api import (
                 ActionCommand,
                 ObservationBundle,
@@ -717,9 +734,6 @@ class DynamicBenchmarkEnv(gym.Env):
             )
             from se3_wam.benchmark.config import load_task_config
             from se3_wam.benchmark.contracts import EventRecord
-            from se3_wam.benchmark.dataset_manifest import (
-                make_task_candidate_manifest,
-            )
             from se3_wam.benchmark.keyed_puck import T5EventTape
             from se3_wam.benchmark.p0_grasp_manifest import (
                 make_p0_grasp_candidate_manifest,
@@ -730,6 +744,11 @@ class DynamicBenchmarkEnv(gym.Env):
                 get_task_spec,
             )
             from se3_wam.benchmark.suite import make_mujoco_env
+
+            (
+                make_task_candidate_manifest,
+                make_dataset_candidate_manifest,
+            ) = _resolve_candidate_manifest_factories(dataset_manifest)
         except ImportError as exc:
             raise ImportError(
                 "DynamicBenchmarkEnv requires the SE3-WAM benchmark source on PYTHONPATH"
@@ -740,6 +759,7 @@ class DynamicBenchmarkEnv(gym.Env):
         self._StepResult = StepResult
         self._EventRecord = EventRecord
         self._make_task_candidate_manifest = make_task_candidate_manifest
+        self._make_dataset_candidate_manifest = make_dataset_candidate_manifest
         self._make_p0_grasp_candidate_manifest = make_p0_grasp_candidate_manifest
         self._load_task_config = load_task_config
         self._T5EventTape = T5EventTape
@@ -764,13 +784,21 @@ class DynamicBenchmarkEnv(gym.Env):
                 attempts=self.manifest_size,
                 manifest_seed=manifest_seed,
             )
-        else:
+        elif self._make_task_candidate_manifest is not None:
             rows = self._make_task_candidate_manifest(
                 task_id=self.task_id,
                 split=self._split,
                 attempts=self.manifest_size,
                 manifest_seed=manifest_seed,
             )
+        else:
+            all_rows = self._make_dataset_candidate_manifest(
+                split=self._split,
+                attempts_per_task=self.manifest_size,
+                manifest_seed=manifest_seed,
+                tasks=self._active_task_ids,
+            )
+            rows = tuple(row for row in all_rows if row.request.task_id == self.task_id)
         self._phase_add("manifest.generate", generation_start)
         validation_start = self._phase_start()
         if len(rows) != self.manifest_size:
