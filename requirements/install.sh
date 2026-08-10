@@ -86,7 +86,7 @@ NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_ENGINES=("sglang" "vllm")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0" "molmoact2" "evo1")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "dynamic_benchmark" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 #=======================Utility Functions=======================
 
@@ -2021,6 +2021,9 @@ install_env_only() {
             install_common_embodied_deps
             install_embodichain_env
             ;;
+        dynamic_benchmark)
+            install_dynamic_benchmark_env
+            ;;
         gim_arm)
             uv sync --extra gim_arm --active $NO_INSTALL_RLINF_CMD
             ;;
@@ -2209,6 +2212,22 @@ install_behavior_env() {
 
 install_metaworld_env() {
     uv pip install metaworld==3.0.0
+}
+
+install_dynamic_benchmark_env() {
+    uv sync --extra embodied --active $NO_INSTALL_RLINF_CMD
+    uv pip install "gym==0.26.2" "mujoco==3.11.0" "robosuite==1.4.0" "h5py>=3.16,<4"
+
+    if [ "${SE3_WAM_INSTALL_MODE:-source}" = "deps-only" ]; then
+        echo "Installed Dynamic Benchmark runtime dependencies only."
+        echo "Install the research-only SE3-WAM source before running the environment."
+        return
+    fi
+    if [ -z "${SE3_WAM_PATH:-}" ] || [ ! -f "$SE3_WAM_PATH/pyproject.toml" ]; then
+        echo "dynamic_benchmark requires SE3_WAM_PATH to a local SE3-WAM checkout." >&2
+        exit 1
+    fi
+    uv pip install -e "${SE3_WAM_PATH}[benchmark]"
 }
 
 install_calvin_env() {

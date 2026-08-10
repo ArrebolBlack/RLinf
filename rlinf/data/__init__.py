@@ -16,4 +16,16 @@
 
 from rlinf.data import schema, storage
 
-__all__ = ["schema", "storage"]
+from .device_replay_buffer import (
+    DeviceReplayBatch,
+    DeviceReplayBuffer,
+    DeviceReplayContractError,
+)
+
+__all__ = [
+    "schema",
+    "storage",
+    "DeviceReplayBatch",
+    "DeviceReplayBuffer",
+    "DeviceReplayContractError",
+]

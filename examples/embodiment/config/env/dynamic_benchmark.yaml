@@ -1,0 +1,27 @@
+env_type: dynamic_benchmark
+task_id: null
+split: train
+task_prompt: null
+
+total_num_envs: null
+group_size: 1
+max_steps_per_rollout_epoch: 160
+
+manifest_seed: 20261050
+manifest_size: 4096
+image_size: 64
+camera_observations: false
+auto_reset: true
+ignore_terminations: false
+
+reward_progress_scale: 5.0
+reward_success_bonus: 10.0
+reward_failure_penalty: -3.0
+reward_safety_penalty: -10.0
+reward_timeout_penalty: -1.0
+reward_step_penalty: -0.01
+reward_action_l2_scale: -0.001
+
+video_cfg:
+  save_video: false
+  video_base_dir: ${runner.logger.log_path}/video/train

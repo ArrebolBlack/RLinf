@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">Dynamic Benchmark task families</title>
+  <desc id="desc">A Franka arm learns dynamic grasping, placement, interaction, and replanning tasks from privileged state.</desc>
+  <rect width="1200" height="420" rx="28" fill="#f5f7fb"/>
+  <text x="600" y="58" text-anchor="middle" font-family="sans-serif" font-size="30" font-weight="700" fill="#17213a">Dynamic Benchmark · 14 Tasks</text>
+  <g font-family="sans-serif" text-anchor="middle">
+    <g transform="translate(35 105)"><rect width="210" height="190" rx="20" fill="#dce9ff" stroke="#5c83c6"/><text x="105" y="48" font-size="26" font-weight="700" fill="#244a84">T1</text><text x="105" y="88" font-size="18" fill="#17213a">Conveyor grasp</text><text x="105" y="120" font-size="16" fill="#40506d">belt · xyz · SO(3)</text><text x="105" y="148" font-size="16" fill="#40506d">occlusion</text></g>
+    <g transform="translate(265 105)"><rect width="210" height="190" rx="20" fill="#ddf4ec" stroke="#4e9a80"/><text x="105" y="48" font-size="26" font-weight="700" fill="#236b56">T2</text><text x="105" y="88" font-size="18" fill="#17213a">Dynamic place</text><text x="105" y="120" font-size="16" fill="#40506d">translation · SE(3)</text></g>
+    <g transform="translate(495 105)"><rect width="210" height="190" rx="20" fill="#fff0d8" stroke="#d1943f"/><text x="105" y="48" font-size="26" font-weight="700" fill="#8b5a17">T3–T4</text><text x="105" y="88" font-size="18" fill="#17213a">Timed interaction</text><text x="105" y="120" font-size="16" fill="#40506d">phase · full</text><text x="105" y="148" font-size="16" fill="#40506d">4 release/capture tasks</text></g>
+    <g transform="translate(725 105)"><rect width="210" height="190" rx="20" fill="#f1e5ff" stroke="#9061bd"/><text x="105" y="48" font-size="26" font-weight="700" fill="#653796">T5</text><text x="105" y="88" font-size="18" fill="#17213a">Event replanning</text><text x="105" y="120" font-size="16" fill="#40506d">online post-event action</text></g>
+    <g transform="translate(955 105)"><rect width="210" height="190" rx="20" fill="#ffe4e0" stroke="#c76b5c"/><text x="105" y="48" font-size="26" font-weight="700" fill="#963e31">P0</text><text x="105" y="88" font-size="18" fill="#17213a">Dynamic grasp</text><text x="105" y="120" font-size="16" fill="#40506d">contact · hold · lift</text></g>
+  </g>
+  <path d="M150 338 H1050" stroke="#6a7894" stroke-width="4" stroke-linecap="round"/>
+  <path d="M1030 324 L1054 338 L1030 352" fill="none" stroke="#6a7894" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="600" y="385" text-anchor="middle" font-family="sans-serif" font-size="19" fill="#40506d">privileged state → MLP expert → audited best-known trajectories</text>
+</svg>

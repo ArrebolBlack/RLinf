@@ -858,6 +858,37 @@ jobs:
           rm -rf .venv
           uv cache prune
 
+  embodied-dynamic-benchmark-test:
+    if: ${{ vars.ENABLE_DYNAMIC_BENCHMARK_E2E == 'true' }}
+    runs-on: embodied
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create Dynamic Benchmark environment
+        run: |
+          unset UV_DEFAULT_INDEX
+          export UV_PATH=/workspace/dataset/.uv
+          export UV_LINK_MODE=symlink
+          export UV_CACHE_DIR=/workspace/dataset/.uv_cache
+          export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
+          export SE3_WAM_PATH="${{ vars.SE3_WAM_PATH }}"
+          bash requirements/install.sh embodied --env dynamic_benchmark
+
+      - name: Dynamic Benchmark RLPD smoke
+        timeout-minutes: 20
+        run: |
+          export REPO_PATH=$(pwd)
+          export SE3_WAM_PATH="${{ vars.SE3_WAM_PATH }}"
+          source .venv/bin/activate
+          bash tests/e2e_tests/embodied/run_dynamic_benchmark.sh
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf .venv
+          uv cache prune
+
   embodied-openvlaoft-metaworld-test:
     runs-on: embodied
     steps:

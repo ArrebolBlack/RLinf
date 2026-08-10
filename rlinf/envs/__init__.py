@@ -36,6 +36,7 @@ class SupportedEnvType(Enum):
     ROBOVERSE = "roboverse"
     D4RL = "d4rl"
     POLARIS = "polaris"
+    DYNAMIC_BENCHMARK = "dynamic_benchmark"
 
 
 def get_env_cls(env_type: str, env_cfg=None):
@@ -148,5 +149,11 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.polaris.polaris_env import PolarisEnv
 
         return PolarisEnv
+    elif env_type == SupportedEnvType.DYNAMIC_BENCHMARK:
+        from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
+            DynamicBenchmarkEnv,
+        )
+
+        return DynamicBenchmarkEnv
     else:
         raise NotImplementedError(f"Environment type {env_type} not implemented")

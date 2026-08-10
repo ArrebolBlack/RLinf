@@ -1,0 +1,66 @@
+# RLOPT-P0G shared-infra example recipe (initial recommendation only).
+# Final weights/feature choices belong to the RLOPT-P0G environment agent.
+# Keep --rlinf-commit, --benchmark-commit, --output, and optional --resume on
+# the CLI.  Every arm must use seed-paired RLE2 manifests
+# (s1=20261050/20261150 family for p0_grasp).
+task: p0_grasp
+algorithm: residual_rlpd
+seed: 1
+num_envs: 2
+eval_num_envs: 2
+total_env_steps: 20000
+random_env_steps: 2000
+demo_episodes: 16
+demo_max_attempts: 160
+demo_ratio: 0.5
+bc_steps: 2000
+batch_size: 512
+replay_capacity: 250000
+updates_per_vector_step: 1
+q_heads: 10
+q_target_subset: 2
+gamma: 0.99
+tau: 0.005
+actor_lr: 0.0003
+actor_bc_weight: 100.0
+residual_scale: 0.25
+reward_safety_penalty: -10.0
+critic_lr: 0.0003
+alpha_lr: 0.0003
+initial_alpha: 0.01
+target_entropy: -7.0
+eval_interval: 10000
+eval_episodes: 8
+checkpoint_interval: 10000
+log_interval: 1000
+train_manifest_seed: 20261050
+validation_manifest_seed: 20261150
+manifest_size: 1024
+image_size: 64
+
+# Shared RLOPT infra: current-state derived features (no future oracle).
+# belt_speed is included because the benchmark exposes belt surface velocity.
+features:
+  relative_pose: true
+  object_vel: true
+  ee_vel: true
+  relative_vel: true
+  belt_speed: true
+  time_to_goal: true
+  stage: true
+  action_history:
+    k: 3
+  goal_error: true
+
+# Shared RLOPT infra: dense reward components (weight 0 disables a component).
+reward_components:
+  r_vel_align:
+    weight: 0.5
+    speed_scale_m_s: 0.5
+  r_timing:
+    weight: 1.0
+    dist_threshold_m: 0.05
+    target_ttc_s: 0.1
+    ttc_scale_s: 0.1
+  r_stage:
+    weight: 2.0
