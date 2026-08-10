@@ -1788,7 +1788,7 @@ class DynamicBenchmarkEnv(gym.Env):
             "process_start_method": self.process_start_method,
             "state_schema": self.state_schema,
         }
-        if self._gpu_backend is not None:
+        if getattr(self, "_gpu_backend", None) is not None:
             identity["gpu_native"] = True
             identity["gpu_native_export_dir"] = self._gpu_backend.export_dir
             identity["gpu_native_device_ordinal"] = int(
