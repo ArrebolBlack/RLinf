@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sys
 import textwrap
+import types
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,9 +29,11 @@ import pytest
 from examples.embodiment.evaluate_dynamic_benchmark_tensor_expert import (
     EPISODE_LEDGER_SCHEMA,
     SEQUENCE_SCHEMA,
+    SOURCE_MANIFEST_SCHEMA,
     WORKER_SPEC_SCHEMA,
     PinnedSequence,
     TensorEvaluationError,
+    _build_backend,
     _rename_directory_with_claim,
     assert_strict_finite,
     collect_process_identity,
@@ -179,6 +184,63 @@ def test_runtime_episode_ids_and_backend_api_runtime_pins_are_exact() -> None:
             source_snapshot=sources,
             sequence=sequence,
         )
+
+
+def test_backend_construction_threads_caller_pinned_se3_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_manifest = {
+        "schema_version": SOURCE_MANIFEST_SCHEMA,
+        "sources": [
+            {
+                "name": "rlinf",
+                "root": "/source/rlinf",
+                "commit": "1" * 40,
+                "tree": "2" * 40,
+                "module": "rlinf",
+            },
+            {
+                "name": "se3_wam",
+                "root": "/source/se3",
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "module": "se3_wam",
+            },
+        ],
+    }
+    source_path = tmp_path / "source-manifest.json"
+    source_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    captured: dict = {}
+
+    class _Backend:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    backend_module = types.ModuleType("rlinf.envs.dynamic_benchmark.gpu_tensor_backend")
+    backend_module.GpuNativeTensorBackendEnv = _Backend
+    monkeypatch.setitem(
+        sys.modules,
+        "rlinf.envs.dynamic_benchmark.gpu_tensor_backend",
+        backend_module,
+    )
+    sequence = PinnedSequence.from_payload(_sequence_payload())
+    spec = {
+        "source_manifest_path": str(source_path),
+        "source_manifest_sha256": source_sha256,
+        "num_envs": 2,
+        "export_dir": "/export",
+        "expected_gpu_uuid": "GPU-803b6f88-a884-134a-d92d-cdc532e22e14",
+        "device_ordinal": 0,
+        "image_size": 64,
+    }
+
+    _build_backend(spec, sequence, (object(), object()))
+
+    assert captured["expected_se3_source_commit"] == "a" * 40
+    assert captured["expected_se3_source_tree"] == "b" * 40
+    assert captured["manifest_sha256"] == sequence.manifest_sha256
 
 
 @dataclass(frozen=True)

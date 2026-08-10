@@ -52,6 +52,8 @@ _zero_copy_torch_view = _MODULE._zero_copy_torch_view
 _GPU_UUID = "GPU-803b6f88-a884-134a-d92d-cdc532e22e14"
 _OTHER_GPU_UUID = "GPU-7d65018e-96c7-8c5e-bb64-3a74ca558ab3"
 _PCI_BUS_ID = "00000000:17:00.0"
+_SE3_SOURCE_COMMIT = "a" * 40
+_SE3_SOURCE_TREE = "b" * 40
 _EXPORT_DIGESTS = {
     "request_sha256": "1" * 64,
     "bundle_sha256": "2" * 64,
@@ -239,8 +241,8 @@ class _FakeEnv:
             device_platform="cuda",
             precision="float32",
             device_ordinal=0,
-            git_commit=_MODULE._SE3_SOURCE_COMMIT,
-            git_tree=_MODULE._SE3_SOURCE_TREE,
+            git_commit=_SE3_SOURCE_COMMIT,
+            git_tree=_SE3_SOURCE_TREE,
             implementation_version="direct-mjwarp-p0-grasp-foundation-v0.1",
             runtime_versions={
                 "mujoco": "3.3.4",
@@ -639,6 +641,8 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert {
         name: getattr(fake_env.capabilities, name) for name in _MODULE._CAPABILITY_NAMES
@@ -648,8 +652,8 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert captured["factory"][1]["engine_kwargs"] == {
         "expected_device_uuid": _GPU_UUID,
         "expected_model_sha256": _EXPORT_DIGESTS["model_sha256"],
-        "expected_source_commit": _MODULE._SE3_SOURCE_COMMIT,
-        "expected_source_tree": _MODULE._SE3_SOURCE_TREE,
+        "expected_source_commit": _SE3_SOURCE_COMMIT,
+        "expected_source_tree": _SE3_SOURCE_TREE,
     }
 
     reset = backend.reset()
@@ -695,6 +699,8 @@ def test_r0_cursor_is_transactional_boundary_only_and_resumable(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_seed=77,
         manifest_size=6,
     )
@@ -723,6 +729,8 @@ def test_r0_cursor_is_transactional_boundary_only_and_resumable(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_seed=77,
         manifest_size=6,
     )
@@ -742,6 +750,8 @@ def test_r0_cursor_is_transactional_boundary_only_and_resumable(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_seed=77,
         manifest_size=6,
     )
@@ -767,6 +777,8 @@ def test_tensor_backend_rejects_cross_runtime_device_identity_drift(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
     assert fake_env.closed is True
 
@@ -783,6 +795,8 @@ def test_tensor_backend_rejects_transport_and_layout_drift(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     backend.reset()
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
@@ -842,6 +856,8 @@ def test_constructor_rejects_uuid_pci_alias_and_ordinal_drift(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
 
 
@@ -856,6 +872,8 @@ def test_constructor_normalizes_only_exact_unprefixed_torch_uuid(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert backend.device_identity.torch_uuid == _GPU_UUID
 
@@ -874,6 +892,8 @@ def test_attest_end_reobserves_after_success_and_close_checks_independently(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert backend.attest_end() == backend.device_identity_start
 
@@ -900,6 +920,8 @@ def test_constructor_rejects_identity_change_between_start_and_end(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
     assert fake_env.closed is True
 
@@ -924,6 +946,8 @@ def test_exact_v02_capability_difference_fails_closed(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
     assert fake_env.closed is True
 
@@ -938,6 +962,8 @@ def test_old_v01_abi_is_not_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
 
 
@@ -951,6 +977,8 @@ def test_task_quality_is_enabled_before_first_reset(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         task_quality_schema_version="db0-episode-task-quality-v1",
         task_quality_evaluator_backend_id="quality-backend-v1",
     )
@@ -975,6 +1003,8 @@ def test_public_task_quality_enable_is_pre_reset_only(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     backend.enable_task_quality(
         schema_version="db0-episode-task-quality-v1",
@@ -999,6 +1029,8 @@ def test_stable_and_active_export_identity_are_separate(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert not set(_EXPORT_DIGESTS).intersection(backend.stable_identity)
     assert set(backend.active_export_identity) == {
@@ -1028,6 +1060,8 @@ def test_caller_pinned_manifest_is_exact_and_portable(
         num_envs=3,
         export_dir="/tmp/export-a",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_size=6,
     )
     requests = generated.sequence_requests
@@ -1039,6 +1073,8 @@ def test_caller_pinned_manifest_is_exact_and_portable(
         num_envs=3,
         export_dir="/different/runtime/path",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_requests=requests,
         manifest_sha256=digest,
     )
@@ -1053,6 +1089,8 @@ def test_caller_pinned_manifest_is_exact_and_portable(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
             manifest_requests=requests,
             manifest_sha256="0" * 64,
         )
@@ -1080,6 +1118,8 @@ def test_caller_manifest_nested_factors_are_frozen_and_defensively_exposed(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_requests=requests,
         manifest_sha256=digest,
     )
@@ -1104,6 +1144,8 @@ def test_reset_rehashes_frozen_manifest_before_any_engine_write(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     object.__setattr__(
         backend._manifest_requests[0],  # noqa: SLF001
@@ -1128,6 +1170,8 @@ def test_b1_and_full_cohort_reset_succeed_but_partial_reset_has_zero_writes(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     with pytest.raises(GpuNativeTensorBackendUnavailableError, match="partial reset"):
         backend.reset(reset_mask=(True, False, True))
@@ -1141,6 +1185,8 @@ def test_b1_and_full_cohort_reset_succeed_but_partial_reset_has_zero_writes(
         num_envs=1,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     reset_b1 = backend_b1.reset(reset_mask=(True,))
     assert len(reset_b1.episode_ids) == 1
@@ -1157,6 +1203,8 @@ def test_steady_state_ast_and_spies_forbid_host_materialization(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     reset = backend.reset()
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
@@ -1202,6 +1250,8 @@ def test_each_device_output_contract_drift_fails_closed(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     backend.reset()
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
@@ -1231,6 +1281,8 @@ def test_terminal_ledger_is_typed_once_and_quality_is_success_only(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         task_quality_schema_version="db0-episode-task-quality-v1",
         task_quality_evaluator_backend_id="quality-backend-v1",
     )
@@ -1367,6 +1419,8 @@ def test_success_terminal_without_typed_quality_fails_closed(
         num_envs=1,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     reset = backend.reset()
     fake_env.terminal_outcomes[0] = {

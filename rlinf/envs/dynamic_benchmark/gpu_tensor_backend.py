@@ -43,8 +43,6 @@ class GpuNativeTensorBackendUnavailableError(RuntimeError):
 _RESET_CURSOR_SCHEMA_VERSION = "rlinf-gpu-native-r0-cursor-v0.1"
 _GPU_NATIVE_API_VERSION = "gpu-native-api-v0.2"
 _GPU_NATIVE_BACKEND_ID = "mjwarp_gpu_v1"
-_SE3_SOURCE_COMMIT = "12048d1a5a7efaa6bcafffbac0c777cba4aa72af"
-_SE3_SOURCE_TREE = "ee270a6a348801711dba8f493ef5c3176080b760"
 _CAPABILITY_NAMES = (
     "physics",
     "robot_control",
@@ -107,6 +105,17 @@ def _canonical_sha256(value: Any, *, name: str) -> str:
         raise GpuNativeTensorBackendUnavailableError(
             f"{name} must be a lowercase 64-character SHA-256 digest"
         )
+    return value
+
+
+def _full_git_object(value: Any, *, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase full Git object id")
     return value
 
 
@@ -713,6 +722,8 @@ class GpuNativeTensorBackendEnv:
         num_envs: int,
         export_dir: str,
         expected_gpu_uuid: str,
+        expected_se3_source_commit: str,
+        expected_se3_source_tree: str,
         device_ordinal: int = 0,
         image_size: int = 64,
         split: str = "train",
@@ -734,6 +745,14 @@ class GpuNativeTensorBackendEnv:
         ):
             raise ValueError("device_ordinal must be a non-negative integer")
         expected_gpu_uuid = _canonical_gpu_uuid(expected_gpu_uuid)
+        expected_se3_source_commit = _full_git_object(
+            expected_se3_source_commit,
+            name="expected_se3_source_commit",
+        )
+        expected_se3_source_tree = _full_git_object(
+            expected_se3_source_tree,
+            name="expected_se3_source_tree",
+        )
         _require_single_uuid_visibility(expected_gpu_uuid, device_ordinal)
         if task_id != "p0_grasp":
             raise ValueError("GPU tensor R0 admission is currently limited to p0_grasp")
@@ -799,6 +818,8 @@ class GpuNativeTensorBackendEnv:
         self._num_envs = num_envs
         self._export_dir = export_dir
         self._expected_gpu_uuid = expected_gpu_uuid
+        self._expected_se3_source_commit = expected_se3_source_commit
+        self._expected_se3_source_tree = expected_se3_source_tree
         self._device_ordinal = device_ordinal
         self._device = device
         self._torch = torch
@@ -926,8 +947,8 @@ class GpuNativeTensorBackendEnv:
             engine_kwargs={
                 "expected_device_uuid": expected_gpu_uuid,
                 "expected_model_sha256": export_identity_start["model_sha256"],
-                "expected_source_commit": _SE3_SOURCE_COMMIT,
-                "expected_source_tree": _SE3_SOURCE_TREE,
+                "expected_source_commit": expected_se3_source_commit,
+                "expected_source_tree": expected_se3_source_tree,
             },
         )
         try:
@@ -947,8 +968,8 @@ class GpuNativeTensorBackendEnv:
                     "SE3-WAM provenance backend/device contract differs from clean v0.2"
                 )
             if (
-                getattr(provenance, "git_commit", None) != _SE3_SOURCE_COMMIT
-                or getattr(provenance, "git_tree", None) != _SE3_SOURCE_TREE
+                getattr(provenance, "git_commit", None) != expected_se3_source_commit
+                or getattr(provenance, "git_tree", None) != expected_se3_source_tree
             ):
                 raise GpuNativeTensorBackendUnavailableError(
                     "loaded SE3-WAM source commit/tree differs from the pinned clean API"
@@ -1069,8 +1090,8 @@ class GpuNativeTensorBackendEnv:
                 "batch_size": num_envs,
                 "backend_id": _GPU_NATIVE_BACKEND_ID,
                 "api_version": _GPU_NATIVE_API_VERSION,
-                "source_commit": _SE3_SOURCE_COMMIT,
-                "source_tree": _SE3_SOURCE_TREE,
+                "source_commit": expected_se3_source_commit,
+                "source_tree": expected_se3_source_tree,
                 "implementation_version": implementation_version,
                 "runtime_versions": dict(runtime_versions),
                 "contract_capabilities": dict(contract_capabilities),
