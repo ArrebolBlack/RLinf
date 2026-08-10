@@ -143,13 +143,21 @@ return 可比较。
 有状态的 planner 实例。``--residual-scale`` 默认 ``0.25``，每个 scale 与 actor-BC
 权重组合都必须登记为独立实验臂。
 
-环境 step 也可使用持久化子进程分片，而非串行或线程 adapter。设置
-``--eval-worker-processes 2``（也可用 ``4``/``8``）可加速冻结 manifest 的 validation，
-``--env-worker-processes`` 则用于分片训练 reset/step。manifest row 仍由主进程分配，
-返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖 worker 完成顺序。每个子进程
-内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``；
-``--process-start-method spawn`` 是跨平台且 CUDA-safe 的默认值。进程数属于执行 provenance，
-checkpoint 恢复时必须使用相同配置。
+精确 CPU process recipe 现在默认开启。没有 YAML 覆盖时，训练和 validation 均使用 32 个
+环境；省略 ``--env-worker-processes`` 或 ``--eval-worker-processes`` 时，进程数自动等于
+对应 vector width。Linux 默认使用 ``forkserver``，其他平台保留可移植的 ``spawn``。
+只要 evaluation process 已开启，默认复用 checkpoint-rewind evaluation worker；
+residual-RLPD 还默认在环境所属子进程内计算 privileged planner。需要显式串行兼容模式时，
+使用自动生成的 ``--no-persistent-eval-workers``、``--no-eval-planner-in-processes``，或将
+两类 process 数都设为 ``0``。sampler/learner overlap 仍默认关闭，因为它会改变 replay 顺序。
+
+manifest row 仍由主进程分配，返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖
+worker 完成顺序。每个子进程内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``。
+worker 继承启动器的 CPU affinity；已测量的 W32 recipe 要求显式限定在同一 NUMA 节点的
+32 个逻辑 CPU（例如使用 ``taskset``），process tree 峰值 RSS 约 47 GiB。trainer 无法安全
+推断哪一个 NUMA 节点与所用 GPU 相邻。process topology 属于执行 provenance，checkpoint
+恢复时必须使用相同配置。使用当前 RLinf 与 SE3-WAM 源码时，task-only manifest、mutable
+``MjModel`` 精确 reset 恢复、v0.3 checkpoint 和有界 process cleanup 无需额外开关。
 
 吞吐 bakeoff 前，应在真实 benchmark checkout 上运行进程正确性 gate。它会比较
 serial/process 的 reset 与 step digest，验证 process 模式 checkpoint/resume 的精确

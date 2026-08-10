@@ -610,6 +610,11 @@ def test_recipe_yaml_sets_defaults_but_keeps_run_identity_explicit(tmp_path) -> 
     assert args.task == "t2_trans"
     assert args.algorithm == "rlpd"
     assert args.num_envs == 2
+    config = _config(args)
+    assert config.env_worker_processes == 2
+    assert config.eval_worker_processes == 32
+    assert config.persistent_eval_workers is True
+    assert config.eval_planner_in_processes is False
 
 
 @pytest.mark.parametrize(
@@ -645,7 +650,52 @@ def test_actor_bc_regularization_is_explicit_and_non_negative(tmp_path) -> None:
         _config(_parse_args([*common, "--actor-bc-weight", "-1"]))
 
 
-def test_process_worker_configuration_is_explicit_and_thread_exclusive(
+def test_exact_cpu_process_recipe_is_enabled_by_default(tmp_path) -> None:
+    common = [
+        "--task",
+        "t4_sphere",
+        "--algorithm",
+        "residual_rlpd",
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "run"),
+    ]
+
+    config = _config(_parse_args(common))
+
+    assert config.num_envs == 32
+    assert config.eval_num_envs == 32
+    assert config.env_worker_processes == 32
+    assert config.eval_worker_processes == 32
+    assert config.process_start_method == expert_trainer._default_process_start_method()
+    assert config.eval_planner_in_processes is True
+    assert config.persistent_eval_workers is True
+    assert config.borrow_training_env_for_eval is False
+    assert config.sampler_learner_overlap is False
+
+    serial = _config(
+        _parse_args(
+            [
+                *common,
+                "--env-worker-processes",
+                "0",
+                "--eval-worker-processes",
+                "0",
+                "--no-eval-planner-in-processes",
+                "--no-persistent-eval-workers",
+            ]
+        )
+    )
+    assert serial.env_worker_processes == 0
+    assert serial.eval_worker_processes == 0
+    assert serial.eval_planner_in_processes is False
+    assert serial.persistent_eval_workers is False
+
+
+def test_process_worker_configuration_is_overridable_and_thread_exclusive(
     tmp_path,
 ) -> None:
     common = [
@@ -678,27 +728,27 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
 
     assert config.env_worker_processes == 4
     assert config.eval_worker_processes == 8
-    assert config.process_start_method == "spawn"
+    assert config.process_start_method == expert_trainer._default_process_start_method()
     assert env_cfg["worker_processes"] == 8
-    assert env_cfg["process_start_method"] == "spawn"
+    assert (
+        env_cfg["process_start_method"]
+        == expert_trainer._default_process_start_method()
+    )
     assert env_cfg["process_residual_planner"] is False
     assert config.sampler_learner_overlap is False
-    assert config.persistent_eval_workers is False
+    assert config.eval_planner_in_processes is True
+    assert config.persistent_eval_workers is True
     assert config.borrow_training_env_for_eval is False
     overlap_config = _config(_parse_args([*common, "--sampler-learner-overlap"]))
     assert overlap_config.sampler_learner_overlap is True
     with pytest.raises(ValueError, match="threads=1"):
         _config(_parse_args([*common, "--env-worker-threads", "2"]))
-    without_processes = [
-        item
-        for index, item in enumerate(common)
-        if not (
-            item == "--env-worker-processes"
-            or (index > 0 and common[index - 1] == "--env-worker-processes")
-        )
-    ]
     with pytest.raises(ValueError, match="requires training process workers"):
-        _config(_parse_args([*without_processes, "--sampler-learner-overlap"]))
+        _config(
+            _parse_args(
+                [*common, "--env-worker-processes", "0", "--sampler-learner-overlap"]
+            )
+        )
     planner_config = _config(_parse_args([*common, "--eval-planner-in-processes"]))
     planner_env_cfg = _env_cfg(
         planner_config,
@@ -712,20 +762,30 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     )
     assert planner_config.eval_planner_in_processes is True
     assert planner_env_cfg["process_residual_planner"] is True
-    without_eval_processes = [
-        item
-        for index, item in enumerate(common)
-        if not (
-            item == "--eval-worker-processes"
-            or (index > 0 and common[index - 1] == "--eval-worker-processes")
-        )
-    ]
     with pytest.raises(ValueError, match="process evaluation planner requires"):
-        _config(_parse_args([*without_eval_processes, "--eval-planner-in-processes"]))
+        _config(
+            _parse_args(
+                [
+                    *common,
+                    "--eval-worker-processes",
+                    "0",
+                    "--eval-planner-in-processes",
+                ]
+            )
+        )
     persistent_config = _config(_parse_args([*common, "--persistent-eval-workers"]))
     assert persistent_config.persistent_eval_workers is True
     with pytest.raises(ValueError, match="persistent evaluation requires"):
-        _config(_parse_args([*without_eval_processes, "--persistent-eval-workers"]))
+        _config(
+            _parse_args(
+                [
+                    *common,
+                    "--eval-worker-processes",
+                    "0",
+                    "--persistent-eval-workers",
+                ]
+            )
+        )
     borrowed_common = [
         "--task",
         "t4_sphere",
