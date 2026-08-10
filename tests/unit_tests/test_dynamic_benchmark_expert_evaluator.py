@@ -19,6 +19,7 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -703,6 +704,24 @@ def test_terminal_task_quality_is_validated_and_recorded_canonically() -> None:
     assert recorded == expected
     assert recorded["terminal"] is True
     assert recorded["schema_sha256"] == identity["task_quality_schema_sha256"]
+    assert (
+        _task_quality_from_terminal_infos(
+            {"task_quality": [None]},
+            identity=identity,
+            task_id="t1_xyz",
+            episode_id="episode-2",
+            success=False,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="unsuccessful terminal"):
+        _task_quality_from_terminal_infos(
+            {"task_quality": [expected]},
+            identity=identity,
+            task_id="t1_xyz",
+            episode_id="episode-1",
+            success=False,
+        )
 
 
 def test_task_quality_aggregates_all_and_successful_records() -> None:
@@ -730,7 +749,7 @@ def test_task_quality_aggregates_all_and_successful_records() -> None:
             "completion_time_s": None,
             "return": 1.0,
             "action_l2_sum": 2.0,
-            "task_quality": _quality_summary("episode-2", values=(0.3, 0.4, 0.5, 0.6)),
+            "task_quality": None,
         },
     ]
 
@@ -750,10 +769,10 @@ def test_task_quality_aggregates_all_and_successful_records() -> None:
     assert aggregates["record_count"] == 2
     assert aggregates["successful_record_count"] == 1
     assert first["all_records"] == {
-        "count": 2,
-        "mean": pytest.approx(0.2),
+        "count": 1,
+        "mean": pytest.approx(0.1),
         "minimum": pytest.approx(0.1),
-        "maximum": pytest.approx(0.3),
+        "maximum": pytest.approx(0.1),
     }
     assert first["successful_records"] == {
         "count": 1,
@@ -1114,6 +1133,73 @@ def test_expert_replay_binds_terminal_task_quality_exactly(
         validation["task_quality_summary_sha256"]
         == _quality_summary("episode-1", values=replay_values)["summary_sha256"]
     )
+
+
+@pytest.mark.parametrize("replay_quality, expected_passed", [(None, True), ({}, False)])
+def test_expert_replay_binds_non_success_task_quality_absence_exactly(
+    replay_quality: dict[str, Any] | None, expected_passed: bool
+) -> None:
+    identity = _task_quality_identity("t1_xyz")
+
+    class Request:
+        episode_id = "episode-2"
+        task_id = "t1_xyz"
+
+    request = Request()
+
+    class RawEnv:
+        def reset(self, value):
+            assert value is request
+            return "observation"
+
+        def step(self, action):
+            assert action == "action"
+            return SimpleNamespace(
+                terminated=False,
+                truncated=True,
+                task_quality=replay_quality,
+            )
+
+        def save_state(self):
+            return b"state"
+
+        def close(self):
+            pass
+
+    class VectorEnv:
+        image_size = 64
+        camera_observations = False
+        task_quality_schema_version = identity["task_quality_schema"]["schema_version"]
+        task_quality_evaluator_backend_id = TASK_QUALITY_BACKEND_ID
+
+        def _make_mujoco_env(self, task_id, **kwargs):
+            assert task_id == "t1_xyz"
+            return RawEnv()
+
+        def _arm_hidden_t5_event(self, raw_env, value):
+            pass
+
+    def replay_fn(proxy, **kwargs):
+        proxy.reset(request)
+        proxy.step("action")
+        return {"passed": True, "final_state_exact": True, "outcomes_exact": True}
+
+    validation = _replay_actions_on_fresh_env(
+        vector_env=VectorEnv(),
+        task_id="t1_xyz",
+        request=request,
+        expected_observations=("observation",),
+        actions=("action",),
+        expected_outcomes=((False, True, False, "timeout", 0.0),),
+        expected_final_state=b"state",
+        expected_task_quality=None,
+        task_quality_identity=identity,
+        replay_fn=replay_fn,
+    )
+
+    assert validation["task_quality_exact"] is expected_passed
+    assert validation["task_quality_summary_sha256"] is None
+    assert validation["passed"] is expected_passed
 
 
 def test_formal_producer_tape_passes_promotion_validator(tmp_path: Path) -> None:

@@ -252,14 +252,21 @@ def _task_quality_from_terminal_infos(
     identity: Mapping[str, Any],
     task_id: str,
     episode_id: str,
-) -> dict[str, Any]:
-    """Read and validate ``infos['task_quality'][0]`` at episode termination."""
+    success: bool = True,
+) -> dict[str, Any] | None:
+    """Validate the success-only task-quality value at episode termination."""
 
     if "task_quality" not in infos:
         raise ValueError("terminal infos are missing task_quality")
     rows = infos["task_quality"]
     if not isinstance(rows, (list, tuple)) or len(rows) != 1:
         raise ValueError("terminal task-quality vector must contain exactly one row")
+    if not success:
+        if rows[0] is not None:
+            raise ValueError(
+                "unsuccessful terminal infos must not contain task-quality summary"
+            )
+        return None
     if rows[0] is None:
         raise ValueError("terminal infos contain no task-quality summary")
     return _validate_task_quality_summary(
@@ -292,7 +299,7 @@ def _task_quality_aggregates(
     identity: Mapping[str, Any],
     task_id: str,
 ) -> dict[str, Any]:
-    """Aggregate every canonical component over all and successful episodes."""
+    """Aggregate canonical components over released success-only summaries."""
 
     if not records:
         raise ValueError("task-quality aggregation requires at least one record")
@@ -319,14 +326,20 @@ def _task_quality_aggregates(
             raise ValueError(
                 f"task-quality record {index} success flag must be boolean"
             )
+        succeeded = bool(record["success"])
+        successful_count += int(succeeded)
+        if not succeeded:
+            if record.get("task_quality") is not None:
+                raise ValueError(
+                    f"task-quality record {index} leaked a non-success summary"
+                )
+            continue
         summary = _validate_task_quality_summary(
             record.get("task_quality"),
             identity=identity,
             task_id=task_id,
             episode_id=episode_id,
         )
-        succeeded = bool(record["success"])
-        successful_count += int(succeeded)
         raw_components = summary["components"]
         for name in names:
             value = float(raw_components[name]["value"])
@@ -698,18 +711,25 @@ def _replay_actions_on_fresh_env(
             expected_outcomes=expected_outcomes,
             expected_final_state=expected_final_state,
         )
-        if (expected_task_quality is None) != (task_quality_identity is None):
-            raise ValueError(
-                "expected task quality and its identity must be supplied together"
-            )
-        if expected_task_quality is None:
+        if task_quality_identity is None:
+            if expected_task_quality is not None:
+                raise ValueError(
+                    "expected task quality requires its canonical identity"
+                )
             return validation
         if not isinstance(validation, Mapping):
             raise ValueError("replay validation must be a mapping")
         episode_id = getattr(request, "episode_id", None)
         if not isinstance(episode_id, str) or not episode_id:
             raise ValueError("replay request episode identity is missing")
-        assert task_quality_identity is not None
+        result = dict(validation)
+        if expected_task_quality is None:
+            result["task_quality_exact"] = replay_env.terminal_task_quality is None
+            result["task_quality_summary_sha256"] = None
+            result["passed"] = bool(
+                result.get("passed") is True and result["task_quality_exact"]
+            )
+            return result
         recorded = _validate_task_quality_summary(
             expected_task_quality,
             identity=task_quality_identity,
@@ -722,7 +742,6 @@ def _replay_actions_on_fresh_env(
             task_id=task_id,
             episode_id=episode_id,
         )
-        result = dict(validation)
         result["task_quality_exact"] = replayed == recorded
         result["task_quality_summary_sha256"] = replayed["summary_sha256"]
         result["passed"] = bool(
@@ -907,6 +926,7 @@ def _episode(
                 identity=task_quality_identity,
                 task_id=task_id,
                 episode_id=request.episode_id,
+                success=result_info["success"],
             )
         observation = next_observation
         obs = next_obs
