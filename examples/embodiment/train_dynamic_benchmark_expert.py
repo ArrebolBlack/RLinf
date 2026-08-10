@@ -64,6 +64,13 @@ _SAFETY_CEILING_TOLERANCE = 1e-12
 _MATCHED_PLANNER_BASELINE_SOURCE = (
     "initial_exact_zero_residual_policy_on_validation_resets"
 )
+_DEFAULT_CPU_VECTOR_WIDTH = 32
+
+
+def _default_process_start_method() -> str:
+    """Use the exact CPU recipe on Linux and the portable backend elsewhere."""
+
+    return "forkserver" if sys.platform.startswith("linux") else "spawn"
 
 
 @dataclass(frozen=True)
@@ -423,8 +430,8 @@ def _parser() -> argparse.ArgumentParser:
             "explicitly when multiple learner seeds share one frozen demo cache."
         ),
     )
-    parser.add_argument("--num-envs", type=int, default=4)
-    parser.add_argument("--eval-num-envs", type=int, default=4)
+    parser.add_argument("--num-envs", type=int, default=_DEFAULT_CPU_VECTOR_WIDTH)
+    parser.add_argument("--eval-num-envs", type=int, default=_DEFAULT_CPU_VECTOR_WIDTH)
     parser.add_argument(
         "--demo-num-envs",
         type=int,
@@ -436,29 +443,39 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--env-worker-processes",
         type=int,
-        default=0,
-        help="Persistent subprocess shards for training environment reset/step (0 is serial).",
+        default=None,
+        help=(
+            "Persistent subprocess shards for training reset/step; defaults to "
+            "--num-envs so the CPU process vector is enabled (0 is serial)."
+        ),
     )
     parser.add_argument(
         "--eval-worker-processes",
         type=int,
-        default=0,
-        help="Persistent subprocess shards for validation environment reset/step (0 is serial).",
+        default=None,
+        help=(
+            "Persistent subprocess shards for validation reset/step; defaults to "
+            "--eval-num-envs so the CPU process vector is enabled (0 is serial)."
+        ),
     )
     parser.add_argument(
         "--eval-planner-in-processes",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "For residual RLPD validation, compute each privileged planner action "
-            "inside its owning environment subprocess."
+            "inside its owning environment subprocess. Defaults on when residual "
+            "RLPD uses evaluation processes."
         ),
     )
     parser.add_argument(
         "--persistent-eval-workers",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "Keep the validation process pool alive and restore one frozen initial "
-            "environment checkpoint before each evaluation."
+            "environment checkpoint before each evaluation. Defaults on with "
+            "evaluation processes."
         ),
     )
     parser.add_argument(
@@ -473,8 +490,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--process-start-method",
         choices=("spawn", "forkserver", "fork"),
-        default="spawn",
-        help="Environment subprocess start method; spawn is CUDA-safe and portable.",
+        default=_default_process_start_method(),
+        help=(
+            "Environment subprocess start method; defaults to forkserver on Linux "
+            "and spawn on other platforms."
+        ),
     )
     parser.add_argument(
         "--sampler-learner-overlap",
@@ -604,6 +624,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _config(args: argparse.Namespace) -> TrainConfig:
     demo_ratio = 0.0 if args.algorithm == "sac" else float(args.demo_ratio)
+    env_worker_processes = (
+        args.num_envs
+        if args.env_worker_processes is None
+        else int(args.env_worker_processes)
+    )
+    eval_worker_processes = (
+        args.eval_num_envs
+        if args.eval_worker_processes is None
+        else int(args.eval_worker_processes)
+    )
+    persistent_eval_workers = (
+        bool(eval_worker_processes) and not args.borrow_training_env_for_eval
+        if args.persistent_eval_workers is None
+        else bool(args.persistent_eval_workers)
+    )
+    eval_planner_in_processes = (
+        args.algorithm == "residual_rlpd"
+        and bool(eval_worker_processes)
+        and not args.borrow_training_env_for_eval
+        if args.eval_planner_in_processes is None
+        else bool(args.eval_planner_in_processes)
+    )
     config = TrainConfig(
         task=args.task,
         algorithm=args.algorithm,
@@ -617,10 +659,10 @@ def _config(args: argparse.Namespace) -> TrainConfig:
         demo_num_envs=args.demo_num_envs,
         env_worker_threads=args.env_worker_threads,
         eval_worker_threads=args.eval_worker_threads,
-        env_worker_processes=args.env_worker_processes,
-        eval_worker_processes=args.eval_worker_processes,
-        eval_planner_in_processes=args.eval_planner_in_processes,
-        persistent_eval_workers=args.persistent_eval_workers,
+        env_worker_processes=env_worker_processes,
+        eval_worker_processes=eval_worker_processes,
+        eval_planner_in_processes=eval_planner_in_processes,
+        persistent_eval_workers=persistent_eval_workers,
         borrow_training_env_for_eval=args.borrow_training_env_for_eval,
         process_start_method=args.process_start_method,
         sampler_learner_overlap=args.sampler_learner_overlap,

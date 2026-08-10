@@ -146,15 +146,27 @@ critic stay in residual-action space, planner demonstrations map to the exact ze
 residual, and checkpoints include the stateful planner instances. ``--residual-scale``
 defaults to ``0.25``; treat each scale and actor-BC weight as a separate arm.
 
-Environment stepping can use persistent subprocess shards instead of the serial or
-threaded adapter. Set ``--eval-worker-processes 2`` (or ``4``/``8``) to accelerate
-the frozen-manifest validation loop, and ``--env-worker-processes`` to shard training
-reset/step calls. The parent process still assigns manifest rows and restores replies
-by environment index, so seed and episode order do not depend on worker completion
-order. Each subprocess is serial internally; keep the corresponding
-``--*-worker-threads`` value at ``1``. ``--process-start-method spawn`` is the
-portable, CUDA-safe default. Process count is execution provenance and therefore a
-checkpoint must be resumed with the same configuration.
+The exact CPU process recipe is enabled by default. Without YAML overrides the trainer
+uses 32 training and validation environments; omitted ``--env-worker-processes`` and
+``--eval-worker-processes`` values expand to their respective vector widths. Linux
+uses ``forkserver`` while other platforms retain the portable ``spawn`` fallback.
+Persistent checkpoint-rewind evaluation is enabled whenever evaluation processes are
+active, and residual-RLPD evaluates its privileged planner in the owning subprocess.
+Use the generated ``--no-persistent-eval-workers`` and
+``--no-eval-planner-in-processes`` switches, or set both process counts to ``0``, for
+an explicit serial compatibility run. Sampler/learner overlap remains disabled because
+it changes replay order.
+
+The parent process still assigns manifest rows and restores replies by environment
+index, so seed and episode order do not depend on worker completion order. Each
+subprocess is serial internally; keep the corresponding ``--*-worker-threads`` value
+at ``1``. Workers inherit the launcher's CPU affinity. The measured W32 recipe requires
+an explicit 32-logical-CPU, single-NUMA cpuset (for example via ``taskset``) and about
+47 GiB peak process-tree RSS; the trainer cannot safely infer GPU-local NUMA placement.
+Process topology is execution provenance and a checkpoint must be resumed with the
+same configuration. Task-local manifests, exact mutable-``MjModel`` reset restoration,
+v0.3 checkpoints, and bounded process cleanup need no extra flag with current RLinf and
+SE3-WAM sources.
 
 Before a throughput bakeoff, run the process correctness gate against the real
 benchmark checkout. It compares serial/process reset and step digests, verifies an
