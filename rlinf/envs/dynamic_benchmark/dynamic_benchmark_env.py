@@ -790,7 +790,7 @@ class DynamicBenchmarkEnv(gym.Env):
         separate from reset makes validation borrowing exactly reversible.
         """
 
-        if self._gpu_backend is not None:
+        if getattr(self, "_gpu_backend", None) is not None:
             raise ValueError(
                 "Dynamic Benchmark GPU-native mode does not support manifest contexts"
             )
