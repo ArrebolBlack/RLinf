@@ -52,6 +52,8 @@ from examples.embodiment.export_dynamic_benchmark_rld2_review import (
     _validate_quality_v2_calibration_wave_receipt,
 )
 
+_CALIBRATION_BENCHMARK_COMMIT = "4" * 40
+
 
 def _gate(smooth: float, orientation: float) -> dict:
     checks = [
@@ -558,7 +560,12 @@ def test_review_attempt_tape_uses_canonical_auditor_and_rejects_tampering(
 
 
 def _promotion_receipt(
-    *, env_steps: int = 12_000, role: str = "best", decision: str = "promote"
+    *,
+    env_steps: int = 12_000,
+    role: str = "best",
+    decision: str = "promote",
+    reason: str = "strict_planner_nonworse_improvement",
+    rejection_reasons: list[dict] | None = None,
 ) -> dict:
     payload = {
         "schema_version": "rld2-qa-policy-promotion-v0.2",
@@ -609,8 +616,12 @@ def _promotion_receipt(
         },
         "selection": {
             "decision": decision,
+            "reason": reason,
             "planner_nonworse_all_dimensions": True,
             "strict_improvement_dimensions": ["path.translation"],
+            "rejection_reasons": (
+                [] if rejection_reasons is None else rejection_reasons
+            ),
             "selector_contract_sha256": "f" * 64,
             "selector_contract_path": "validation/selector.json",
             "planner_evaluation_path": "validation/planner_evaluation.json",
@@ -710,6 +721,15 @@ def test_promotion_receipt_rejects_zero_step_final_unpromoted_and_test_exposure(
         (("policy", "env_steps", 0), "env_steps"),
         (("policy", "checkpoint_role", "final"), "checkpoint_role=best"),
         (("selection", "decision", "hold"), "promote decision"),
+        (("selection", "reason", "no_strict_improvement"), "noncanonical"),
+        (
+            (
+                "selection",
+                "rejection_reasons",
+                [{"code": "planner_success_policy_failure"}],
+            ),
+            "formal rejection reasons",
+        ),
         (("validation_receipt", "test_exposure", True), "test-exposed"),
         (
             ("validation_receipt", "all_successful_t5_causal_gates_passed", False),
@@ -732,6 +752,50 @@ def test_promotion_receipt_rejects_zero_step_final_unpromoted_and_test_exposure(
     historical["payload_sha256"] = _payload_sha256(historical)
     with pytest.raises(ValueError, match="historical promotion schema"):
         _validate_receipt(historical)
+
+
+def test_promotion_v02_selection_is_exact_and_keep_planner_never_enters_pool() -> None:
+    validated = _validate_receipt(_promotion_receipt())
+    assert set(validated["selection"]) == review_exporter._SELECTION_KEYS
+    assert validated["selection"]["reason"] == ("strict_planner_nonworse_improvement")
+    assert validated["selection"]["rejection_reasons"] == []
+
+    for field_inventory_mutation in ("missing", "extra"):
+        receipt = _promotion_receipt()
+        if field_inventory_mutation == "missing":
+            receipt["selection"].pop("reason")
+        else:
+            receipt["selection"]["decision_reason"] = receipt["selection"]["reason"]
+        _reseal_promotion_receipt(receipt)
+        with pytest.raises(ValueError, match="selection field inventory"):
+            _validate_receipt(receipt)
+
+    formal_rejection = _promotion_receipt(
+        decision="keep_planner",
+        reason="formal_gate_rejection",
+        rejection_reasons=[
+            {
+                "code": "planner_success_policy_failure",
+                "scope": "reset",
+                "reset_index": 0,
+                "episode_id": "validation-00",
+            }
+        ],
+    )
+    formal_rejection["selection"]["planner_nonworse_all_dimensions"] = False
+    formal_rejection["selection"]["strict_improvement_dimensions"] = []
+    _reseal_promotion_receipt(formal_rejection)
+    with pytest.raises(ValueError, match="no promote decision"):
+        _validate_receipt(formal_rejection)
+
+    exact_tie = _promotion_receipt(
+        decision="keep_planner",
+        reason="no_strict_improvement",
+    )
+    exact_tie["selection"]["strict_improvement_dimensions"] = []
+    _reseal_promotion_receipt(exact_tie)
+    with pytest.raises(ValueError, match="no promote decision"):
+        _validate_receipt(exact_tie)
 
 
 def test_promotion_v02_source_identity_is_exact_and_hash_bound() -> None:
@@ -943,7 +1007,10 @@ def _calibration_receipt_fixture(tmp_path: Path) -> tuple[dict, Path, str]:
         "task_order": task_order,
         "wave_contract_sha256": "a" * 64,
         "predeclaration_receipt_sha256": "b" * 64,
-        "source_identity": {"wave_id": "review-unit-test"},
+        "source_identity": {
+            "wave_id": "review-unit-test",
+            "benchmark_commit": _CALIBRATION_BENCHMARK_COMMIT,
+        },
         "disjointness": {"verified": True},
         "tasks": receipt_tasks,
     }
@@ -975,7 +1042,10 @@ def test_review_calibration_receipt_is_copied_bound_and_root_checksummed(
     thresholds, receipt_path, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
 
     provenance, identity = _validate_quality_v2_calibration_wave_receipt(
-        thresholds, receipt_path, receipt_sha256
+        thresholds,
+        receipt_path,
+        receipt_sha256,
+        expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
     )
     output = tmp_path / "review"
     output.mkdir()
@@ -1003,12 +1073,29 @@ def test_review_calibration_receipt_is_copied_bound_and_root_checksummed(
     ).read_text(encoding="utf-8")
 
 
+def test_review_calibration_receipt_binds_evaluator_benchmark_commit(
+    tmp_path: Path,
+) -> None:
+    thresholds, receipt_path, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="authenticated evaluator benchmark commit"):
+        _validate_quality_v2_calibration_wave_receipt(
+            thresholds,
+            receipt_path,
+            receipt_sha256,
+            expected_benchmark_commit="5" * 40,
+        )
+
+
 def test_review_calibration_receipt_missing_fails_closed(tmp_path: Path) -> None:
     thresholds, _, receipt_sha256 = _calibration_receipt_fixture(tmp_path)
 
     with pytest.raises(ValueError, match="missing or symlinked"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, tmp_path / "missing.json", receipt_sha256
+            thresholds,
+            tmp_path / "missing.json",
+            receipt_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 
@@ -1024,7 +1111,10 @@ def test_review_calibration_receipt_noncanonical_tamper_fails_closed(
 
     with pytest.raises(ValueError, match="not canonical JSON"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, tampered_path, tampered_sha256
+            thresholds,
+            tampered_path,
+            tampered_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 
@@ -1042,7 +1132,10 @@ def test_review_calibration_receipt_task_hash_tamper_fails_closed(
 
     with pytest.raises(ValueError, match="task .* task_contract_sha256 mismatch"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, tampered_path, tampered_sha256
+            thresholds,
+            tampered_path,
+            tampered_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 
@@ -1054,7 +1147,10 @@ def test_review_calibration_receipt_path_traversal_fails_closed(
 
     with pytest.raises(ValueError, match="unsafe .*calibration receipt path"):
         _validate_quality_v2_calibration_wave_receipt(
-            thresholds, receipt_path, receipt_sha256
+            thresholds,
+            receipt_path,
+            receipt_sha256,
+            expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
         )
 
 

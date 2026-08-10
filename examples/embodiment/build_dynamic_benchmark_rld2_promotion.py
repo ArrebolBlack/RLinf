@@ -36,7 +36,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 if __package__ in {None, ""}:
@@ -50,6 +50,8 @@ POLICY_SCHEMA = "rlinf-dynamic-benchmark-expert-policy-v0.1"
 POLICY_METADATA_SCHEMA = "rlinf-dynamic-benchmark-expert-summary-v0.1"
 POLICY_EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-expert-evaluation-v0.3"
 PLANNER_EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-planner-evaluation-v0.2"
+SOURCE_SNAPSHOT_SCHEMA = "rld2-qa-source-snapshot-v0.1"
+SOURCE_SNAPSHOT_RECEIPT_SCHEMA = "rld2-qa-source-snapshot-receipt-v0.1"
 QUALITY_V2_THRESHOLD_SCHEMA = "se3-wam-trajectory-quality-v2-thresholds-v0.3"
 QUALITY_V2_SUMMARY_SCHEMA = "se3-wam-trajectory-quality-v2"
 QUALITY_V2_GATE_SCHEMA = "se3-wam-trajectory-quality-v2-gate-v0.1"
@@ -268,10 +270,12 @@ def _policy_checkpoint_metadata(path: Path) -> dict[str, Any]:
         _require_mapping(checkpoint.get("validation"), "policy validation metadata"),
         "policy validation metadata",
     )
-    infra_identity = _json_safe_copy(
-        _require_mapping(checkpoint.get("infra_identity"), "policy infra identity"),
-        "policy infra identity",
-    )
+    if "infra_identity" not in checkpoint:
+        raise ValueError("policy infra identity is missing")
+    raw_infra_identity = checkpoint["infra_identity"]
+    if raw_infra_identity is not None and not isinstance(raw_infra_identity, Mapping):
+        raise ValueError("policy infra identity must be a mapping or null")
+    infra_identity = _json_safe_copy(raw_infra_identity, "policy infra identity")
     env_steps = _require_int(checkpoint.get("env_steps"), "policy env_steps", minimum=1)
     metadata = {
         "schema_version": POLICY_SCHEMA,
@@ -441,14 +445,10 @@ def _validate_evaluation(
     ):
         raise ValueError(f"{label} did not pass every exact replay")
     if label == "policy evaluation":
-        if (
-            _require_bool(
-                payload.get("all_successful_quality_v2_gates_passed"),
-                "policy successful quality gates",
-            )
-            is not True
-        ):
-            raise ValueError("policy evaluation did not pass all successful Qv3 gates")
+        _require_bool(
+            payload.get("all_successful_quality_v2_gates_passed"),
+            "policy successful quality gates",
+        )
         identity = _require_mapping(payload.get("policy_identity"), "policy identity")
         if identity.get("task") != task:
             raise ValueError("policy evaluation task identity mismatch")
@@ -795,6 +795,8 @@ def _compare_both_success(
     planner_quality_values: Mapping[str, float],
     policy_gate: bool,
     planner_gate: bool,
+    policy_causal_timing: Mapping[str, Any],
+    planner_causal_timing: Mapping[str, Any],
 ) -> dict[str, Any]:
     from examples.embodiment import (
         export_dynamic_benchmark_optimal_trajectories as optimal,
@@ -872,11 +874,40 @@ def _compare_both_success(
             }
         )
 
-    policy_causal_latency = optimal._t5_causal_latency(policy)
-    planner_causal_latency = optimal._t5_causal_latency(planner)
-    if policy_causal_latency is not None:
-        if planner_causal_latency is None:
-            raise ValueError("T5 policy/planner causal-latency identity mismatch")
+    if policy["task_id"] == "t5_replan":
+        policy_causal_gate = bool(
+            policy_causal_timing["t5_replan_causal_timing_passed"]
+        )
+        planner_causal_gate = bool(
+            planner_causal_timing["t5_replan_causal_timing_passed"]
+        )
+        gate_dimension = "causal.t5_replan_causal_timing_gate"
+        gate_nonworse = policy_causal_gate
+        gate_strict = policy_causal_gate and not planner_causal_gate
+        nonworse &= gate_nonworse
+        if gate_strict:
+            strict.append(gate_dimension)
+        dimensions.append(
+            {
+                "name": gate_dimension,
+                "direction": "pass",
+                "planner": planner_causal_gate,
+                "policy": policy_causal_gate,
+                "nonworse": gate_nonworse,
+                "strictly_better": gate_strict,
+            }
+        )
+
+    if (
+        policy_causal_timing["t5_replan_causal_timing_passed"] is True
+        and planner_causal_timing["t5_replan_causal_timing_passed"] is True
+    ):
+        policy_causal_latency = float(
+            policy_causal_timing["impact_end_to_first_qualifying_applied_correction_s"]
+        )
+        planner_causal_latency = float(
+            planner_causal_timing["impact_end_to_first_qualifying_applied_correction_s"]
+        )
         dimension_name = "causal.impact_end_to_first_qualifying_applied_correction_s"
         dimension_nonworse = (
             policy_causal_latency
@@ -947,6 +978,13 @@ def _artifact_identity(
     return identity
 
 
+def _require_exact_keys(
+    value: Mapping[str, Any], expected: set[str], label: str
+) -> None:
+    if set(value) != expected:
+        raise ValueError(f"{label} keys do not match its canonical schema")
+
+
 def _expected_sha(expected_sha256: Mapping[str, str] | None, name: str) -> str | None:
     if expected_sha256 is None:
         return None
@@ -955,14 +993,331 @@ def _expected_sha(expected_sha256: Mapping[str, str] | None, name: str) -> str |
     return expected_sha256[name]
 
 
+def _validate_evaluation_sha256sums(
+    *,
+    evaluation_path: Path,
+    sha256sums_path: Path,
+    expected_sha256: str | None,
+    external_entries: Sequence[tuple[str, str]],
+    label: str,
+) -> dict[str, str]:
+    """Recompute one formal evaluation bundle's exact checksum inventory."""
+
+    raw_evaluation = Path(evaluation_path)
+    raw_sums = Path(sha256sums_path)
+    if raw_evaluation.is_symlink() or raw_sums.is_symlink():
+        raise ValueError(f"{label} bundle artifacts must not be symlinks")
+    evaluation = raw_evaluation.resolve(strict=True)
+    sums = raw_sums.resolve(strict=True)
+    root = evaluation.parent
+    if evaluation.name != "evaluation.json":
+        raise ValueError(f"{label} path must end in evaluation.json")
+    if sums != root / "SHA256SUMS" or not sums.is_file():
+        raise ValueError(f"{label} SHA256SUMS must be its canonical sibling")
+    observed_sums_sha256 = _verify_file(sums, expected_sha256, f"{label} SHA256SUMS")
+
+    owned_paths: list[tuple[str, Path]] = []
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise ValueError(f"{label} bundle contains a symlink: {candidate}")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise ValueError(f"{label} bundle contains a non-regular artifact")
+        if candidate != sums:
+            owned_paths.append((candidate.relative_to(root).as_posix(), candidate))
+    owned_paths.sort(key=lambda row: row[0])
+    if evaluation not in {path for _, path in owned_paths}:
+        raise ValueError(f"{label} bundle does not contain evaluation.json")
+    rows = [f"{_sha256(path)}  {relative}\n" for relative, path in owned_paths]
+    labels = {relative for relative, _ in owned_paths}
+    for sha256, external_label in external_entries:
+        digest = _require_sha256(sha256, f"{label} external SHA-256")
+        external_label = _require_string(external_label, f"{label} external path")
+        if "\n" in external_label or "\r" in external_label or external_label in labels:
+            raise ValueError(f"{label} external checksum path is unsafe or duplicate")
+        labels.add(external_label)
+        rows.append(f"{digest}  {external_label}\n")
+    expected_body = "".join(rows).encode("utf-8")
+    if sums.read_bytes() != expected_body:
+        raise ValueError(f"{label} SHA256SUMS exact inventory mismatch")
+    if _sha256(sums) != observed_sums_sha256:
+        raise RuntimeError(f"{label} SHA256SUMS changed during validation")
+    return {"path": str(sums), "sha256": observed_sums_sha256}
+
+
+def _validate_policy_source_snapshot_receipt(
+    *,
+    evaluation_path: Path,
+    policy_commit: str,
+    evaluator_commit: str,
+    benchmark_commit: str,
+    evaluator_source: Mapping[str, Any],
+    base_image_sha256: str,
+) -> dict[str, Any]:
+    receipt_path = evaluation_path.resolve(strict=True).parent / "source_snapshot.json"
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError("policy evaluation source snapshot receipt is missing")
+    receipt = _read_json(receipt_path, "policy source snapshot receipt")
+    _require_exact_keys(
+        receipt,
+        {
+            "schema_version",
+            "base_image_id",
+            "source_snapshot_image_id",
+            "source_manifest",
+            "sources",
+            "evaluator_source",
+            "payload_sha256",
+        },
+        "policy source snapshot receipt",
+    )
+    if receipt.get("schema_version") != SOURCE_SNAPSHOT_RECEIPT_SCHEMA:
+        raise ValueError("policy source snapshot receipt schema mismatch")
+    _verify_payload_hash(receipt, "policy source snapshot receipt")
+    for name in ("base_image_id", "source_snapshot_image_id"):
+        value = receipt.get(name)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+        ):
+            raise ValueError(f"policy source snapshot {name} is invalid")
+    if (
+        receipt.get("base_image_id")
+        != f"sha256:{_require_sha256(base_image_sha256, 'base image SHA-256')}"
+    ):
+        raise ValueError("policy source snapshot base image does not match promotion")
+    if receipt.get("source_snapshot_image_id") == receipt.get("base_image_id"):
+        raise ValueError("policy source snapshot image equals its base image")
+    manifest = _require_mapping(
+        receipt.get("source_manifest"), "policy source snapshot manifest identity"
+    )
+    _require_exact_keys(
+        manifest,
+        {"path", "sha256", "schema_version", "payload_sha256"},
+        "policy source snapshot manifest identity",
+    )
+    _require_string(manifest.get("path"), "policy source snapshot manifest path")
+    _require_sha256(manifest.get("sha256"), "policy source snapshot manifest SHA-256")
+    _require_sha256(
+        manifest.get("payload_sha256"),
+        "policy source snapshot manifest payload SHA-256",
+    )
+    if manifest.get("schema_version") != SOURCE_SNAPSHOT_SCHEMA:
+        raise ValueError("policy source snapshot manifest schema mismatch")
+    if manifest.get("path") != "source_manifest.json":
+        raise ValueError("policy source snapshot manifest path is not canonical")
+    manifest_path = evaluation_path.resolve(strict=True).parent / "source_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("policy source snapshot manifest is missing")
+    if _sha256(manifest_path) != manifest.get("sha256"):
+        raise ValueError("policy source snapshot manifest SHA-256 mismatch")
+    manifest_payload = _read_json(manifest_path, "policy source snapshot manifest")
+    _require_exact_keys(
+        manifest_payload,
+        {
+            "schema_version",
+            "base_image_id",
+            "sources",
+            "runtime_dependencies",
+            "payload_sha256",
+        },
+        "policy source snapshot manifest",
+    )
+    if (
+        manifest_payload.get("schema_version") != SOURCE_SNAPSHOT_SCHEMA
+        or manifest_payload.get("payload_sha256") != manifest.get("payload_sha256")
+        or _payload_sha256(manifest_payload) != manifest.get("payload_sha256")
+        or manifest_payload.get("base_image_id") != receipt.get("base_image_id")
+    ):
+        raise ValueError("policy source snapshot manifest identity mismatch")
+    sources = _require_mapping(
+        receipt.get("sources"), "policy source snapshot source identities"
+    )
+    _require_exact_keys(
+        sources,
+        {"policy_rlinf", "evaluator_rlinf", "benchmark"},
+        "policy source snapshot source identities",
+    )
+    expected_commits = {
+        "policy_rlinf": policy_commit,
+        "evaluator_rlinf": evaluator_commit,
+        "benchmark": benchmark_commit,
+    }
+    expected_roots = {
+        "policy_rlinf": "/opt/rld2-source-snapshot/source/policy_rlinf",
+        "evaluator_rlinf": "/opt/rld2-source-snapshot/source/evaluator_rlinf",
+        "benchmark": "/opt/rld2-source-snapshot/source/benchmark",
+    }
+    for role, expected_commit in expected_commits.items():
+        source = _require_mapping(sources.get(role), f"policy source snapshot {role}")
+        _require_exact_keys(
+            source,
+            {"root", "commit", "tree", "inventory_sha256"},
+            f"policy source snapshot {role}",
+        )
+        _require_string(source.get("root"), f"policy source snapshot {role} root")
+        if (
+            source.get("root") != expected_roots[role]
+            or source.get("commit") != expected_commit
+        ):
+            raise ValueError(f"policy source snapshot {role} commit mismatch")
+        _require_commit(source.get("tree"), f"policy source snapshot {role} tree")
+        _require_sha256(
+            source.get("inventory_sha256"),
+            f"policy source snapshot {role} inventory SHA-256",
+        )
+    manifest_sources = _require_mapping(
+        manifest_payload.get("sources"), "policy source snapshot manifest sources"
+    )
+    _require_exact_keys(
+        manifest_sources,
+        {"policy_rlinf", "evaluator_rlinf", "benchmark"},
+        "policy source snapshot manifest sources",
+    )
+    for role in ("policy_rlinf", "evaluator_rlinf", "benchmark"):
+        source = _require_mapping(
+            manifest_sources.get(role), f"policy source snapshot manifest {role}"
+        )
+        _require_exact_keys(
+            source,
+            {"root", "commit", "tree", "files", "inventory_sha256"},
+            f"policy source snapshot manifest {role}",
+        )
+        rows = _require_sequence(
+            source.get("files"), f"policy source snapshot manifest {role} files"
+        )
+        canonical_rows: list[dict[str, str]] = []
+        previous_path = ""
+        for index, raw_row in enumerate(rows):
+            row = _require_mapping(
+                raw_row, f"policy source snapshot manifest {role} file {index}"
+            )
+            _require_exact_keys(
+                row,
+                {"path", "mode", "git_blob_sha1", "sha256"},
+                f"policy source snapshot manifest {role} file {index}",
+            )
+            path = _require_string(
+                row.get("path"), f"policy source snapshot manifest {role} file path"
+            )
+            pure_path = PurePosixPath(path)
+            if (
+                pure_path.is_absolute()
+                or pure_path.as_posix() != path
+                or not pure_path.parts
+                or any(part in {"", ".", ".."} for part in pure_path.parts)
+                or path <= previous_path
+            ):
+                raise ValueError(
+                    f"policy source snapshot manifest {role} file order/path is invalid"
+                )
+            previous_path = path
+            mode = _require_string(
+                row.get("mode"), f"policy source snapshot manifest {role} file mode"
+            )
+            if mode not in {"100644", "100755"}:
+                raise ValueError(
+                    f"policy source snapshot manifest {role} file mode is invalid"
+                )
+            canonical_rows.append(
+                {
+                    "path": path,
+                    "mode": mode,
+                    "git_blob_sha1": _require_commit(
+                        row.get("git_blob_sha1"),
+                        f"policy source snapshot manifest {role} Git blob",
+                    ),
+                    "sha256": _require_sha256(
+                        row.get("sha256"),
+                        f"policy source snapshot manifest {role} file SHA-256",
+                    ),
+                }
+            )
+        if _value_sha256(canonical_rows) != source.get("inventory_sha256"):
+            raise ValueError(
+                f"policy source snapshot manifest {role} inventory SHA-256 mismatch"
+            )
+        projected = {
+            name: source[name]
+            for name in ("root", "commit", "tree", "inventory_sha256")
+        }
+        if projected != sources.get(role):
+            raise ValueError(
+                f"policy source snapshot receipt/manifest {role} identity mismatch"
+            )
+    runtime_dependencies = _require_mapping(
+        manifest_payload.get("runtime_dependencies"),
+        "policy source snapshot runtime dependencies",
+    )
+    _require_exact_keys(
+        runtime_dependencies,
+        {"portable", "a800_core"},
+        "policy source snapshot runtime dependencies",
+    )
+    expected_runtime_roots = {
+        "portable": "/opt/rld2-source-snapshot/runtime/pydeps-portable-v1",
+        "a800_core": "/opt/rld2-source-snapshot/runtime/pydeps-a800-core-v1",
+    }
+    for name in ("portable", "a800_core"):
+        dependency = _require_mapping(
+            runtime_dependencies.get(name), f"policy source snapshot runtime {name}"
+        )
+        _require_exact_keys(
+            dependency,
+            {"root", "inventory_sha256"},
+            f"policy source snapshot runtime {name}",
+        )
+        if (
+            _require_string(
+                dependency.get("root"), f"policy source snapshot runtime {name} root"
+            )
+            != expected_runtime_roots[name]
+        ):
+            raise ValueError(f"policy source snapshot runtime {name} root mismatch")
+        _require_sha256(
+            dependency.get("inventory_sha256"),
+            f"policy source snapshot runtime {name} inventory SHA-256",
+        )
+    if receipt.get("evaluator_source") != dict(evaluator_source):
+        raise ValueError("policy source snapshot evaluator source identity mismatch")
+    evaluator_repository_path = _require_string(
+        evaluator_source.get("repository_path"),
+        "policy source snapshot evaluator repository path",
+    )
+    evaluator_rows = _require_sequence(
+        _require_mapping(
+            manifest_sources.get("evaluator_rlinf"),
+            "policy source snapshot evaluator manifest",
+        ).get("files"),
+        "policy source snapshot evaluator files",
+    )
+    evaluator_matches = [
+        row
+        for row in evaluator_rows
+        if isinstance(row, Mapping) and row.get("path") == evaluator_repository_path
+    ]
+    if len(evaluator_matches) != 1 or evaluator_matches[0].get(
+        "sha256"
+    ) != evaluator_source.get("sha256"):
+        raise ValueError("policy source snapshot evaluator blob identity mismatch")
+    return receipt
+
+
 def build_selection_evidence(
     *,
     candidate_id: str,
     run_tag: str,
+    trainer_run_root: Path,
     policy_path: Path,
     policy_metadata_path: Path,
+    checkpoint_selection_path: Path,
+    checkpoint_selection_outcome_path: Path,
+    policy_rlinf_source_root: Path,
     policy_evaluation_path: Path,
+    policy_evaluation_sha256sums_path: Path,
     planner_evaluation_path: Path,
+    planner_evaluation_sha256sums_path: Path,
     reset_manifest_path: Path,
     quality_v2_thresholds_path: Path,
     quality_v2_calibration_wave_receipt_path: Path,
@@ -976,6 +1331,10 @@ def build_selection_evidence(
 ) -> dict[str, Any]:
     """Reopen exact artifacts and return deterministic promotion evidence."""
 
+    from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+        validate_selected_learned_policy,
+    )
+
     candidate_id = _require_string(candidate_id, "candidate_id")
     run_tag = _require_string(run_tag, "run_tag")
     image_reference = _require_string(image_reference, "image reference")
@@ -983,8 +1342,12 @@ def build_selection_evidence(
     paths = {
         "policy": policy_path,
         "policy_metadata": policy_metadata_path,
+        "checkpoint_selection": checkpoint_selection_path,
+        "checkpoint_selection_outcome": checkpoint_selection_outcome_path,
         "policy_evaluation": policy_evaluation_path,
+        "policy_evaluation_sha256sums": policy_evaluation_sha256sums_path,
         "planner_evaluation": planner_evaluation_path,
+        "planner_evaluation_sha256sums": planner_evaluation_sha256sums_path,
         "reset_manifest": reset_manifest_path,
         "quality_v2_thresholds": quality_v2_thresholds_path,
         "quality_v2_calibration_wave_receipt": (
@@ -1007,7 +1370,7 @@ def build_selection_evidence(
         )
 
     checkpoint = _policy_checkpoint_metadata(policy_path)
-    metadata = _validate_training_metadata(
+    _validate_training_metadata(
         _read_json(policy_metadata_path, "policy metadata"), checkpoint=checkpoint
     )
     config = _require_mapping(checkpoint["config"], "policy config")
@@ -1021,6 +1384,66 @@ def build_selection_evidence(
         raise ValueError(
             "policy checkpoint selection reused a review/calibration/test manifest seed"
         )
+    policy_evaluation = _read_json(policy_evaluation_path, "policy evaluation")
+    admission_evaluator_source = _require_mapping(
+        policy_evaluation.get("source_identity"),
+        "policy evaluation source identity",
+    )
+    admission_evaluator_commit = _require_commit(
+        admission_evaluator_source.get("evaluator_rlinf_commit"),
+        "policy evaluator commit",
+    )
+    evaluator_source_root = policy_evaluator_source_path.resolve(strict=True).parents[2]
+    learned_policy_admission = validate_selected_learned_policy(
+        trainer_run_root=trainer_run_root,
+        policy_path=policy_path,
+        trainer_summary_path=policy_metadata_path,
+        checkpoint_selection_path=checkpoint_selection_path,
+        checkpoint_selection_outcome_path=checkpoint_selection_outcome_path,
+        policy_rlinf_source_root=policy_rlinf_source_root,
+        verifier_rlinf_source_root=evaluator_source_root,
+        evaluator_rlinf_source_root=evaluator_source_root,
+        expected_checkpoint_selection_outcome_sha256=hashes[
+            "checkpoint_selection_outcome"
+        ],
+        expected_policy_sha256=hashes["policy"],
+        expected_trainer_summary_sha256=hashes["policy_metadata"],
+        expected_checkpoint_selection_sha256=hashes["checkpoint_selection"],
+        expected_rlinf_commit=_require_commit(
+            config.get("rlinf_commit"), "policy RLinf commit"
+        ),
+        expected_benchmark_commit=_require_commit(
+            config.get("benchmark_commit"), "policy benchmark commit"
+        ),
+        expected_verifier_rlinf_commit=admission_evaluator_commit,
+        expected_evaluator_rlinf_commit=admission_evaluator_commit,
+    )
+    policy_sha256sums_identity = _validate_evaluation_sha256sums(
+        evaluation_path=policy_evaluation_path,
+        sha256sums_path=policy_evaluation_sha256sums_path,
+        expected_sha256=hashes["policy_evaluation_sha256sums"],
+        external_entries=tuple(
+            (
+                learned_policy_admission[name]["sha256"],
+                learned_policy_admission[name]["path"],
+            )
+            for name in (
+                "policy",
+                "trainer_summary",
+                "checkpoint_selection",
+                "checkpoint_selection_outcome",
+                "config",
+            )
+        ),
+        label="policy evaluation",
+    )
+    planner_sha256sums_identity = _validate_evaluation_sha256sums(
+        evaluation_path=planner_evaluation_path,
+        sha256sums_path=planner_evaluation_sha256sums_path,
+        expected_sha256=hashes["planner_evaluation_sha256sums"],
+        external_entries=(),
+        label="planner evaluation",
+    )
     env_steps = _require_int(checkpoint.get("env_steps"), "policy env_steps", minimum=1)
     rlinf_commit = _require_commit(config.get("rlinf_commit"), "policy RLinf commit")
     benchmark_commit = _require_commit(
@@ -1046,6 +1469,7 @@ def build_selection_evidence(
         threshold_payload,
         quality_v2_calibration_wave_receipt_path,
         expected_sha256=hashes["quality_v2_calibration_wave_receipt"],
+        expected_benchmark_commit=benchmark_commit,
     )
     if calibration_receipt.sha256 != hashes["quality_v2_calibration_wave_receipt"]:
         raise ValueError(
@@ -1056,7 +1480,6 @@ def build_selection_evidence(
     quality_contract = _quality_contract(
         threshold_payload, task=task, sha256=hashes["quality_v2_thresholds"]
     )
-    policy_evaluation = _read_json(policy_evaluation_path, "policy evaluation")
     planner_evaluation = _read_json(planner_evaluation_path, "planner evaluation")
     reset_rows = _read_jsonl(reset_manifest_path, "promotion reset manifest")
     row_manifest_seed, reset_identities = _validate_reset_manifest(
@@ -1108,9 +1531,12 @@ def build_selection_evidence(
         or policy_identity.get("training_seed") != training_seed
         or policy_identity.get("training_env_steps") != env_steps
         or policy_identity.get("validation") != checkpoint["validation"]
+        or policy_identity.get("checkpoint_role") != "best"
         or policy_evaluation.get("state_schema") != checkpoint["state_schema"]
     ):
         raise ValueError("policy evaluation/checkpoint metadata identity mismatch")
+    if policy_evaluation.get("learned_policy_admission") != learned_policy_admission:
+        raise ValueError("policy evaluation learned-policy admission identity mismatch")
     threshold_identity = _require_mapping(
         policy_evaluation.get("quality_v2_threshold_identity"),
         "policy evaluation Qv3 threshold identity",
@@ -1127,6 +1553,21 @@ def build_selection_evidence(
     planner_source = _require_mapping(
         planner_evaluation.get("source_identity"), "planner evaluation source identity"
     )
+    _require_exact_keys(
+        policy_source,
+        {
+            "evaluator_rlinf_commit",
+            "policy_rlinf_commit",
+            "benchmark_commit",
+            "evaluator_source",
+        },
+        "policy evaluation source identity",
+    )
+    _require_exact_keys(
+        planner_source,
+        {"evaluator_rlinf_commit", "benchmark_commit"},
+        "planner evaluation source identity",
+    )
     evaluator_commit = _require_commit(
         policy_source.get("evaluator_rlinf_commit"), "policy evaluator commit"
     )
@@ -1137,13 +1578,51 @@ def build_selection_evidence(
         or planner_source.get("benchmark_commit") != benchmark_commit
     ):
         raise ValueError("policy/planner evaluator source commit identity mismatch")
-    if policy_evaluator_source_path.name != "evaluate_dynamic_benchmark_expert.py":
+    if (
+        Path(policy_evaluator_source_path).is_symlink()
+        or policy_evaluator_source_path.name != "evaluate_dynamic_benchmark_expert.py"
+    ):
         raise ValueError("policy evaluator source path is not canonical")
-    if planner_evaluator_source_path.name != "evaluate_dynamic_benchmark_planner.py":
+    if (
+        Path(planner_evaluator_source_path).is_symlink()
+        or planner_evaluator_source_path.name != "evaluate_dynamic_benchmark_planner.py"
+    ):
         raise ValueError("planner evaluator source path is not canonical")
+    checkpoint_outcome = _read_json(
+        checkpoint_selection_outcome_path, "checkpoint-selection outcome"
+    )
+    outcome_source = _require_mapping(
+        checkpoint_outcome.get("source_identity"),
+        "checkpoint-selection outcome source identity",
+    )
+    outcome_evaluator_source = _require_mapping(
+        outcome_source.get("evaluator_source"),
+        "checkpoint-selection outcome evaluator source",
+    )
+    expected_evaluator_path = evaluator_source_root / (
+        "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+    )
+    if (
+        policy_evaluator_source_path.resolve(strict=True) != expected_evaluator_path
+        or hashes["policy_evaluator_source"] != outcome_evaluator_source.get("sha256")
+        or policy_source.get("evaluator_source") != outcome_evaluator_source
+    ):
+        raise ValueError(
+            "policy evaluator source path/SHA does not match outcome and evaluation"
+        )
+    _validate_policy_source_snapshot_receipt(
+        evaluation_path=policy_evaluation_path,
+        policy_commit=rlinf_commit,
+        evaluator_commit=evaluator_commit,
+        benchmark_commit=benchmark_commit,
+        evaluator_source=outcome_evaluator_source,
+        base_image_sha256=image_sha256,
+    )
 
     per_reset: list[dict[str, Any]] = []
     strict_dimensions: set[str] = set()
+    rejection_reasons: list[dict[str, Any]] = []
+    planner_nonworse_all_both_success = True
     counts = {
         "both_success": 0,
         "policy_only_success": 0,
@@ -1223,16 +1702,35 @@ def build_selection_evidence(
         counts["planner_t5_causal_timing_passed"] += int(
             planner_causal["t5_replan_causal_timing_passed"] is True
         )
-        if policy_success and (
-            policy_safety or not policy_gate or policy_causal_gate is False
-        ):
-            raise ValueError(
-                "successful policy reset failed safety, Qv3, or the T5 causal gate"
-            )
+        per_reset_rejections: list[dict[str, Any]] = []
+        if policy_success:
+            failed_gates = [
+                gate_name
+                for gate_name, failed in (
+                    ("safety", policy_safety),
+                    ("quality_v3", not policy_gate),
+                    ("t5_causal_timing", policy_causal_gate is False),
+                )
+                if failed
+            ]
+            if failed_gates:
+                per_reset_rejections.append(
+                    {
+                        "code": "successful_policy_gate_failure",
+                        "scope": "reset",
+                        "reset_index": index,
+                        "episode_id": episode_id,
+                        "failed_gates": failed_gates,
+                    }
+                )
         if planner_success and not policy_success:
-            counts["planner_only_success"] += 1
-            raise ValueError(
-                "planner-success to policy-failure regression is forbidden"
+            per_reset_rejections.append(
+                {
+                    "code": "planner_success_policy_failure",
+                    "scope": "reset",
+                    "reset_index": index,
+                    "episode_id": episode_id,
+                }
             )
         if policy_success and planner_success:
             counts["both_success"] += 1
@@ -1245,32 +1743,64 @@ def build_selection_evidence(
                 planner_quality_values=planner_quality,
                 policy_gate=policy_gate,
                 planner_gate=planner_gate,
+                policy_causal_timing=policy_causal,
+                planner_causal_timing=planner_causal,
             )
+            planner_nonworse_all_both_success &= comparison[
+                "planner_nonworse_all_dimensions"
+            ]
             if comparison["planner_nonworse_all_dimensions"] is not True:
-                failed = [
+                failed_dimensions = sorted(
                     row["name"]
                     for row in comparison["dimensions"]
                     if row.get("nonworse") is False
-                ]
-                raise ValueError(
-                    "policy Qv3/task-quality degradation versus planner: "
-                    + ", ".join(failed)
+                    and row["name"]
+                    not in {
+                        "quality_v3.absolute_gate",
+                        "causal.t5_replan_causal_timing_gate",
+                    }
                 )
+                if failed_dimensions:
+                    per_reset_rejections.append(
+                        {
+                            "code": "both_success_metric_nonworse_failure",
+                            "scope": "reset",
+                            "reset_index": index,
+                            "episode_id": episode_id,
+                            "failed_dimensions": failed_dimensions,
+                        }
+                    )
             strict_dimensions.update(comparison["strict_improvement_dimensions"])
             outcome = "both_success"
         elif policy_success:
             counts["policy_only_success"] += 1
-            if policy_safety:
-                raise ValueError("planner-fail rescue is not safe")
-            rescue = f"success.safe_planner_failure_rescue.reset_{index:02d}"
-            strict_dimensions.add(rescue)
+            if per_reset_rejections:
+                comparison = {
+                    "planner_nonworse_all_dimensions": False,
+                    "strict_improvement_dimensions": [],
+                    "exact_tie": False,
+                    "dimensions": [],
+                }
+                outcome = "policy_only_success_formal_gate_rejection"
+            else:
+                rescue = f"success.safe_planner_failure_rescue.reset_{index:02d}"
+                strict_dimensions.add(rescue)
+                comparison = {
+                    "planner_nonworse_all_dimensions": True,
+                    "strict_improvement_dimensions": [rescue],
+                    "exact_tie": False,
+                    "dimensions": [],
+                }
+                outcome = "safe_policy_rescue"
+        elif planner_success:
+            counts["planner_only_success"] += 1
             comparison = {
-                "planner_nonworse_all_dimensions": True,
-                "strict_improvement_dimensions": [rescue],
+                "planner_nonworse_all_dimensions": False,
+                "strict_improvement_dimensions": [],
                 "exact_tie": False,
                 "dimensions": [],
             }
-            outcome = "safe_policy_rescue"
+            outcome = "planner_only_success"
         else:
             counts["neither_success"] += 1
             comparison = {
@@ -1303,22 +1833,65 @@ def build_selection_evidence(
                     "attempt_tape": planner_tape,
                 },
                 "comparison": comparison,
+                "rejection_reasons": per_reset_rejections,
             }
         )
+        rejection_reasons.extend(per_reset_rejections)
 
+    all_successful_policy_quality_v3_gates_passed = all(
+        row["policy"]["quality_v3_gate"]["passed"] is True
+        for row in per_reset
+        if row["policy"]["success"]
+    )
+    if (
+        policy_evaluation.get("all_successful_quality_v2_gates_passed")
+        is not all_successful_policy_quality_v3_gates_passed
+    ):
+        raise ValueError(
+            "policy evaluation successful-Qv3 aggregate disagrees with audited records"
+        )
     if counts["policy_safety_failure"] > counts["planner_safety_failure"]:
-        raise ValueError("policy safety failures exceed the matched planner")
+        rejection_reasons.append(
+            {
+                "code": "aggregate_policy_safety_count_worse",
+                "scope": "aggregate",
+                "policy_failure_count": counts["policy_safety_failure"],
+                "planner_failure_count": counts["planner_safety_failure"],
+            }
+        )
     if counts["policy_safety_failure"] < counts["planner_safety_failure"]:
         strict_dimensions.add("safety.failure_count")
-    if counts["planner_only_success"]:
-        raise AssertionError("success regression escaped the per-reset validator")
-    decision = "promote" if strict_dimensions else "keep_planner"
-    exact_tie = decision != "promote"
+    if rejection_reasons:
+        decision = "keep_planner"
+        selection_reason = "formal_gate_rejection"
+        planner_nonworse_all_dimensions = False
+        exact_tie = False
+    elif strict_dimensions:
+        decision = "promote"
+        selection_reason = "strict_planner_nonworse_improvement"
+        planner_nonworse_all_dimensions = True
+        exact_tie = False
+    else:
+        decision = "keep_planner"
+        selection_reason = "no_strict_improvement"
+        planner_nonworse_all_dimensions = True
+        exact_tie = True
 
     from examples.embodiment import (
         audit_dynamic_benchmark_optimal_trajectories as optimal_auditor,
     )
 
+    policy_trainer_source_path = (
+        Path(policy_rlinf_source_root).resolve(strict=True)
+        / "examples/embodiment/train_dynamic_benchmark_expert.py"
+    )
+    policy_trainer_sha256 = _verify_file(
+        policy_trainer_source_path, None, "policy trainer source"
+    )
+    if policy_trainer_sha256 != _require_mapping(
+        outcome_source.get("trainer_source"), "outcome trainer source"
+    ).get("sha256"):
+        raise ValueError("policy trainer source does not match checkpoint outcome")
     source_files = {
         "policy_evaluator": {
             "path": str(policy_evaluator_source_path.resolve()),
@@ -1363,6 +1936,11 @@ def build_selection_evidence(
             },
         },
         "inputs": {
+            "policy_rlinf_source": {
+                "path": str(Path(policy_rlinf_source_root).resolve(strict=True)),
+                "commit": rlinf_commit,
+                "trainer_source_sha256": policy_trainer_sha256,
+            },
             "policy": {
                 **_artifact_identity(policy_path, sha256=hashes["policy"]),
                 "metadata_payload_sha256": checkpoint["payload_sha256"],
@@ -1371,12 +1949,14 @@ def build_selection_evidence(
                 "env_steps": env_steps,
                 "run_tag": run_tag,
             },
-            "policy_metadata": _artifact_identity(
-                policy_metadata_path,
-                sha256=hashes["policy_metadata"],
-                schema_version=POLICY_METADATA_SCHEMA,
-                payload_sha256=metadata["payload_sha256"],
+            "policy_metadata": dict(learned_policy_admission["trainer_summary"]),
+            "checkpoint_selection": dict(
+                learned_policy_admission["checkpoint_selection"]
             ),
+            "checkpoint_selection_outcome": dict(
+                learned_policy_admission["checkpoint_selection_outcome"]
+            ),
+            "policy_evaluation_sha256sums": policy_sha256sums_identity,
             "policy_evaluation": _artifact_identity(
                 policy_evaluation_path,
                 sha256=hashes["policy_evaluation"],
@@ -1389,6 +1969,7 @@ def build_selection_evidence(
                 schema_version=PLANNER_EVALUATION_SCHEMA,
                 payload_sha256=planner_evaluation["payload_sha256"],
             ),
+            "planner_evaluation_sha256sums": planner_sha256sums_identity,
             "reset_manifest": {
                 **_artifact_identity(reset_manifest_path, sha256=reset_sha),
                 "payload_sha256": _value_sha256(reset_rows),
@@ -1447,8 +2028,10 @@ def build_selection_evidence(
                     counts["planner_safety_failure"], RESET_COUNT
                 ),
             },
-            "planner_nonworse_all_both_success": True,
-            "all_successful_policy_quality_v3_gates_passed": True,
+            "planner_nonworse_all_both_success": (planner_nonworse_all_both_success),
+            "all_successful_policy_quality_v3_gates_passed": (
+                all_successful_policy_quality_v3_gates_passed
+            ),
             "all_successful_policy_t5_causal_gates_passed": all(
                 row["policy"]["action_application"]["t5_replan_causal_timing_passed"]
                 is not False
@@ -1459,16 +2042,43 @@ def build_selection_evidence(
         },
         "selection": {
             "decision": decision,
-            "planner_nonworse_all_dimensions": True,
+            "reason": selection_reason,
+            "planner_nonworse_all_dimensions": planner_nonworse_all_dimensions,
             "strict_improvement_dimensions": sorted(strict_dimensions),
+            "rejection_reasons": rejection_reasons,
             "exact_aggregate_tie": exact_tie,
             "rule": (
-                "no safety or planner-success regression; successful policy Qv3 and T5 causal "
-                "gates pass; each both-success reset is nonworse under frozen selector/Qv3/"
-                "causal tolerances; at least one strict improvement is required"
+                "all integrity evidence must validate; any formal safety, success, Qv3, T5 "
+                "causal, or paired nonworse regression keeps the planner; otherwise at least "
+                "one strict planner-nonworse improvement is required for promotion"
             ),
         },
     }
+    final_admission = validate_selected_learned_policy(
+        trainer_run_root=trainer_run_root,
+        policy_path=policy_path,
+        trainer_summary_path=policy_metadata_path,
+        checkpoint_selection_path=checkpoint_selection_path,
+        checkpoint_selection_outcome_path=checkpoint_selection_outcome_path,
+        policy_rlinf_source_root=policy_rlinf_source_root,
+        verifier_rlinf_source_root=evaluator_source_root,
+        evaluator_rlinf_source_root=evaluator_source_root,
+        expected_checkpoint_selection_outcome_sha256=hashes[
+            "checkpoint_selection_outcome"
+        ],
+        expected_policy_sha256=hashes["policy"],
+        expected_trainer_summary_sha256=hashes["policy_metadata"],
+        expected_checkpoint_selection_sha256=hashes["checkpoint_selection"],
+        expected_rlinf_commit=rlinf_commit,
+        expected_benchmark_commit=benchmark_commit,
+        expected_verifier_rlinf_commit=evaluator_commit,
+        expected_evaluator_rlinf_commit=evaluator_commit,
+    )
+    if final_admission != learned_policy_admission:
+        raise RuntimeError("learned-policy admission changed during promotion")
+    for name, path in paths.items():
+        if _sha256(path.resolve(strict=True)) != hashes[name]:
+            raise RuntimeError(f"{name} changed during promotion")
     evidence["payload_sha256"] = _payload_sha256(evidence)
     return evidence
 
@@ -1498,17 +2108,45 @@ def _input_hashes(evidence: Mapping[str, Any]) -> dict[str, str]:
             ).get("sha256"),
             "evidence policy metadata SHA-256",
         ),
+        "checkpoint_selection": _require_sha256(
+            _require_mapping(
+                inputs.get("checkpoint_selection"),
+                "evidence checkpoint-selection manifest",
+            ).get("sha256"),
+            "evidence checkpoint-selection SHA-256",
+        ),
+        "checkpoint_selection_outcome": _require_sha256(
+            _require_mapping(
+                inputs.get("checkpoint_selection_outcome"),
+                "evidence checkpoint-selection outcome",
+            ).get("sha256"),
+            "evidence checkpoint-selection outcome SHA-256",
+        ),
         "policy_evaluation": _require_sha256(
             _require_mapping(
                 inputs.get("policy_evaluation"), "evidence policy evaluation"
             ).get("sha256"),
             "evidence policy evaluation SHA-256",
         ),
+        "policy_evaluation_sha256sums": _require_sha256(
+            _require_mapping(
+                inputs.get("policy_evaluation_sha256sums"),
+                "evidence policy evaluation SHA256SUMS",
+            ).get("sha256"),
+            "evidence policy evaluation SHA256SUMS SHA-256",
+        ),
         "planner_evaluation": _require_sha256(
             _require_mapping(
                 inputs.get("planner_evaluation"), "evidence planner evaluation"
             ).get("sha256"),
             "evidence planner evaluation SHA-256",
+        ),
+        "planner_evaluation_sha256sums": _require_sha256(
+            _require_mapping(
+                inputs.get("planner_evaluation_sha256sums"),
+                "evidence planner evaluation SHA256SUMS",
+            ).get("sha256"),
+            "evidence planner evaluation SHA256SUMS SHA-256",
         ),
         "reset_manifest": _require_sha256(
             _require_mapping(
@@ -1571,6 +2209,33 @@ def validate_selection_evidence_artifacts(
         raise ValueError("selection evidence schema mismatch")
     _verify_payload_hash(evidence, "selection evidence")
     inputs = _require_mapping(evidence.get("inputs"), "selection evidence inputs")
+    policy_source_input = _require_mapping(
+        inputs.get("policy_rlinf_source"), "selection evidence policy RLinf source"
+    )
+    _require_exact_keys(
+        policy_source_input,
+        {"path", "commit", "trainer_source_sha256"},
+        "selection evidence policy RLinf source",
+    )
+    _require_commit(
+        policy_source_input.get("commit"), "selection evidence policy RLinf commit"
+    )
+    _require_sha256(
+        policy_source_input.get("trainer_source_sha256"),
+        "selection evidence policy trainer source SHA-256",
+    )
+    for input_name in (
+        "policy_evaluation_sha256sums",
+        "planner_evaluation_sha256sums",
+    ):
+        checksum_identity = _require_mapping(
+            inputs.get(input_name), f"selection evidence {input_name}"
+        )
+        _require_exact_keys(
+            checksum_identity,
+            {"path", "sha256"},
+            f"selection evidence {input_name}",
+        )
     policy = _require_mapping(inputs.get("policy"), "selection evidence policy")
     inference = _require_mapping(
         evidence.get("inference"), "selection evidence inference"
@@ -1584,10 +2249,22 @@ def validate_selection_evidence_artifacts(
     recomputed = build_selection_evidence(
         candidate_id=str(evidence.get("candidate_id")),
         run_tag=str(policy.get("run_tag")),
+        trainer_run_root=_input_path(evidence, "policy").parent,
         policy_path=_input_path(evidence, "policy"),
         policy_metadata_path=_input_path(evidence, "policy_metadata"),
+        checkpoint_selection_path=_input_path(evidence, "checkpoint_selection"),
+        checkpoint_selection_outcome_path=_input_path(
+            evidence, "checkpoint_selection_outcome"
+        ),
+        policy_rlinf_source_root=_input_path(evidence, "policy_rlinf_source"),
         policy_evaluation_path=_input_path(evidence, "policy_evaluation"),
+        policy_evaluation_sha256sums_path=_input_path(
+            evidence, "policy_evaluation_sha256sums"
+        ),
         planner_evaluation_path=_input_path(evidence, "planner_evaluation"),
+        planner_evaluation_sha256sums_path=_input_path(
+            evidence, "planner_evaluation_sha256sums"
+        ),
         reset_manifest_path=_input_path(evidence, "reset_manifest"),
         quality_v2_thresholds_path=_input_path(evidence, "quality_v3_thresholds"),
         quality_v2_calibration_wave_receipt_path=_input_path(
@@ -1749,10 +2426,12 @@ def build_promotion_receipt(
         "quality_v2_calibration_wave_receipt": dict(calibration_receipt),
         "selection": {
             "decision": selection["decision"],
+            "reason": selection["reason"],
             "planner_nonworse_all_dimensions": selection[
                 "planner_nonworse_all_dimensions"
             ],
             "strict_improvement_dimensions": selection["strict_improvement_dimensions"],
+            "rejection_reasons": selection["rejection_reasons"],
             "selector_contract_path": selector["path"],
             "selector_contract_sha256": selector["sha256"],
             "planner_evaluation_path": planner_evaluation["path"],
@@ -1807,13 +2486,6 @@ def write_promotion_artifacts(
         raise ValueError("evidence and receipt paths must be different")
     if evidence_path.exists() or receipt_path.exists():
         raise FileExistsError("refusing to overwrite promotion artifacts")
-    decision = _require_mapping(evidence.get("selection"), "selection evidence").get(
-        "decision"
-    )
-    if require_promote and decision != "promote":
-        raise RuntimeError(
-            "--require-promote was requested but the planner wins an exact tie"
-        )
     evidence_body = _json_bytes(evidence)
     evidence_file_sha = hashlib.sha256(evidence_body).hexdigest()
     receipt = build_promotion_receipt(
@@ -1821,6 +2493,12 @@ def write_promotion_artifacts(
         evidence_path=evidence_path,
         evidence_file_sha256=evidence_file_sha,
     )
+    selection = _require_mapping(receipt.get("selection"), "promotion selection")
+    if require_promote and selection.get("decision") != "promote":
+        raise RuntimeError(
+            "--require-promote was requested but selection keeps the planner: "
+            + str(selection.get("reason"))
+        )
     receipt_body = _json_bytes(receipt)
     _write_new(evidence_path, evidence_body)
     try:
@@ -1836,14 +2514,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-id", required=True)
     parser.add_argument("--run-tag", required=True)
+    parser.add_argument("--trainer-run-root", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--expected-policy-sha256", required=True)
     parser.add_argument("--policy-metadata", type=Path, required=True)
     parser.add_argument("--expected-policy-metadata-sha256", required=True)
+    parser.add_argument("--checkpoint-selection", type=Path, required=True)
+    parser.add_argument("--expected-checkpoint-selection-sha256", required=True)
+    parser.add_argument("--checkpoint-selection-outcome", type=Path, required=True)
+    parser.add_argument("--expected-checkpoint-selection-outcome-sha256", required=True)
+    parser.add_argument("--policy-rlinf-source-root", type=Path, required=True)
     parser.add_argument("--policy-evaluation", type=Path, required=True)
     parser.add_argument("--expected-policy-evaluation-sha256", required=True)
+    parser.add_argument("--policy-evaluation-sha256sums", type=Path, required=True)
+    parser.add_argument("--expected-policy-evaluation-sha256sums-sha256", required=True)
     parser.add_argument("--planner-evaluation", type=Path, required=True)
     parser.add_argument("--expected-planner-evaluation-sha256", required=True)
+    parser.add_argument("--planner-evaluation-sha256sums", type=Path, required=True)
+    parser.add_argument(
+        "--expected-planner-evaluation-sha256sums-sha256", required=True
+    )
     parser.add_argument("--reset-manifest", type=Path, required=True)
     parser.add_argument("--expected-reset-manifest-sha256", required=True)
     parser.add_argument("--quality-v2-thresholds", type=Path, required=True)
@@ -1874,10 +2564,16 @@ def main() -> None:
     evidence = build_selection_evidence(
         candidate_id=args.candidate_id,
         run_tag=args.run_tag,
+        trainer_run_root=args.trainer_run_root,
         policy_path=args.policy,
         policy_metadata_path=args.policy_metadata,
+        checkpoint_selection_path=args.checkpoint_selection,
+        checkpoint_selection_outcome_path=args.checkpoint_selection_outcome,
+        policy_rlinf_source_root=args.policy_rlinf_source_root,
         policy_evaluation_path=args.policy_evaluation,
+        policy_evaluation_sha256sums_path=args.policy_evaluation_sha256sums,
         planner_evaluation_path=args.planner_evaluation,
+        planner_evaluation_sha256sums_path=args.planner_evaluation_sha256sums,
         reset_manifest_path=args.reset_manifest,
         quality_v2_thresholds_path=args.quality_v2_thresholds,
         quality_v2_calibration_wave_receipt_path=(
@@ -1891,8 +2587,18 @@ def main() -> None:
         expected_sha256={
             "policy": args.expected_policy_sha256,
             "policy_metadata": args.expected_policy_metadata_sha256,
+            "checkpoint_selection": args.expected_checkpoint_selection_sha256,
+            "checkpoint_selection_outcome": (
+                args.expected_checkpoint_selection_outcome_sha256
+            ),
             "policy_evaluation": args.expected_policy_evaluation_sha256,
+            "policy_evaluation_sha256sums": (
+                args.expected_policy_evaluation_sha256sums_sha256
+            ),
             "planner_evaluation": args.expected_planner_evaluation_sha256,
+            "planner_evaluation_sha256sums": (
+                args.expected_planner_evaluation_sha256sums_sha256
+            ),
             "reset_manifest": args.expected_reset_manifest_sha256,
             "quality_v2_thresholds": args.expected_quality_v2_thresholds_sha256,
             "quality_v2_calibration_wave_receipt": (

@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,6 +31,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+    SOURCE_SNAPSHOT_MANIFEST_FILENAME,
+    SOURCE_SNAPSHOT_SCHEMA,
+    validate_selected_learned_policy,
+    validate_source_snapshot_manifest,
+)
 from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
     materialize_evaluation_attempt,
     recursive_output_checksums,
@@ -45,14 +52,29 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
 POLICY_SCHEMA = "rlinf-dynamic-benchmark-expert-policy-v0.1"
 EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-expert-evaluation-v0.2"
 FORMAL_EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-expert-evaluation-v0.3"
+SOURCE_SNAPSHOT_RECEIPT_SCHEMA = "rld2-qa-source-snapshot-receipt-v0.1"
 TASK_QUALITY_BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
 SUPPORTED_ALGORITHMS = frozenset({"bc", "sac", "rlpd", "residual_rlpd", "ppo"})
+EVALUATOR_REPOSITORY_PATH = "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+EVALUATOR_MODULE = "examples.embodiment.evaluate_dynamic_benchmark_expert"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--expected-policy-sha256", required=True)
+    parser.add_argument("--trainer-run-root", type=Path)
+    parser.add_argument("--trainer-summary", type=Path)
+    parser.add_argument("--checkpoint-selection", type=Path)
+    parser.add_argument("--checkpoint-selection-outcome", type=Path)
+    parser.add_argument("--expected-checkpoint-selection-outcome-sha256")
+    parser.add_argument("--policy-rlinf-source-root", type=Path)
+    parser.add_argument("--evaluator-rlinf-source-root", type=Path)
+    parser.add_argument("--benchmark-source-root", type=Path)
+    parser.add_argument("--source-snapshot-manifest", type=Path)
+    parser.add_argument("--expected-source-snapshot-manifest-sha256")
+    parser.add_argument("--base-image-id")
+    parser.add_argument("--source-snapshot-image-id")
     parser.add_argument("--evaluator-commit", required=True)
     parser.add_argument("--rlinf-commit", required=True)
     parser.add_argument("--benchmark-commit", required=True)
@@ -76,6 +98,31 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _actual_evaluator_source_identity(
+    evaluator_rlinf_source_root: Path,
+) -> dict[str, str]:
+    raw_actual = Path(__file__)
+    if raw_actual.is_symlink() or not raw_actual.is_file():
+        raise ValueError(
+            "executing evaluator source must be a regular non-symlink file"
+        )
+    actual = raw_actual.resolve(strict=True)
+    raw_root = Path(evaluator_rlinf_source_root)
+    if raw_root.is_symlink() or not raw_root.is_dir():
+        raise ValueError("declared evaluator source root must be a regular directory")
+    expected = raw_root.resolve(strict=True) / EVALUATOR_REPOSITORY_PATH
+    if actual != expected:
+        raise ValueError(
+            "executing evaluator source path does not match the declared source root"
+        )
+    source_bytes = actual.read_bytes()
+    return {
+        "module": EVALUATOR_MODULE,
+        "repository_path": EVALUATOR_REPOSITORY_PATH,
+        "sha256": hashlib.sha256(source_bytes).hexdigest(),
+    }
 
 
 def _payload_sha256(payload: Mapping[str, Any]) -> str:
@@ -205,14 +252,21 @@ def _task_quality_from_terminal_infos(
     identity: Mapping[str, Any],
     task_id: str,
     episode_id: str,
-) -> dict[str, Any]:
-    """Read and validate ``infos['task_quality'][0]`` at episode termination."""
+    success: bool = True,
+) -> dict[str, Any] | None:
+    """Validate the success-only task-quality value at episode termination."""
 
     if "task_quality" not in infos:
         raise ValueError("terminal infos are missing task_quality")
     rows = infos["task_quality"]
     if not isinstance(rows, (list, tuple)) or len(rows) != 1:
         raise ValueError("terminal task-quality vector must contain exactly one row")
+    if not success:
+        if rows[0] is not None:
+            raise ValueError(
+                "unsuccessful terminal infos must not contain task-quality summary"
+            )
+        return None
     if rows[0] is None:
         raise ValueError("terminal infos contain no task-quality summary")
     return _validate_task_quality_summary(
@@ -245,7 +299,7 @@ def _task_quality_aggregates(
     identity: Mapping[str, Any],
     task_id: str,
 ) -> dict[str, Any]:
-    """Aggregate every canonical component over all and successful episodes."""
+    """Aggregate canonical components over released success-only summaries."""
 
     if not records:
         raise ValueError("task-quality aggregation requires at least one record")
@@ -272,14 +326,20 @@ def _task_quality_aggregates(
             raise ValueError(
                 f"task-quality record {index} success flag must be boolean"
             )
+        succeeded = bool(record["success"])
+        successful_count += int(succeeded)
+        if not succeeded:
+            if record.get("task_quality") is not None:
+                raise ValueError(
+                    f"task-quality record {index} leaked a non-success summary"
+                )
+            continue
         summary = _validate_task_quality_summary(
             record.get("task_quality"),
             identity=identity,
             task_id=task_id,
             episode_id=episode_id,
         )
-        succeeded = bool(record["success"])
-        successful_count += int(succeeded)
         raw_components = summary["components"]
         for name in names:
             value = float(raw_components[name]["value"])
@@ -651,18 +711,25 @@ def _replay_actions_on_fresh_env(
             expected_outcomes=expected_outcomes,
             expected_final_state=expected_final_state,
         )
-        if (expected_task_quality is None) != (task_quality_identity is None):
-            raise ValueError(
-                "expected task quality and its identity must be supplied together"
-            )
-        if expected_task_quality is None:
+        if task_quality_identity is None:
+            if expected_task_quality is not None:
+                raise ValueError(
+                    "expected task quality requires its canonical identity"
+                )
             return validation
         if not isinstance(validation, Mapping):
             raise ValueError("replay validation must be a mapping")
         episode_id = getattr(request, "episode_id", None)
         if not isinstance(episode_id, str) or not episode_id:
             raise ValueError("replay request episode identity is missing")
-        assert task_quality_identity is not None
+        result = dict(validation)
+        if expected_task_quality is None:
+            result["task_quality_exact"] = replay_env.terminal_task_quality is None
+            result["task_quality_summary_sha256"] = None
+            result["passed"] = bool(
+                result.get("passed") is True and result["task_quality_exact"]
+            )
+            return result
         recorded = _validate_task_quality_summary(
             expected_task_quality,
             identity=task_quality_identity,
@@ -675,7 +742,6 @@ def _replay_actions_on_fresh_env(
             task_id=task_id,
             episode_id=episode_id,
         )
-        result = dict(validation)
         result["task_quality_exact"] = replayed == recorded
         result["task_quality_summary_sha256"] = replayed["summary_sha256"]
         result["passed"] = bool(
@@ -860,6 +926,7 @@ def _episode(
                 identity=task_quality_identity,
                 task_id=task_id,
                 episode_id=request.episode_id,
+                success=result_info["success"],
             )
         observation = next_observation
         obs = next_obs
@@ -999,10 +1066,65 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_bytes(path: Path, content: bytes) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)
+
+
 def _evaluation_schema(*, formal_attempts: bool) -> str:
     """Return v0.3 only for a frozen-threshold formal attempt producer."""
 
     return FORMAL_EVALUATION_SCHEMA if formal_attempts else EVALUATION_SCHEMA
+
+
+def _immutable_image_id(value: str | None, label: str) -> str:
+    if value is None or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} must be an immutable Docker image ID")
+    return value
+
+
+def _source_snapshot_receipt(
+    *,
+    manifest_sha256: str,
+    manifest: Mapping[str, Any],
+    base_image_id: str,
+    source_snapshot_image_id: str,
+    evaluator_source_identity: Mapping[str, str],
+) -> dict[str, Any]:
+    sources = manifest.get("sources")
+    if not isinstance(sources, Mapping):
+        raise ValueError("source snapshot manifest sources are missing")
+    projected_sources: dict[str, dict[str, Any]] = {}
+    for role in ("policy_rlinf", "evaluator_rlinf", "benchmark"):
+        source = sources.get(role)
+        if not isinstance(source, Mapping):
+            raise ValueError(f"source snapshot {role} identity is missing")
+        projected_sources[role] = {
+            name: source[name]
+            for name in ("root", "commit", "tree", "inventory_sha256")
+        }
+    immutable_base_image_id = _immutable_image_id(base_image_id, "base image ID")
+    immutable_snapshot_image_id = _immutable_image_id(
+        source_snapshot_image_id, "source snapshot image ID"
+    )
+    if immutable_snapshot_image_id == immutable_base_image_id:
+        raise ValueError("source snapshot image must differ from its base image")
+    receipt: dict[str, Any] = {
+        "schema_version": SOURCE_SNAPSHOT_RECEIPT_SCHEMA,
+        "base_image_id": immutable_base_image_id,
+        "source_snapshot_image_id": immutable_snapshot_image_id,
+        "source_manifest": {
+            "path": SOURCE_SNAPSHOT_MANIFEST_FILENAME,
+            "sha256": manifest_sha256,
+            "schema_version": SOURCE_SNAPSHOT_SCHEMA,
+            "payload_sha256": manifest["payload_sha256"],
+        },
+        "sources": projected_sources,
+        "evaluator_source": dict(evaluator_source_identity),
+    }
+    receipt["payload_sha256"] = _payload_sha256(receipt)
+    return receipt
 
 
 def main() -> None:
@@ -1050,6 +1172,129 @@ def main() -> None:
     policy_sha256 = _sha256(args.policy)
     if policy_sha256 != expected_policy_sha256:
         raise ValueError("policy SHA-256 does not match the expected identity")
+    admission_arguments = (
+        args.trainer_run_root,
+        args.trainer_summary,
+        args.checkpoint_selection,
+        args.checkpoint_selection_outcome,
+        args.expected_checkpoint_selection_outcome_sha256,
+        args.policy_rlinf_source_root,
+        args.evaluator_rlinf_source_root,
+    )
+    if any(value is not None for value in admission_arguments) and not all(
+        value is not None for value in admission_arguments
+    ):
+        raise ValueError(
+            "trainer summary, checkpoint-selection manifest, checkpoint-selection "
+            "outcome, expected outcome SHA-256, explicit trainer run root, policy "
+            "source root, and evaluator source root must be supplied together"
+        )
+    if args.quality_v2_thresholds is not None and args.trainer_summary is None:
+        raise ValueError(
+            "formal learned-policy evaluation requires the trainer summary and "
+            "checkpoint-selection manifest"
+        )
+    snapshot_arguments = (
+        args.benchmark_source_root,
+        args.source_snapshot_manifest,
+        args.expected_source_snapshot_manifest_sha256,
+        args.base_image_id,
+        args.source_snapshot_image_id,
+    )
+    if any(value is not None for value in snapshot_arguments) and not all(
+        value is not None for value in snapshot_arguments
+    ):
+        raise ValueError("source snapshot arguments must be supplied together")
+    if args.source_snapshot_manifest is not None and args.trainer_summary is None:
+        raise ValueError(
+            "an immutable source snapshot is valid only with learned-policy admission"
+        )
+    if args.quality_v2_thresholds is not None and not all(
+        value is not None for value in snapshot_arguments
+    ):
+        raise ValueError(
+            "formal learned-policy evaluation requires an immutable source snapshot"
+        )
+    source_snapshot_manifest: dict[str, Any] | None = None
+    source_snapshot_manifest_sha256: str | None = None
+    if args.source_snapshot_manifest is not None:
+        assert args.benchmark_source_root is not None
+        assert args.expected_source_snapshot_manifest_sha256 is not None
+        assert args.base_image_id is not None
+        source_snapshot_manifest_sha256 = _expected_sha256(
+            args.expected_source_snapshot_manifest_sha256
+        )
+        source_snapshot_manifest = validate_source_snapshot_manifest(
+            args.source_snapshot_manifest,
+            expected_sha256=source_snapshot_manifest_sha256,
+            expected_base_image_id=args.base_image_id,
+            expected_sources={
+                "policy_rlinf": (
+                    args.policy_rlinf_source_root,
+                    rlinf_commit,
+                    None,
+                ),
+                "evaluator_rlinf": (
+                    args.evaluator_rlinf_source_root,
+                    evaluator_commit,
+                    None,
+                ),
+                "benchmark": (
+                    args.benchmark_source_root,
+                    benchmark_commit,
+                    None,
+                ),
+            },
+            verify_inventory=True,
+        )
+        snapshot_environment = {
+            "RLD2_SOURCE_SNAPSHOT_MANIFEST": str(
+                args.source_snapshot_manifest.resolve(strict=True)
+            ),
+            "RLD2_SOURCE_SNAPSHOT_MANIFEST_SHA256": (source_snapshot_manifest_sha256),
+        }
+        for name, value in snapshot_environment.items():
+            if os.environ.get(name) not in {None, value}:
+                raise ValueError(f"conflicting {name} environment identity")
+            os.environ[name] = value
+    learned_policy_admission: dict[str, Any] | None = None
+    evaluator_source_identity: dict[str, str] | None = None
+    if args.trainer_summary is not None:
+        assert args.trainer_run_root is not None
+        assert args.checkpoint_selection is not None
+        learned_policy_admission = validate_selected_learned_policy(
+            trainer_run_root=args.trainer_run_root,
+            policy_path=args.policy,
+            trainer_summary_path=args.trainer_summary,
+            checkpoint_selection_path=args.checkpoint_selection,
+            checkpoint_selection_outcome_path=args.checkpoint_selection_outcome,
+            policy_rlinf_source_root=args.policy_rlinf_source_root,
+            verifier_rlinf_source_root=args.evaluator_rlinf_source_root,
+            evaluator_rlinf_source_root=args.evaluator_rlinf_source_root,
+            expected_checkpoint_selection_outcome_sha256=(
+                args.expected_checkpoint_selection_outcome_sha256
+            ),
+            expected_policy_sha256=policy_sha256,
+            expected_rlinf_commit=rlinf_commit,
+            expected_benchmark_commit=benchmark_commit,
+            expected_verifier_rlinf_commit=evaluator_commit,
+            expected_evaluator_rlinf_commit=evaluator_commit,
+        )
+        evaluator_source_identity = _actual_evaluator_source_identity(
+            args.evaluator_rlinf_source_root
+        )
+        checkpoint_outcome = json.loads(
+            args.checkpoint_selection_outcome.read_text(encoding="utf-8")
+        )
+        outcome_source_identity = checkpoint_outcome.get("source_identity")
+        if (
+            not isinstance(outcome_source_identity, Mapping)
+            or outcome_source_identity.get("evaluator_source")
+            != evaluator_source_identity
+        ):
+            raise ValueError(
+                "executing evaluator source identity does not match checkpoint outcome"
+            )
     payload = torch.load(args.policy, map_location="cpu", weights_only=False)
     config, state_schema = _validate_policy_payload(
         payload,
@@ -1161,25 +1406,33 @@ def main() -> None:
             quality_v2_enabled=quality_v2_thresholds is not None,
         )
         latency = _latency_summary(latencies_s)
+        policy_identity = {
+            "path": str(args.policy.resolve()),
+            "sha256": policy_sha256,
+            "schema_version": payload["schema_version"],
+            "task": task_id,
+            "algorithm": config["algorithm"],
+            "training_seed": config["seed"],
+            "training_env_steps": payload["env_steps"],
+            "validation": payload["validation"],
+        }
+        if learned_policy_admission is not None:
+            policy_identity["checkpoint_role"] = learned_policy_admission[
+                "checkpoint_role"
+            ]
+        source_identity: dict[str, Any] = {
+            "evaluator_rlinf_commit": evaluator_commit,
+            "policy_rlinf_commit": rlinf_commit,
+            "benchmark_commit": benchmark_commit,
+        }
+        if evaluator_source_identity is not None:
+            source_identity["evaluator_source"] = evaluator_source_identity
         result = {
             "schema_version": _evaluation_schema(
                 formal_attempts=quality_v2_thresholds is not None
             ),
-            "policy_identity": {
-                "path": str(args.policy.resolve()),
-                "sha256": policy_sha256,
-                "schema_version": payload["schema_version"],
-                "task": task_id,
-                "algorithm": config["algorithm"],
-                "training_seed": config["seed"],
-                "training_env_steps": payload["env_steps"],
-                "validation": payload["validation"],
-            },
-            "source_identity": {
-                "evaluator_rlinf_commit": evaluator_commit,
-                "policy_rlinf_commit": rlinf_commit,
-                "benchmark_commit": benchmark_commit,
-            },
+            "policy_identity": policy_identity,
+            "source_identity": source_identity,
             "task_quality_identity": task_quality_identity,
             "quality_v2_threshold_identity": (
                 None
@@ -1213,29 +1466,152 @@ def main() -> None:
             "started_unix_s": started,
             "finished_unix_s": time.time(),
         }
+        if learned_policy_admission is not None:
+            result["learned_policy_admission"] = learned_policy_admission
         if _sha256(args.policy) != policy_sha256:
             raise RuntimeError("policy file changed during evaluation")
+        if learned_policy_admission is not None:
+            try:
+                observed_admission = validate_selected_learned_policy(
+                    trainer_run_root=args.trainer_run_root,
+                    policy_path=args.policy,
+                    trainer_summary_path=args.trainer_summary,
+                    checkpoint_selection_path=args.checkpoint_selection,
+                    checkpoint_selection_outcome_path=(
+                        args.checkpoint_selection_outcome
+                    ),
+                    policy_rlinf_source_root=args.policy_rlinf_source_root,
+                    verifier_rlinf_source_root=args.evaluator_rlinf_source_root,
+                    evaluator_rlinf_source_root=args.evaluator_rlinf_source_root,
+                    expected_checkpoint_selection_outcome_sha256=(
+                        learned_policy_admission["checkpoint_selection_outcome"][
+                            "sha256"
+                        ]
+                    ),
+                    expected_policy_sha256=policy_sha256,
+                    expected_trainer_summary_sha256=learned_policy_admission[
+                        "trainer_summary"
+                    ]["sha256"],
+                    expected_checkpoint_selection_sha256=learned_policy_admission[
+                        "checkpoint_selection"
+                    ]["sha256"],
+                    expected_rlinf_commit=rlinf_commit,
+                    expected_benchmark_commit=benchmark_commit,
+                    expected_verifier_rlinf_commit=evaluator_commit,
+                    expected_evaluator_rlinf_commit=evaluator_commit,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise RuntimeError(
+                    "learned-policy admission artifacts changed during evaluation"
+                ) from error
+            if observed_admission != learned_policy_admission:
+                raise RuntimeError(
+                    "learned-policy admission identity changed during evaluation"
+                )
         if (
             args.quality_v2_thresholds is not None
             and _sha256(args.quality_v2_thresholds) != quality_v2_thresholds_sha256
         ):
             raise RuntimeError("quality-v2 threshold file changed during evaluation")
+        source_snapshot_receipt: dict[str, Any] | None = None
+        if source_snapshot_manifest is not None:
+            assert source_snapshot_manifest_sha256 is not None
+            assert args.source_snapshot_manifest is not None
+            assert args.base_image_id is not None
+            assert args.source_snapshot_image_id is not None
+            assert args.benchmark_source_root is not None
+            observed_snapshot_manifest = validate_source_snapshot_manifest(
+                args.source_snapshot_manifest,
+                expected_sha256=source_snapshot_manifest_sha256,
+                expected_base_image_id=args.base_image_id,
+                expected_sources={
+                    "policy_rlinf": (
+                        args.policy_rlinf_source_root,
+                        rlinf_commit,
+                        None,
+                    ),
+                    "evaluator_rlinf": (
+                        args.evaluator_rlinf_source_root,
+                        evaluator_commit,
+                        None,
+                    ),
+                    "benchmark": (
+                        args.benchmark_source_root,
+                        benchmark_commit,
+                        None,
+                    ),
+                },
+                verify_inventory=True,
+            )
+            if observed_snapshot_manifest != source_snapshot_manifest:
+                raise RuntimeError("source snapshot identity changed during evaluation")
+            if evaluator_source_identity is None or (
+                _actual_evaluator_source_identity(args.evaluator_rlinf_source_root)
+                != evaluator_source_identity
+            ):
+                raise RuntimeError(
+                    "executing evaluator source changed during evaluation"
+                )
+            published_manifest_path = args.output / SOURCE_SNAPSHOT_MANIFEST_FILENAME
+            source_manifest_bytes = args.source_snapshot_manifest.read_bytes()
+            if hashlib.sha256(source_manifest_bytes).hexdigest() != (
+                source_snapshot_manifest_sha256
+            ):
+                raise RuntimeError(
+                    "source snapshot manifest changed before publication"
+                )
+            _atomic_bytes(published_manifest_path, source_manifest_bytes)
+            if _sha256(published_manifest_path) != source_snapshot_manifest_sha256:
+                raise RuntimeError(
+                    "published source snapshot manifest identity mismatch"
+                )
+            source_snapshot_receipt = _source_snapshot_receipt(
+                manifest_sha256=source_snapshot_manifest_sha256,
+                manifest=source_snapshot_manifest,
+                base_image_id=args.base_image_id,
+                source_snapshot_image_id=args.source_snapshot_image_id,
+                evaluator_source_identity=evaluator_source_identity,
+            )
         result["payload_sha256"] = _payload_sha256(result)
         result_path = args.output / "evaluation.json"
         _atomic_json(result_path, result)
+        if source_snapshot_receipt is not None:
+            _atomic_json(args.output / "source_snapshot.json", source_snapshot_receipt)
+        admission_checksums = (
+            ()
+            if learned_policy_admission is None
+            else tuple(
+                (
+                    learned_policy_admission[name]["sha256"],
+                    learned_policy_admission[name]["path"],
+                )
+                for name in (
+                    "trainer_summary",
+                    "checkpoint_selection",
+                    "checkpoint_selection_outcome",
+                    "config",
+                )
+            )
+        )
         checksums = (
             recursive_output_checksums(
                 args.output,
-                extra_entries=((policy_sha256, str(args.policy.resolve())),),
+                extra_entries=(
+                    (policy_sha256, str(args.policy.resolve())),
+                    *admission_checksums,
+                ),
             )
             if quality_v2_thresholds is not None
             else (
                 f"{_sha256(result_path)}  evaluation.json\n"
                 f"{_sha256(reset_manifest_path)}  reset_manifest.jsonl\n"
                 f"{policy_sha256}  {args.policy.resolve()}\n"
+                + "".join(f"{sha256}  {path}\n" for sha256, path in admission_checksums)
             )
         )
-        (args.output / "SHA256SUMS").write_text(checksums, encoding="utf-8")
+        (args.output / "SHA256SUMS").write_text(
+            checksums, encoding="utf-8", newline="\n"
+        )
         print(
             json.dumps(
                 {

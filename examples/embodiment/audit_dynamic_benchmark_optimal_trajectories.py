@@ -288,6 +288,8 @@ def _quality_v2_calibration_receipt_binding(
 def _audit_quality_v2_calibration_receipt_artifact(
     root: Path,
     thresholds: Mapping[str, Any],
+    *,
+    expected_benchmark_commit: str | None = None,
 ) -> dict[str, str]:
     """Reopen the dataset-local receipt instead of trusting threshold metadata."""
 
@@ -335,6 +337,25 @@ def _audit_quality_v2_calibration_receipt_artifact(
     ):
         if wave.get(key) != receipt.get(key):
             raise ValueError(f"quality-v2 calibration receipt/threshold {key} mismatch")
+    source_identity = receipt.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        raise ValueError("quality-v2 calibration receipt source identity is missing")
+    receipt_benchmark_commit = _full_commit(
+        "quality-v2 calibration receipt benchmark commit",
+        source_identity.get("benchmark_commit"),
+    )
+    if (
+        expected_benchmark_commit is not None
+        and receipt_benchmark_commit
+        != _full_commit(
+            "expected quality-v2 calibration benchmark commit",
+            expected_benchmark_commit,
+        )
+    ):
+        raise ValueError(
+            "quality-v2 calibration receipt benchmark commit differs from the "
+            "authenticated evaluator benchmark commit"
+        )
     raw_receipt_tasks = receipt.get("tasks")
     raw_binding_tasks = wave.get("tasks")
     if (
@@ -3297,10 +3318,6 @@ def _audit_dataset(
         raise ValueError(
             "quality-v2 threshold contract is not eligible for formal freeze"
         )
-    calibration_receipt_identity = _audit_quality_v2_calibration_receipt_artifact(
-        root,
-        quality_v2_thresholds,
-    )
     expected_threshold_identity = {
         "schema_version": quality_v2_thresholds.get("schema_version"),
         "sha256": expected_quality_v2_thresholds_sha256,
@@ -3337,6 +3354,22 @@ def _audit_dataset(
         card=card,
         candidate_payload=candidate_payload,
         planner_dominance=planner_dominance,
+    )
+    source_identity = card["source_identity"]
+    if not isinstance(source_identity, Mapping):
+        raise ValueError("dataset source identity is missing")
+    calibration_benchmark_commit = (
+        _full_commit(
+            "dataset benchmark commit",
+            source_identity.get("benchmark_commit"),
+        )
+        if evaluator_identity is None
+        else evaluator_identity["evaluator_benchmark_commit"]
+    )
+    calibration_receipt_identity = _audit_quality_v2_calibration_receipt_artifact(
+        root,
+        quality_v2_thresholds,
+        expected_benchmark_commit=calibration_benchmark_commit,
     )
     _audit_candidate_release_chain(
         root,

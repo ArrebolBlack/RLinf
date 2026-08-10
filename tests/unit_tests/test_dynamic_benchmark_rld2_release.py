@@ -199,7 +199,10 @@ def _calibration_wave_receipt() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "task_order": list(EXACT_TASKS),
         "wave_contract_sha256": "a" * 64,
         "predeclaration_receipt_sha256": "b" * 64,
-        "source_identity": {"wave_id": "release-unit-test"},
+        "source_identity": {
+            "wave_id": "release-unit-test",
+            "benchmark_commit": EVALUATOR_BENCHMARK,
+        },
         "disjointness": {"verified": True},
         "tasks": receipt_tasks,
     }
@@ -982,6 +985,41 @@ def synthetic_tape_replay(monkeypatch: pytest.MonkeyPatch) -> None:
         "_audit_attempt_tape_binding",
         lambda *args, **kwargs: None,
     )
+
+
+def test_release_threshold_receipt_binds_evaluator_benchmark_commit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    thresholds = _quality_v2_thresholds()
+    receipt, _ = _calibration_wave_receipt()
+    receipt_relative = thresholds["calibration_wave_receipt"]["relative_path"]
+    receipt_path = root / receipt_relative
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_bytes(_canonical_bytes(receipt))
+    threshold_path = root / "quality_v2_thresholds.json"
+    _write_json(threshold_path, thresholds)
+    threshold_sha256 = _sha256(threshold_path)
+
+    _, _, identity, receipt_identity = release_auditor._validate_quality_v2_thresholds(
+        threshold_path,
+        root=root,
+        task="t1_xyz",
+        expected_sha256=threshold_sha256,
+        expected_benchmark_commit=EVALUATOR_BENCHMARK,
+    )
+    assert identity["sha256"] == threshold_sha256
+    assert receipt_identity["file_sha256"] == _sha256(receipt_path)
+
+    with pytest.raises(ReleaseAuditError, match="authenticated evaluator benchmark"):
+        release_auditor._validate_quality_v2_thresholds(
+            threshold_path,
+            root=root,
+            task="t1_xyz",
+            expected_sha256=threshold_sha256,
+            expected_benchmark_commit="f" * 40,
+        )
 
 
 def test_exact14_release_builds_then_independent_audit_grants_eligibility(

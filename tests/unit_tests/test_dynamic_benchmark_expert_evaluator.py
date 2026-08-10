@@ -16,13 +16,24 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
+import test_dynamic_benchmark_checkpoint_selection_outcome as outcome_fixtures
 import torch
 
+from examples.embodiment import (
+    dynamic_benchmark_checkpoint_admission as checkpoint_admission,
+)
+from examples.embodiment import evaluate_dynamic_benchmark_expert as expert_evaluator
+from examples.embodiment import train_dynamic_benchmark_expert as expert_trainer
+from examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome import (
+    write_checkpoint_selection_outcome,
+)
 from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
     attempt_schema_version,
     materialize_evaluation_attempt,
@@ -48,7 +59,15 @@ from examples.embodiment.evaluate_dynamic_benchmark_expert import (
     _task_quality_identity,
     _task_summary,
     _validate_policy_payload,
+    validate_selected_learned_policy,
 )
+
+
+@pytest.fixture
+def tmp_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep two-full-commit outcome paths below Windows MAX_PATH in tests."""
+
+    return tmp_path_factory.mktemp("e")
 
 
 def _payload(algorithm: str = "rlpd") -> dict:
@@ -65,6 +84,551 @@ def _payload(algorithm: str = "rlpd") -> dict:
         "model": {"fixture": 1},
         "normalizer": {"fixture": 2},
     }
+
+
+def _trainer_selection_artifacts(
+    root: Path, *, eligible: bool = True
+) -> SimpleNamespace:
+    """Use the canonical producer fixture, including clean source roots/metrics."""
+
+    run = outcome_fixtures._trainer_run(root, eligible=eligible)
+    outcome_path = write_checkpoint_selection_outcome(
+        **outcome_fixtures._write_kwargs(run)
+    )
+    return SimpleNamespace(
+        run_root=run.run_root,
+        policy_path=run.best_policy_path,
+        initial_policy_path=run.initial_policy_path,
+        summary_path=run.summary_path,
+        selection_path=run.selection_path,
+        metrics_path=run.metrics_path,
+        outcome_path=outcome_path,
+        outcome_sha256=expert_trainer._file_sha256(outcome_path),
+        policy_root=run.policy_root,
+        verifier_root=run.verifier_root,
+        evaluator_root=run.evaluator_root,
+        policy_commit=run.policy_commit,
+        verifier_commit=run.verifier_commit,
+        evaluator_commit=run.evaluator_commit,
+    )
+
+
+def _reseal_trainer_json(path: Path, payload: dict) -> None:
+    payload.pop("payload_sha256", None)
+    payload["payload_sha256"] = expert_trainer._canonical_json_sha256(payload)
+    expert_trainer._atomic_json(path, payload)
+
+
+def _outcome_admission_kwargs(artifacts: SimpleNamespace) -> dict:
+    return {
+        "trainer_run_root": artifacts.run_root,
+        "checkpoint_selection_outcome_path": artifacts.outcome_path,
+        "policy_rlinf_source_root": artifacts.policy_root,
+        "verifier_rlinf_source_root": artifacts.verifier_root,
+        "evaluator_rlinf_source_root": artifacts.evaluator_root,
+        "expected_checkpoint_selection_outcome_sha256": artifacts.outcome_sha256,
+        "expected_rlinf_commit": artifacts.policy_commit,
+        "expected_benchmark_commit": "b" * 40,
+        "expected_verifier_rlinf_commit": artifacts.verifier_commit,
+        "expected_evaluator_rlinf_commit": artifacts.evaluator_commit,
+    }
+
+
+def test_evaluator_admits_real_trainer_selected_snapshot(tmp_path: Path) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "run")
+
+    admission = validate_selected_learned_policy(
+        policy_path=artifacts.policy_path,
+        trainer_summary_path=artifacts.summary_path,
+        checkpoint_selection_path=artifacts.selection_path,
+        **_outcome_admission_kwargs(artifacts),
+        expected_policy_sha256=expert_trainer._file_sha256(artifacts.policy_path),
+    )
+
+    assert admission["checkpoint_role"] == "best"
+    assert admission["policy"]["env_steps"] == 100
+    assert admission["checkpoint_selection"]["status"] == ("selected_eligible_snapshot")
+    assert set(admission["checkpoint_selection_outcome"]) == {
+        "path",
+        "sha256",
+        "schema_version",
+        "payload_sha256",
+    }
+    assert admission["checkpoint_selection_outcome"]["sha256"] == (
+        artifacts.outcome_sha256
+    )
+    assert admission["source_identity"]["algorithm"] == "residual_rlpd"
+
+
+@pytest.mark.parametrize("case", ["missing", "symlink", "wrong_sha"])
+def test_evaluator_rejects_missing_symlinked_or_wrong_sha_outcome(
+    tmp_path: Path, case: str
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / case)
+    kwargs = _outcome_admission_kwargs(artifacts)
+    if case == "missing":
+        artifacts.outcome_path.unlink()
+        expected_error: type[Exception] = FileNotFoundError
+    elif case == "symlink":
+        target = artifacts.outcome_path.with_name("outcome-copy.json")
+        target.write_bytes(artifacts.outcome_path.read_bytes())
+        artifacts.outcome_path.unlink()
+        try:
+            artifacts.outcome_path.symlink_to(target.name)
+        except OSError as error:
+            pytest.skip(f"symlink creation is unavailable: {error}")
+        expected_error = ValueError
+    else:
+        kwargs["expected_checkpoint_selection_outcome_sha256"] = "0" * 64
+        expected_error = ValueError
+
+    with pytest.raises(expected_error):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **kwargs,
+        )
+
+
+def test_evaluator_rejects_resealed_cross_run_and_source_drift_outcomes(
+    tmp_path: Path,
+) -> None:
+    first = _trainer_selection_artifacts(tmp_path / "first")
+    second = _trainer_selection_artifacts(tmp_path / "second")
+    first.outcome_path.write_bytes(second.outcome_path.read_bytes())
+    first.outcome_sha256 = expert_trainer._file_sha256(first.outcome_path)
+    with pytest.raises(ValueError, match="authoritative producer replay"):
+        validate_selected_learned_policy(
+            policy_path=first.policy_path,
+            trainer_summary_path=first.summary_path,
+            checkpoint_selection_path=first.selection_path,
+            **_outcome_admission_kwargs(first),
+        )
+
+    drift = _trainer_selection_artifacts(tmp_path / "source-drift")
+    outcome = json.loads(drift.outcome_path.read_text(encoding="utf-8"))
+    outcome["source_identity"]["evaluator_source"]["sha256"] = "f" * 64
+    _reseal_trainer_json(drift.outcome_path, outcome)
+    drift.outcome_sha256 = expert_trainer._file_sha256(drift.outcome_path)
+    with pytest.raises(ValueError, match="authoritative producer replay"):
+        validate_selected_learned_policy(
+            policy_path=drift.policy_path,
+            trainer_summary_path=drift.summary_path,
+            checkpoint_selection_path=drift.selection_path,
+            **_outcome_admission_kwargs(drift),
+        )
+
+
+@pytest.mark.parametrize("target", ["metrics", "baseline", "snapshot"])
+def test_evaluator_rejects_resealed_outcome_evidence_drift(
+    tmp_path: Path, target: str
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / target)
+    outcome = json.loads(artifacts.outcome_path.read_text(encoding="utf-8"))
+    if target == "metrics":
+        events = [
+            json.loads(line)
+            for line in artifacts.metrics_path.read_text(encoding="utf-8").splitlines()
+        ]
+        events[-1]["success_rate"] = 0.125
+        artifacts.metrics_path.write_bytes(
+            "".join(
+                json.dumps(event, sort_keys=True) + "\n" for event in events
+            ).encode("utf-8")
+        )
+        outcome["trainer_artifacts"]["metrics"]["sha256"] = expert_trainer._file_sha256(
+            artifacts.metrics_path
+        )
+        outcome["trainer_artifacts"]["metrics"]["validation_event_inventory_sha256"] = (
+            "f" * 64
+        )
+    elif target == "baseline":
+        outcome["matched_planner_baseline"]["validation_evidence"]["line_number"] += 1
+    else:
+        selector_metrics = outcome["evaluated_snapshots"][0]["selector_metrics"]
+        selector_metrics["success_rate"] = 0.125
+        outcome["evaluated_snapshots"][0]["selector_metrics_sha256"] = (
+            expert_trainer._canonical_json_sha256(selector_metrics)
+        )
+    _reseal_trainer_json(artifacts.outcome_path, outcome)
+    artifacts.outcome_sha256 = expert_trainer._file_sha256(artifacts.outcome_path)
+
+    with pytest.raises(ValueError):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **_outcome_admission_kwargs(artifacts),
+        )
+
+
+def test_evaluator_rejects_wrong_policy_trainer_commit_semantics(
+    tmp_path: Path,
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "wrong-trainer-commit")
+    kwargs = _outcome_admission_kwargs(artifacts)
+    kwargs["expected_rlinf_commit"] = artifacts.evaluator_commit
+
+    with pytest.raises(ValueError, match="policy RLinf source-root HEAD"):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **kwargs,
+        )
+
+
+def test_evaluator_revalidation_rejects_policy_source_mutation(
+    tmp_path: Path,
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "source-mutation")
+    validate_selected_learned_policy(
+        policy_path=artifacts.policy_path,
+        trainer_summary_path=artifacts.summary_path,
+        checkpoint_selection_path=artifacts.selection_path,
+        **_outcome_admission_kwargs(artifacts),
+    )
+    trainer_source = (
+        artifacts.policy_root
+        / "examples"
+        / "embodiment"
+        / "train_dynamic_benchmark_expert.py"
+    )
+    with trainer_source.open("a", encoding="utf-8") as stream:
+        stream.write("\n# mutation after admission preflight\n")
+
+    with pytest.raises(ValueError, match="policy RLinf source root must be clean"):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **_outcome_admission_kwargs(artifacts),
+        )
+
+
+def test_trainer_loader_uses_authenticated_bytes_after_source_path_swap(
+    tmp_path: Path,
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "authenticated-trainer-bytes")
+    commit, sources = checkpoint_admission._verify_source_checkout(
+        root=artifacts.policy_root,
+        expected_commit=artifacts.policy_commit,
+        sources={
+            "trainer_source": (
+                "examples.embodiment.train_dynamic_benchmark_expert",
+                "examples/embodiment/train_dynamic_benchmark_expert.py",
+            )
+        },
+        label="policy RLinf",
+    )
+    assert commit == artifacts.policy_commit
+    authenticated = sources["trainer_source"]
+    authenticated.path.write_text(
+        "raise RuntimeError('untrusted swapped trainer source')\n", encoding="utf-8"
+    )
+
+    loaded = checkpoint_admission._load_authoritative_trainer(
+        authenticated.content, source_path=authenticated.path
+    )
+
+    assert loaded._canonical_json_sha256({"authenticated": True})
+
+
+def test_evaluator_rejects_wrong_actual_source_path(tmp_path: Path) -> None:
+    declared_root = Path(expert_evaluator.__file__).resolve().parents[2]
+    original_file = expert_evaluator.__file__
+    wrong_source = tmp_path / "evaluate_dynamic_benchmark_expert.py"
+    wrong_source.write_bytes(Path(original_file).read_bytes())
+    expert_evaluator.__file__ = str(wrong_source)
+    try:
+        with pytest.raises(ValueError, match="executing evaluator source path"):
+            expert_evaluator._actual_evaluator_source_identity(declared_root)
+    finally:
+        expert_evaluator.__file__ = original_file
+
+
+def _source_snapshot_manifest_fixture(
+    root: Path,
+) -> tuple[Path, str, str, dict[str, tuple[Path, str, str]]]:
+    base_image_id = "sha256:" + "d" * 64
+    source_specs = {
+        "policy_rlinf": ("a" * 40, "1" * 40),
+        "evaluator_rlinf": ("b" * 40, "2" * 40),
+        "benchmark": ("c" * 40, "3" * 40),
+    }
+    sources = {}
+    expected_sources = {}
+    for role, (commit, tree) in source_specs.items():
+        source_root = root / "source" / role
+        source_root.mkdir(parents=True)
+        relative = f"src/{role}.py"
+        source_path = source_root / relative
+        source_path.parent.mkdir()
+        source_path.write_text(f"ROLE = {role!r}\n", encoding="utf-8")
+        row = {
+            "path": relative,
+            "mode": "100644",
+            "git_blob_sha1": checkpoint_admission._git_blob_sha1(
+                source_path.read_bytes()
+            ),
+            "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        }
+        sources[role] = {
+            "root": str(source_root.resolve()),
+            "commit": commit,
+            "tree": tree,
+            "files": [row],
+            "inventory_sha256": checkpoint_admission._canonical_json_sha256([row]),
+        }
+        expected_sources[role] = (source_root, commit, tree)
+    dependencies = {}
+    for name in ("portable", "a800_core"):
+        dependency_root = root / "runtime" / name
+        dependency_root.mkdir(parents=True)
+        dependency_file = dependency_root / "dependency.py"
+        dependency_file.write_text(f"NAME = {name!r}\n", encoding="utf-8")
+        rows = [
+            {
+                "path": "dependency.py",
+                "mode": "100644",
+                "sha256": hashlib.sha256(dependency_file.read_bytes()).hexdigest(),
+            }
+        ]
+        dependencies[name] = {
+            "root": str(dependency_root.resolve()),
+            "inventory_sha256": checkpoint_admission._canonical_json_sha256(rows),
+        }
+    manifest = {
+        "schema_version": checkpoint_admission.SOURCE_SNAPSHOT_SCHEMA,
+        "base_image_id": base_image_id,
+        "sources": sources,
+        "runtime_dependencies": dependencies,
+    }
+    manifest["payload_sha256"] = checkpoint_admission._canonical_json_sha256(manifest)
+    manifest_path = root / checkpoint_admission.SOURCE_SNAPSHOT_MANIFEST_FILENAME
+    expert_trainer._atomic_json(manifest_path, manifest)
+    return (
+        manifest_path,
+        expert_trainer._file_sha256(manifest_path),
+        base_image_id,
+        expected_sources,
+    )
+
+
+def test_source_snapshot_manifest_rejects_file_and_image_drift(tmp_path: Path) -> None:
+    manifest_path, manifest_sha, base_image_id, expected_sources = (
+        _source_snapshot_manifest_fixture(tmp_path / "snapshot")
+    )
+    checkpoint_admission.validate_source_snapshot_manifest(
+        manifest_path,
+        expected_sha256=manifest_sha,
+        expected_base_image_id=base_image_id,
+        expected_sources=expected_sources,
+        verify_inventory=True,
+    )
+    with pytest.raises(ValueError, match="base image ID mismatch"):
+        checkpoint_admission.validate_source_snapshot_manifest(
+            manifest_path,
+            expected_sha256=manifest_sha,
+            expected_base_image_id="sha256:" + "e" * 64,
+            expected_sources=expected_sources,
+            verify_inventory=True,
+        )
+    policy_file = (
+        tmp_path / "snapshot" / "source" / "policy_rlinf" / "src" / ("policy_rlinf.py")
+    )
+    policy_file.write_text("ROLE = 'mutated'\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="file identity mismatch"):
+        checkpoint_admission.validate_source_snapshot_manifest(
+            manifest_path,
+            expected_sha256=manifest_sha,
+            expected_base_image_id=base_image_id,
+            expected_sources=expected_sources,
+            verify_inventory=True,
+        )
+
+
+def test_source_snapshot_manifest_rejects_resealed_git_blob_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path, _, base_image_id, expected_sources = (
+        _source_snapshot_manifest_fixture(tmp_path / "snapshot-git-blob")
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rows = manifest["sources"]["policy_rlinf"]["files"]
+    rows[0]["git_blob_sha1"] = "f" * 40
+    manifest["sources"]["policy_rlinf"]["inventory_sha256"] = (
+        checkpoint_admission._canonical_json_sha256(rows)
+    )
+    unsigned = dict(manifest)
+    unsigned.pop("payload_sha256")
+    manifest["payload_sha256"] = checkpoint_admission._canonical_json_sha256(unsigned)
+    expert_trainer._atomic_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="file identity mismatch"):
+        checkpoint_admission.validate_source_snapshot_manifest(
+            manifest_path,
+            expected_sha256=expert_trainer._file_sha256(manifest_path),
+            expected_base_image_id=base_image_id,
+            expected_sources=expected_sources,
+            verify_inventory=True,
+        )
+    manifest_sha = expert_trainer._file_sha256(manifest_path)
+    monkeypatch.setenv("RLD2_SOURCE_SNAPSHOT_MANIFEST", str(manifest_path))
+    monkeypatch.setenv("RLD2_SOURCE_SNAPSHOT_MANIFEST_SHA256", manifest_sha)
+    policy_root, policy_commit, _ = expected_sources["policy_rlinf"]
+    with pytest.raises(ValueError, match="differs from its snapshot blob"):
+        checkpoint_admission._verify_source_checkout(
+            root=policy_root,
+            expected_commit=policy_commit,
+            sources={"policy": ("snapshot.policy", "src/policy_rlinf.py")},
+            label="policy RLinf",
+        )
+
+
+def test_source_snapshot_receipt_publishes_sibling_manifest_identity(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest_sha, base_image_id, expected_sources = (
+        _source_snapshot_manifest_fixture(tmp_path / "snapshot-receipt")
+    )
+    manifest = checkpoint_admission.validate_source_snapshot_manifest(
+        manifest_path,
+        expected_sha256=manifest_sha,
+        expected_base_image_id=base_image_id,
+        expected_sources=expected_sources,
+        verify_inventory=True,
+    )
+    evaluator_source = {
+        "module": expert_evaluator.EVALUATOR_MODULE,
+        "repository_path": expert_evaluator.EVALUATOR_REPOSITORY_PATH,
+        "sha256": "f" * 64,
+    }
+
+    receipt = expert_evaluator._source_snapshot_receipt(
+        manifest_sha256=manifest_sha,
+        manifest=manifest,
+        base_image_id=base_image_id,
+        source_snapshot_image_id="sha256:" + "e" * 64,
+        evaluator_source_identity=evaluator_source,
+    )
+
+    assert receipt["source_manifest"] == {
+        "path": checkpoint_admission.SOURCE_SNAPSHOT_MANIFEST_FILENAME,
+        "sha256": manifest_sha,
+        "schema_version": checkpoint_admission.SOURCE_SNAPSHOT_SCHEMA,
+        "payload_sha256": manifest["payload_sha256"],
+    }
+    assert receipt["evaluator_source"] == evaluator_source
+    unsigned_receipt = dict(receipt)
+    unsigned_receipt.pop("payload_sha256")
+    assert receipt["payload_sha256"] == expert_evaluator._payload_sha256(
+        unsigned_receipt
+    )
+    with pytest.raises(ValueError, match="must differ"):
+        expert_evaluator._source_snapshot_receipt(
+            manifest_sha256=manifest_sha,
+            manifest=manifest,
+            base_image_id=base_image_id,
+            source_snapshot_image_id=base_image_id,
+            evaluator_source_identity=evaluator_source,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["mutate", "delete"])
+def test_evaluator_revalidation_rejects_outcome_mutation_or_deletion(
+    tmp_path: Path, mutation: str
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / mutation)
+    admission = validate_selected_learned_policy(
+        policy_path=artifacts.policy_path,
+        trainer_summary_path=artifacts.summary_path,
+        checkpoint_selection_path=artifacts.selection_path,
+        **_outcome_admission_kwargs(artifacts),
+    )
+    if mutation == "mutate":
+        artifacts.outcome_path.write_bytes(artifacts.outcome_path.read_bytes() + b"\n")
+    else:
+        artifacts.outcome_path.unlink()
+    kwargs = _outcome_admission_kwargs(artifacts)
+    kwargs["expected_checkpoint_selection_outcome_sha256"] = admission[
+        "checkpoint_selection_outcome"
+    ]["sha256"]
+    with pytest.raises((FileNotFoundError, ValueError)):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **kwargs,
+        )
+
+
+def test_evaluator_rejects_planner_fallback_and_initial_env0(tmp_path: Path) -> None:
+    fallback = _trainer_selection_artifacts(tmp_path / "fallback", eligible=False)
+    with pytest.raises(ValueError, match="planner_fallback_no_eligible"):
+        validate_selected_learned_policy(
+            policy_path=fallback.policy_path,
+            trainer_summary_path=fallback.summary_path,
+            checkpoint_selection_path=fallback.selection_path,
+            **_outcome_admission_kwargs(fallback),
+        )
+
+    selected = _trainer_selection_artifacts(tmp_path / "selected")
+    with pytest.raises(ValueError, match="checkpoint_role=best"):
+        validate_selected_learned_policy(
+            policy_path=selected.initial_policy_path,
+            trainer_summary_path=selected.summary_path,
+            checkpoint_selection_path=selected.selection_path,
+            **_outcome_admission_kwargs(selected),
+        )
+
+
+@pytest.mark.parametrize(
+    "field, message",
+    [
+        ("selected_snapshot_identity", "selected snapshot is null"),
+        ("best_policy", "best policy is null"),
+    ],
+)
+def test_evaluator_rejects_null_selected_or_best_identity(
+    tmp_path: Path, field: str, message: str
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / field)
+    manifest = json.loads(artifacts.selection_path.read_text(encoding="utf-8"))
+    manifest["selection"][field] = None
+    _reseal_trainer_json(artifacts.selection_path, manifest)
+
+    with pytest.raises(ValueError, match=f"{message}|identities diverged"):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **_outcome_admission_kwargs(artifacts),
+        )
+
+
+def test_evaluator_rejects_resealed_checkpoint_selection_tampering(
+    tmp_path: Path,
+) -> None:
+    artifacts = _trainer_selection_artifacts(tmp_path / "run")
+    manifest = json.loads(artifacts.selection_path.read_text(encoding="utf-8"))
+    manifest["evaluated_snapshots"][0]["eligible"] = False
+    _reseal_trainer_json(artifacts.selection_path, manifest)
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    summary["checkpoint_selection"]["manifest_payload_sha256"] = manifest[
+        "payload_sha256"
+    ]
+    _reseal_trainer_json(artifacts.summary_path, summary)
+
+    with pytest.raises(ValueError, match="eligible snapshot count|select exactly"):
+        validate_selected_learned_policy(
+            policy_path=artifacts.policy_path,
+            trainer_summary_path=artifacts.summary_path,
+            checkpoint_selection_path=artifacts.selection_path,
+            **_outcome_admission_kwargs(artifacts),
+        )
 
 
 def _quality_summary(
@@ -140,6 +704,24 @@ def test_terminal_task_quality_is_validated_and_recorded_canonically() -> None:
     assert recorded == expected
     assert recorded["terminal"] is True
     assert recorded["schema_sha256"] == identity["task_quality_schema_sha256"]
+    assert (
+        _task_quality_from_terminal_infos(
+            {"task_quality": [None]},
+            identity=identity,
+            task_id="t1_xyz",
+            episode_id="episode-2",
+            success=False,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="unsuccessful terminal"):
+        _task_quality_from_terminal_infos(
+            {"task_quality": [expected]},
+            identity=identity,
+            task_id="t1_xyz",
+            episode_id="episode-1",
+            success=False,
+        )
 
 
 def test_task_quality_aggregates_all_and_successful_records() -> None:
@@ -167,7 +749,7 @@ def test_task_quality_aggregates_all_and_successful_records() -> None:
             "completion_time_s": None,
             "return": 1.0,
             "action_l2_sum": 2.0,
-            "task_quality": _quality_summary("episode-2", values=(0.3, 0.4, 0.5, 0.6)),
+            "task_quality": None,
         },
     ]
 
@@ -187,10 +769,10 @@ def test_task_quality_aggregates_all_and_successful_records() -> None:
     assert aggregates["record_count"] == 2
     assert aggregates["successful_record_count"] == 1
     assert first["all_records"] == {
-        "count": 2,
-        "mean": pytest.approx(0.2),
+        "count": 1,
+        "mean": pytest.approx(0.1),
         "minimum": pytest.approx(0.1),
-        "maximum": pytest.approx(0.3),
+        "maximum": pytest.approx(0.1),
     }
     assert first["successful_records"] == {
         "count": 1,
@@ -551,6 +1133,73 @@ def test_expert_replay_binds_terminal_task_quality_exactly(
         validation["task_quality_summary_sha256"]
         == _quality_summary("episode-1", values=replay_values)["summary_sha256"]
     )
+
+
+@pytest.mark.parametrize("replay_quality, expected_passed", [(None, True), ({}, False)])
+def test_expert_replay_binds_non_success_task_quality_absence_exactly(
+    replay_quality: dict[str, Any] | None, expected_passed: bool
+) -> None:
+    identity = _task_quality_identity("t1_xyz")
+
+    class Request:
+        episode_id = "episode-2"
+        task_id = "t1_xyz"
+
+    request = Request()
+
+    class RawEnv:
+        def reset(self, value):
+            assert value is request
+            return "observation"
+
+        def step(self, action):
+            assert action == "action"
+            return SimpleNamespace(
+                terminated=False,
+                truncated=True,
+                task_quality=replay_quality,
+            )
+
+        def save_state(self):
+            return b"state"
+
+        def close(self):
+            pass
+
+    class VectorEnv:
+        image_size = 64
+        camera_observations = False
+        task_quality_schema_version = identity["task_quality_schema"]["schema_version"]
+        task_quality_evaluator_backend_id = TASK_QUALITY_BACKEND_ID
+
+        def _make_mujoco_env(self, task_id, **kwargs):
+            assert task_id == "t1_xyz"
+            return RawEnv()
+
+        def _arm_hidden_t5_event(self, raw_env, value):
+            pass
+
+    def replay_fn(proxy, **kwargs):
+        proxy.reset(request)
+        proxy.step("action")
+        return {"passed": True, "final_state_exact": True, "outcomes_exact": True}
+
+    validation = _replay_actions_on_fresh_env(
+        vector_env=VectorEnv(),
+        task_id="t1_xyz",
+        request=request,
+        expected_observations=("observation",),
+        actions=("action",),
+        expected_outcomes=((False, True, False, "timeout", 0.0),),
+        expected_final_state=b"state",
+        expected_task_quality=None,
+        task_quality_identity=identity,
+        replay_fn=replay_fn,
+    )
+
+    assert validation["task_quality_exact"] is expected_passed
+    assert validation["task_quality_summary_sha256"] is None
+    assert validation["passed"] is expected_passed
 
 
 def test_formal_producer_tape_passes_promotion_validator(tmp_path: Path) -> None:

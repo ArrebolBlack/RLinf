@@ -2290,6 +2290,7 @@ def _validate_quality_v2_thresholds(
     root: Path,
     task: str,
     expected_sha256: str,
+    expected_benchmark_commit: str,
 ) -> tuple[
     dict[str, Any],
     dict[str, Any],
@@ -2317,7 +2318,9 @@ def _validate_quality_v2_thresholds(
     try:
         calibration_receipt_identity = (
             _optimal_auditor._audit_quality_v2_calibration_receipt_artifact(
-                root, payload
+                root,
+                payload,
+                expected_benchmark_commit=expected_benchmark_commit,
             )
         )
     except Exception as error:
@@ -2476,6 +2479,9 @@ def _collect_release(
             root=root,
             task=task,
             expected_sha256=row["quality_v2_thresholds_sha256"],
+            expected_benchmark_commit=candidate_release["evaluator_identity"][
+                "evaluator_benchmark_commit"
+            ],
         )
         if common_quality_v2_threshold_identity is None:
             common_quality_v2_threshold_identity = quality_v2_threshold_identity

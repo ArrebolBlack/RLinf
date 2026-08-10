@@ -477,6 +477,7 @@ def _validate_quality_v2_calibration_receipt_artifact(
     receipt_path: Path,
     *,
     expected_sha256: str | None = None,
+    expected_benchmark_commit: str | None = None,
 ) -> ProvenanceFile:
     """Reopen and cross-check the distributable exact-14 calibration receipt."""
 
@@ -535,6 +536,25 @@ def _validate_quality_v2_calibration_receipt_artifact(
     ):
         if wave.get(key) != receipt.get(key):
             raise ValueError(f"quality-v2 calibration receipt/threshold {key} mismatch")
+    source_identity = receipt.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        raise ValueError("quality-v2 calibration receipt source identity is missing")
+    receipt_benchmark_commit = _full_commit(
+        "quality-v2 calibration receipt benchmark commit",
+        source_identity.get("benchmark_commit"),
+    )
+    if (
+        expected_benchmark_commit is not None
+        and receipt_benchmark_commit
+        != _full_commit(
+            "expected quality-v2 calibration benchmark commit",
+            expected_benchmark_commit,
+        )
+    ):
+        raise ValueError(
+            "quality-v2 calibration receipt benchmark commit differs from the "
+            "authenticated evaluator benchmark commit"
+        )
     raw_receipt_tasks = receipt.get("tasks")
     raw_binding_tasks = wave.get("tasks")
     if (
@@ -3614,11 +3634,6 @@ def main() -> None:
         "schema_version": quality_v2_thresholds.get("schema_version"),
         "sha256": quality_v2_thresholds_sha256,
     }
-    quality_v2_calibration_receipt = _validate_quality_v2_calibration_receipt_artifact(
-        quality_v2_thresholds,
-        args.quality_v2_calibration_wave_receipt,
-        expected_sha256=(args.expected_quality_v2_calibration_wave_receipt_sha256),
-    )
     if (
         args.shard_count < 1
         or args.shard_index < 0
@@ -3728,6 +3743,18 @@ def main() -> None:
         evaluator_rlinf_commit=evaluator_commit,
         evaluator_benchmark_commit=evaluator_benchmark_commit,
         planner_dominance=planner_dominance,
+    )
+    calibration_benchmark_commit = _full_commit(
+        "authenticated evaluator benchmark commit",
+        benchmark_commit
+        if evaluator_identity is None
+        else evaluator_identity["evaluator_benchmark_commit"],
+    )
+    quality_v2_calibration_receipt = _validate_quality_v2_calibration_receipt_artifact(
+        quality_v2_thresholds,
+        args.quality_v2_calibration_wave_receipt,
+        expected_sha256=(args.expected_quality_v2_calibration_wave_receipt_sha256),
+        expected_benchmark_commit=calibration_benchmark_commit,
     )
     calibration_evidence = _validate_calibration_evidence(
         manifest_path=args.candidate_manifest.resolve(),
