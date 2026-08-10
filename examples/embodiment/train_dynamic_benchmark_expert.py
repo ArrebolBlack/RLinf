@@ -52,6 +52,14 @@ _CHECKPOINT_SELECTION_SCHEMA = "rlinf-dynamic-benchmark-checkpoint-selection-v0.
 _CHECKPOINT_SELECTION_STATE_SCHEMA = (
     "rlinf-dynamic-benchmark-checkpoint-selection-state-v0.1"
 )
+_TRAINER_CHECKPOINT_SCHEMA = "rlinf-dynamic-benchmark-trainer-checkpoint-v0.3"
+_TRAINER_CHECKPOINT_LEGACY_SCHEMAS = frozenset(
+    {
+        "rlinf-dynamic-benchmark-trainer-checkpoint-v0.1",
+        "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2",
+    }
+)
+_EPISODE_LOGGING_STATE_SCHEMA = "rlinf-dynamic-benchmark-episode-logging-v0.1"
 _SAFETY_CEILING_TOLERANCE = 1e-12
 _MATCHED_PLANNER_BASELINE_SOURCE = (
     "initial_exact_zero_residual_policy_on_validation_resets"
@@ -860,6 +868,52 @@ def _restore_rng(state: dict[str, Any]) -> None:
     torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+def _checkpoint_episode_logging_state(
+    recent_episodes: list[dict[str, Any]],
+    episode_returns: torch.Tensor,
+    episode_steps: torch.Tensor,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _EPISODE_LOGGING_STATE_SCHEMA,
+        "recent_episodes": copy.deepcopy(recent_episodes),
+        "episode_returns": episode_returns.detach().cpu().clone(),
+        "episode_steps": episode_steps.detach().cpu().clone(),
+    }
+
+
+def _restore_episode_logging_state(
+    state: Mapping[str, Any],
+    *,
+    num_envs: int,
+) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
+    if state.get("schema_version") != _EPISODE_LOGGING_STATE_SCHEMA:
+        raise ValueError("episode logging checkpoint schema does not match")
+    recent_episodes = state.get("recent_episodes")
+    episode_returns = state.get("episode_returns")
+    episode_steps = state.get("episode_steps")
+    if not isinstance(recent_episodes, list) or any(
+        not isinstance(record, Mapping) for record in recent_episodes
+    ):
+        raise ValueError("episode logging checkpoint records are malformed")
+    if not torch.is_tensor(episode_returns) or episode_returns.dtype != torch.float32:
+        raise ValueError("episode logging checkpoint returns must be float32 tensor")
+    if not torch.is_tensor(episode_steps) or episode_steps.dtype != torch.int64:
+        raise ValueError("episode logging checkpoint steps must be int64 tensor")
+    expected_shape = (num_envs,)
+    if tuple(episode_returns.shape) != expected_shape or tuple(episode_steps.shape) != expected_shape:
+        raise ValueError("episode logging checkpoint tensor shape does not match num_envs")
+    if not bool(torch.isfinite(episode_returns).all()):
+        raise ValueError("episode logging checkpoint returns must be finite")
+    if bool((episode_steps < 0).any()):
+        raise ValueError("episode logging checkpoint steps must be nonnegative")
+    restored_records = [dict(copy.deepcopy(record)) for record in recent_episodes]
+    return (
+        restored_records,
+        episode_returns.detach().cpu().clone(),
+        episode_steps.detach().cpu().clone(),
+    )
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -1385,10 +1439,16 @@ def _build_evaluation_environment(
         total_num_processes=max(1, min(config.eval_worker_processes, count)),
         worker_info=None,
     )
+    teacher_construction_start = env._phase_start()
     teachers = (
         _make_planner_teachers(config.task, env)
         if config.algorithm == "residual_rlpd" and not config.eval_planner_in_processes
         else None
+    )
+    env._phase_add(
+        "evaluation.teacher_construction",
+        teacher_construction_start,
+        count=env.num_envs,
     )
     return env, teachers
 
@@ -1411,7 +1471,7 @@ def _request_checkpoint_row(request: Any) -> dict[str, Any]:
 def _rewind_evaluation_environment(
     env: Any, initial_checkpoint: Mapping[str, Any]
 ) -> None:
-    """Reset a frozen evaluation manifest without replaying expensive sim state."""
+    """Restore the exact frozen evaluation checkpoint without reconstructing its pool."""
 
     if initial_checkpoint.get("schema_version") not in {
         "rlinf-dynamic-benchmark-checkpoint-v0.2",
@@ -1443,9 +1503,7 @@ def _rewind_evaluation_environment(
     expected_requests = [dict(row) for row in initial_checkpoint["requests"]]
     if len(expected_requests) != env.num_envs:
         raise ValueError("evaluation rewind checkpoint vector length mismatch")
-    env._manifest_generation = int(initial_checkpoint["manifest_generation"])
-    env._refresh_manifest()
-    env.reset(options={"env_idx": list(range(env.num_envs))})
+    env.load_checkpoint_state(initial_checkpoint)
     if env._manifest_cursor != int(initial_checkpoint["manifest_cursor"]):
         raise RuntimeError("evaluation rewind manifest cursor diverged")
     observed_requests = [_request_checkpoint_row(request) for request in env._requests]
@@ -1702,6 +1760,7 @@ def _evaluate(
     model.eval()
     completed = False
     training_environment_restore_s = 0.0
+    environment_phase_timings = None
     try:
         obs = env._last_obs
         if obs is None:
@@ -1818,11 +1877,12 @@ def _evaluate(
             env.close()
         else:
             training_environment_restore_s = runtime.finish(completed=completed)
+        environment_phase_timings = env.phase_timing_snapshot()
         model.train()
         _restore_rng(preserved_rng)
     records.sort(key=lambda record: record["manifest_episode_index"])
     wall_time_s = time.monotonic() - evaluation_start
-    return {
+    result = {
         "episodes": len(records),
         "success_rate": float(np.mean([record["success"] for record in records])),
         "safety_failure_rate": float(
@@ -1872,6 +1932,9 @@ def _evaluate(
         "worker_pids": process_worker_pids,
         "records": records,
     }
+    if environment_phase_timings is not None:
+        result["environment_phase_timings"] = environment_phase_timings
+    return result
 
 
 def _score(metrics: dict[str, Any]) -> tuple[float, ...]:
@@ -2774,6 +2837,8 @@ def main() -> None:
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
     device = torch.device("cuda:0")
+    phase_timings = PhaseTimings()
+    training_environment_construction_start = time.perf_counter()
     env = DynamicBenchmarkEnv(
         cfg=_env_cfg(
             config,
@@ -2788,6 +2853,13 @@ def main() -> None:
         seed_offset=0,
         total_num_processes=max(1, min(config.env_worker_processes, config.num_envs)),
         worker_info=None,
+    )
+    training_environment_construction_s = (
+        time.perf_counter() - training_environment_construction_start
+    )
+    phase_timings.add(
+        "training_environment_construction",
+        training_environment_construction_s,
     )
     _append_jsonl(
         metrics_path,
@@ -2807,6 +2879,7 @@ def main() -> None:
         state_schema,
         config_file_sha256,
     )
+    trainer_setup_start = time.perf_counter()
     normalizer = RunningNormalizer(state_dim, int(state_schema["mask_dim"]))
     demos = TransitionReplay(
         config.replay_capacity,
@@ -2851,6 +2924,8 @@ def main() -> None:
         requires_grad=True,
     )
     alpha_optimizer = torch.optim.Adam([log_alpha], lr=config.alpha_lr)
+    trainer_setup_s = time.perf_counter() - trainer_setup_start
+    phase_timings.add("trainer_setup", trainer_setup_s)
     global_env_steps = 0
     update_steps = 0
     best_score: tuple[float, ...] | None = None
@@ -2859,12 +2934,13 @@ def main() -> None:
     next_checkpoint = config.checkpoint_interval
     next_log = config.log_interval
     recent_episodes: list[dict[str, Any]] = []
+    episode_returns = torch.zeros(config.num_envs)
+    episode_steps = torch.zeros(config.num_envs, dtype=torch.int64)
     demo_source: dict[str, Any] | None = None
     last_validation: dict[str, Any] | None = None
     last_validation_env_steps = -1
     training_teachers: list[Any] | None = None
     checkpoint_selection: _CheckpointSelectionLedger | None = None
-    phase_timings = PhaseTimings()
     start_time = time.monotonic()
     evaluation_runtime: _EvaluationRuntime | _BorrowedEvaluationRuntime | None
     if config.persistent_eval_workers:
@@ -2877,67 +2953,86 @@ def main() -> None:
     def evaluate_policy() -> dict[str, Any]:
         if isinstance(evaluation_runtime, _BorrowedEvaluationRuntime):
             evaluation_runtime.training_teachers = training_teachers
-        return _evaluate(
-            config,
-            model,
-            normalizer,
-            device,
-            runtime=evaluation_runtime,
-        )
+        evaluation_start = time.perf_counter()
+        try:
+            return _evaluate(
+                config,
+                model,
+                normalizer,
+                device,
+                runtime=evaluation_runtime,
+            )
+        finally:
+            phase_timings.add(
+                "evaluation_wall",
+                time.perf_counter() - evaluation_start,
+            )
 
     def checkpoint(path: Path) -> None:
-        state = {
-            "schema_version": "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2",
-            "config": asdict(config),
-            "state_schema": state_schema,
-            "model": model.state_dict(),
-            "target_q": target_q.state_dict(),
-            "actor_optimizer": actor_optimizer.state_dict(),
-            "critic_optimizer": critic_optimizer.state_dict(),
-            "log_alpha": log_alpha.detach().cpu(),
-            "alpha_optimizer": alpha_optimizer.state_dict(),
-            "normalizer": normalizer.state_dict(),
-            "demos": demos.state_dict(),
-            "demo_source": demo_source,
-            "online": online.state_dict(),
-            "env": env.checkpoint_state(),
-            "infra_identity": _infra_identity(config),
-            "global_env_steps": global_env_steps,
-            "update_steps": update_steps,
-            "best_score": best_score,
-            "best_metrics": best_metrics,
-            "next_eval": next_eval,
-            "next_checkpoint": next_checkpoint,
-            "next_log": next_log,
-            "last_validation": last_validation,
-            "last_validation_env_steps": last_validation_env_steps,
-            "planner_teachers": training_teachers,
-            "phase_timings": phase_timings.state_dict(),
-            "checkpoint_selection": (
-                checkpoint_selection.checkpoint_state()
-                if checkpoint_selection is not None
-                else None
-            ),
-            "rng": _rng_state(),
-        }
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        torch.save(state, temporary)
-        os.replace(temporary, path)
+        checkpoint_start = time.perf_counter()
+        try:
+            state = {
+                "schema_version": _TRAINER_CHECKPOINT_SCHEMA,
+                "config": asdict(config),
+                "state_schema": state_schema,
+                "model": model.state_dict(),
+                "target_q": target_q.state_dict(),
+                "actor_optimizer": actor_optimizer.state_dict(),
+                "critic_optimizer": critic_optimizer.state_dict(),
+                "log_alpha": log_alpha.detach().cpu(),
+                "alpha_optimizer": alpha_optimizer.state_dict(),
+                "normalizer": normalizer.state_dict(),
+                "demos": demos.state_dict(),
+                "demo_source": demo_source,
+                "online": online.state_dict(),
+                "env": env.checkpoint_state(),
+                "infra_identity": _infra_identity(config),
+                "global_env_steps": global_env_steps,
+                "update_steps": update_steps,
+                "best_score": best_score,
+                "best_metrics": best_metrics,
+                "next_eval": next_eval,
+                "next_checkpoint": next_checkpoint,
+                "next_log": next_log,
+                "last_validation": last_validation,
+                "last_validation_env_steps": last_validation_env_steps,
+                "episode_logging_state": _checkpoint_episode_logging_state(
+                    recent_episodes,
+                    episode_returns,
+                    episode_steps,
+                ),
+                "planner_teachers": training_teachers,
+                "phase_timings": phase_timings.state_dict(),
+                "checkpoint_selection": (
+                    checkpoint_selection.checkpoint_state()
+                    if checkpoint_selection is not None
+                    else None
+                ),
+                "rng": _rng_state(),
+            }
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            torch.save(state, temporary)
+            os.replace(temporary, path)
+        finally:
+            phase_timings.add(
+                "checkpoint_save",
+                time.perf_counter() - checkpoint_start,
+            )
 
     if args.resume is not None:
         restored = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if restored.get("schema_version") not in {
-            "rlinf-dynamic-benchmark-trainer-checkpoint-v0.1",
-            "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2",
+        restored_schema = restored.get("schema_version")
+        if restored_schema not in {
+            _TRAINER_CHECKPOINT_SCHEMA,
+            *_TRAINER_CHECKPOINT_LEGACY_SCHEMAS,
         }:
             raise ValueError("resume trainer checkpoint schema does not match")
         if (
             config.algorithm == "residual_rlpd"
-            and restored.get("schema_version")
-            != "rlinf-dynamic-benchmark-trainer-checkpoint-v0.2"
+            and restored_schema != _TRAINER_CHECKPOINT_SCHEMA
         ):
             raise ValueError(
-                "residual resume predates fail-closed checkpoint selection"
+                "residual resume predates exact checkpoint-selection and episode-logging state"
             )
         if (
             not _configs_equal(restored["config"], asdict(config))
@@ -2967,9 +3062,21 @@ def main() -> None:
         next_log = int(restored["next_log"])
         last_validation = restored.get("last_validation")
         last_validation_env_steps = int(restored.get("last_validation_env_steps", -1))
+        if restored_schema == _TRAINER_CHECKPOINT_SCHEMA:
+            recent_episodes, episode_returns, episode_steps = (
+                _restore_episode_logging_state(
+                    restored["episode_logging_state"],
+                    num_envs=config.num_envs,
+                )
+            )
         training_teachers = restored.get("planner_teachers")
         if restored.get("phase_timings") is not None:
             phase_timings.load_state_dict(restored["phase_timings"])
+            phase_timings.add(
+                "training_environment_construction",
+                training_environment_construction_s,
+            )
+            phase_timings.add("trainer_setup", trainer_setup_s)
         if config.algorithm == "residual_rlpd":
             if training_teachers is None or len(training_teachers) != config.num_envs:
                 raise ValueError("residual checkpoint is missing planner teacher state")
@@ -2999,12 +3106,19 @@ def main() -> None:
                 raise ValueError(
                     "resume best_score diverges from checkpoint-selection manifest"
                 )
-            if best_metrics != checkpoint_selection.best_metrics:
+            selected_metrics = checkpoint_selection.best_metrics
+            # The selector manifest is JSON, so tuples in the in-memory validation
+            # payload (for example worker_pids) round-trip as lists. Compare the
+            # canonical JSON identity instead of Python container types while still
+            # failing closed on any semantic value change.
+            if _canonical_json_sha256(best_metrics) != _canonical_json_sha256(
+                selected_metrics
+            ):
                 raise ValueError(
                     "resume best_metrics diverge from checkpoint-selection manifest"
                 )
             best_score = selected_score
-            best_metrics = checkpoint_selection.best_metrics
+            best_metrics = selected_metrics
         elif restored_selection is not None:
             raise ValueError(
                 "non-residual resume unexpectedly contains checkpoint selection"
@@ -3013,6 +3127,7 @@ def main() -> None:
     else:
         demo_summary = None
         if config.algorithm in {"bc", "rlpd", "residual_rlpd"}:
+            demo_prepare_start = time.perf_counter()
             demo_identity = _demo_replay_identity(config, state_schema)
             if args.demo_replay_in is None:
                 if config.demo_seed != config.seed:
@@ -3049,11 +3164,16 @@ def main() -> None:
                 metrics_path,
                 {"event": "demos", "demo_source": demo_source, **demo_summary},
             )
+            phase_timings.add(
+                "demo_replay_prepare",
+                time.perf_counter() - demo_prepare_start,
+            )
             if config.algorithm == "residual_rlpd":
                 # The persisted cache stays algorithm-neutral (planner actions), while
                 # the residual MDP treats the same planner transitions as action zero.
                 demos.actions[: demos.size].zero_()
         normalizer.update(obs["states"])
+        bc_warm_start = time.perf_counter()
         if config.algorithm == "residual_rlpd":
             # Start BC from the exact residual target. The residual BC loss is then
             # identically zero, leaving a coherent zero-moment optimizer state and
@@ -3068,6 +3188,10 @@ def main() -> None:
             device,
             metrics_path,
         )
+        phase_timings.add(
+            "bc_warm_start",
+            time.perf_counter() - bc_warm_start,
+        )
         initial_validation = evaluate_policy()
         last_validation = initial_validation
         last_validation_env_steps = 0
@@ -3079,27 +3203,41 @@ def main() -> None:
         initial_policy_path = args.output / (
             "best_policy.pt" if config.algorithm == "bc" else "initial_policy.pt"
         )
-        _save_policy(
-            initial_policy_path,
-            config,
-            model,
-            normalizer,
-            state_schema,
-            initial_validation,
-            0,
-        )
+        initial_policy_save_start = time.perf_counter()
+        try:
+            _save_policy(
+                initial_policy_path,
+                config,
+                model,
+                normalizer,
+                state_schema,
+                initial_validation,
+                0,
+            )
+        finally:
+            phase_timings.add(
+                "policy_save",
+                time.perf_counter() - initial_policy_save_start,
+            )
         validation_event = {
             "event": "validation",
             "env_steps": 0,
             **initial_validation,
         }
         if config.algorithm == "residual_rlpd":
-            checkpoint_selection = _CheckpointSelectionLedger.create(
-                args.output,
-                checkpoint_selection_run_identity,
-                initial_validation,
-                initial_policy_path,
-            )
+            checkpoint_selection_start = time.perf_counter()
+            try:
+                checkpoint_selection = _CheckpointSelectionLedger.create(
+                    args.output,
+                    checkpoint_selection_run_identity,
+                    initial_validation,
+                    initial_policy_path,
+                )
+            finally:
+                phase_timings.add(
+                    "checkpoint_selection",
+                    time.perf_counter() - checkpoint_selection_start,
+                )
             validation_event.update(
                 checkpoint_selection_role="matched_planner_safety_ceiling",
                 validation_metrics_sha256=_canonical_json_sha256(initial_validation),
@@ -3137,8 +3275,6 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    episode_returns = torch.zeros(config.num_envs)
-    episode_steps = torch.zeros(config.num_envs, dtype=torch.int64)
     if config.algorithm == "residual_rlpd" and training_teachers is None:
         training_teachers = _make_planner_teachers(config.task, env)
     training_start_time = time.monotonic()
@@ -3370,14 +3506,21 @@ def main() -> None:
                         raise RuntimeError(
                             "residual checkpoint selector is unavailable"
                         )
-                    snapshot_row = checkpoint_selection.capture(
-                        config,
-                        model,
-                        normalizer,
-                        state_schema,
-                        validation,
-                        global_env_steps,
-                    )
+                    checkpoint_selection_start = time.perf_counter()
+                    try:
+                        snapshot_row = checkpoint_selection.capture(
+                            config,
+                            model,
+                            normalizer,
+                            state_schema,
+                            validation,
+                            global_env_steps,
+                        )
+                    finally:
+                        phase_timings.add(
+                            "checkpoint_selection",
+                            time.perf_counter() - checkpoint_selection_start,
+                        )
                     snapshot_identity = checkpoint_selection._snapshot_identity(
                         snapshot_row
                     )
@@ -3435,14 +3578,21 @@ def main() -> None:
             if config.algorithm == "residual_rlpd" and global_env_steps > 0:
                 if checkpoint_selection is None:
                     raise RuntimeError("residual checkpoint selector is unavailable")
-                final_snapshot_row = checkpoint_selection.capture(
-                    config,
-                    model,
-                    normalizer,
-                    state_schema,
-                    final_validation,
-                    global_env_steps,
-                )
+                checkpoint_selection_start = time.perf_counter()
+                try:
+                    final_snapshot_row = checkpoint_selection.capture(
+                        config,
+                        model,
+                        normalizer,
+                        state_schema,
+                        final_validation,
+                        global_env_steps,
+                    )
+                finally:
+                    phase_timings.add(
+                        "checkpoint_selection",
+                        time.perf_counter() - checkpoint_selection_start,
+                    )
                 final_snapshot_identity = checkpoint_selection._snapshot_identity(
                     final_snapshot_row
                 )
@@ -3480,15 +3630,22 @@ def main() -> None:
         # the final evaluation; an older trainer checkpoint must not authorize a
         # newer selection manifest on resume.
         checkpoint(args.output / "checkpoint_latest.pt")
-        _save_policy(
-            args.output / "final_policy.pt",
-            config,
-            model,
-            normalizer,
-            state_schema,
-            final_validation,
-            global_env_steps,
-        )
+        final_policy_save_start = time.perf_counter()
+        try:
+            _save_policy(
+                args.output / "final_policy.pt",
+                config,
+                model,
+                normalizer,
+                state_schema,
+                final_validation,
+                global_env_steps,
+            )
+        finally:
+            phase_timings.add(
+                "policy_save",
+                time.perf_counter() - final_policy_save_start,
+            )
         summary = {
             "schema_version": "rlinf-dynamic-benchmark-expert-summary-v0.1",
             "status": "stopped" if stop_requested else "complete",

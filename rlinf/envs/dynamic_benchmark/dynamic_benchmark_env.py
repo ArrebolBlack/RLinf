@@ -417,6 +417,49 @@ class DynamicBenchmarkEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
+    def _phase_start(self) -> float | None:
+        if not getattr(self, "profile_phase_timings", False):
+            return None
+        return time.perf_counter()
+
+    def _phase_add(
+        self,
+        name: str,
+        started_at: float | None,
+        *,
+        count: int = 1,
+    ) -> None:
+        if started_at is None:
+            return
+        if count < 1:
+            raise ValueError("phase timing count must be positive")
+        seconds = time.perf_counter() - started_at
+        self._phase_timing_seconds[name] = (
+            self._phase_timing_seconds.get(name, 0.0) + seconds
+        )
+        self._phase_timing_counts[name] = self._phase_timing_counts.get(name, 0) + count
+
+    def phase_timing_snapshot(self) -> dict[str, Any] | None:
+        """Return opt-in phase timings without affecting the default runtime contract."""
+
+        if not getattr(self, "profile_phase_timings", False):
+            return None
+        return {
+            "schema_version": "rlinf-dynamic-benchmark-phase-timing-v0.1",
+            "phases": {
+                name: {
+                    "total_s": self._phase_timing_seconds[name],
+                    "samples": self._phase_timing_counts[name],
+                    "mean_ms": (
+                        1000.0
+                        * self._phase_timing_seconds[name]
+                        / self._phase_timing_counts[name]
+                    ),
+                }
+                for name in sorted(self._phase_timing_seconds)
+            },
+        }
+
     def __init__(
         self,
         cfg: Any,
@@ -430,6 +473,21 @@ class DynamicBenchmarkEnv(gym.Env):
         if num_envs < 1:
             raise ValueError("DynamicBenchmarkEnv requires at least one environment")
         self.cfg = cfg
+        configured_phase_timing = _cfg_get(cfg, "profile_phase_timings", None)
+        if configured_phase_timing is None:
+            environment_value = os.environ.get(
+                "RLINF_DYNAMIC_BENCHMARK_PHASE_TIMINGS", "0"
+            )
+            if environment_value not in {"0", "1"}:
+                raise ValueError(
+                    "RLINF_DYNAMIC_BENCHMARK_PHASE_TIMINGS must be 0 or 1"
+                )
+            self.profile_phase_timings = environment_value == "1"
+        else:
+            self.profile_phase_timings = bool(configured_phase_timing)
+        self._phase_timing_seconds: dict[str, float] = {}
+        self._phase_timing_counts: dict[str, int] = {}
+        construction_start = self._phase_start()
         self.num_envs = int(num_envs)
         self.seed_offset = int(seed_offset)
         self.total_num_processes = int(total_num_processes)
@@ -491,7 +549,9 @@ class DynamicBenchmarkEnv(gym.Env):
             else str(configured_prompt)
         )
 
+        contracts_start = self._phase_start()
         self._load_benchmark_contracts()
+        self._phase_add("construction.contract_load", contracts_start)
         if self.task_id not in self._task_ids:
             raise ValueError(
                 f"task {self.task_id!r} is not RL-training eligible; available={self._task_ids}"
@@ -501,6 +561,7 @@ class DynamicBenchmarkEnv(gym.Env):
         self._manifest_rows: tuple[Any, ...] = ()
         self._refresh_manifest()
         self._process_vector = None
+        backend_start = self._phase_start()
         if self.worker_processes:
             from .process_vector import OrderedProcessVector
 
@@ -535,16 +596,20 @@ class DynamicBenchmarkEnv(gym.Env):
                 raise RuntimeError(
                     "Dynamic Benchmark vector members disagree on horizon"
                 )
+            self._phase_add("construction.process_pool", backend_start)
         else:
-            self.envs = [
-                self._make_mujoco_env(
-                    self.task_id,
-                    image_size=self.image_size,
-                    camera_observations=self.camera_observations,
-                    **task_quality_kwargs,
+            self.envs = []
+            for _ in range(self.num_envs):
+                env_factory_start = self._phase_start()
+                self.envs.append(
+                    self._make_mujoco_env(
+                        self.task_id,
+                        image_size=self.image_size,
+                        camera_observations=self.camera_observations,
+                        **task_quality_kwargs,
+                    )
                 )
-                for _ in range(self.num_envs)
-            ]
+                self._phase_add("construction.mujoco_env_factory", env_factory_start)
             self._executor = (
                 ThreadPoolExecutor(
                     max_workers=min(self.worker_threads, self.num_envs),
@@ -558,6 +623,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 raise RuntimeError(
                     "Dynamic Benchmark vector members disagree on horizon"
                 )
+            self._phase_add("construction.serial_backend", backend_start)
         self._raw_observations: list[Any | None] = [None] * self.num_envs
         self._requests: list[Any | None] = [None] * self.num_envs
         self._state_schema: DynamicBenchmarkStateSchema | None = None
@@ -583,7 +649,9 @@ class DynamicBenchmarkEnv(gym.Env):
         self._stage_progresses: list[float | None] = [None] * self.num_envs
         self.info_logging_keys = ["success", "trajectory_completion"]
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(7,), dtype=np.float32)
+        initial_reset_start = self._phase_start()
         self.reset()
+        self._phase_add("construction.initial_reset", initial_reset_start)
         assert self._state_schema is not None
         self.observation_space = gym.spaces.Dict(
             {
@@ -595,6 +663,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 )
             }
         )
+        self._phase_add("construction.total", construction_start)
 
     def _load_benchmark_contracts(self) -> None:
         try:
@@ -607,7 +676,7 @@ class DynamicBenchmarkEnv(gym.Env):
             from se3_wam.benchmark.config import load_task_config
             from se3_wam.benchmark.contracts import EventRecord
             from se3_wam.benchmark.dataset_manifest import (
-                make_dataset_candidate_manifest,
+                make_task_candidate_manifest,
             )
             from se3_wam.benchmark.keyed_puck import T5EventTape
             from se3_wam.benchmark.p0_grasp_manifest import (
@@ -628,7 +697,7 @@ class DynamicBenchmarkEnv(gym.Env):
         self._Split = Split
         self._StepResult = StepResult
         self._EventRecord = EventRecord
-        self._make_dataset_candidate_manifest = make_dataset_candidate_manifest
+        self._make_task_candidate_manifest = make_task_candidate_manifest
         self._make_p0_grasp_candidate_manifest = make_p0_grasp_candidate_manifest
         self._load_task_config = load_task_config
         self._T5EventTape = T5EventTape
@@ -644,7 +713,9 @@ class DynamicBenchmarkEnv(gym.Env):
             ) from exc
 
     def _refresh_manifest(self) -> None:
+        total_start = self._phase_start()
         manifest_seed = self.base_manifest_seed + self._manifest_generation * 10_000_019
+        generation_start = self._phase_start()
         if self.task_id == "p0_grasp":
             rows = self._make_p0_grasp_candidate_manifest(
                 split=self._split,
@@ -652,19 +723,22 @@ class DynamicBenchmarkEnv(gym.Env):
                 manifest_seed=manifest_seed,
             )
         else:
-            all_rows = self._make_dataset_candidate_manifest(
+            rows = self._make_task_candidate_manifest(
+                task_id=self.task_id,
                 split=self._split,
-                attempts_per_task=self.manifest_size,
+                attempts=self.manifest_size,
                 manifest_seed=manifest_seed,
-                tasks=self._active_task_ids,
             )
-            rows = tuple(row for row in all_rows if row.request.task_id == self.task_id)
+        self._phase_add("manifest.generate", generation_start)
+        validation_start = self._phase_start()
         if len(rows) != self.manifest_size:
             raise RuntimeError(
                 f"manifest produced {len(rows)} rows for {self.task_id}, expected {self.manifest_size}"
             )
         self._manifest_rows = tuple(rows)
         self._manifest_cursor = 0
+        self._phase_add("manifest.validate_install", validation_start)
+        self._phase_add("manifest.total", total_start)
 
     def set_manifest_context(self, *, split_name: str, base_manifest_seed: int) -> None:
         """Switch manifest identity without rebuilding the underlying simulators.
@@ -1040,6 +1114,7 @@ class DynamicBenchmarkEnv(gym.Env):
         seed: Optional[Union[int, list[int]]] = None,
         options: Optional[dict[str, Any]] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        total_start = self._phase_start()
         del seed
         options = {} if options is None else dict(options)
         env_idx_value = options.pop("env_idx", None)
@@ -1054,14 +1129,20 @@ class DynamicBenchmarkEnv(gym.Env):
         )
         if np.any(indices < 0) or np.any(indices >= self.num_envs):
             raise IndexError("reset env_idx is out of range")
+        row_count = max(1, int(indices.size))
+        metrics_start = self._phase_start()
         self._reset_metrics(indices)
+        self._phase_add("reset.metrics", metrics_start, count=row_count)
         states = (
             np.zeros((self.num_envs, 0), dtype=np.float32)
             if self._last_obs is None
             else self._last_obs["states"].cpu().numpy().copy()
         )
+        request_start = self._phase_start()
         reset_items = [(int(index), self._next_request()) for index in indices]
         requests_by_index = dict(reset_items)
+        self._phase_add("reset.manifest_requests", request_start, count=row_count)
+        backend_start = self._phase_start()
         if self._process_vector is not None:
             reset_results = [
                 (index, self._unpack_process_observation(payload))
@@ -1071,6 +1152,8 @@ class DynamicBenchmarkEnv(gym.Env):
             reset_results = [self._reset_one(item) for item in reset_items]
         else:
             reset_results = list(self._executor.map(self._reset_one, reset_items))
+        self._phase_add("reset.backend", backend_start, count=row_count)
+        encode_start = self._phase_start()
         for index, observation in reset_results:
             request = requests_by_index[index]
             state = self._encode(observation, request, env_index=int(index))
@@ -1080,9 +1163,13 @@ class DynamicBenchmarkEnv(gym.Env):
             self._raw_observations[index] = observation
             self._requests[index] = request
             self._needs_reset[index] = False
+        self._phase_add("reset.encode", encode_start, count=row_count)
+        finalize_start = self._phase_start()
         obs = {"states": torch.as_tensor(states, dtype=torch.float32)}
         self._last_obs = obs
         self._is_start = True
+        self._phase_add("reset.finalize", finalize_start, count=row_count)
+        self._phase_add("reset.total", total_start, count=row_count)
         return obs, {}
 
     def _normalize_actions(
@@ -1116,7 +1203,11 @@ class DynamicBenchmarkEnv(gym.Env):
         torch.Tensor,
         dict[str, Any],
     ]:
+        total_start = self._phase_start()
+        normalize_start = self._phase_start()
         action_array = self._normalize_actions(actions)
+        self._phase_add("step.normalize_actions", normalize_start, count=self.num_envs)
+        prepare_start = self._phase_start()
         if process_residual_planner_scale is not None:
             if self._process_vector is None or not self.process_residual_planner:
                 raise ValueError(
@@ -1155,6 +1246,9 @@ class DynamicBenchmarkEnv(gym.Env):
                 component_rows[index] = {"total": 0.0}
                 continue
             active_items.append((index, action_array[index]))
+        active_count = max(1, len(active_items))
+        self._phase_add("step.prepare", prepare_start, count=active_count)
+        backend_start = self._phase_start()
         if self._process_vector is not None:
             process_items = []
             for index, values in active_items:
@@ -1226,6 +1320,8 @@ class DynamicBenchmarkEnv(gym.Env):
             step_results = [self._step_one(item) for item in active_items]
         else:
             step_results = list(self._executor.map(self._step_one, active_items))
+        self._phase_add("step.backend", backend_start, count=active_count)
+        postprocess_start = self._phase_start()
         for index, action, result, event_names, task_quality in step_results:
             request = self._requests[index]
             assert request is not None
@@ -1245,6 +1341,7 @@ class DynamicBenchmarkEnv(gym.Env):
                 except (KeyError, IndexError, ValueError, TypeError):
                     pass
             active_stage_progresses[index] = float(result.active_stage_progress)
+            reward_start = self._phase_start()
             geometry = self._current_geometry(result.observation)
             ee_velocity = self._update_eef_velocity(index, result.observation)
             time_to_goal, _ = self._time_to_goal(index, result.observation, ee_velocity)
@@ -1307,9 +1404,12 @@ class DynamicBenchmarkEnv(gym.Env):
             self._action_histories[index].append(
                 np.asarray(action.values, dtype=np.float32)
             )
+            self._phase_add("step.reward", reward_start)
+            encode_start = self._phase_start()
             states[index] = self._encode(
                 result.observation, request, env_index=index
             )
+            self._phase_add("step.encode", encode_start)
             self._raw_observations[index] = result.observation
             rewards[index] = float(reward) + float(registry_reward)
             terminations[index] = bool(result.terminated)
@@ -1326,6 +1426,8 @@ class DynamicBenchmarkEnv(gym.Env):
             if result.terminated or result.truncated:
                 self._needs_reset[index] = True
 
+        self._phase_add("step.postprocess", postprocess_start, count=active_count)
+        finalize_start = self._phase_start()
         self._elapsed_steps[torch.as_tensor(stepped)] += 1
         reward_tensor = torch.as_tensor(rewards, dtype=torch.float32)
         termination_tensor = torch.as_tensor(terminations, dtype=torch.bool)
@@ -1395,6 +1497,8 @@ class DynamicBenchmarkEnv(gym.Env):
             obs, infos = self._handle_auto_reset(dones, obs, infos)
         self._last_obs = obs
         self._is_start = False
+        self._phase_add("step.finalize", finalize_start, count=active_count)
+        self._phase_add("step.total", total_start, count=active_count)
         return obs, reward_tensor, termination_tensor, truncation_tensor, infos
 
     def _handle_auto_reset(

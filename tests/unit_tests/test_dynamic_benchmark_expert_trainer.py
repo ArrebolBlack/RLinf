@@ -96,6 +96,81 @@ def test_config_artifact_identity_accepts_json_array_for_runtime_tuple(
     )
 
 
+def test_resume_metrics_identity_accepts_json_tuple_roundtrip() -> None:
+    checkpoint_metrics = {
+        "success_rate": 1.0,
+        "worker_pids": (101, 102),
+    }
+    manifest_metrics = json.loads(json.dumps(checkpoint_metrics))
+
+    assert expert_trainer._canonical_json_sha256(
+        checkpoint_metrics
+    ) == expert_trainer._canonical_json_sha256(manifest_metrics)
+    manifest_metrics["worker_pids"][1] = 103
+    assert expert_trainer._canonical_json_sha256(
+        checkpoint_metrics
+    ) != expert_trainer._canonical_json_sha256(manifest_metrics)
+
+
+def test_episode_logging_checkpoint_state_roundtrips_exactly_and_immutably() -> None:
+    recent_episodes = [
+        {
+            "success": True,
+            "trajectory_completion": 1.0,
+            "return": 7.5,
+            "duration_steps": 4,
+        }
+    ]
+    episode_returns = torch.tensor([1.25, -2.5], dtype=torch.float32)
+    episode_steps = torch.tensor([3, 6], dtype=torch.int64)
+
+    state = expert_trainer._checkpoint_episode_logging_state(
+        recent_episodes,
+        episode_returns,
+        episode_steps,
+    )
+    recent_episodes[0]["return"] = 999.0
+    episode_returns.zero_()
+    episode_steps.zero_()
+    restored_recent, restored_returns, restored_steps = (
+        expert_trainer._restore_episode_logging_state(state, num_envs=2)
+    )
+
+    assert restored_recent[0]["return"] == 7.5
+    assert torch.equal(restored_returns, torch.tensor([1.25, -2.5]))
+    assert torch.equal(restored_steps, torch.tensor([3, 6], dtype=torch.int64))
+    restored_recent[0]["return"] = -999.0
+    restored_returns.zero_()
+    restored_steps.zero_()
+    assert state["recent_episodes"][0]["return"] == 7.5
+    assert torch.equal(state["episode_returns"], torch.tensor([1.25, -2.5]))
+    assert torch.equal(
+        state["episode_steps"], torch.tensor([3, 6], dtype=torch.int64)
+    )
+
+
+def test_episode_logging_checkpoint_state_fails_closed_on_invalid_tensors() -> None:
+    state = expert_trainer._checkpoint_episode_logging_state(
+        [],
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([3, 4], dtype=torch.int64),
+    )
+    wrong_shape = copy.deepcopy(state)
+    wrong_shape["episode_returns"] = torch.tensor([1.0])
+    with pytest.raises(ValueError, match="shape does not match num_envs"):
+        expert_trainer._restore_episode_logging_state(wrong_shape, num_envs=2)
+
+    nonfinite = copy.deepcopy(state)
+    nonfinite["episode_returns"][1] = float("nan")
+    with pytest.raises(ValueError, match="returns must be finite"):
+        expert_trainer._restore_episode_logging_state(nonfinite, num_envs=2)
+
+    negative_steps = copy.deepcopy(state)
+    negative_steps["episode_steps"][0] = -1
+    with pytest.raises(ValueError, match="steps must be nonnegative"):
+        expert_trainer._restore_episode_logging_state(negative_steps, num_envs=2)
+
+
 @pytest.mark.parametrize(
     "rendered_features",
     [
@@ -969,7 +1044,7 @@ def test_borrowed_evaluation_prepare_failure_restores_training_state(
         "rlinf-dynamic-benchmark-checkpoint-v0.3",
     ),
 )
-def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
+def test_evaluation_rewind_loads_the_exact_frozen_checkpoint(
     checkpoint_schema: str,
 ) -> None:
     identity = {"task_id": "t4_sphere", "num_envs": 2}
@@ -1010,18 +1085,16 @@ def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
             self._manifest_generation = 99
             self._manifest_cursor = 99
             self._requests = []
-            self.reset_options = None
+            self.loaded_checkpoint = None
 
         def _checkpoint_identity(self):
             return identity
 
-        def _refresh_manifest(self):
-            self._manifest_cursor = 0
-
-        def reset(self, *, options):
-            self.reset_options = options
+        def load_checkpoint_state(self, state):
+            self.loaded_checkpoint = state
+            self._manifest_generation = int(state["manifest_generation"])
             self._requests = [request(row) for row in request_rows]
-            self._manifest_cursor = self.num_envs
+            self._manifest_cursor = int(state["manifest_cursor"])
 
     checkpoint = {
         "schema_version": checkpoint_schema,
@@ -1043,7 +1116,7 @@ def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
     expert_trainer._rewind_evaluation_environment(env, checkpoint)
     assert env._manifest_generation == 3
     assert env._manifest_cursor == 2
-    assert env.reset_options == {"env_idx": [0, 1]}
+    assert env.loaded_checkpoint is checkpoint
 
 
 def test_sampler_learner_overlap_runs_updates_while_sampling_is_in_flight() -> None:

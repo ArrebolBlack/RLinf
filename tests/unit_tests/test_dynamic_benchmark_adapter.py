@@ -111,6 +111,60 @@ def test_manifest_cache_round_trip_validates_identity_without_regeneration() -> 
         env.load_manifest_cache_state(dict(cache, task_id="t2_trans"))
 
 
+def test_manifest_refresh_requests_only_the_runtime_task() -> None:
+    calls = []
+
+    def make_task_manifest(**kwargs):
+        calls.append(kwargs)
+        return tuple(
+            SimpleNamespace(request=SimpleNamespace(task_id=kwargs["task_id"]))
+            for _ in range(kwargs["attempts"])
+        )
+
+    env = object.__new__(DynamicBenchmarkEnv)
+    env.task_id = "t4_slider"
+    env._split = SimpleNamespace(value="validation")
+    env.base_manifest_seed = 20261450
+    env.manifest_size = 8
+    env._manifest_generation = 2
+    env._manifest_cursor = 99
+    env._make_task_candidate_manifest = make_task_manifest
+
+    env._refresh_manifest()
+
+    assert calls == [
+        {
+            "task_id": "t4_slider",
+            "split": env._split,
+            "attempts": 8,
+            "manifest_seed": 20261450 + 2 * 10_000_019,
+        }
+    ]
+    assert len(env._manifest_rows) == 8
+    assert env._manifest_cursor == 0
+
+
+def test_phase_timing_is_opt_in_and_reports_counts() -> None:
+    disabled = object.__new__(DynamicBenchmarkEnv)
+    disabled.profile_phase_timings = False
+    assert disabled._phase_start() is None
+    assert disabled.phase_timing_snapshot() is None
+
+    enabled = object.__new__(DynamicBenchmarkEnv)
+    enabled.profile_phase_timings = True
+    enabled._phase_timing_seconds = {}
+    enabled._phase_timing_counts = {}
+    started_at = enabled._phase_start()
+    enabled._phase_add("probe", started_at, count=2)
+
+    snapshot = enabled.phase_timing_snapshot()
+    assert snapshot is not None
+    assert snapshot["schema_version"] == "rlinf-dynamic-benchmark-phase-timing-v0.1"
+    assert snapshot["phases"]["probe"]["samples"] == 2
+    assert snapshot["phases"]["probe"]["total_s"] >= 0.0
+    assert snapshot["phases"]["probe"]["mean_ms"] >= 0.0
+
+
 def test_t5_hidden_event_branch_is_deterministic_balanced_and_not_a_reset_factor() -> None:
     episode_ids = [f"episode-{index:04d}" for index in range(128)]
     branches = [t5_branch_for_episode(episode_id) for episode_id in episode_ids]

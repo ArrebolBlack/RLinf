@@ -16,8 +16,11 @@
 
 from __future__ import annotations
 
+import ctypes
 import multiprocessing as mp
 import os
+import signal
+import sys
 import time
 import traceback
 from collections.abc import Callable, Iterable
@@ -39,6 +42,20 @@ class ProcessVectorHandler(Protocol):
         """Release worker-local environments."""
 
 
+def _arm_linux_parent_death_signal() -> None:
+    """Ask Linux to terminate a worker if its immediate owner disappears."""
+
+    if sys.platform != "linux":
+        return
+    parent_pid = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, int(signal.SIGTERM), 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != parent_pid:
+        os._exit(98)
+
+
 def _worker_main(
     connection: Any,
     handler_factory: Callable[[Any, tuple[int, ...]], ProcessVectorHandler],
@@ -49,6 +66,7 @@ def _worker_main(
 
     handler: ProcessVectorHandler | None = None
     try:
+        _arm_linux_parent_death_signal()
         handler = handler_factory(handler_payload, indices)
         connection.send(
             {
