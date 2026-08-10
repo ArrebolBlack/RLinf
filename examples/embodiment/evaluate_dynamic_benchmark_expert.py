@@ -25,6 +25,7 @@ import re
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -38,7 +39,9 @@ from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
     validate_source_snapshot_manifest,
 )
 from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+    load_quality_v4_rollout_reference,
     materialize_evaluation_attempt,
+    materialize_quality_v4_fresh_replay_attempt,
     recursive_output_checksums,
     validate_formal_quality_v2_thresholds,
 )
@@ -52,6 +55,7 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
 POLICY_SCHEMA = "rlinf-dynamic-benchmark-expert-policy-v0.1"
 EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-expert-evaluation-v0.2"
 FORMAL_EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-expert-evaluation-v0.3"
+QUALITY_V4_EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-expert-evaluation-v0.4"
 SOURCE_SNAPSHOT_RECEIPT_SCHEMA = "rld2-qa-source-snapshot-receipt-v0.1"
 TASK_QUALITY_BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
 SUPPORTED_ALGORITHMS = frozenset({"bc", "sac", "rlpd", "residual_rlpd", "ppo"})
@@ -80,6 +84,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-commit", required=True)
     parser.add_argument("--quality-v2-thresholds", type=Path)
     parser.add_argument("--expected-quality-v2-thresholds-sha256")
+    parser.add_argument("--quality-v4-thresholds", type=Path)
+    parser.add_argument("--expected-quality-v4-thresholds-sha256")
+    parser.add_argument("--quality-v4-reference-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--split",
@@ -641,18 +648,47 @@ def _manifest_row(env: Any, episode_id: str) -> Any:
 class _ArmedResetReplayEnv:
     """Expose raw replay while restoring Dynamic Benchmark hidden reset state."""
 
-    def __init__(self, vector_env: Any, raw_env: Any) -> None:
+    def __init__(
+        self,
+        vector_env: Any,
+        raw_env: Any,
+        *,
+        capture_quality_v4: bool = False,
+    ) -> None:
         self._vector_env = vector_env
         self._raw_env = raw_env
         self._terminal_task_quality: Any | None = None
+        self._capture_quality_v4 = capture_quality_v4
+        self._observations: list[Any] = []
+        self._outcomes: list[tuple[Any, ...]] = []
+        self._rewards: list[float] = []
+        self._physics_samples: list[Any] = []
 
     def reset(self, request: Any) -> Any:
         observation = self._raw_env.reset(request)
         self._vector_env._arm_hidden_t5_event(self._raw_env, request)
+        if self._capture_quality_v4:
+            self._observations = [observation]
+            self._physics_samples = [
+                self._raw_env.quality_v4_current_physics_source_sample()
+            ]
         return observation
 
     def step(self, action: Any) -> Any:
         result = self._raw_env.step(action)
+        if self._capture_quality_v4:
+            self._observations.append(result.observation)
+            self._outcomes.append(
+                (
+                    bool(result.terminated),
+                    bool(result.truncated),
+                    bool(result.success),
+                    result.termination_reason,
+                    float(result.active_stage_progress),
+                )
+            )
+            self._rewards.append(float(result.reward))
+            self._physics_samples.extend(self._raw_env.quality_v4_last_physics_trace())
         if bool(getattr(result, "terminated", False)) or bool(
             getattr(result, "truncated", False)
         ):
@@ -668,6 +704,24 @@ class _ArmedResetReplayEnv:
 
         return self._terminal_task_quality
 
+    def quality_v4_capture(self) -> dict[str, Any]:
+        """Return replay-owned raw sources before the fresh environment closes."""
+
+        if not self._capture_quality_v4 or not self._observations:
+            raise RuntimeError("Qv4 replay capture was not enabled")
+        # The benchmark property already returns detached read-only records.
+        # Keeping that snapshot avoids deepcopy's inability to pickle
+        # MappingProxyType while Qv4 normalizes it into a hashed plain mapping.
+        history = getattr(self._raw_env, "canonical_action_history", None)
+        return {
+            "raw_env": SimpleNamespace(canonical_action_history=history),
+            "observations": tuple(self._observations),
+            "outcomes": tuple(self._outcomes),
+            "rewards": tuple(self._rewards),
+            "physics_samples": tuple(self._physics_samples),
+            "events": tuple(self._raw_env._ledger.events),
+        }
+
 
 def _replay_actions_on_fresh_env(
     *,
@@ -681,7 +735,8 @@ def _replay_actions_on_fresh_env(
     expected_task_quality: Mapping[str, Any] | None = None,
     task_quality_identity: Mapping[str, Any] | None = None,
     replay_fn: Any | None = None,
-) -> dict[str, Any]:
+    capture_quality_v4: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
     """Replay one expert action tape on an independent canonical raw environment."""
     if replay_fn is None:
         from se3_wam.benchmark.evaluation import replay_actions
@@ -702,7 +757,11 @@ def _replay_actions_on_fresh_env(
         **task_quality_kwargs,
     )
     try:
-        replay_env = _ArmedResetReplayEnv(vector_env, raw_env)
+        replay_env = _ArmedResetReplayEnv(
+            vector_env,
+            raw_env,
+            capture_quality_v4=capture_quality_v4,
+        )
         validation = replay_fn(
             replay_env,
             request=request,
@@ -716,37 +775,39 @@ def _replay_actions_on_fresh_env(
                 raise ValueError(
                     "expected task quality requires its canonical identity"
                 )
-            return validation
-        if not isinstance(validation, Mapping):
-            raise ValueError("replay validation must be a mapping")
-        episode_id = getattr(request, "episode_id", None)
-        if not isinstance(episode_id, str) or not episode_id:
-            raise ValueError("replay request episode identity is missing")
-        result = dict(validation)
-        if expected_task_quality is None:
-            result["task_quality_exact"] = replay_env.terminal_task_quality is None
-            result["task_quality_summary_sha256"] = None
+            result = validation
+        else:
+            if not isinstance(validation, Mapping):
+                raise ValueError("replay validation must be a mapping")
+            episode_id = getattr(request, "episode_id", None)
+            if not isinstance(episode_id, str) or not episode_id:
+                raise ValueError("replay request episode identity is missing")
+            result = dict(validation)
+            if expected_task_quality is None:
+                result["task_quality_exact"] = replay_env.terminal_task_quality is None
+                result["task_quality_summary_sha256"] = None
+            else:
+                recorded = _validate_task_quality_summary(
+                    expected_task_quality,
+                    identity=task_quality_identity,
+                    task_id=task_id,
+                    episode_id=episode_id,
+                )
+                replayed = _validate_task_quality_summary(
+                    replay_env.terminal_task_quality,
+                    identity=task_quality_identity,
+                    task_id=task_id,
+                    episode_id=episode_id,
+                )
+                result["task_quality_exact"] = replayed == recorded
+                result["task_quality_summary_sha256"] = replayed["summary_sha256"]
             result["passed"] = bool(
                 result.get("passed") is True and result["task_quality_exact"]
             )
-            return result
-        recorded = _validate_task_quality_summary(
-            expected_task_quality,
-            identity=task_quality_identity,
-            task_id=task_id,
-            episode_id=episode_id,
-        )
-        replayed = _validate_task_quality_summary(
-            replay_env.terminal_task_quality,
-            identity=task_quality_identity,
-            task_id=task_id,
-            episode_id=episode_id,
-        )
-        result["task_quality_exact"] = replayed == recorded
-        result["task_quality_summary_sha256"] = replayed["summary_sha256"]
-        result["passed"] = bool(
-            result.get("passed") is True and result["task_quality_exact"]
-        )
+        if capture_quality_v4:
+            if not isinstance(result, Mapping):
+                raise ValueError("Qv4 replay validation must be a mapping")
+            return dict(result), replay_env.quality_v4_capture()
         return result
     finally:
         raw_env.close()
@@ -821,6 +882,9 @@ def _episode(
     quality_v2_thresholds_sha256: str | None = None,
     attempt_output: Path | None = None,
     attempt_index: int | None = None,
+    quality_v4_thresholds: Mapping[str, Any] | None = None,
+    quality_v4_reference: Mapping[str, Any] | None = None,
+    quality_v4_output: Path | None = None,
 ) -> tuple[dict[str, Any], list[float]]:
     from se3_wam.benchmark.metrics import (
         completion_time_from_events,
@@ -836,6 +900,21 @@ def _episode(
     task_id = str(config["task"])
     row = _manifest_row(env, request.episode_id)
     raw_env = env.envs[0]
+    quality_v4_arguments = (
+        quality_v4_thresholds,
+        quality_v4_reference,
+        quality_v4_output,
+    )
+    if any(value is not None for value in quality_v4_arguments) and not all(
+        value is not None for value in quality_v4_arguments
+    ):
+        raise ValueError("Qv4 evaluator arguments must be supplied together")
+    quality_v4_enabled = all(value is not None for value in quality_v4_arguments)
+    physics_samples = (
+        [raw_env.quality_v4_current_physics_source_sample()]
+        if quality_v4_enabled
+        else []
+    )
     residual = str(config["algorithm"]) == "residual_rlpd"
     teacher = _make_teacher(task_id, request) if residual else None
     residual_scale = float(config.get("residual_scale", 0.25))
@@ -912,6 +991,8 @@ def _episode(
             )
         )
         rewards.append(float(reward[0]))
+        if quality_v4_enabled:
+            physics_samples.extend(raw_env.quality_v4_last_physics_trace())
         terminated_rows.append(terminated_value)
         truncated_rows.append(truncated_value)
         result_info = {
@@ -953,7 +1034,7 @@ def _episode(
         if result_info["success"]
         else None
     )
-    replay_validation = _replay_actions_on_fresh_env(
+    replay_result = _replay_actions_on_fresh_env(
         vector_env=env,
         task_id=task_id,
         request=request,
@@ -963,8 +1044,18 @@ def _episode(
         expected_final_state=final_state,
         expected_task_quality=result_info["task_quality"],
         task_quality_identity=task_quality_identity,
+        capture_quality_v4=quality_v4_enabled,
     )
-    if not replay_validation["passed"]:
+    if quality_v4_enabled:
+        if not isinstance(replay_result, tuple) or len(replay_result) != 2:
+            raise RuntimeError("Qv4 fresh replay did not return its source capture")
+        replay_validation, replay_capture = replay_result
+    else:
+        if not isinstance(replay_result, Mapping):
+            raise RuntimeError("expert replay validation has an invalid type")
+        replay_validation = dict(replay_result)
+        replay_capture = None
+    if not replay_validation["passed"] and not quality_v4_enabled:
         raise RuntimeError(
             "expert rollout replay failed: "
             f"{request.episode_id}: {json.dumps(replay_validation, sort_keys=True)}"
@@ -1009,6 +1100,7 @@ def _episode(
         "candidate_index": row.candidate_index,
         "success": result_info["success"],
         "safety_failure": result_info["termination_reason"] in safety_failures,
+        "reward_schema_safety_failures": sorted(safety_failures),
         "termination_reason": result_info["termination_reason"],
         "trajectory_completion": completion,
         "completion_time_s": completion_time,
@@ -1054,6 +1146,26 @@ def _episode(
             truncated=truncated_rows,
             quality_v2_thresholds_sha256=quality_v2_thresholds_sha256,
         )
+    if quality_v4_enabled:
+        assert quality_v4_output is not None
+        assert quality_v4_thresholds is not None
+        assert quality_v4_reference is not None
+        assert replay_capture is not None
+        record["quality_v4_attempt"] = materialize_quality_v4_fresh_replay_attempt(
+            output=quality_v4_output,
+            record=record,
+            raw_env=raw_env,
+            observations=observations,
+            actions=action_array,
+            rewards=rewards,
+            outcomes=outcomes,
+            physics_samples=physics_samples,
+            events=events,
+            thresholds=quality_v4_thresholds,
+            reference_contract=quality_v4_reference,
+            base_replay_validation=replay_validation,
+            replay_capture=replay_capture,
+        )
     return record, latencies_s
 
 
@@ -1072,9 +1184,11 @@ def _atomic_bytes(path: Path, content: bytes) -> None:
     os.replace(temporary, path)
 
 
-def _evaluation_schema(*, formal_attempts: bool) -> str:
-    """Return v0.3 only for a frozen-threshold formal attempt producer."""
+def _evaluation_schema(*, formal_attempts: bool, quality_v4: bool = False) -> str:
+    """Select the legacy, Qv3-formal, or parallel Qv4 container schema."""
 
+    if quality_v4:
+        return QUALITY_V4_EVALUATION_SCHEMA
     return FORMAL_EVALUATION_SCHEMA if formal_attempts else EVALUATION_SCHEMA
 
 
@@ -1167,6 +1281,37 @@ def main() -> None:
         if not isinstance(loaded_thresholds, Mapping):
             raise ValueError("quality-v2 threshold contract must be a mapping")
         quality_v2_thresholds = dict(loaded_thresholds)
+    quality_v4_arguments = (
+        args.quality_v4_thresholds,
+        args.expected_quality_v4_thresholds_sha256,
+        args.quality_v4_reference_root,
+    )
+    if any(value is not None for value in quality_v4_arguments) and not all(
+        value is not None for value in quality_v4_arguments
+    ):
+        raise ValueError(
+            "Qv4 thresholds, expected file SHA-256, and reference root must be supplied together"
+        )
+    quality_v4_thresholds: Mapping[str, Any] | None = None
+    quality_v4_threshold_validation: dict[str, Any] | None = None
+    if args.quality_v4_thresholds is not None:
+        from examples.embodiment.dynamic_benchmark_quality_v4 import (
+            load_quality_v4_thresholds,
+        )
+
+        if args.quality_v4_reference_root.is_symlink() or not (
+            args.quality_v4_reference_root.is_dir()
+        ):
+            raise FileNotFoundError(args.quality_v4_reference_root)
+        quality_v4_thresholds, quality_v4_threshold_validation = (
+            load_quality_v4_thresholds(
+                args.quality_v4_thresholds,
+                expected_file_sha256=_expected_sha256(
+                    str(args.expected_quality_v4_thresholds_sha256)
+                ),
+                require_formal_freeze=False,
+            )
+        )
     if not args.policy.is_file():
         raise FileNotFoundError(args.policy)
     policy_sha256 = _sha256(args.policy)
@@ -1365,6 +1510,16 @@ def main() -> None:
         latencies_s: list[float] = []
         for episode_index, row in enumerate(rows):
             _reset_rollout_on_fresh_env(vector_env=env, request=row.request)
+            quality_v4_reference = (
+                None
+                if quality_v4_thresholds is None
+                else load_quality_v4_rollout_reference(
+                    args.quality_v4_reference_root,
+                    task_id=task_id,
+                    episode_id=row.request.episode_id,
+                    expected_state_schema_sha256=_payload_sha256(state_schema),
+                )
+            )
             record, episode_latencies = _episode(
                 env=env,
                 model=model,
@@ -1379,6 +1534,11 @@ def main() -> None:
                 ),
                 attempt_index=(
                     episode_index if quality_v2_thresholds is not None else None
+                ),
+                quality_v4_thresholds=quality_v4_thresholds,
+                quality_v4_reference=quality_v4_reference,
+                quality_v4_output=(
+                    args.output if quality_v4_thresholds is not None else None
                 ),
             )
             if record["episode_id"] != row.request.episode_id:
@@ -1429,7 +1589,8 @@ def main() -> None:
             source_identity["evaluator_source"] = evaluator_source_identity
         result = {
             "schema_version": _evaluation_schema(
-                formal_attempts=quality_v2_thresholds is not None
+                formal_attempts=quality_v2_thresholds is not None,
+                quality_v4=quality_v4_thresholds is not None,
             ),
             "policy_identity": policy_identity,
             "source_identity": source_identity,
@@ -1441,6 +1602,11 @@ def main() -> None:
                     "schema_version": quality_v2_thresholds.get("schema_version"),
                     "sha256": quality_v2_thresholds_sha256,
                 }
+            ),
+            "quality_v4_threshold_identity": (
+                None
+                if quality_v4_threshold_validation is None
+                else dict(quality_v4_threshold_validation)
             ),
             "split": args.split,
             "manifest_seed": args.manifest_seed,
@@ -1462,6 +1628,16 @@ def main() -> None:
                     for row in records
                     if row["success"]
                 )
+            ),
+            "all_quality_v4_layer1_gates_passed": (
+                None
+                if quality_v4_thresholds is None
+                else all(row["quality_v4_attempt"]["layer1_passed"] for row in records)
+            ),
+            "all_quality_v4_layer2_gates_passed": (
+                None
+                if quality_v4_thresholds is None
+                else all(row["quality_v4_attempt"]["layer2_passed"] for row in records)
             ),
             "started_unix_s": started,
             "finished_unix_s": time.time(),
@@ -1513,6 +1689,13 @@ def main() -> None:
             and _sha256(args.quality_v2_thresholds) != quality_v2_thresholds_sha256
         ):
             raise RuntimeError("quality-v2 threshold file changed during evaluation")
+        if (
+            args.quality_v4_thresholds is not None
+            and quality_v4_threshold_validation is not None
+            and _sha256(args.quality_v4_thresholds)
+            != quality_v4_threshold_validation["file_sha256"]
+        ):
+            raise RuntimeError("Qv4 threshold file changed during evaluation")
         source_snapshot_receipt: dict[str, Any] | None = None
         if source_snapshot_manifest is not None:
             assert source_snapshot_manifest_sha256 is not None
@@ -1601,7 +1784,7 @@ def main() -> None:
                     *admission_checksums,
                 ),
             )
-            if quality_v2_thresholds is not None
+            if quality_v2_thresholds is not None or quality_v4_thresholds is not None
             else (
                 f"{_sha256(result_path)}  evaluation.json\n"
                 f"{_sha256(reset_manifest_path)}  reset_manifest.jsonl\n"

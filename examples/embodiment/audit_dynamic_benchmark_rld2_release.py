@@ -80,6 +80,9 @@ HISTORICAL_RELEASE_AUDIT_SCHEMAS = (
     "rlinf-dynamic-benchmark-rld2-release-audit-v0.2",
 )
 RELEASE_AUDIT_SCHEMA = "rlinf-dynamic-benchmark-rld2-release-audit-v0.3"
+QUALITY_V4_RELEASE_READINESS_SCHEMA = (
+    "rlinf-dynamic-benchmark-rld2-quality-v4-release-readiness-v0.1"
+)
 CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.2"
 CANDIDATE_RELEASE_SCHEMA = "rlinf-dynamic-benchmark-rld2-candidate-release-v0.2"
 EVALUATOR_IDENTITY_SCHEMA = "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
@@ -1491,7 +1494,99 @@ def _validate_task_audit(
         raise ReleaseAuditError(f"{task} independent audit summary contract mismatch")
     _contract_from_audit_summary(summary, contract, task=task)
     _evaluator_from_audit_summary(summary, evaluator_identity, task=task)
+    quality_v4 = summary.get("quality_v4_full_exports")
+    if quality_v4 is not None:
+        if not isinstance(quality_v4, Mapping) or set(quality_v4) != {
+            "enabled",
+            "audited_count",
+            "thresholds_sha256",
+            "orientation_contract_sha256",
+            "gate_sha256",
+        }:
+            raise ReleaseAuditError(f"{task} Qv4 audit summary inventory mismatch")
+        enabled = quality_v4.get("enabled")
+        count = quality_v4.get("audited_count")
+        gate_hashes = quality_v4.get("gate_sha256")
+        if (
+            not isinstance(enabled, bool)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not isinstance(gate_hashes, list)
+        ):
+            raise ReleaseAuditError(f"{task} Qv4 audit summary types are invalid")
+        if enabled:
+            _require_sha256(
+                quality_v4.get("thresholds_sha256"), f"{task} Qv4 thresholds"
+            )
+            _require_sha256(
+                quality_v4.get("orientation_contract_sha256"),
+                f"{task} Qv4 orientation contract",
+            )
+            if count != accepted_count or len(gate_hashes) != accepted_count:
+                raise ReleaseAuditError(f"{task} Qv4 winner audit count mismatch")
+            for value in gate_hashes:
+                _require_sha256(value, f"{task} Qv4 full-export gate")
+        elif (
+            count != 0
+            or quality_v4.get("thresholds_sha256") is not None
+            or quality_v4.get("orientation_contract_sha256") is not None
+            or gate_hashes
+        ):
+            raise ReleaseAuditError(f"{task} disabled Qv4 audit summary is non-empty")
     return audit, dict(summary)
+
+
+def quality_v4_release_readiness(
+    task_audit_summaries: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate the parallel exact-14 Qv4 release boundary without mutating Qv3."""
+
+    if set(task_audit_summaries) != set(EXACT_TASKS):
+        raise ReleaseAuditError("Qv4 release readiness requires the exact-14 task set")
+    threshold_hashes = set()
+    orientation_hashes = set()
+    gate_count = 0
+    for task in EXACT_TASKS:
+        summary = task_audit_summaries[task]
+        quality_v4 = summary.get("quality_v4_full_exports")
+        if not isinstance(quality_v4, Mapping) or quality_v4.get("enabled") is not True:
+            raise ReleaseAuditError(f"{task} Qv4 full-export audit is not enabled")
+        count = quality_v4.get("audited_count")
+        hashes = quality_v4.get("gate_sha256")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != ACCEPTED_PER_TASK
+            or not isinstance(hashes, list)
+            or len(hashes) != count
+        ):
+            raise ReleaseAuditError(f"{task} Qv4 full-export count mismatch")
+        threshold_hashes.add(
+            _require_sha256(
+                quality_v4.get("thresholds_sha256"), f"{task} Qv4 thresholds"
+            )
+        )
+        orientation_hashes.add(
+            _require_sha256(
+                quality_v4.get("orientation_contract_sha256"),
+                f"{task} Qv4 orientation contract",
+            )
+        )
+        for value in hashes:
+            _require_sha256(value, f"{task} Qv4 full-export gate")
+        gate_count += count
+    if len(threshold_hashes) != 1 or len(orientation_hashes) != 1:
+        raise ReleaseAuditError("Qv4 release mixes threshold or orientation contracts")
+    result: dict[str, Any] = {
+        "schema_version": QUALITY_V4_RELEASE_READINESS_SCHEMA,
+        "task_count": len(EXACT_TASKS),
+        "full_export_gate_count": gate_count,
+        "thresholds_sha256": next(iter(threshold_hashes)),
+        "orientation_contract_sha256": next(iter(orientation_hashes)),
+        "release_ready": True,
+    }
+    result["payload_sha256"] = _payload_sha256(result)
+    return result
 
 
 def _eligible(record: Mapping[str, Any]) -> bool:

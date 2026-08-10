@@ -24,7 +24,7 @@ import math
 import os
 import time
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
@@ -3282,6 +3282,68 @@ def _audit_export_state_and_progress(
             raise ValueError(f"progress boundary does not match final {name}")
 
 
+def _audit_quality_v4_full_exports(
+    root: Path, winner_rows: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Independently re-gate every Qv4 winner HDF5 when the new path exists."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        QUALITY_V4_FULL_EXPORT_SUBDIRECTORY,
+        audit_quality_v4_full_export,
+        dataset_quality_v4_validation,
+    )
+
+    directory = root / QUALITY_V4_FULL_EXPORT_SUBDIRECTORY
+    if not directory.exists():
+        return {
+            "enabled": False,
+            "audited_count": 0,
+            "thresholds_sha256": None,
+            "orientation_contract_sha256": None,
+            "gate_sha256": [],
+        }
+    episode_ids = []
+    for winner in winner_rows:
+        request = winner.get("request")
+        episode_id = request.get("episode_id") if isinstance(request, Mapping) else None
+        if not isinstance(episode_id, str) or not episode_id:
+            raise ValueError("Qv4 winner has no episode identity")
+        episode_ids.append(episode_id)
+    expected_files = {
+        *(f"{episode_id}.h5" for episode_id in episode_ids),
+        *(f"{episode_id}.gate.json" for episode_id in episode_ids),
+    }
+    actual_files = {path.name for path in directory.iterdir() if path.is_file()}
+    if actual_files != expected_files:
+        raise ValueError("Qv4 full-export file inventory mismatch")
+    gate_hashes = []
+    threshold_hashes = set()
+    orientation_hashes = set()
+    for episode_id in episode_ids:
+        export_path = directory / f"{episode_id}.h5"
+        recorded_gate = json.loads(
+            (directory / f"{episode_id}.gate.json").read_text(encoding="utf-8")
+        )
+        recomputed_gate = audit_quality_v4_full_export(export_path)
+        if recorded_gate != recomputed_gate:
+            raise ValueError("Qv4 recorded full-export gate does not recompute")
+        dataset_gate = dataset_quality_v4_validation(recomputed_gate)
+        if not dataset_gate["passed"]:
+            raise ValueError("Qv4 winner is not behavior-cloning eligible")
+        gate_hashes.append(recomputed_gate["gate_sha256"])
+        threshold_hashes.add(recomputed_gate["thresholds_sha256"])
+        orientation_hashes.add(recomputed_gate["orientation_contract_sha256"])
+    if len(threshold_hashes) != 1 or len(orientation_hashes) != 1:
+        raise ValueError("Qv4 winners mix threshold or orientation contracts")
+    return {
+        "enabled": True,
+        "audited_count": len(episode_ids),
+        "thresholds_sha256": next(iter(threshold_hashes)),
+        "orientation_contract_sha256": next(iter(orientation_hashes)),
+        "gate_sha256": gate_hashes,
+    }
+
+
 def _audit_dataset(
     *,
     root: Path,
@@ -3504,6 +3566,7 @@ def _audit_dataset(
         if not isinstance(episode_id, str) or episode_id in winner_by_episode:
             raise ValueError("winner episode IDs must be non-empty and unique")
         winner_by_episode[episode_id] = winner
+    quality_v4_full_exports = _audit_quality_v4_full_exports(root, winner_rows)
 
     accepted = 0
     render_parity_skips: Counter[str] = Counter()
@@ -3728,6 +3791,7 @@ def _audit_dataset(
         "source_identity": card["source_identity"],
         "quality_v2_threshold_identity": expected_threshold_identity,
         "quality_v2_calibration_wave_receipt_identity": (calibration_receipt_identity),
+        "quality_v4_full_exports": quality_v4_full_exports,
         "accepted_count": accepted,
         "attempted_reset_count": len(reset_results),
         "candidate_attempt_count": len(attempt_rows),

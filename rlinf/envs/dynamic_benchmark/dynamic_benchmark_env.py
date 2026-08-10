@@ -316,6 +316,9 @@ class _DynamicBenchmarkProcessHandler:
         payload["task_quality"] = (
             None if task_quality is None else task_quality.to_dict()
         )
+        payload["trajectory_quality_v4_physics"] = copy.deepcopy(
+            getattr(step_result, "trajectory_quality_v4_physics", None)
+        )
         if action_values is not None:
             payload["action_values"] = np.asarray(action_values, dtype=np.float32)
         return payload
@@ -1164,7 +1167,14 @@ class DynamicBenchmarkEnv(gym.Env):
 
     def _step_one(
         self, item: tuple[int, np.ndarray]
-    ) -> tuple[int, Any, Any, tuple[str, ...], dict[str, Any] | None]:
+    ) -> tuple[
+        int,
+        Any,
+        Any,
+        tuple[str, ...],
+        dict[str, Any] | None,
+        Mapping[str, Any] | None,
+    ]:
         index, values = item
         env = self.envs[index]
         observation = self._raw_observations[index]
@@ -1179,12 +1189,16 @@ class DynamicBenchmarkEnv(gym.Env):
         result = env.step(action)
         event_names = tuple(event.name for event in env._ledger.events)
         task_quality = getattr(result, "task_quality", None)
+        trajectory_quality_v4_physics = getattr(
+            result, "trajectory_quality_v4_physics", None
+        )
         return (
             index,
             action,
             result,
             event_names,
             None if task_quality is None else task_quality.to_dict(),
+            trajectory_quality_v4_physics,
         )
 
     def reset(
@@ -1314,6 +1328,9 @@ class DynamicBenchmarkEnv(gym.Env):
         completions = np.zeros(self.num_envs, dtype=np.float32)
         termination_reasons: list[str | None] = [None] * self.num_envs
         task_quality_rows: list[dict[str, Any] | None] = [None] * self.num_envs
+        trajectory_quality_v4_physics_rows: list[Mapping[str, Any] | None] = [
+            None
+        ] * self.num_envs
         component_rows: list[dict[str, float]] = [{} for _ in range(self.num_envs)]
         event_name_rows: list[list[str]] = [[] for _ in range(self.num_envs)]
         active_stage_progresses = np.zeros(self.num_envs, dtype=np.float64)
@@ -1395,6 +1412,9 @@ class DynamicBenchmarkEnv(gym.Env):
                     success=bool(payload["success"]),
                     termination_reason=payload["termination_reason"],
                     active_stage_progress=float(payload["active_stage_progress"]),
+                    trajectory_quality_v4_physics=payload.get(
+                        "trajectory_quality_v4_physics"
+                    ),
                 )
                 step_results.append(
                     (
@@ -1403,6 +1423,7 @@ class DynamicBenchmarkEnv(gym.Env):
                         result,
                         payload["event_names"],
                         payload.get("task_quality"),
+                        payload.get("trajectory_quality_v4_physics"),
                     )
                 )
         elif self._gpu_backend is not None:
@@ -1445,6 +1466,7 @@ class DynamicBenchmarkEnv(gym.Env):
                             for event in result.observation.events_since_last_observation
                         ),
                         getattr(result, "task_quality", None),
+                        getattr(result, "trajectory_quality_v4_physics", None),
                     )
                 )
         elif self._executor is None or len(active_items) < 2:
@@ -1453,7 +1475,14 @@ class DynamicBenchmarkEnv(gym.Env):
             step_results = list(self._executor.map(self._step_one, active_items))
         self._phase_add("step.backend", backend_start, count=active_count)
         postprocess_start = self._phase_start()
-        for index, action, result, event_names, task_quality in step_results:
+        for (
+            index,
+            action,
+            result,
+            event_names,
+            task_quality,
+            trajectory_quality_v4_physics,
+        ) in step_results:
             request = self._requests[index]
             assert request is not None
             event_name_rows[index] = list(event_names)
@@ -1552,6 +1581,7 @@ class DynamicBenchmarkEnv(gym.Env):
             )
             termination_reasons[index] = result.termination_reason
             task_quality_rows[index] = task_quality
+            trajectory_quality_v4_physics_rows[index] = trajectory_quality_v4_physics
             component_rows[index] = {**components, **registry_values}
             stepped[index] = True
             if result.terminated or result.truncated:
@@ -1596,6 +1626,7 @@ class DynamicBenchmarkEnv(gym.Env):
             "trajectory_completion": completion_tensor,
             "termination_reason": termination_reasons,
             "task_quality": task_quality_rows,
+            "trajectory_quality_v4_physics": trajectory_quality_v4_physics_rows,
             "reward_components": {
                 name: torch.as_tensor(
                     [row.get(name, 0.0) for row in component_rows], dtype=torch.float32
