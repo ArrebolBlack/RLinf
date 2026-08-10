@@ -847,7 +847,13 @@ class GpuNativeTensorBackendEnv:
                 attempts=effective_manifest_size,
                 manifest_seed=manifest_seed,
             )
-            requests = tuple(row.request for row in manifest_rows)
+            requests = tuple(
+                replace(
+                    row.request,
+                    observation_track=ObservationTrack.STATE,
+                )
+                for row in manifest_rows
+            )
             if len(requests) != effective_manifest_size:
                 raise GpuNativeTensorBackendUnavailableError(
                     "P0-Grasp manifest generator returned the wrong number of requests"

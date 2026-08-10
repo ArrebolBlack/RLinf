@@ -490,6 +490,7 @@ def _install_fakes(
 
     class ObservationTrack(enum.Enum):
         STATE = "state"
+        HYBRID = "hybrid"
 
     class Split(enum.Enum):
         TRAIN = "train"
@@ -575,11 +576,12 @@ def _install_fakes(
                         split=split,
                         seed=manifest_seed + index,
                         action_mode="E7",
-                        observation_track=ObservationTrack.STATE,
+                        observation_track=ObservationTrack.HYBRID,
                         factors=factors,
                     )
                 )
             )
+        captured["generated_manifest_requests"] = tuple(row.request for row in rows)
         return tuple(rows)
 
     modules[
@@ -687,6 +689,41 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert sys.modules["warp"].to_torch_calls == first_conversion_count
     backend.close()
     assert fake_env.closed
+
+
+def test_generated_manifest_projects_only_observation_track_to_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    captured, _fake_env, _device = _install_fakes(monkeypatch)
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+        manifest_seed=77,
+        manifest_size=6,
+    )
+
+    source_requests = captured["generated_manifest_requests"]
+    projected_requests = backend.sequence_requests
+    track = sys.modules["se3_wam.benchmark.contracts"].ObservationTrack
+    assert all(request.observation_track is track.HYBRID for request in source_requests)
+    assert all(
+        request.observation_track is track.STATE for request in projected_requests
+    )
+    for source, projected in zip(source_requests, projected_requests, strict=True):
+        assert projected.task_id == source.task_id
+        assert projected.episode_id == source.episode_id
+        assert projected.split == source.split
+        assert projected.seed == source.seed
+        assert projected.action_mode == source.action_mode
+        assert projected.object_mode == source.object_mode
+        assert projected.reset_mode == source.reset_mode
+        assert projected.factors == source.factors
+        assert projected.api_version == source.api_version
 
 
 def test_r0_cursor_is_transactional_boundary_only_and_resumable(
