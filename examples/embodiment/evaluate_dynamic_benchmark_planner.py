@@ -28,15 +28,47 @@ from typing import Any
 import numpy as np
 import torch
 
+from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+    materialize_evaluation_attempt,
+    recursive_output_checksums,
+    validate_formal_quality_v2_thresholds,
+)
 from examples.embodiment.evaluate_dynamic_benchmark_expert import (
     _atomic_json,
+    _expected_sha256,
     _full_commit,
     _latency_summary,
     _payload_sha256,
     _sha256,
+    _task_quality_identity,
 )
 
 EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-planner-evaluation-v0.1"
+FORMAL_EVALUATION_SCHEMA = "rlinf-dynamic-benchmark-planner-evaluation-v0.2"
+TASK_QUALITY_BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
+
+
+def _trajectory_quality_v2_from_rollout(
+    observations: list[Any],
+    action_array: np.ndarray,
+    *,
+    task_id: str,
+    task_config: Mapping[str, object] | None,
+) -> dict[str, Any]:
+    """Compute replay-bound quality-v2 measurements for planner calibration."""
+
+    from se3_wam.benchmark.trajectory_quality import (
+        trajectory_quality_v2_from_observations,
+    )
+
+    return trajectory_quality_v2_from_observations(
+        observations,
+        action_array,
+        task_id=task_id,
+        task_config=task_config,
+        sample_period_s=0.05,
+        continuous_dimensions=max(1, int(action_array.shape[1]) - 1),
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -53,6 +85,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-seed", type=int, required=True)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--image-size", type=int, default=64)
+    parser.add_argument("--quality-v2-thresholds", type=Path)
+    parser.add_argument("--expected-quality-v2-thresholds-sha256")
     return parser
 
 
@@ -139,7 +173,9 @@ def _reset_rollout_on_fresh_env(*, vector_env: Any, request: Any) -> Any:
     if int(vector_env.num_envs) != 1:
         raise ValueError("planner evaluation requires exactly one vector member")
     if request.task_id != vector_env.task_id:
-        raise ValueError("planner evaluation request task does not match the environment")
+        raise ValueError(
+            "planner evaluation request task does not match the environment"
+        )
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
         _task_quality_make_kwargs,
     )
@@ -175,14 +211,20 @@ def _reset_rollout_on_fresh_env(*, vector_env: Any, request: Any) -> Any:
     vector_env._raw_observations[0] = observation
     vector_env._requests[0] = request
     vector_env._needs_reset[0] = False
-    vector_env._last_obs = {
-        "states": torch.as_tensor(state[None], dtype=torch.float32)
-    }
+    vector_env._last_obs = {"states": torch.as_tensor(state[None], dtype=torch.float32)}
     vector_env._is_start = True
     return observation
 
 
-def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
+def _episode(
+    *,
+    env: Any,
+    task_id: str,
+    quality_v2_thresholds: Mapping[str, object] | None = None,
+    quality_v2_thresholds_sha256: str | None = None,
+    attempt_output: Path | None = None,
+    attempt_index: int | None = None,
+) -> tuple[dict[str, Any], list[float]]:
     from se3_wam.benchmark.metrics import (
         completion_time_from_events,
         hierarchical_task_completion,
@@ -209,9 +251,15 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
         teacher.reset()
     raw_env = env.envs[0]
     observations = [observation]
+    if env._last_obs is None:
+        raise RuntimeError("planner evaluation environment lost its encoded state")
+    states = [np.asarray(env._last_obs["states"][0], dtype=np.float32)]
     actions = []
+    policy_action_values = []
     outcomes = []
     rewards = []
+    terminated_rows = []
+    truncated_rows = []
     latencies_s = []
     result_info: dict[str, Any] | None = None
     terminated_value = False
@@ -226,7 +274,7 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
             values=values,
             policy_step=observation.policy_step,
         )
-        _, reward, terminated, truncated, infos = env.step(
+        next_obs, reward, terminated, truncated, infos = env.step(
             env_actions, auto_reset=False
         )
         next_observation = env._raw_observations[0]
@@ -239,7 +287,9 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
         reason = infos["termination_reason"][0]
         active_progress = float(infos["reward_inputs"]["active_stage_progress"][0])
         observations.append(next_observation)
+        states.append(np.asarray(next_obs["states"][0], dtype=np.float32))
         actions.append(action)
+        policy_action_values.append(np.asarray(env_actions[0], dtype=np.float32))
         outcomes.append(
             (
                 terminated_value,
@@ -250,10 +300,13 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
             )
         )
         rewards.append(float(reward[0]))
+        terminated_rows.append(terminated_value)
+        truncated_rows.append(truncated_value)
         result_info = {
             "success": bool(infos["success"][0]),
             "termination_reason": reason,
             "active_stage_progress": active_progress,
+            "task_quality": infos["task_quality"][0],
         }
         observation = next_observation
         if len(actions) > int(env.horizon_steps):
@@ -294,35 +347,81 @@ def _episode(*, env: Any, task_id: str) -> tuple[dict[str, Any], list[float]]:
             f"{request.episode_id}: {json.dumps(replay_validation, sort_keys=True)}"
         )
     action_array = np.stack([action.values for action in actions])
-    safety_failures = set(env.reward_schema["safety_failures"])
-    return (
-        {
-            "episode_id": request.episode_id,
-            "task_id": task_id,
-            "seed": request.seed,
-            "factors": dict(request.factors),
-            "source_group_id": row.source_group_id,
-            "pair_id": row.pair_id,
-            "pair_member_id": row.pair_member_id,
-            "candidate_index": row.candidate_index,
-            "success": result_info["success"],
-            "safety_failure": result_info["termination_reason"] in safety_failures,
-            "termination_reason": result_info["termination_reason"],
-            "trajectory_completion": completion,
-            "completion_time_s": completion_time,
-            "return": float(sum(rewards)),
-            "control_steps": len(actions),
-            "action_l2_sum": float(np.square(action_array).sum()),
-            "action_sha256": hashlib.sha256(
-                np.ascontiguousarray(action_array).tobytes()
-            ).hexdigest(),
-            "actions": action_array.tolist(),
-            "teacher_preparation": preparation,
-            "replay_validation": replay_validation,
-            "events": [event.name for event in events],
-        },
-        latencies_s,
+    quality_v2 = _trajectory_quality_v2_from_rollout(
+        observations,
+        action_array,
+        task_id=task_id,
+        task_config=getattr(raw_env, "task_config", None),
     )
+    quality_v2_gate = None
+    if quality_v2_thresholds is not None:
+        if quality_v2_thresholds_sha256 is None:
+            raise ValueError("quality-v2 gate is missing its threshold SHA-256")
+        from se3_wam.benchmark.trajectory_quality import evaluate_quality_v2_gate
+
+        quality_v2_gate = evaluate_quality_v2_gate(
+            quality_v2,
+            quality_v2_thresholds,
+            task_id=task_id,
+        )
+        quality_v2_gate["contract_sha256"] = quality_v2_thresholds_sha256
+    safety_failures = set(env.reward_schema["safety_failures"])
+    record = {
+        "episode_id": request.episode_id,
+        "task_id": task_id,
+        "seed": request.seed,
+        "factors": dict(request.factors),
+        "source_group_id": row.source_group_id,
+        "pair_id": row.pair_id,
+        "pair_member_id": row.pair_member_id,
+        "candidate_index": row.candidate_index,
+        "success": result_info["success"],
+        "safety_failure": result_info["termination_reason"] in safety_failures,
+        "termination_reason": result_info["termination_reason"],
+        "trajectory_completion": completion,
+        "completion_time_s": completion_time,
+        "return": float(sum(rewards)),
+        "control_steps": len(actions),
+        "action_l2_sum": float(np.square(action_array).sum()),
+        "task_quality": result_info["task_quality"],
+        "quality_v2": quality_v2,
+        "quality_v2_sha256": _payload_sha256(quality_v2),
+        "action_sha256": hashlib.sha256(
+            np.ascontiguousarray(action_array).tobytes()
+        ).hexdigest(),
+        "actions": action_array.tolist(),
+        "teacher_preparation": preparation,
+        "replay_validation": replay_validation,
+        "events": [event.name for event in events],
+    }
+    if quality_v2_gate is not None:
+        record["quality_v2_gate"] = quality_v2_gate
+    producer_arguments = (
+        quality_v2_thresholds is not None,
+        quality_v2_thresholds_sha256 is not None,
+        attempt_output is not None,
+        attempt_index is not None,
+    )
+    if any(producer_arguments) and not all(producer_arguments):
+        raise ValueError("formal attempt producer arguments must be supplied together")
+    if all(producer_arguments):
+        assert attempt_output is not None
+        assert attempt_index is not None
+        assert quality_v2_thresholds_sha256 is not None
+        record = materialize_evaluation_attempt(
+            attempt_output,
+            record,
+            candidate_index=attempt_index,
+            raw_env=raw_env,
+            observations=observations,
+            states=states,
+            policy_actions=policy_action_values,
+            rewards=rewards,
+            terminated=terminated_rows,
+            truncated=truncated_rows,
+            quality_v2_thresholds_sha256=quality_v2_thresholds_sha256,
+        )
+    return record, latencies_s
 
 
 def _task_summary(task_id: str, records: list[Mapping[str, Any]]) -> dict[str, Any]:
@@ -337,9 +436,42 @@ def _task_summary(task_id: str, records: list[Mapping[str, Any]]) -> dict[str, A
     return summary
 
 
+def _evaluation_schema(*, formal_attempts: bool) -> str:
+    """Select the container schema without changing metric-calibration output."""
+
+    return FORMAL_EVALUATION_SCHEMA if formal_attempts else EVALUATION_SCHEMA
+
+
+def _evaluation_checksums(
+    output: Path,
+    *,
+    result_path: Path,
+    reset_manifest_path: Path,
+    formal_attempts: bool,
+) -> str:
+    """Seal formal tapes recursively or enforce the two-file calibration contract."""
+
+    if formal_attempts:
+        return recursive_output_checksums(output)
+    owned = {
+        path.relative_to(output).as_posix()
+        for path in output.rglob("*")
+        if path.is_file() and path.name != "SHA256SUMS"
+    }
+    if owned != {"evaluation.json", "reset_manifest.jsonl"}:
+        raise ValueError(
+            "metric-calibration planner output must contain exactly its two data files"
+        )
+    return (
+        f"{_sha256(result_path)}  evaluation.json\n"
+        f"{_sha256(reset_manifest_path)}  reset_manifest.jsonl\n"
+    )
+
+
 def main() -> None:
     from se3_wam.benchmark.contracts import canonical_json
     from se3_wam.benchmark.evaluation import manifest_record
+    from se3_wam.benchmark.task_quality import task_quality_schema_manifest
 
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 
@@ -352,6 +484,37 @@ def main() -> None:
         raise ValueError("--image-size must be at least 64")
     evaluator_commit = _full_commit("evaluator_commit", args.evaluator_commit)
     benchmark_commit = _full_commit("benchmark_commit", args.benchmark_commit)
+    if (args.quality_v2_thresholds is None) != (
+        args.expected_quality_v2_thresholds_sha256 is None
+    ):
+        raise ValueError(
+            "quality-v2 thresholds and expected SHA-256 must be supplied together"
+        )
+    quality_v2_thresholds: Mapping[str, object] | None = None
+    quality_v2_thresholds_sha256: str | None = None
+    if args.quality_v2_thresholds is not None:
+        if not args.quality_v2_thresholds.is_file():
+            raise FileNotFoundError(args.quality_v2_thresholds)
+        quality_v2_thresholds_sha256 = _sha256(args.quality_v2_thresholds)
+        expected_thresholds_sha256 = _expected_sha256(
+            str(args.expected_quality_v2_thresholds_sha256)
+        )
+        if quality_v2_thresholds_sha256 != expected_thresholds_sha256:
+            raise ValueError(
+                "quality-v2 threshold SHA-256 does not match the expected identity"
+            )
+        loaded_thresholds = json.loads(
+            args.quality_v2_thresholds.read_text(encoding="utf-8")
+        )
+        if not isinstance(loaded_thresholds, Mapping):
+            raise ValueError("quality-v2 threshold contract must be a mapping")
+        quality_v2_thresholds = dict(loaded_thresholds)
+        validate_formal_quality_v2_thresholds(
+            quality_v2_thresholds,
+            task_id=args.task,
+            thresholds_sha256=quality_v2_thresholds_sha256,
+        )
+    task_quality_identity = _task_quality_identity(args.task)
     manifest_size = max(args.episodes, 2)
     if manifest_size % 2:
         manifest_size += 1
@@ -366,6 +529,10 @@ def main() -> None:
             "auto_reset": False,
             "ignore_terminations": False,
             "group_size": 1,
+            "task_quality_schema_version": task_quality_schema_manifest(args.task)[
+                "schema_version"
+            ],
+            "task_quality_evaluator_backend_id": TASK_QUALITY_BACKEND_ID,
         },
         num_envs=1,
         seed_offset=0,
@@ -387,7 +554,18 @@ def main() -> None:
         latencies_s: list[float] = []
         for episode_index, row in enumerate(rows):
             _reset_rollout_on_fresh_env(vector_env=env, request=row.request)
-            record, episode_latencies = _episode(env=env, task_id=args.task)
+            record, episode_latencies = _episode(
+                env=env,
+                task_id=args.task,
+                quality_v2_thresholds=quality_v2_thresholds,
+                quality_v2_thresholds_sha256=quality_v2_thresholds_sha256,
+                attempt_output=(
+                    args.output if quality_v2_thresholds is not None else None
+                ),
+                attempt_index=(
+                    episode_index if quality_v2_thresholds is not None else None
+                ),
+            )
             if record["episode_id"] != row.request.episode_id:
                 raise RuntimeError(
                     "planner rollout order diverged from the frozen reset manifest"
@@ -408,12 +586,30 @@ def main() -> None:
             )
         latency = _latency_summary(latencies_s)
         result = {
-            "schema_version": EVALUATION_SCHEMA,
+            "schema_version": _evaluation_schema(
+                formal_attempts=quality_v2_thresholds is not None
+            ),
             "planner_identity": {"task": args.task, "kind": "privileged_teacher"},
             "source_identity": {
                 "evaluator_rlinf_commit": evaluator_commit,
                 "benchmark_commit": benchmark_commit,
             },
+            **(
+                {
+                    "task_quality_identity": task_quality_identity,
+                    "quality_v2_threshold_identity": {
+                        "schema_version": quality_v2_thresholds.get("schema_version"),
+                        "sha256": quality_v2_thresholds_sha256,
+                    },
+                    "all_successful_quality_v2_gates_passed": all(
+                        bool(row["quality_v2_gate"]["passed"])
+                        for row in records
+                        if row["success"]
+                    ),
+                }
+                if quality_v2_thresholds is not None
+                else {}
+            ),
             "split": args.split,
             "manifest_seed": args.manifest_seed,
             "reset_manifest_sha256": _sha256(reset_manifest_path),
@@ -427,16 +623,21 @@ def main() -> None:
             "started_unix_s": started,
             "finished_unix_s": time.time(),
         }
+        if (
+            args.quality_v2_thresholds is not None
+            and _sha256(args.quality_v2_thresholds) != quality_v2_thresholds_sha256
+        ):
+            raise RuntimeError("quality-v2 threshold file changed during evaluation")
         result["payload_sha256"] = _payload_sha256(result)
         result_path = args.output / "evaluation.json"
         _atomic_json(result_path, result)
-        (args.output / "SHA256SUMS").write_text(
-            (
-                f"{_sha256(result_path)}  evaluation.json\n"
-                f"{_sha256(reset_manifest_path)}  reset_manifest.jsonl\n"
-            ),
-            encoding="utf-8",
+        checksums = _evaluation_checksums(
+            args.output,
+            result_path=result_path,
+            reset_manifest_path=reset_manifest_path,
+            formal_attempts=quality_v2_thresholds is not None,
         )
+        (args.output / "SHA256SUMS").write_text(checksums, encoding="utf-8")
         print(
             json.dumps(
                 {

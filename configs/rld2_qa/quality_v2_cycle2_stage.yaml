@@ -1,0 +1,14 @@
+# Cycle-2 repair arm for tasks whose deterministic validation shows phase/stage
+# regressions.  This file is not a Cycle-1 result and must only be launched
+# after the corresponding seed-1 validation row is recorded.
+reward_components:
+  r_action_rate:
+    weight: 0.10
+    scale: 1.0
+  r_stage:
+    weight: 0.50
+
+features:
+  action_history:
+    k: 3
+  stage: {}

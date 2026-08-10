@@ -16,11 +16,12 @@
 """Prepare the immutable, pre-allocation RLD2 calibration launch package.
 
 This utility performs checkpoint inventory only: it hashes and CPU-loads frozen
-policies, expands the exact-14 launch candidate pool, emits one compatibility
-request per unique task/checkpoint, freezes fourteen planner-calibration jobs,
-and signs the complete package.  It never creates a simulator or performs
-policy inference.  Consequently the output is explicitly a launch input, not a
-production RLD2 candidate release.
+policies, builds an exact-14 deterministic-mean launch candidate pool, emits one
+compatibility request per unique task/checkpoint, freezes fourteen planner-
+calibration jobs, and signs the complete package.  Stochastic policy expansions
+from historical manifests are deliberately excluded.  The utility never creates
+a simulator or performs policy inference.  Consequently the output is explicitly
+a launch input, not a production RLD2 candidate release.
 """
 
 from __future__ import annotations
@@ -46,14 +47,15 @@ from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
 
 SOURCE_SPEC_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-source-spec-v0.1"
 LAUNCH_CANDIDATE_SCHEMA = (
-    "rlinf-dynamic-benchmark-rld2-launch-candidates-v0.1"
+    "rlinf-dynamic-benchmark-rld2-launch-candidates-v0.2"
 )
 CHECKPOINT_REQUEST_SCHEMA = (
     "rlinf-dynamic-benchmark-rld2-compatibility-request-v0.1"
 )
 CALIBRATION_JOB_SCHEMA = "rlinf-dynamic-benchmark-rld2-calibration-job-v0.1"
 LANE_PLAN_SCHEMA = "rlinf-dynamic-benchmark-rld2-lane-plan-v0.1"
-PACKAGE_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-package-v0.3"
+PACKAGE_SCHEMA = "rlinf-dynamic-benchmark-rld2-launch-package-v0.4"
+DETERMINISTIC_INFERENCE_MODE = "deterministic_mean"
 PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
 POLICY_SCHEMA = "rlinf-dynamic-benchmark-expert-policy-v0.1"
 BACKEND_ID = "mujoco311-rs140-v1-rld2-quality"
@@ -671,6 +673,8 @@ def _build_package(
             }:
                 raise LaunchGateError(f"old candidate row is invalid for {task}")
             row = copy.deepcopy(dict(candidate))
+            if row["kind"] == "policy" and bool(row.get("stochastic", False)):
+                continue
             if row["kind"] == "policy":
                 sha256 = _require_sha256(
                     row.get("policy_sha256"), f"{task} old policy"
@@ -716,6 +720,7 @@ def _build_package(
             "release_id": "RLD2",
             "task": task,
             "production_release": False,
+            "inference_mode": DETERMINISTIC_INFERENCE_MODE,
             "evaluator_target": {
                 "evaluator_rlinf_commit": rlinf_commit,
                 "evaluator_benchmark_commit": se3_commit,
@@ -730,6 +735,7 @@ def _build_package(
         "release_id": "RLD2",
         "task": "t1_xyz",
         "production_release": False,
+        "inference_mode": DETERMINISTIC_INFERENCE_MODE,
         "evaluator_target": {
             "evaluator_rlinf_commit": rlinf_commit,
             "evaluator_benchmark_commit": se3_commit,
@@ -801,10 +807,7 @@ def _build_package(
                 f"{task}-{group['experiment']}-{group['arm'] or 'none'}-"
                 f"s{policy['seed']}-best"
             ).lower().replace("_", "-")
-            for mode, stochastic, offset in [
-                ("deterministic", False, 0),
-                *(("stochastic", True, value) for value in range(1, 7)),
-            ]:
+            for mode, stochastic, offset in [("deterministic", False, 0)]:
                 row = {
                     "candidate_id": prefix
                     + f"-{mode}"
@@ -835,6 +838,19 @@ def _build_package(
             raise LaunchGateError(f"{task} planner must be candidate zero")
         if sum(row["kind"] == "planner" for row in candidates) != 1:
             raise LaunchGateError(f"{task} must contain exactly one planner")
+        if any(
+            row["kind"] == "policy"
+            and (
+                bool(row.get("stochastic", False))
+                or int(row.get("exploration_seed_offset", 0)) != 0
+                or row.get("provenance", {}).get("expansion", {}).get("mode")
+                != "deterministic"
+            )
+            for row in candidates
+        ):
+            raise LaunchGateError(
+                f"{task} launch candidates violate deterministic-mean inference"
+            )
         semantics = [_semantics(row) for row in candidates]
         if len(semantics) != len(set(semantics)):
             raise LaunchGateError(f"{task} launch candidates are not de-duplicated")
@@ -968,6 +984,7 @@ def _build_package(
             "release_id": "RLD2",
             "status": "blocked-awaiting-allocation",
             "production_release": False,
+            "candidate_inference_mode": DETERMINISTIC_INFERENCE_MODE,
             "tasks": list(EXACT_TASKS),
             "task_count": len(EXACT_TASKS),
             "candidate_count": {
@@ -1026,6 +1043,8 @@ def validate_package(root: Path) -> dict[str, Any]:
         or package.get("task_count") != len(EXACT_TASKS)
         or package.get("status") != "blocked-awaiting-allocation"
         or package.get("production_release") is not False
+        or package.get("candidate_inference_mode")
+        != DETERMINISTIC_INFERENCE_MODE
         or package.get("allocation_required_before_execution") is not True
         or package.get("allowed_lanes") != list(DEFAULT_LANES)
         or not isinstance(lane_summaries, dict)
@@ -1045,9 +1064,38 @@ def validate_package(root: Path) -> dict[str, Any]:
     runtime_identity = _runtime_deps_identity(runtime_deps_root)
     if runtime_deps != runtime_identity:
         raise LaunchGateError("runtime dependency identity mismatch")
-    manifests = list(root.glob("candidates/*/candidate_manifest.json"))
-    if {path.parent.name for path in manifests} != set(EXACT_TASKS):
+    manifest_paths = list(root.glob("candidates/*/candidate_manifest.json"))
+    if {path.parent.name for path in manifest_paths} != set(EXACT_TASKS):
         raise LaunchGateError("launch candidate manifest set is not exact14")
+    manifests = {
+        path.parent.name: _load_json(path, "launch candidate manifest")
+        for path in manifest_paths
+    }
+    for task, manifest in manifests.items():
+        candidates = manifest.get("candidates")
+        if (
+            manifest.get("schema_version") != LAUNCH_CANDIDATE_SCHEMA
+            or manifest.get("task") != task
+            or manifest.get("production_release") is not False
+            or manifest.get("inference_mode") != DETERMINISTIC_INFERENCE_MODE
+            or not isinstance(candidates, list)
+            or not candidates
+            or candidates[0].get("kind") != "planner"
+            or len(candidates) != package.get("candidate_count", {}).get(task)
+        ):
+            raise LaunchGateError(
+                f"{task} launch candidate identity or count mismatch"
+            )
+        for candidate in candidates:
+            if candidate.get("kind") == "policy" and (
+                candidate.get("stochastic", False) is not False
+                or candidate.get("exploration_seed_offset", 0) != 0
+                or candidate.get("provenance", {}).get("expansion", {}).get("mode")
+                != "deterministic"
+            ):
+                raise LaunchGateError(
+                    f"{task} launch package contains a stochastic policy candidate"
+                )
     request_lines = (root / "compatibility" / "checkpoint_requests.jsonl").read_text(
         encoding="utf-8"
     ).splitlines()
@@ -1106,7 +1154,7 @@ def validate_package(root: Path) -> dict[str, Any]:
             raise LaunchGateError("lane plan coverage or identity mismatch")
     return {
         "status": "validated",
-        "task_count": len(manifests),
+        "task_count": len(manifest_paths),
         "unique_checkpoint_count": len(requests),
         "launch_package_sha256": _sha256(root / "launch_package.json"),
     }

@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,19 +34,171 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     RunningNormalizer,
     TransitionReplay,
     _BorrowedEvaluationRuntime,
+    _checkpoint_selection_run_identity,
+    _CheckpointSelectionLedger,
     _compose_residual_actions,
     _config,
+    _config_artifact_identity,
     _demo_replay_identity,
     _env_cfg,
     _EvaluationRuntime,
     _load_demo_replay_cache,
     _load_demo_replay_cache_for_training,
+    _make_exact_zero_residual_policy,
     _overlap_sample_and_update,
     _parse_args,
     _rng_state,
     _save_demo_replay_cache,
     _score,
 )
+
+
+def test_config_artifact_identity_matches_promotion_canonical_payload(tmp_path) -> None:
+    payload = {"seed": 2, "task": "p0_grasp", "weights": [1.0, 2.0]}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    identity = _config_artifact_identity(config_path, payload)
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+
+    assert identity["config_sha256"] == hashlib.sha256(canonical).hexdigest()
+    assert (
+        identity["config_file_sha256"]
+        == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    )
+    assert identity["config_sha256"] != identity["config_file_sha256"]
+
+
+def test_config_artifact_identity_accepts_json_array_for_runtime_tuple(
+    tmp_path,
+) -> None:
+    payload = {
+        "seed": 1,
+        "task": "t2_se3",
+        "state_derived_features": ("goal_planar_error", "eef_speed"),
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    identity = _config_artifact_identity(config_path, payload)
+
+    assert (
+        identity["config_sha256"]
+        == hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+    )
+
+
+def test_resume_metrics_identity_accepts_json_tuple_roundtrip() -> None:
+    checkpoint_metrics = {
+        "success_rate": 1.0,
+        "worker_pids": (101, 102),
+    }
+    manifest_metrics = json.loads(json.dumps(checkpoint_metrics))
+
+    assert expert_trainer._canonical_json_sha256(
+        checkpoint_metrics
+    ) == expert_trainer._canonical_json_sha256(manifest_metrics)
+    manifest_metrics["worker_pids"][1] = 103
+    assert expert_trainer._canonical_json_sha256(
+        checkpoint_metrics
+    ) != expert_trainer._canonical_json_sha256(manifest_metrics)
+
+
+def test_episode_logging_checkpoint_state_roundtrips_exactly_and_immutably() -> None:
+    recent_episodes = [
+        {
+            "success": True,
+            "trajectory_completion": 1.0,
+            "return": 7.5,
+            "duration_steps": 4,
+        }
+    ]
+    episode_returns = torch.tensor([1.25, -2.5], dtype=torch.float32)
+    episode_steps = torch.tensor([3, 6], dtype=torch.int64)
+
+    state = expert_trainer._checkpoint_episode_logging_state(
+        recent_episodes,
+        episode_returns,
+        episode_steps,
+    )
+    recent_episodes[0]["return"] = 999.0
+    episode_returns.zero_()
+    episode_steps.zero_()
+    restored_recent, restored_returns, restored_steps = (
+        expert_trainer._restore_episode_logging_state(state, num_envs=2)
+    )
+
+    assert restored_recent[0]["return"] == 7.5
+    assert torch.equal(restored_returns, torch.tensor([1.25, -2.5]))
+    assert torch.equal(restored_steps, torch.tensor([3, 6], dtype=torch.int64))
+    restored_recent[0]["return"] = -999.0
+    restored_returns.zero_()
+    restored_steps.zero_()
+    assert state["recent_episodes"][0]["return"] == 7.5
+    assert torch.equal(state["episode_returns"], torch.tensor([1.25, -2.5]))
+    assert torch.equal(
+        state["episode_steps"], torch.tensor([3, 6], dtype=torch.int64)
+    )
+
+
+def test_episode_logging_checkpoint_state_fails_closed_on_invalid_tensors() -> None:
+    state = expert_trainer._checkpoint_episode_logging_state(
+        [],
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([3, 4], dtype=torch.int64),
+    )
+    wrong_shape = copy.deepcopy(state)
+    wrong_shape["episode_returns"] = torch.tensor([1.0])
+    with pytest.raises(ValueError, match="shape does not match num_envs"):
+        expert_trainer._restore_episode_logging_state(wrong_shape, num_envs=2)
+
+    nonfinite = copy.deepcopy(state)
+    nonfinite["episode_returns"][1] = float("nan")
+    with pytest.raises(ValueError, match="returns must be finite"):
+        expert_trainer._restore_episode_logging_state(nonfinite, num_envs=2)
+
+    negative_steps = copy.deepcopy(state)
+    negative_steps["episode_steps"][0] = -1
+    with pytest.raises(ValueError, match="steps must be nonnegative"):
+        expert_trainer._restore_episode_logging_state(negative_steps, num_envs=2)
+
+
+@pytest.mark.parametrize(
+    "rendered_features",
+    [
+        ["eef_speed", "goal_planar_error"],
+        ["goal_planar_error"],
+        ["goal_planar_error", "eef_speed", "unexpected"],
+    ],
+)
+def test_config_artifact_identity_rejects_semantic_sequence_tampering(
+    tmp_path, rendered_features
+) -> None:
+    payload = {
+        "seed": 1,
+        "task": "t2_se3",
+        "state_derived_features": ("goal_planar_error", "eef_speed"),
+    }
+    rendered = dict(payload)
+    rendered["state_derived_features"] = rendered_features
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(rendered, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="rendered training config does not match the resolved payload"
+    ):
+        _config_artifact_identity(config_path, payload)
 
 
 def test_running_normalizer_standardizes_values_but_preserves_mask() -> None:
@@ -146,6 +299,286 @@ def test_policy_score_is_success_then_safety_lexicographic() -> None:
 
     assert _score(safer_but_less_complete) > _score(unsafe)
     assert _score(more_success) > _score(baseline)
+
+
+def _selection_metrics(
+    *,
+    success: float,
+    safety: float,
+    completion: float = 0.5,
+    mean_return: float = 1.0,
+    duration: float = 20.0,
+    effort: float = 5.0,
+) -> dict[str, float]:
+    return {
+        "episodes": 20,
+        "success_rate": success,
+        "safety_failure_rate": safety,
+        "mean_completion": completion,
+        "mean_return": mean_return,
+        "mean_duration_steps": duration,
+        "mean_action_l2_sum": effort,
+    }
+
+
+def _write_selection_policy(
+    path,
+    config,
+    state_schema,
+    metrics,
+    env_steps: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "schema_version": "rlinf-dynamic-benchmark-expert-policy-v0.1",
+            "config": asdict(config),
+            "model": {"fixture": torch.tensor([float(env_steps)])},
+            "normalizer": {"fixture": True},
+            "state_schema": state_schema,
+            "validation": metrics,
+            "env_steps": env_steps,
+        },
+        path,
+    )
+
+
+def _selection_ledger(tmp_path, planner_safety: float):
+    output = tmp_path / "run"
+    output.mkdir()
+    config = _config(
+        _parse_args(
+            [
+                "--task",
+                "t3_full",
+                "--algorithm",
+                "residual_rlpd",
+                "--rlinf-commit",
+                "a" * 40,
+                "--benchmark-commit",
+                "b" * 40,
+                "--output",
+                str(output),
+            ]
+        )
+    )
+    state_schema = {"state_dim": 3, "mask_dim": 0, "fields": ["fixture"]}
+    planner_metrics = _selection_metrics(
+        success=0.5,
+        safety=planner_safety,
+        completion=0.8,
+    )
+    initial_policy = output / "initial_policy.pt"
+    _write_selection_policy(
+        initial_policy,
+        config,
+        state_schema,
+        planner_metrics,
+        0,
+    )
+    run_identity = _checkpoint_selection_run_identity(
+        config,
+        state_schema,
+        "c" * 64,
+    )
+    ledger = _CheckpointSelectionLedger.create(
+        output,
+        run_identity,
+        planner_metrics,
+        initial_policy,
+    )
+    return ledger, config, state_schema, run_identity
+
+
+def _record_selection_candidate(
+    ledger,
+    config,
+    state_schema,
+    metrics,
+    env_steps: int,
+):
+    path = ledger.output / "policy_snapshots" / f"policy_step_{env_steps:012d}.pt"
+    _write_selection_policy(path, config, state_schema, metrics, env_steps)
+    return ledger.record_existing_snapshot(path, metrics, env_steps)
+
+
+def test_checkpoint_selector_rejects_unsafe_high_success(tmp_path) -> None:
+    ledger, config, state_schema, _ = _selection_ledger(tmp_path, 0.1)
+    safe = _selection_metrics(success=0.2, safety=0.1, completion=0.4)
+    unsafe = _selection_metrics(success=1.0, safety=0.15, completion=1.0)
+
+    safe_row = _record_selection_candidate(ledger, config, state_schema, safe, 100)
+    unsafe_row = _record_selection_candidate(ledger, config, state_schema, unsafe, 200)
+
+    assert safe_row["eligible"] is True
+    assert unsafe_row["eligible"] is False
+    assert ledger.best_metrics == safe
+    assert (
+        ledger.manifest["selection"]["selected_snapshot_identity"]["env_steps"] == 100
+    )
+    assert (
+        hashlib.sha256((ledger.output / "best_policy.pt").read_bytes()).hexdigest()
+        == safe_row["policy"]["sha256"]
+    )
+
+
+def test_checkpoint_selector_zero_ceiling_allows_only_numerical_zero(tmp_path) -> None:
+    ledger, config, state_schema, _ = _selection_ledger(tmp_path, 0.0)
+    zero = _selection_metrics(success=0.1, safety=0.0)
+    nonzero = _selection_metrics(success=1.0, safety=1e-6)
+
+    zero_row = _record_selection_candidate(ledger, config, state_schema, zero, 100)
+    nonzero_row = _record_selection_candidate(
+        ledger, config, state_schema, nonzero, 200
+    )
+
+    assert zero_row["eligible"] is True
+    assert nonzero_row["eligible"] is False
+    assert ledger.best_metrics == zero
+
+
+def test_checkpoint_selector_without_safe_candidate_uses_planner_fallback(
+    tmp_path,
+) -> None:
+    ledger, config, state_schema, _ = _selection_ledger(tmp_path, 0.0)
+    unsafe = _selection_metrics(success=1.0, safety=0.05)
+
+    row = _record_selection_candidate(ledger, config, state_schema, unsafe, 100)
+
+    assert row["eligible"] is False
+    assert ledger.best_score is None
+    assert ledger.best_metrics is None
+    assert not (ledger.output / "best_policy.pt").exists()
+    assert ledger.manifest["selection"]["status"] == "planner_fallback_no_eligible"
+    assert ledger.manifest["selection"]["selected_snapshot_identity"] is None
+    assert (
+        ledger.manifest["selection"]["planner_fallback_policy"]["path"]
+        == "initial_policy.pt"
+    )
+
+
+def test_checkpoint_selector_exact_tie_keeps_earlier_snapshot(tmp_path) -> None:
+    ledger, config, state_schema, _ = _selection_ledger(tmp_path, 0.0)
+    tied = _selection_metrics(success=0.7, safety=0.0, completion=0.9)
+
+    first = _record_selection_candidate(ledger, config, state_schema, tied, 100)
+    second = _record_selection_candidate(ledger, config, state_schema, tied, 200)
+
+    assert (
+        ledger.manifest["selection"]["selected_snapshot_identity"]["env_steps"] == 100
+    )
+    assert ledger.manifest["evaluated_snapshots"][0]["selected"] is True
+    assert ledger.manifest["evaluated_snapshots"][1]["selected"] is False
+    assert first["policy"]["sha256"] != second["policy"]["sha256"]
+    assert (
+        hashlib.sha256((ledger.output / "best_policy.pt").read_bytes()).hexdigest()
+        == first["policy"]["sha256"]
+    )
+
+
+def test_checkpoint_selector_capture_is_immutable_and_unique_per_step(tmp_path) -> None:
+    ledger, config, state_schema, _ = _selection_ledger(tmp_path, 0.0)
+    metrics = _selection_metrics(success=0.5, safety=0.0)
+    model = torch.nn.Linear(3, 7)
+    normalizer = RunningNormalizer(dimension=3, mask_dim=0)
+    normalizer.update(torch.tensor([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]))
+
+    first = ledger.capture(
+        config,
+        model,
+        normalizer,
+        state_schema,
+        metrics,
+        100,
+    )
+    first_bytes = (ledger.output / first["policy"]["path"]).read_bytes()
+    with torch.no_grad():
+        model.weight.fill_(99.0)
+    repeated = ledger.capture(
+        config,
+        model,
+        normalizer,
+        state_schema,
+        metrics,
+        100,
+    )
+
+    assert repeated == first
+    assert (ledger.output / first["policy"]["path"]).read_bytes() == first_bytes
+    changed_metrics = dict(metrics, success_rate=0.6)
+    with pytest.raises(ValueError, match="changed its metrics identity"):
+        ledger.capture(
+            config,
+            model,
+            normalizer,
+            state_schema,
+            changed_metrics,
+            100,
+        )
+
+
+@pytest.mark.parametrize("tamper_target", ["manifest", "snapshot"])
+def test_checkpoint_selector_resume_rejects_tampered_evidence(
+    tmp_path,
+    tamper_target: str,
+) -> None:
+    ledger, config, state_schema, run_identity = _selection_ledger(tmp_path, 0.0)
+    metrics = _selection_metrics(success=0.7, safety=0.0)
+    row = _record_selection_candidate(ledger, config, state_schema, metrics, 100)
+    checkpoint_state = ledger.checkpoint_state()
+    if tamper_target == "manifest":
+        payload = json.loads(ledger.manifest_path.read_text(encoding="utf-8"))
+        payload["evaluated_snapshots"][0]["eligible"] = False
+        ledger.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        with (ledger.output / row["policy"]["path"]).open("ab") as stream:
+            stream.write(b"tamper")
+
+    with pytest.raises(ValueError, match="checkpoint-selection|policy"):
+        _CheckpointSelectionLedger.resume(
+            ledger.output,
+            run_identity,
+            checkpoint_state,
+        )
+
+
+def test_checkpoint_selector_resume_preserves_existing_snapshot_identities(
+    tmp_path,
+) -> None:
+    ledger, config, state_schema, run_identity = _selection_ledger(tmp_path, 0.0)
+    first_metrics = _selection_metrics(success=0.2, safety=0.0)
+    _record_selection_candidate(ledger, config, state_schema, first_metrics, 100)
+    first_identity = json.loads(
+        json.dumps(ledger.manifest["evaluated_snapshots"][0], sort_keys=True)
+    )
+    first_identity.pop("selected")
+
+    resumed = _CheckpointSelectionLedger.resume(
+        ledger.output,
+        run_identity,
+        ledger.checkpoint_state(),
+    )
+    second_metrics = _selection_metrics(success=0.3, safety=0.0)
+    _record_selection_candidate(
+        resumed,
+        config,
+        state_schema,
+        second_metrics,
+        200,
+    )
+
+    resumed_first = copy.deepcopy(resumed.manifest["evaluated_snapshots"][0])
+    resumed_first.pop("selected")
+    assert resumed_first == first_identity
+    assert len(resumed.manifest["evaluated_snapshots"]) == 2
+    bad_state = resumed.checkpoint_state()
+    bad_state["manifest_payload_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="identities diverged"):
+        _CheckpointSelectionLedger.resume(
+            resumed.output,
+            run_identity,
+            bad_state,
+        )
 
 
 def test_throughput_probe_requires_full_frozen_source_commits() -> None:
@@ -266,9 +699,7 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     ]
     with pytest.raises(ValueError, match="requires training process workers"):
         _config(_parse_args([*without_processes, "--sampler-learner-overlap"]))
-    planner_config = _config(
-        _parse_args([*common, "--eval-planner-in-processes"])
-    )
+    planner_config = _config(_parse_args([*common, "--eval-planner-in-processes"]))
     planner_env_cfg = _env_cfg(
         planner_config,
         split="validation",
@@ -291,14 +722,10 @@ def test_process_worker_configuration_is_explicit_and_thread_exclusive(
     ]
     with pytest.raises(ValueError, match="process evaluation planner requires"):
         _config(_parse_args([*without_eval_processes, "--eval-planner-in-processes"]))
-    persistent_config = _config(
-        _parse_args([*common, "--persistent-eval-workers"])
-    )
+    persistent_config = _config(_parse_args([*common, "--persistent-eval-workers"]))
     assert persistent_config.persistent_eval_workers is True
     with pytest.raises(ValueError, match="persistent evaluation requires"):
-        _config(
-            _parse_args([*without_eval_processes, "--persistent-eval-workers"])
-        )
+        _config(_parse_args([*without_eval_processes, "--persistent-eval-workers"]))
     borrowed_common = [
         "--task",
         "t4_sphere",
@@ -617,7 +1044,7 @@ def test_borrowed_evaluation_prepare_failure_restores_training_state(
         "rlinf-dynamic-benchmark-checkpoint-v0.3",
     ),
 )
-def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
+def test_evaluation_rewind_loads_the_exact_frozen_checkpoint(
     checkpoint_schema: str,
 ) -> None:
     identity = {"task_id": "t4_sphere", "num_envs": 2}
@@ -658,18 +1085,16 @@ def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
             self._manifest_generation = 99
             self._manifest_cursor = 99
             self._requests = []
-            self.reset_options = None
+            self.loaded_checkpoint = None
 
         def _checkpoint_identity(self):
             return identity
 
-        def _refresh_manifest(self):
-            self._manifest_cursor = 0
-
-        def reset(self, *, options):
-            self.reset_options = options
+        def load_checkpoint_state(self, state):
+            self.loaded_checkpoint = state
+            self._manifest_generation = int(state["manifest_generation"])
             self._requests = [request(row) for row in request_rows]
-            self._manifest_cursor = self.num_envs
+            self._manifest_cursor = int(state["manifest_cursor"])
 
     checkpoint = {
         "schema_version": checkpoint_schema,
@@ -691,7 +1116,7 @@ def test_evaluation_rewind_resets_the_frozen_manifest_without_loading_state(
     expert_trainer._rewind_evaluation_environment(env, checkpoint)
     assert env._manifest_generation == 3
     assert env._manifest_cursor == 2
-    assert env.reset_options == {"env_idx": [0, 1]}
+    assert env.loaded_checkpoint is checkpoint
 
 
 def test_sampler_learner_overlap_runs_updates_while_sampling_is_in_flight() -> None:
@@ -779,6 +1204,17 @@ def test_residual_action_composition_is_scaled_and_clamped() -> None:
     )
     with pytest.raises(ValueError, match="residual_scale"):
         _compose_residual_actions(planner, residual, 0.0)
+
+
+def test_exact_zero_residual_policy_matches_planner_for_every_state() -> None:
+    model = SimpleNamespace(actor_mean=torch.nn.Linear(3, 7))
+    with torch.no_grad():
+        model.actor_mean.weight.fill_(2.0)
+        model.actor_mean.bias.fill_(3.0)
+
+    _make_exact_zero_residual_policy(model)
+
+    assert torch.equal(model.actor_mean(torch.randn(5, 3)), torch.zeros(5, 7))
 
 
 def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
@@ -916,12 +1352,8 @@ def test_demo_replay_cache_round_trip_and_identity_gate(tmp_path) -> None:
     )
     restored_rng_state = _rng_state()
     assert restored_rng_state["python"] == learner_rng_state["python"]
-    assert np.array_equal(
-        restored_rng_state["numpy"][1], learner_rng_state["numpy"][1]
-    )
-    assert torch.equal(
-        restored_rng_state["torch_cpu"], learner_rng_state["torch_cpu"]
-    )
+    assert np.array_equal(restored_rng_state["numpy"][1], learner_rng_state["numpy"][1])
+    assert torch.equal(restored_rng_state["torch_cpu"], learner_rng_state["torch_cpu"])
     assert torch.equal(
         multiseed_replay.generator.get_state(), learner_replay_generator_state
     )

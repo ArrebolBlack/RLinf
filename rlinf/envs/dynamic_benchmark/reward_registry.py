@@ -86,6 +86,15 @@ def _r_effort(inputs: Mapping[str, Any], _params: Mapping[str, Any]) -> float:
     return -float(action_l2)
 
 
+def _r_action_rate(inputs: Mapping[str, Any], params: Mapping[str, Any]) -> float:
+    """Penalize continuous-arm action changes using only past information."""
+
+    delta = inputs.get("action_delta_l2")
+    if delta is None or not math.isfinite(float(delta)):
+        return 0.0
+    return -float(delta) / float(params["scale"])
+
+
 def _r_completion_shaping(
     inputs: Mapping[str, Any], params: Mapping[str, Any]
 ) -> float:
@@ -133,6 +142,7 @@ COMPONENT_IMPL: dict[str, Any] = {
     "r_ori_geodesic": _r_ori_geodesic,
     "r_rel_pose": _r_rel_pose,
     "r_effort": _r_effort,
+    "r_action_rate": _r_action_rate,
     "r_completion_shaping": _r_completion_shaping,
     "r_vel_align": _r_vel_align,
     "r_timing": _r_timing,
@@ -143,6 +153,7 @@ COMPONENT_DEFAULT_PARAMS: dict[str, Mapping[str, Any]] = {
     "r_ori_geodesic": {"scale_rad": 1.0},
     "r_rel_pose": {"scale_pos_m": 0.1, "scale_rot_rad": 1.0},
     "r_effort": {},
+    "r_action_rate": {"scale": 1.0},
     "r_completion_shaping": {"near_threshold": 0.9, "scale": 1.0},
     "r_vel_align": {"speed_scale_m_s": 1.0},
     "r_timing": {"dist_threshold_m": 0.05, "target_ttc_s": 0.1, "ttc_scale_s": 0.1},

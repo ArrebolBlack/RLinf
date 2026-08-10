@@ -31,6 +31,7 @@ from examples.embodiment.build_dynamic_benchmark_rld2_manifests import (
 )
 from examples.embodiment.prepare_dynamic_benchmark_rld2_launch_gate import (
     DEFAULT_LANES,
+    DETERMINISTIC_INFERENCE_MODE,
     LAUNCH_CANDIDATE_SCHEMA,
     PACKAGE_SCHEMA,
     REQUIRED_ADDITIONS,
@@ -38,13 +39,6 @@ from examples.embodiment.prepare_dynamic_benchmark_rld2_launch_gate import (
     LaunchGateError,
     _build_package,
     validate_package,
-)
-from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
-    _environment_config,
-    copy_json,
-)
-from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
-    _write_json as write_launch_result_json,
 )
 
 POLICY_COMMIT = "1" * 40
@@ -54,6 +48,10 @@ EVALUATOR_BENCHMARK_COMMIT = "4" * 40
 
 
 def test_rld2_environment_config_explicitly_enables_task_quality() -> None:
+    from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
+        _environment_config,
+    )
+
     config = _environment_config(
         task="t1_xyz",
         split="validation",
@@ -74,6 +72,13 @@ def test_rld2_environment_config_explicitly_enables_task_quality() -> None:
 def test_task_quality_component_order_survives_json_round_trips(
     tmp_path: Path,
 ) -> None:
+    from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
+        _write_json as write_launch_result_json,
+    )
+    from examples.embodiment.run_dynamic_benchmark_rld2_launch_gate import (
+        copy_json,
+    )
+
     value = {
         "components": {
             "terminal_goal_planar_error_m": {"value": 0.1},
@@ -152,6 +157,14 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, dict[str, Any]]]:
                     "policy_sha256": sha256,
                     "stochastic": False,
                     "exploration_seed_offset": 0,
+                },
+                {
+                    "candidate_id": f"{task}-policy-stochastic-1",
+                    "kind": "policy",
+                    "policy_path": str(policy),
+                    "policy_sha256": sha256,
+                    "stochastic": True,
+                    "exploration_seed_offset": 1,
                 },
             ],
         }
@@ -282,6 +295,7 @@ def test_prepare_exact14_launch_gate_and_validate(
     assert package["schema_version"] == PACKAGE_SCHEMA
     assert package["status"] == "blocked-awaiting-allocation"
     assert package["production_release"] is False
+    assert package["candidate_inference_mode"] == DETERMINISTIC_INFERENCE_MODE
     assert package["allowed_lanes"] == list(DEFAULT_LANES)
     assert tuple(package["lanes"]) == DEFAULT_LANES
     assert "forbidden_lane" not in package
@@ -294,10 +308,18 @@ def test_prepare_exact14_launch_gate_and_validate(
     assert all(
         manifest["schema_version"] == LAUNCH_CANDIDATE_SCHEMA
         and manifest["production_release"] is False
+        and manifest["inference_mode"] == DETERMINISTIC_INFERENCE_MODE
         for manifest in manifests.values()
     )
-    assert len(manifests["t1_xyz"]["candidates"]) == 36
-    assert len(manifests["t1_so3"]["candidates"]) == 37
+    assert len(manifests["t1_xyz"]["candidates"]) == 6
+    assert len(manifests["t1_so3"]["candidates"]) == 7
+    assert all(
+        candidate.get("stochastic", False) is False
+        and candidate.get("exploration_seed_offset", 0) == 0
+        for manifest in manifests.values()
+        for candidate in manifest["candidates"]
+        if candidate["kind"] == "policy"
+    )
     assert len(package["lanes"]) == 8
     assert sum(
         row["calibration_job_count"] for row in package["lanes"].values()
