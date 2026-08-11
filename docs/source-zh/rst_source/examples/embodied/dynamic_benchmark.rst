@@ -358,11 +358,21 @@ identity，再按合同记录的安全 dataset-relative ``provenance/.../wave_re
 同级 recovery 目录，将 JSONL 截断到最后一次原子提交的 reset 边界，并重跑该 reset。每次
 attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据；winner 额外保存 RGB-D/HDF5。
 
+若要逐项比较 uninterrupted 与 resumed 最终 artifact，每次运行都应把
+``--execution-receipt-json`` 指向 dataset root 之外的路径。执行专属的 resume/recovery provenance
+只进入该 sidecar，sealed dataset 仅保留 ``render_parity_skip`` 等科学事件。
+``--phase-profile-json`` 同样是 opt-in 外部 sidecar，只记录 exporter 与 environment 分段时间，
+不改变 dataset payload；两个 sidecar 都拒绝覆盖已有目标。
+
 如果独立选出的轻量 winner 未通过 canonical render replay，该 reset 会被拒绝而不是发布。新导出
 会把结构化 ``render_parity_skip`` 证据绑定到被选 attempt，并在 sealed recovery log 中保留
 失败事件。分片导出必须使用 ``merge_optimal_export_shards.py`` 封存，保证这些事件在前缀截断后
 仍被保留。auditor 只有在独立选出同一 attempt、确认没有发布 winner、并校验匹配的 recovery
 证据后才接受 skip；skip reset 永远不计入 accepted 配额。
+
+merger 默认仍采用 accepted-prefix 语义。若 campaign 的科学合同固定完整 reset 工作量，必须增加
+``--require-max-resets``；该模式保留到 ``export_state.max_resets`` 的全部 reset，并在完整工作量
+的 winner 数不恰好等于 ``--accepted-episodes`` 时 fail closed。
 
 消费数据集前必须运行独立 auditor。计算最终 ``dataset_card.json`` 与根目录
 ``SHA256SUMS`` 的哈希，并同时传入冻结的 Qv3 threshold identity：

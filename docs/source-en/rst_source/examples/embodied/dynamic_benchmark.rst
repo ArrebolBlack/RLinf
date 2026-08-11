@@ -382,6 +382,14 @@ reset boundary, and reruns that reset. Every attempt keeps a lightweight
 state/action/reward tape and exact replay evidence; each winner additionally keeps
 RGB-D/HDF5 evidence.
 
+For an exact uninterrupted-versus-resumed artifact comparison, pass
+``--execution-receipt-json`` with a path outside the dataset root on every run. The
+external receipt retains execution-only resume/recovery provenance, while the sealed
+dataset keeps only scientific events such as ``render_parity_skip``. The opt-in
+``--phase-profile-json`` argument similarly writes exporter and environment timing to
+an external sidecar and never changes the dataset payload; both sidecars refuse an
+existing destination.
+
 If the independently selected lightweight winner fails canonical render replay, the
 reset is rejected instead of being published. New exports bind a structured
 ``render_parity_skip`` record to the selected attempt, while the sealed recovery log
@@ -390,6 +398,11 @@ retains the failure event. Sharded exports must be sealed with
 auditor accepts a skipped reset only when it independently selects the same attempt,
 finds no published winner, and validates the matching recovery evidence; skipped
 resets never count toward the accepted quota.
+
+The merger's default remains accepted-prefix semantics. A campaign whose scientific
+contract fixes the full reset workload must add ``--require-max-resets``. That mode
+keeps every reset through ``export_state.max_resets`` and fails closed unless the
+complete workload contains exactly ``--accepted-episodes`` winners.
 
 Run the independent auditor before consuming the dataset. Hash the final
 ``dataset_card.json`` and root ``SHA256SUMS`` files and pass the frozen Qv3 threshold
