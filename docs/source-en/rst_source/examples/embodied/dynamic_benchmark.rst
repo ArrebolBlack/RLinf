@@ -193,9 +193,19 @@ control plane; the learned-policy rollout and replay/update path remain device-o
 An optional ``--demo-teacher-overrides FILE`` accepts a strict, bounded JSON object
 containing only audited planner parameters. The parsed bytes are hash-pinned in
 ``demo_quality.json``; unknown or duplicate keys, evaluator/task settings, and use
-outside privileged-teacher RLPD fail closed. The resulting v0.3 checkpoint is
-evaluation-compatible but is not policy-quality qualified until a separate held-out
-evaluation passes.
+outside privileged-teacher RLPD fail closed.
+
+For a success-only GPU demonstration bank, add
+``--demo-success-only-replay --minimum-qualified-demo-episodes N`` and leave
+``--minimum-demo-success-rate`` at zero. ``N`` must be at least 24 and cannot exceed
+the configured number of attempts. Every attempt remains in ``episode_ledger.jsonl``;
+only every valid transition from lanes with a real terminal success is selected by a
+CUDA mask and physically inserted into demonstration replay. The trainer fails before
+online updates unless the qualified count, unique manifest coverage, and full replay
+retention gates all pass. Failed-attempt transitions are never imitation data, and the
+task evaluator and scientific thresholds are unchanged. The resulting v0.4 checkpoint
+is evaluation-compatible but is not policy-quality qualified until a separate
+held-out evaluation passes.
 
 Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
 with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or

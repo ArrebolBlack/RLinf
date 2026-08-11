@@ -52,8 +52,9 @@ from examples.embodiment.evaluate_dynamic_benchmark_tensor_expert import (
 )
 
 
-def test_policy_schema_accepts_planner_tuned_offpolicy_v03() -> None:
+def test_policy_schema_accepts_planner_tuned_and_success_only_offpolicy() -> None:
     assert "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.3" in POLICY_SCHEMAS
+    assert "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.4" in POLICY_SCHEMAS
 
 
 def _export_identity() -> dict:
