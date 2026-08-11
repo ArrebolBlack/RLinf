@@ -192,7 +192,16 @@ GPU-native RLPD 可在在线训练前追加
 plane；learned-policy rollout 以及 replay/update 热路径仍保持 device-only。可选的
 ``--demo-teacher-overrides FILE`` 只接受有界、白名单内的规划器参数 JSON；实际解析字节的
 哈希写入 ``demo_quality.json``，未知/重复键、任务或 evaluator 设置，以及在非 privileged
-teacher RLPD 中使用都会 fail closed。生成的 v0.3 checkpoint 可交给 tensor evaluator，
+teacher RLPD 中使用都会 fail closed。
+
+如需构建 successful-only GPU 示教库，追加
+``--demo-success-only-replay --minimum-qualified-demo-episodes N``，并保持
+``--minimum-demo-success-rate`` 为 0。``N`` 不得小于 24，也不得超过已配置的 attempt 数。
+所有 attempt 仍逐条写入 ``episode_ledger.jsonl``；只有真实终态 success lane 的全部有效
+transition 才由 CUDA mask 选中并物理写入 demonstration replay。qualified 数量、唯一 manifest
+覆盖或 replay 完整保留任一门未通过，trainer 都会在 online update 前 fail closed；失败 attempt
+的 transition 不会成为 imitation 数据，任务 evaluator 与科学阈值均不改变。生成的 v0.4
+checkpoint 可交给 tensor evaluator，
 但只有独立 held-out evaluation 通过后才能声称策略质量达标。
 
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过

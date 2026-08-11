@@ -364,6 +364,8 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
     assert all(fragment in source for fragment in required_checkpoint_fragments)
     assert '"zero_action": "zero_action_device_cohort_v1"' in source
     assert '"privileged_teacher": "current_gpu_state_privileged_teacher_v2"' in source
+    assert 'CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.4"' in source
+    assert 'DEMO_QUALITY_SCHEMA = "rlinf-gpuenv0-demo-quality-v0.3"' in source
     assert '"demo_quality": demo_quality' in source
     assert '"rlpd_demo_quality_qualified": bool(' in source
 
@@ -407,3 +409,38 @@ def test_tensor_offpolicy_teacher_control_plane_is_separate_and_accounted() -> N
     assert len(host_transfers(teacher)) == 1
     assert "torch.as_tensor" in teacher_source
     assert "terminal_mask_host_materializations" in teacher_source
+
+
+def test_success_only_demo_selection_stays_on_the_rollout_device() -> None:
+    script = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "embodiment"
+        / "train_dynamic_benchmark_tensor_offpolicy_smoke.py"
+    )
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    methods = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    selector = methods["_successful_demo_lane_mask"]
+    insertion = methods["_add_rollout_to_replay"]
+    calls = [
+        call
+        for method in (selector, insertion)
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+    ]
+    forbidden = {"cpu", "item", "numpy", "tolist"}
+    assert not [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute) and call.func.attr in forbidden
+    ]
+    selector_source = ast.unparse(selector)
+    insertion_source = ast.unparse(insertion)
+    assert "rollout.success & rollout.done & rollout.valid" in selector_source
+    assert "selector = rollout.valid & lane_mask.unsqueeze(0)" in insertion_source
+    assert "rollout.observation[selector]" in insertion_source
+    assert "replay.add_batch" in insertion_source

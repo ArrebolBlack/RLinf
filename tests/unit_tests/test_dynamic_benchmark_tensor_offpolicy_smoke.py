@@ -149,6 +149,8 @@ def test_privileged_teacher_config_requires_positive_predeclared_gate(
     assert config.demo_policy == "privileged_teacher"
     assert config.demo_cohorts == 4
     assert config.minimum_demo_success_rate == pytest.approx(0.75)
+    assert config.demo_success_only_replay is False
+    assert config.minimum_qualified_demo_episodes == 0
     assert config.demo_teacher_overrides == {}
     assert config.demo_teacher_overrides_sha256 is None
 
@@ -162,6 +164,209 @@ def test_privileged_teacher_config_requires_positive_predeclared_gate(
                 "0",
             )
         )
+
+
+def test_success_only_demo_bank_requires_24_successes_and_explicit_count_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+    config = module._config(
+        _arguments(
+            module,
+            "--demo-policy",
+            "privileged_teacher",
+            "--demo-success-only-replay",
+            "--minimum-qualified-demo-episodes",
+            "24",
+        )
+    )
+    assert config.demo_success_only_replay is True
+    assert config.minimum_qualified_demo_episodes == 24
+    assert config.minimum_demo_success_rate == 0.0
+
+    with pytest.raises(ValueError, match="at least 24"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--demo-success-only-replay",
+                "--minimum-qualified-demo-episodes",
+                "23",
+            )
+        )
+    with pytest.raises(ValueError, match="exceeds configured demo attempts"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--demo-success-only-replay",
+                "--minimum-qualified-demo-episodes",
+                "65",
+            )
+        )
+    with pytest.raises(ValueError, match="episode-count gate"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--demo-success-only-replay",
+                "--minimum-qualified-demo-episodes",
+                "24",
+                "--minimum-demo-success-rate",
+                "0.5",
+            )
+        )
+    with pytest.raises(ValueError, match="requires privileged_teacher"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-success-only-replay",
+                "--minimum-qualified-demo-episodes",
+                "24",
+            )
+        )
+    with pytest.raises(ValueError, match="requires success-only replay"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--minimum-demo-success-rate",
+                "0.75",
+                "--minimum-qualified-demo-episodes",
+                "24",
+            )
+        )
+    sac_args = _arguments(
+        module,
+        "--demo-success-only-replay",
+        "--minimum-qualified-demo-episodes",
+        "24",
+    )
+    sac_args.algorithm = "sac"
+    with pytest.raises(ValueError, match="require RLPD"):
+        module._config(sac_args)
+
+
+def test_success_only_replay_filters_complete_success_lanes_on_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+    module.torch.bool = "bool"
+
+    class Tensor:
+        def __init__(
+            self,
+            values: Any,
+            *,
+            dtype: str = "float32",
+            device: str = "cuda:0",
+        ) -> None:
+            self.values = np.asarray(values)
+            self.dtype = dtype
+            self.device = device
+
+        @property
+        def shape(self) -> tuple[int, ...]:
+            return self.values.shape
+
+        def __and__(self, other: Tensor) -> Tensor:
+            return Tensor(
+                self.values & other.values,
+                dtype="bool",
+                device=self.device,
+            )
+
+        def __getitem__(self, index: Any) -> Tensor:
+            selected = index.values if isinstance(index, Tensor) else index
+            return Tensor(self.values[selected], dtype=self.dtype, device=self.device)
+
+        def any(self, *, dim: int) -> Tensor:
+            return Tensor(
+                self.values.any(axis=dim),
+                dtype="bool",
+                device=self.device,
+            )
+
+        def contiguous(self) -> Tensor:
+            return self
+
+        def reshape(self, *shape: int) -> Tensor:
+            return Tensor(
+                self.values.reshape(*shape),
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+        def unsqueeze(self, dim: int) -> Tensor:
+            return Tensor(
+                np.expand_dims(self.values, axis=dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+    valid = Tensor(
+        [[True, True, True], [True, True, False], [True, False, False]],
+        dtype="bool",
+    )
+    done = Tensor(
+        [[False, False, True], [False, True, False], [True, False, False]],
+        dtype="bool",
+    )
+    success = Tensor(
+        [[False, False, True], [False, False, False], [True, False, False]],
+        dtype="bool",
+    )
+    values = np.arange(9, dtype=np.float32).reshape(3, 3, 1)
+    rollout = SimpleNamespace(
+        observation=Tensor(values),
+        action=Tensor(np.repeat(values, 7, axis=2)),
+        reward=Tensor(values[..., 0]),
+        next_observation=Tensor(values + 1),
+        terminated=done,
+        truncated=Tensor(np.zeros((3, 3), dtype=np.bool_), dtype="bool"),
+        success=success,
+        done=done,
+        valid=valid,
+    )
+
+    class Replay:
+        def __init__(self) -> None:
+            self.batch: dict[str, Tensor] | None = None
+
+        def add_batch(self, **batch: Tensor) -> None:
+            self.batch = batch
+
+    replay = Replay()
+    lane_mask = module._successful_demo_lane_mask(rollout)
+    inserted = module._add_rollout_to_replay(
+        replay,
+        rollout,
+        lane_mask=lane_mask,
+    )
+
+    assert inserted == 4
+    assert replay.batch is not None
+    np.testing.assert_array_equal(
+        replay.batch["observation"].values[:, 0],
+        np.array([0.0, 2.0, 3.0, 6.0], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        replay.batch["valid"].values,
+        np.ones(4, dtype=np.bool_),
+    )
+    assert 1.0 not in replay.batch["observation"].values
+    assert 4.0 not in replay.batch["observation"].values
+
+    legacy_replay = Replay()
+    legacy_inserted = module._add_rollout_to_replay(legacy_replay, rollout)
+    assert legacy_inserted == 9
+    assert legacy_replay.batch is not None
+    assert legacy_replay.batch["valid"].values.sum() == 6
+    assert 1.0 in legacy_replay.batch["observation"].values
 
 
 def test_teacher_overrides_are_strict_planner_only_identity(
