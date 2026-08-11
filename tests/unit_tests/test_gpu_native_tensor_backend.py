@@ -52,6 +52,8 @@ _zero_copy_torch_view = _MODULE._zero_copy_torch_view
 _GPU_UUID = "GPU-803b6f88-a884-134a-d92d-cdc532e22e14"
 _OTHER_GPU_UUID = "GPU-7d65018e-96c7-8c5e-bb64-3a74ca558ab3"
 _PCI_BUS_ID = "00000000:17:00.0"
+_SE3_SOURCE_COMMIT = "a" * 40
+_SE3_SOURCE_TREE = "b" * 40
 _EXPORT_DIGESTS = {
     "request_sha256": "1" * 64,
     "bundle_sha256": "2" * 64,
@@ -206,6 +208,36 @@ class _TerminalLedgerBatch:
     rows: tuple[_TerminalLedgerRow, ...]
 
 
+@dataclass(frozen=True)
+class _ObservationBundle:
+    episode_id: str
+    task_id: str
+    physics_step: int
+    control_step: int
+    policy_step: int
+
+
+@dataclass(frozen=True)
+class _AuditRequest:
+    lanes: tuple[int, ...]
+    include_step_result: bool = False
+
+
+@dataclass(frozen=True)
+class _AuditLane:
+    lane: int
+    episode_id: str
+    observation: _ObservationBundle
+    step_result: Any | None = None
+
+
+@dataclass(frozen=True)
+class _AuditBatch:
+    backend_id: str
+    provenance: Any
+    lanes: tuple[_AuditLane, ...]
+
+
 class _FakeEnv:
     backend_id = "mjwarp_gpu_v1"
 
@@ -239,8 +271,8 @@ class _FakeEnv:
             device_platform="cuda",
             precision="float32",
             device_ordinal=0,
-            git_commit=_MODULE._SE3_SOURCE_COMMIT,
-            git_tree=_MODULE._SE3_SOURCE_TREE,
+            git_commit=_SE3_SOURCE_COMMIT,
+            git_tree=_SE3_SOURCE_TREE,
             implementation_version="direct-mjwarp-p0-grasp-foundation-v0.1",
             runtime_versions={
                 "mujoco": "3.3.4",
@@ -265,6 +297,8 @@ class _FakeEnv:
         self._pointer = 1000
         self._step_arrays: dict[str, _WarpArray] | None = None
         self.reset_error = False
+        self.control_step = 0
+        self.audit_lane_order_override: tuple[int, ...] | None = None
         self.terminal_outcomes: dict[int, dict[str, Any]] = {}
         self._device_terminal_consumed_lanes: set[int] = set()
 
@@ -281,6 +315,7 @@ class _FakeEnv:
         self.reset_calls.append(tuple(requests))
         self.reset_masks.append(reset_mask)
         self._device_terminal_consumed_lanes.clear()
+        self.control_step = 0
         return SimpleNamespace(
             observation=self._array(self.dtype, 5),
             state=SimpleNamespace(
@@ -293,6 +328,7 @@ class _FakeEnv:
 
     def step_device(self, action: Any) -> Any:
         self.step_calls.append(action)
+        self.control_step += 1
         if self._step_arrays is None:
             self._step_arrays = {
                 "observation": self._array(self.dtype, 5),
@@ -319,6 +355,33 @@ class _FakeEnv:
                 output_ptrs={
                     name: value.ptr for name, value in self._step_arrays.items()
                 },
+            ),
+        )
+
+    def materialize_audit(self, request: Any) -> _AuditBatch:
+        self.materialize_audit_calls.append(request)
+        active_requests = self.reset_calls[-1]
+        lanes = (
+            request.lanes
+            if self.audit_lane_order_override is None
+            else self.audit_lane_order_override
+        )
+        return _AuditBatch(
+            backend_id="mjwarp_gpu_v1",
+            provenance=self.provenance,
+            lanes=tuple(
+                _AuditLane(
+                    lane=lane,
+                    episode_id=active_requests[lane].episode_id,
+                    observation=_ObservationBundle(
+                        episode_id=active_requests[lane].episode_id,
+                        task_id="p0_grasp",
+                        physics_step=25 * self.control_step,
+                        control_step=self.control_step,
+                        policy_step=self.control_step,
+                    ),
+                )
+                for lane in lanes
             ),
         )
 
@@ -488,6 +551,7 @@ def _install_fakes(
 
     class ObservationTrack(enum.Enum):
         STATE = "state"
+        HYBRID = "hybrid"
 
     class Split(enum.Enum):
         TRAIN = "train"
@@ -497,11 +561,6 @@ def _install_fakes(
 
     class GpuNativeConsumer(enum.Enum):
         RL = "rl"
-
-    @dataclass(frozen=True)
-    class AuditRequest:
-        lanes: tuple[int, ...]
-        include_step_result: bool = False
 
     env = _FakeEnv(batch_size, device, float32, captured["call_order"])
 
@@ -520,7 +579,10 @@ def _install_fakes(
         "clock": {"horizon_steps": 250}
     }
     modules["se3_wam.benchmark.gpu_native.tasks"].GpuNativeConsumer = GpuNativeConsumer
-    modules["se3_wam.benchmark.gpu_native.audit"].AuditRequest = AuditRequest
+    modules["se3_wam.benchmark.api"].ObservationBundle = _ObservationBundle
+    modules["se3_wam.benchmark.gpu_native.audit"].AuditBatch = _AuditBatch
+    modules["se3_wam.benchmark.gpu_native.audit"].AuditLane = _AuditLane
+    modules["se3_wam.benchmark.gpu_native.audit"].AuditRequest = _AuditRequest
     modules[
         "se3_wam.benchmark.gpu_native.audit"
     ].TerminalLedgerBatch = _TerminalLedgerBatch
@@ -573,11 +635,12 @@ def _install_fakes(
                         split=split,
                         seed=manifest_seed + index,
                         action_mode="E7",
-                        observation_track=ObservationTrack.STATE,
+                        observation_track=ObservationTrack.HYBRID,
                         factors=factors,
                     )
                 )
             )
+        captured["generated_manifest_requests"] = tuple(row.request for row in rows)
         return tuple(rows)
 
     modules[
@@ -639,6 +702,8 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert {
         name: getattr(fake_env.capabilities, name) for name in _MODULE._CAPABILITY_NAMES
@@ -648,8 +713,8 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert captured["factory"][1]["engine_kwargs"] == {
         "expected_device_uuid": _GPU_UUID,
         "expected_model_sha256": _EXPORT_DIGESTS["model_sha256"],
-        "expected_source_commit": _MODULE._SE3_SOURCE_COMMIT,
-        "expected_source_tree": _MODULE._SE3_SOURCE_TREE,
+        "expected_source_commit": _SE3_SOURCE_COMMIT,
+        "expected_source_tree": _SE3_SOURCE_TREE,
     }
 
     reset = backend.reset()
@@ -685,6 +750,41 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert fake_env.closed
 
 
+def test_generated_manifest_projects_only_observation_track_to_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    captured, _fake_env, _device = _install_fakes(monkeypatch)
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+        manifest_seed=77,
+        manifest_size=6,
+    )
+
+    source_requests = captured["generated_manifest_requests"]
+    projected_requests = backend.sequence_requests
+    track = sys.modules["se3_wam.benchmark.contracts"].ObservationTrack
+    assert all(request.observation_track is track.HYBRID for request in source_requests)
+    assert all(
+        request.observation_track is track.STATE for request in projected_requests
+    )
+    for source, projected in zip(source_requests, projected_requests, strict=True):
+        assert projected.task_id == source.task_id
+        assert projected.episode_id == source.episode_id
+        assert projected.split == source.split
+        assert projected.seed == source.seed
+        assert projected.action_mode == source.action_mode
+        assert projected.object_mode == source.object_mode
+        assert projected.reset_mode == source.reset_mode
+        assert projected.factors == source.factors
+        assert projected.api_version == source.api_version
+
+
 def test_r0_cursor_is_transactional_boundary_only_and_resumable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -695,6 +795,8 @@ def test_r0_cursor_is_transactional_boundary_only_and_resumable(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_seed=77,
         manifest_size=6,
     )
@@ -723,6 +825,8 @@ def test_r0_cursor_is_transactional_boundary_only_and_resumable(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_seed=77,
         manifest_size=6,
     )
@@ -742,6 +846,8 @@ def test_r0_cursor_is_transactional_boundary_only_and_resumable(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_seed=77,
         manifest_size=6,
     )
@@ -767,6 +873,8 @@ def test_tensor_backend_rejects_cross_runtime_device_identity_drift(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
     assert fake_env.closed is True
 
@@ -783,6 +891,8 @@ def test_tensor_backend_rejects_transport_and_layout_drift(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     backend.reset()
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
@@ -842,6 +952,8 @@ def test_constructor_rejects_uuid_pci_alias_and_ordinal_drift(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
 
 
@@ -856,6 +968,8 @@ def test_constructor_normalizes_only_exact_unprefixed_torch_uuid(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert backend.device_identity.torch_uuid == _GPU_UUID
 
@@ -874,6 +988,8 @@ def test_attest_end_reobserves_after_success_and_close_checks_independently(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert backend.attest_end() == backend.device_identity_start
 
@@ -900,6 +1016,8 @@ def test_constructor_rejects_identity_change_between_start_and_end(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
     assert fake_env.closed is True
 
@@ -924,6 +1042,8 @@ def test_exact_v02_capability_difference_fails_closed(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
     assert fake_env.closed is True
 
@@ -938,6 +1058,8 @@ def test_old_v01_abi_is_not_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
         )
 
 
@@ -951,6 +1073,8 @@ def test_task_quality_is_enabled_before_first_reset(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         task_quality_schema_version="db0-episode-task-quality-v1",
         task_quality_evaluator_backend_id="quality-backend-v1",
     )
@@ -975,6 +1099,8 @@ def test_public_task_quality_enable_is_pre_reset_only(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     backend.enable_task_quality(
         schema_version="db0-episode-task-quality-v1",
@@ -999,6 +1125,8 @@ def test_stable_and_active_export_identity_are_separate(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     assert not set(_EXPORT_DIGESTS).intersection(backend.stable_identity)
     assert set(backend.active_export_identity) == {
@@ -1028,6 +1156,8 @@ def test_caller_pinned_manifest_is_exact_and_portable(
         num_envs=3,
         export_dir="/tmp/export-a",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_size=6,
     )
     requests = generated.sequence_requests
@@ -1039,6 +1169,8 @@ def test_caller_pinned_manifest_is_exact_and_portable(
         num_envs=3,
         export_dir="/different/runtime/path",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_requests=requests,
         manifest_sha256=digest,
     )
@@ -1053,6 +1185,8 @@ def test_caller_pinned_manifest_is_exact_and_portable(
             num_envs=3,
             export_dir="/tmp/export",
             expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
             manifest_requests=requests,
             manifest_sha256="0" * 64,
         )
@@ -1080,6 +1214,8 @@ def test_caller_manifest_nested_factors_are_frozen_and_defensively_exposed(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         manifest_requests=requests,
         manifest_sha256=digest,
     )
@@ -1104,6 +1240,8 @@ def test_reset_rehashes_frozen_manifest_before_any_engine_write(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     object.__setattr__(
         backend._manifest_requests[0],  # noqa: SLF001
@@ -1128,6 +1266,8 @@ def test_b1_and_full_cohort_reset_succeed_but_partial_reset_has_zero_writes(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     with pytest.raises(GpuNativeTensorBackendUnavailableError, match="partial reset"):
         backend.reset(reset_mask=(True, False, True))
@@ -1141,10 +1281,70 @@ def test_b1_and_full_cohort_reset_succeed_but_partial_reset_has_zero_writes(
         num_envs=1,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     reset_b1 = backend_b1.reset(reset_mask=(True,))
     assert len(reset_b1.episode_ids) == 1
     assert fake_env_b1.reset_write_count == 1
+
+
+def test_teacher_observation_control_plane_is_explicit_ordered_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    _captured, fake_env, device = _install_fakes(monkeypatch)
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+    )
+    with pytest.raises(
+        GpuNativeTensorBackendUnavailableError, match="active reset cohort"
+    ):
+        backend.materialize_teacher_observations()
+    reset = backend.reset()
+    observations = backend.materialize_teacher_observations((2, 0))
+    assert tuple(observation.episode_id for observation in observations) == (
+        reset.episode_ids[2],
+        reset.episode_ids[0],
+    )
+    assert all(observation.policy_step == 0 for observation in observations)
+    assert backend.teacher_audit_materializations == 1
+    assert fake_env.materialize_audit_calls == [
+        _AuditRequest(lanes=(2, 0), include_step_result=False)
+    ]
+
+    action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
+    backend.step_device(action)
+    next_observations = backend.materialize_teacher_observations()
+    assert all(observation.policy_step == 1 for observation in next_observations)
+    assert backend.teacher_audit_materializations == 2
+    with pytest.raises(TypeError, match="immutable tuple"):
+        backend.materialize_teacher_observations([0])  # type: ignore[arg-type]
+
+
+def test_teacher_observation_control_plane_rejects_lane_order_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    _captured, fake_env, _device = _install_fakes(monkeypatch)
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+    )
+    backend.reset()
+    fake_env.audit_lane_order_override = (1, 0)
+    with pytest.raises(GpuNativeTensorBackendUnavailableError, match="lane order"):
+        backend.materialize_teacher_observations((0, 1))
+    assert backend.teacher_audit_materializations == 0
 
 
 def test_steady_state_ast_and_spies_forbid_host_materialization(
@@ -1157,6 +1357,8 @@ def test_steady_state_ast_and_spies_forbid_host_materialization(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     reset = backend.reset()
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
@@ -1174,6 +1376,7 @@ def test_steady_state_ast_and_spies_forbid_host_materialization(
     assert action.host_materialization_calls == []
     assert reset.observation.host_materialization_calls == []
     assert fake_env.materialize_audit_calls == []
+    assert backend.teacher_audit_materializations == 0
     output_ptrs = backend.last_transport_receipt["output_ptrs"]
     for name in output_ptrs:
         tensor = getattr(step, name)
@@ -1202,6 +1405,8 @@ def test_each_device_output_contract_drift_fails_closed(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     backend.reset()
     action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
@@ -1231,6 +1436,8 @@ def test_terminal_ledger_is_typed_once_and_quality_is_success_only(
         num_envs=3,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
         task_quality_schema_version="db0-episode-task-quality-v1",
         task_quality_evaluator_backend_id="quality-backend-v1",
     )
@@ -1367,6 +1574,8 @@ def test_success_terminal_without_typed_quality_fails_closed(
         num_envs=1,
         export_dir="/tmp/export",
         expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
     )
     reset = backend.reset()
     fake_env.terminal_outcomes[0] = {

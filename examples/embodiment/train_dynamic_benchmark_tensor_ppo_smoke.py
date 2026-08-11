@@ -631,6 +631,8 @@ def main() -> int:
         num_envs=config.num_envs,
         export_dir=config.export_dir,
         expected_gpu_uuid=config.expected_gpu_uuid,
+        expected_se3_source_commit=config.se3_commit,
+        expected_se3_source_tree=config.se3_tree,
         device_ordinal=config.device_ordinal,
         image_size=config.image_size,
         split=config.split,

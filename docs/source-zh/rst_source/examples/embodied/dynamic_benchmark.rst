@@ -183,6 +183,16 @@ matched on-policy 对照使用独立的可恢复 trainer：
 validation manifest 与 update-boundary checkpoint/resume。time-limit truncation 会对
 value target 做 bootstrap，但会在 reset 边界停止 advantage 递推。
 
+GPU-native RLPD 可在在线训练前追加
+``--demo-policy privileged_teacher --demo-cohorts N
+--minimum-demo-success-rate P``，对示教质量做预声明门禁。每个 teacher 动作只读取对应
+仍活跃 ``mjwarp_gpu_v1`` lane 的当前状态；trainer 会先原子写出
+``demo_quality.json``，若成功率未达到阈值则在任何在线更新前 fail closed。GPU→host 的
+观测/终态 mask 读取与 host→GPU 的 teacher 动作传输会单独计入 demonstration control
+plane；learned-policy rollout 以及 replay/update 热路径仍保持 device-only。生成的 v0.2
+checkpoint 可交给 tensor evaluator，但只有独立 held-out evaluation 通过后才能声称策略
+质量达标。
+
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
 ``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、
 manifest、环境数和示教合同，并恢复 replay sampling state、normalizer 与收集后的 RNG，

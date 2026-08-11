@@ -58,6 +58,7 @@ POLICY_SCHEMAS = frozenset(
     {
         "rlinf-dynamic-benchmark-expert-policy-v0.1",
         "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.1",
+        "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.2",
         "rlinf-gpuenv0-tensor-ppo-smoke-v0.1",
         "rlinf-gpuenv0-tensor-ppo-smoke-v0.2",
     }
@@ -1142,7 +1143,7 @@ def _make_offpolicy_smoke_policy(
     module.eval()
 
     class Adapter:
-        checkpoint_schema = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.1"
+        checkpoint_schema = str(payload["schema_version"])
 
         def __init__(self) -> None:
             self.observation_dim = observation_dim
@@ -1700,11 +1701,21 @@ def _build_backend(
         GpuNativeTensorBackendEnv,
     )
 
+    source_manifest = load_pinned_json(
+        Path(spec["source_manifest_path"]),
+        spec["source_manifest_sha256"],
+        name="source manifest",
+    )
+    source_pins = validate_source_manifest(source_manifest)
+    se3_source = next(pin for pin in source_pins if pin["name"] == "se3_wam")
+
     return GpuNativeTensorBackendEnv(
         task_id=sequence.task_id,
         num_envs=spec["num_envs"],
         export_dir=spec["export_dir"],
         expected_gpu_uuid=spec["expected_gpu_uuid"],
+        expected_se3_source_commit=se3_source["commit"],
+        expected_se3_source_tree=se3_source["tree"],
         device_ordinal=spec["device_ordinal"],
         image_size=spec["image_size"],
         split=sequence.split,

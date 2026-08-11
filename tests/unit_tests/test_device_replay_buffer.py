@@ -362,5 +362,48 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
         '_restore_rng_state(restored["rng_state"])',
     )
     assert all(fragment in source for fragment in required_checkpoint_fragments)
-    assert 'DEMO_PRODUCER = "zero_action_device_cohort_v1"' in source
-    assert '"rlpd_demo_quality_qualified": False' in source
+    assert '"zero_action": "zero_action_device_cohort_v1"' in source
+    assert '"privileged_teacher": "current_gpu_state_privileged_teacher_v1"' in source
+    assert '"demo_quality": demo_quality' in source
+    assert '"rlpd_demo_quality_qualified": bool(' in source
+
+
+def test_tensor_offpolicy_teacher_control_plane_is_separate_and_accounted() -> None:
+    script = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "embodiment"
+        / "train_dynamic_benchmark_tensor_offpolicy_smoke.py"
+    )
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    methods = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    online = methods["_rollout_cohort"]
+    teacher = methods["_rollout_privileged_teacher_cohort"]
+    online_source = ast.unparse(online)
+    teacher_source = ast.unparse(teacher)
+
+    def host_transfers(method: ast.AST) -> list[ast.Call]:
+        return [
+            call
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "to"
+            and any(
+                keyword.arg == "device"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "cpu"
+                for keyword in call.keywords
+            )
+        ]
+
+    assert "materialize_teacher_observations" not in online_source
+    assert host_transfers(online) == []
+    assert "materialize_teacher_observations" in teacher_source
+    assert len(host_transfers(teacher)) == 1
+    assert "torch.as_tensor" in teacher_source
+    assert "terminal_mask_host_materializations" in teacher_source
