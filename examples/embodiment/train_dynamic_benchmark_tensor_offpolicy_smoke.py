@@ -74,6 +74,7 @@ TEACHER_OVERRIDE_FLOAT_RANGES = {
     "track_to_descend_distance_m": (0.005, 0.15, False),
     "close_horizontal_tolerance_m": (0.005, 0.08, False),
     "close_vertical_tolerance_m": (0.005, 0.08, False),
+    "close_axis_alignment_tolerance_rad": (0.0, math.pi / 2, False),
     "lift_action_z_max": (0.05, 1.0, False),
 }
 TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS = {
