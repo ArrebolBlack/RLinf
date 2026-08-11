@@ -30,6 +30,7 @@ import shutil
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -236,6 +237,45 @@ T5_TIMING_COUNT_SEMANTIC_LABELS = (
 )
 
 
+@dataclass
+class _PhaseProfiler:
+    phases: dict[str, list[float]]
+
+    @classmethod
+    def create(cls) -> "_PhaseProfiler":
+        return cls(phases={})
+
+    @contextmanager
+    def phase(self, name: str):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.phases.setdefault(name, []).append(time.perf_counter() - started)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            name: {
+                "count": len(samples),
+                "total_s": sum(samples),
+                "mean_s": sum(samples) / len(samples),
+            }
+            for name, samples in sorted(self.phases.items())
+        }
+
+
+_ACTIVE_PHASE_PROFILER: _PhaseProfiler | None = None
+
+
+@contextmanager
+def _profile_phase(name: str):
+    if _ACTIVE_PHASE_PROFILER is None:
+        yield
+        return
+    with _ACTIVE_PHASE_PROFILER.phase(name):
+        yield
+
+
 @dataclass(frozen=True)
 class CandidateSpec:
     """One immutable planner or policy candidate."""
@@ -368,6 +408,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument(
+        "--phase-profile-json",
+        type=Path,
+        help=(
+            "write opt-in exporter and environment phase timings outside the "
+            "dataset artifact root"
+        ),
+    )
+    parser.add_argument(
+        "--execution-receipt-json",
+        type=Path,
+        help=(
+            "write resume/recovery execution provenance outside the dataset root; "
+            "the sealed dataset then retains only scientific recovery events so an "
+            "exact resumed artifact matches an uninterrupted artifact"
+        ),
+    )
     return parser
 
 
@@ -2745,21 +2802,24 @@ def _candidate_seed(episode_id: str, candidate: LoadedCandidate) -> int:
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    with _profile_phase("serialization.atomic_json"):
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(dict(payload), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     from se3_wam.benchmark.contracts import canonical_json
 
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(canonical_json(dict(payload)) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    with _profile_phase("serialization.jsonl_encode_write"):
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(canonical_json(dict(payload)) + "\n")
+            stream.flush()
+            with _profile_phase("filesystem.jsonl_fsync"):
+                os.fsync(stream.fileno())
 
 
 def _file_boundary(path: Path) -> dict[str, Any]:
@@ -2885,10 +2945,13 @@ def _write_attempt_tape(
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".npz.tmp")
     with temporary.open("wb") as stream:
-        np.savez_compressed(stream, **arrays)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+        with _profile_phase("serialization.attempt_npz_compress_write"):
+            np.savez_compressed(stream, **arrays)
+            stream.flush()
+        with _profile_phase("filesystem.attempt_npz_fsync"):
+            os.fsync(stream.fileno())
+    with _profile_phase("filesystem.attempt_npz_rename"):
+        os.replace(temporary, path)
     return relative.as_posix(), _sha256(path)
 
 
@@ -3183,36 +3246,40 @@ def _rollout(
             ).unsqueeze(0)
             policy_action = env_actions.clone()
         elif candidate.spec.kind == "planner":
-            env_actions = _planner_actions(env, [teacher])
-            policy_action = env_actions.clone()
+            with _profile_phase("inference.planner"):
+                env_actions = _planner_actions(env, [teacher])
+                policy_action = env_actions.clone()
         else:
-            with torch.inference_mode():
-                policy_action, _ = _policy_action(
-                    candidate.model,
-                    candidate.normalizer,
-                    obs["states"],
-                    device,
-                    stochastic=candidate.spec.stochastic,
-                )
+            with _profile_phase("inference.policy"):
+                with torch.inference_mode():
+                    policy_action, _ = _policy_action(
+                        candidate.model,
+                        candidate.normalizer,
+                        obs["states"],
+                        device,
+                        stochastic=candidate.spec.stochastic,
+                    )
             policy_action = policy_action.cpu()
             env_actions = policy_action
             if residual:
                 assert teacher is not None and residual_scale is not None
-                env_actions = _compose_residual_actions(
-                    _planner_actions(env, [teacher]),
-                    policy_action,
-                    residual_scale,
-                )
+                with _profile_phase("inference.residual_planner"):
+                    env_actions = _compose_residual_actions(
+                        _planner_actions(env, [teacher]),
+                        policy_action,
+                        residual_scale,
+                    )
         values = np.clip(np.asarray(env_actions[0], dtype=np.float64), -1.0, 1.0)
         action = env._ActionCommand(
             mode=request.action_mode,
             values=values,
             policy_step=observation.policy_step,
         )
-        next_obs, reward, terminated, truncated, infos = env.step(
-            env_actions,
-            auto_reset=False,
-        )
+        with _profile_phase("rollout.environment_step"):
+            next_obs, reward, terminated, truncated, infos = env.step(
+                env_actions,
+                auto_reset=False,
+            )
         next_observation = env._raw_observations[0]
         if next_observation is None:
             raise RuntimeError("optimal-trajectory rollout lost its raw observation")
@@ -3287,14 +3354,15 @@ def _rollout(
         if result_info["success"]
         else None
     )
-    replay_validation = replay_actions(
-        _ArmedResetReplayEnv(env, raw_env),
-        request=request,
-        expected_observations=tuple(observations),
-        actions=tuple(actions),
-        expected_outcomes=tuple(outcomes),
-        expected_final_state=final_state,
-    )
+    with _profile_phase("rollout.replay_validation"):
+        replay_validation = replay_actions(
+            _ArmedResetReplayEnv(env, raw_env),
+            request=request,
+            expected_observations=tuple(observations),
+            actions=tuple(actions),
+            expected_outcomes=tuple(outcomes),
+            expected_final_state=final_state,
+        )
     action_array = np.stack([action.values for action in actions]).astype(np.float64)
     policy_action_array = np.stack(policy_actions).astype(np.float32)
     state_array = np.stack(states).astype(np.float32)
@@ -3464,6 +3532,7 @@ def _make_env(
     policy: Mapping[str, Any] | None = None,
     task_quality_schema_version: str | None = None,
     task_quality_evaluator_backend_id: str | None = None,
+    profile_phase_timings: bool = False,
 ) -> Any:
     from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkEnv
 
@@ -3477,6 +3546,7 @@ def _make_env(
         "auto_reset": False,
         "ignore_terminations": False,
         "group_size": 1,
+        "profile_phase_timings": profile_phase_timings,
     }
     if task_quality_schema_version is not None:
         config.update(
@@ -3606,13 +3676,112 @@ def _materialize_additional_provenance(
         )
 
 
+def _environment_phase_profiles(
+    env_pairs: Mapping[str, tuple[Any, Any]],
+) -> dict[str, Any]:
+    """Collect opt-in adapter timings without changing the dataset payload."""
+
+    environments: list[dict[str, Any]] = []
+    aggregate: dict[str, dict[str, float | int]] = {}
+    for pair_index, (schema_key, pair) in enumerate(sorted(env_pairs.items())):
+        for role, env in zip(("lightweight", "rendered"), pair, strict=True):
+            snapshot = env.phase_timing_snapshot()
+            if snapshot is None:
+                continue
+            environments.append(
+                {
+                    "pair_index": pair_index,
+                    "role": role,
+                    "state_schema_key": schema_key,
+                    "profile": snapshot,
+                }
+            )
+            for name, row in snapshot["phases"].items():
+                total_s = float(row["total_s"])
+                samples = int(row["samples"])
+                target = aggregate.setdefault(name, {"total_s": 0.0, "samples": 0})
+                target["total_s"] = float(target["total_s"]) + total_s
+                target["samples"] = int(target["samples"]) + samples
+    return {
+        "environments": environments,
+        "aggregate_phases": {
+            name: {
+                "total_s": float(row["total_s"]),
+                "samples": int(row["samples"]),
+                "mean_ms": 1000.0 * float(row["total_s"]) / int(row["samples"]),
+            }
+            for name, row in sorted(aggregate.items())
+        },
+    }
+
+
+def _write_phase_profile(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write one external profiling receipt without entering the dataset root."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(dict(payload), indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _scientific_recovery_events(events: Sequence[str]) -> list[str]:
+    """Keep scientific render-parity events and reject unknown provenance kinds."""
+
+    scientific = []
+    for event in events:
+        if not isinstance(event, str) or not event:
+            raise ValueError("recovery event must be a non-empty string")
+        if event.startswith("render_parity_skip:"):
+            scientific.append(event)
+            continue
+        prefix, separator, timestamp = event.rpartition(".recovery-")
+        if separator and prefix and timestamp.isdigit() and "/" not in event and "\\" not in event:
+            continue
+        raise ValueError(f"unknown recovery event cannot be externalized: {event!r}")
+    return scientific
+
+
 def main() -> None:
     from se3_wam.benchmark.contracts import canonical_json
     from se3_wam.benchmark.dataset import write_episode_atomic
     from se3_wam.benchmark.evaluation import manifest_record
 
+    global _ACTIVE_PHASE_PROFILER
     args = _parser().parse_args()
     import yaml
+
+    _ACTIVE_PHASE_PROFILER = None
+    phase_profile_path = (
+        None if args.phase_profile_json is None else args.phase_profile_json.resolve()
+    )
+    if phase_profile_path is not None:
+        if phase_profile_path.exists():
+            raise FileExistsError(
+                f"refusing to overwrite phase profile {phase_profile_path}"
+            )
+        if phase_profile_path.is_relative_to(args.output.resolve()):
+            raise ValueError("phase profile must be outside the dataset output root")
+        _ACTIVE_PHASE_PROFILER = _PhaseProfiler.create()
+    execution_receipt_path = (
+        None
+        if args.execution_receipt_json is None
+        else args.execution_receipt_json.resolve()
+    )
+    if execution_receipt_path is not None:
+        if execution_receipt_path.exists():
+            raise FileExistsError(
+                f"refusing to overwrite execution receipt {execution_receipt_path}"
+            )
+        if execution_receipt_path.is_relative_to(args.output.resolve()):
+            raise ValueError("execution receipt must be outside the dataset output root")
+    outer_started = time.perf_counter()
+    outer_started_unix_s = time.time()
+    execution_status = "failed"
+    execution_resume_count = 0
+    execution_recovery_events: list[str] = []
 
     if not args.quality_v2_thresholds.is_file():
         raise FileNotFoundError(args.quality_v2_thresholds)
@@ -3772,13 +3941,14 @@ def main() -> None:
         candidate_pool_size=len(specs),
     )
     device = _device(args.device)
-    candidates = _load_candidates(
-        specs,
-        task=task,
-        rlinf_commit=rlinf_commit,
-        benchmark_commit=benchmark_commit,
-        device=device,
-    )
+    with _profile_phase("inputs.candidate_load"):
+        candidates = _load_candidates(
+            specs,
+            task=task,
+            rlinf_commit=rlinf_commit,
+            benchmark_commit=benchmark_commit,
+            device=device,
+        )
     manifest_size = args.max_resets + args.max_resets % 2
     quality_schema_version = (
         None
@@ -3800,19 +3970,21 @@ def main() -> None:
             "policy": policy,
             "task_quality_schema_version": quality_schema_version,
             "task_quality_evaluator_backend_id": quality_backend_id,
+            "profile_phase_timings": phase_profile_path is not None,
         }
-        return (
-            _make_env(
-                **common,
-                image_size=64,
-                camera_observations=False,
-            ),
-            _make_env(
-                **common,
-                image_size=args.image_size,
-                camera_observations=True,
-            ),
-        )
+        with _profile_phase("environment.construct_pair"):
+            return (
+                _make_env(
+                    **common,
+                    image_size=64,
+                    camera_observations=False,
+                ),
+                _make_env(
+                    **common,
+                    image_size=args.image_size,
+                    camera_observations=True,
+                ),
+            )
 
     light_env, render_env = make_env_pair(None)
     default_schema_key = canonical_json(light_env.state_schema)
@@ -4011,6 +4183,8 @@ def main() -> None:
             recovery_events = list(progress["recovery_events"])
             if recovery_event is not None:
                 recovery_events.append(recovery_event)
+            execution_resume_count = resume_count
+            execution_recovery_events = list(recovery_events)
             expected_line_counts = {
                 attempts_path: attempt_count,
                 reset_results_path: attempted_resets,
@@ -4118,7 +4292,8 @@ def main() -> None:
                 for candidate in candidates[len(reset_attempts) : budget]:
                     env_key = candidate_env_keys[candidate.index]
                     candidate_env = env_pairs[env_key][0]
-                    _restore_candidate_start(candidate_env, initial_states[env_key])
+                    with _profile_phase("reset.restore_candidate_start"):
+                        _restore_candidate_start(candidate_env, initial_states[env_key])
                     record, arrays, _ = _rollout(
                         env=candidate_env,
                         candidate=candidate,
@@ -4238,7 +4413,8 @@ def main() -> None:
                     for key in parity_keys:
                         if render_record[key] != winner[key]:
                             raise RuntimeError(f"winner render parity failed for {key}")
-                    episode_record = write_episode_atomic(run_output, trace)
+                    with _profile_phase("serialization.winner_episode_write"):
+                        episode_record = write_episode_atomic(run_output, trace)
                     winner_row = {
                         **episode_record,
                         "candidate_id": candidate.spec.candidate_id,
@@ -4298,6 +4474,7 @@ def main() -> None:
                         f"render_parity_skip:reset:{reset_index}:"
                         f"{row.request.episode_id}:{str(exc)}"
                     )
+                    execution_recovery_events = list(recovery_events)
             _atomic_json(
                 progress_path,
                 _progress_payload(
@@ -4328,6 +4505,29 @@ def main() -> None:
                 raise RuntimeError(
                     f"candidate policy changed during export: {candidate.spec.candidate_id}"
                 )
+        artifact_resume_count = resume_count
+        artifact_recovery_events = list(recovery_events)
+        if execution_receipt_path is not None:
+            execution_resume_count = resume_count
+            execution_recovery_events = list(recovery_events)
+            artifact_resume_count = 0
+            artifact_recovery_events = _scientific_recovery_events(recovery_events)
+            _atomic_json(
+                progress_path,
+                _progress_payload(
+                    export_state_sha256=export_state_sha256,
+                    started_unix_s=started,
+                    next_reset_index=attempted_resets,
+                    accepted_count=accepted,
+                    candidate_attempt_count=attempt_count,
+                    budget_histogram=budget_histogram,
+                    attempts_path=attempts_path,
+                    reset_results_path=reset_results_path,
+                    winners_path=winners_path,
+                    resume_count=artifact_resume_count,
+                    recovery_events=artifact_recovery_events,
+                ),
+            )
         if sharded:
             _atomic_json(
                 run_output / "shard_complete.json",
@@ -4356,6 +4556,7 @@ def main() -> None:
                 ),
                 flush=True,
             )
+            execution_status = "complete"
             return
         status = "complete" if accepted == args.accepted_episodes else "incomplete"
         card = {
@@ -4390,8 +4591,8 @@ def main() -> None:
             "reset_manifest_sha256": _sha256(reset_manifest_path),
             "export_state_sha256": export_state_sha256,
             "progress_sha256": _sha256(progress_path),
-            "resume_count": resume_count,
-            "recovery_events": recovery_events,
+            "resume_count": artifact_resume_count,
+            "recovery_events": artifact_recovery_events,
             "source_identity": source_identity,
             "quality_v2_threshold_identity": quality_v2_threshold_identity,
             "image_size": args.image_size,
@@ -4401,7 +4602,8 @@ def main() -> None:
         }
         card["payload_sha256"] = _payload_sha256(card)
         _atomic_json(args.output / "dataset_card.json", card)
-        checksum_count = _root_checksums(args.output)
+        with _profile_phase("finalization.root_checksums"):
+            checksum_count = _root_checksums(args.output)
         print(
             json.dumps(
                 {
@@ -4419,10 +4621,56 @@ def main() -> None:
             raise RuntimeError(
                 f"accepted {accepted}/{args.accepted_episodes} winners within {attempted_resets} resets"
             )
+        execution_status = "complete"
     finally:
-        for lightweight, rendered in env_pairs.values():
-            lightweight.close()
-            rendered.close()
+        environment_profiles = _environment_phase_profiles(env_pairs)
+        with _profile_phase("environment.close_all"):
+            for lightweight, rendered in env_pairs.values():
+                lightweight.close()
+                rendered.close()
+        exception_type = (
+            None if sys.exc_info()[0] is None else sys.exc_info()[0].__name__
+        )
+        if _ACTIVE_PHASE_PROFILER is not None:
+            _ACTIVE_PHASE_PROFILER.phases.setdefault("outer.wall", []).append(
+                time.perf_counter() - outer_started
+            )
+            assert phase_profile_path is not None
+            _write_phase_profile(
+                phase_profile_path,
+                {
+                    "schema_version": (
+                        "rlinf-dynamic-benchmark-export-phase-profile-v0.1"
+                    ),
+                    "status": execution_status,
+                    "exception_type": exception_type,
+                    "exporter_phases": _ACTIVE_PHASE_PROFILER.snapshot(),
+                    "environment_phases": environment_profiles,
+                },
+            )
+            _ACTIVE_PHASE_PROFILER = None
+        if execution_receipt_path is not None:
+            scientific_events = _scientific_recovery_events(execution_recovery_events)
+            receipt = {
+                "schema_version": "rlinf-dynamic-benchmark-execution-receipt-v0.1",
+                "status": execution_status,
+                "exception_type": exception_type,
+                "output": str(args.output.resolve()),
+                "shard_index": args.shard_index,
+                "shard_count": args.shard_count,
+                "started_unix_s": outer_started_unix_s,
+                "finished_unix_s": time.time(),
+                "resume_count": execution_resume_count,
+                "recovery_events": execution_recovery_events,
+                "scientific_recovery_events_sealed_in_artifact": scientific_events,
+                "execution_only_recovery_events": [
+                    event
+                    for event in execution_recovery_events
+                    if event not in scientific_events
+                ],
+            }
+            receipt["payload_sha256"] = _payload_sha256(receipt)
+            _write_phase_profile(execution_receipt_path, receipt)
 
 
 if __name__ == "__main__":

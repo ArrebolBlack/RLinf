@@ -63,6 +63,7 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _eligible,
     _file_boundary,
     _progress_payload,
+    _scientific_recovery_events,
     _quality_score,
     _quality_v2_dominance_contract,
     _quality_v2_metric_thresholds,
@@ -80,7 +81,9 @@ from examples.embodiment.merge_optimal_export_shards import (
     _expected_shard_indices,
     _kept_recovery_events,
     _load_shard_receipts,
+    _select_merged_workload,
     _validate_shard_records,
+    _write_jsonl,
 )
 from examples.embodiment.merge_optimal_export_shards import (
     main as _merge_shards_main,
@@ -1166,6 +1169,52 @@ def test_shard_merge_keeps_only_render_skip_events_in_the_sealed_prefix() -> Non
         _kept_recovery_events(["render_parity_skip:bad"], max_reset=5)
 
 
+def test_shard_merge_fixed_reset_workload_keeps_trailing_rejection() -> None:
+    results = [
+        {
+            "reset_index": index,
+            "episode_id": f"episode-{index}",
+            "accepted": index < 2,
+        }
+        for index in range(3)
+    ]
+    winners = [
+        {"request": {"episode_id": "episode-1"}},
+        {"request": {"episode_id": "episode-0"}},
+    ]
+
+    default_winners, default_results, default_max_reset = _select_merged_workload(
+        results=results,
+        winners=winners,
+        accepted_episodes=2,
+        require_max_resets=False,
+    )
+    assert [row["request"]["episode_id"] for row in default_winners] == [
+        "episode-0",
+        "episode-1",
+    ]
+    assert default_results == results[:2]
+    assert default_max_reset == 1
+
+    fixed_winners, fixed_results, fixed_max_reset = _select_merged_workload(
+        results=results,
+        winners=winners,
+        accepted_episodes=2,
+        require_max_resets=True,
+    )
+    assert fixed_winners == default_winners
+    assert fixed_results == results
+    assert fixed_max_reset == 2
+
+    with pytest.raises(RuntimeError, match="fixed reset workload produced 2/1"):
+        _select_merged_workload(
+            results=results,
+            winners=winners,
+            accepted_episodes=1,
+            require_max_resets=True,
+        )
+
+
 def _shard_receipt(*, shard_index: int = 0, shard_count: int = 1) -> dict:
     return {
         "schema_version": "rlinf-dynamic-benchmark-optimal-shard-v0.1",
@@ -1266,6 +1315,42 @@ def test_shard_merge_proves_exact_reset_and_full_pool_coverage(tmp_path: Path) -
             attempts=duplicate_attempts,
             winners=winners,
         )
+
+
+def test_shard_merge_accepts_legacy_full_pool_coverage(tmp_path: Path) -> None:
+    export_state = {
+        "max_resets": 2,
+        "candidate_pool_size": 2,
+        "candidate_search_mode": "full-pool",
+        "selection_mode": "legacy-lexicographic",
+    }
+    reset_manifest = [{"episode_id": f"episode-{index}"} for index in range(2)]
+    results, attempts, winners = _shard_records()
+    results = [
+        {**row, "selection_mode": "legacy-lexicographic"} for row in results
+    ]
+    receipt = {
+        **_shard_receipt(),
+        "selection_mode": "legacy-lexicographic",
+    }
+
+    _validate_shard_records(
+        shard=tmp_path / "shard-00",
+        receipt=receipt,
+        export_state=export_state,
+        reset_manifest=reset_manifest,
+        results=results,
+        attempts=attempts,
+        winners=winners,
+    )
+
+
+def test_shard_merge_writes_exporter_canonical_jsonl(tmp_path: Path) -> None:
+    output = tmp_path / "rows.jsonl"
+
+    _write_jsonl(output, [{"z": 1, "a": [2, 3]}])
+
+    assert output.read_bytes() == b'{"a":[2,3],"z":1}\n'
 
 
 def _write_sharded_quality_merge_fixture(
@@ -1966,3 +2051,12 @@ def test_replay_proxy_rearms_after_canonical_reset() -> None:
     assert vector_env.armed == [(raw_env, request)]
     assert proxy.step("action") == ("step", "action")
     assert proxy.save_state() == b"state"
+
+
+def test_scientific_recovery_events_externalize_only_resume_provenance() -> None:
+    render_skip = "render_parity_skip:reset:3:episode-3:replay mismatch"
+    assert _scientific_recovery_events(
+        ["dataset.recovery-1786395000000000000", render_skip]
+    ) == [render_skip]
+    with pytest.raises(ValueError, match="unknown recovery event"):
+        _scientific_recovery_events(["unexpected-recovery-kind"])

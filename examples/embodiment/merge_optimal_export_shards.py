@@ -21,7 +21,9 @@ root. This entrypoint validates that every shard finished its slice, merges
 ``attempts.jsonl`` / ``reset_results.jsonl`` / ``winner_manifest.jsonl`` in
 global reset order, keeps the first ``--accepted-episodes`` winners, copies the
 corresponding episodes and lightweight tapes, then seals a dataset card and
-``SHA256SUMS`` exactly like the single-process exporter.
+``SHA256SUMS`` exactly like the single-process exporter. An opt-in fixed-reset
+mode keeps the complete reset workload and requires its winner count to equal
+the declared target.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     EXPORT_SCHEMA,
     FIRST_ELIGIBLE_SEARCH_MODE,
     LEGACY_SELECTION_MODE,
+    PLANNER_PARETO_SELECTION_MODE,
     PROGRESS_SCHEMA,
     QUALITY_V2_THRESHOLDS_SCHEMA,
     _atomic_json,
@@ -59,6 +62,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--accepted-episodes", type=int, default=100)
+    parser.add_argument(
+        "--require-max-resets",
+        action="store_true",
+        help=(
+            "seal every reset declared by export_state.max_resets and require "
+            "the complete workload to contain exactly --accepted-episodes winners"
+        ),
+    )
     return parser
 
 
@@ -205,11 +216,12 @@ def _validate_shard_records(
         or receipt.get("selection_mode") != export_state.get("selection_mode")
     ):
         raise ValueError(f"{shard} completion receipt differs from its sealed rows")
-    if (
-        export_state.get("candidate_search_mode") != "full-pool"
-        or export_state.get("selection_mode") != "planner-pareto"
-    ):
-        raise ValueError(f"{shard} is not a full-pool planner-pareto export")
+    selection_mode = export_state.get("selection_mode")
+    if export_state.get("candidate_search_mode") != "full-pool" or selection_mode not in {
+        LEGACY_SELECTION_MODE,
+        PLANNER_PARETO_SELECTION_MODE,
+    }:
+        raise ValueError(f"{shard} is not a supported full-pool export")
 
     attempts_by_episode: dict[str, list[dict[str, Any]]] = {}
     for attempt in attempts:
@@ -234,7 +246,7 @@ def _validate_shard_records(
             result.get("candidate_count") != candidate_pool_size
             or result.get("budget_used") != candidate_pool_size
             or result.get("candidate_search_mode") != "full-pool"
-            or result.get("selection_mode") != "planner-pareto"
+            or result.get("selection_mode") != selection_mode
         ):
             raise ValueError(f"{shard} reset did not evaluate the exact full pool")
         episode_attempts = attempts_by_episode.pop(expected_episode, [])
@@ -258,7 +270,16 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
         for row in rows:
-            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.write(
+                json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
             stream.flush()
     temporary.replace(path)
 
@@ -275,6 +296,42 @@ def _winner_episode_id(row: dict[str, Any]) -> str:
     if not isinstance(request, dict) or not isinstance(request.get("episode_id"), str):
         raise KeyError("winner row is missing request.episode_id")
     return request["episode_id"]
+
+
+def _select_merged_workload(
+    *,
+    results: list[dict[str, Any]],
+    winners: list[dict[str, Any]],
+    accepted_episodes: int,
+    require_max_resets: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Select the sealed reset/winner workload after exact shard validation."""
+
+    reset_index_by_episode = {
+        row["episode_id"]: int(row["reset_index"]) for row in results
+    }
+    ordered_winners = sorted(
+        winners,
+        key=lambda row: reset_index_by_episode[_winner_episode_id(row)],
+    )
+    if require_max_resets:
+        if len(ordered_winners) != accepted_episodes:
+            raise RuntimeError(
+                "fixed reset workload produced "
+                f"{len(ordered_winners)}/{accepted_episodes} winners"
+            )
+        return ordered_winners, list(results), int(results[-1]["reset_index"])
+
+    kept_winners = ordered_winners[:accepted_episodes]
+    if len(kept_winners) < accepted_episodes:
+        raise RuntimeError(
+            f"only {len(kept_winners)}/{accepted_episodes} winners across shards"
+        )
+    max_reset = reset_index_by_episode[_winner_episode_id(kept_winners[-1])]
+    kept_results = [
+        row for row in results if int(row["reset_index"]) <= max_reset
+    ]
+    return kept_winners, kept_results, max_reset
 
 
 def _kept_recovery_events(events: list[str], *, max_reset: int) -> list[str]:
@@ -482,14 +539,12 @@ def main() -> None:
     reset_index_by_episode: dict[str, int] = {
         row["episode_id"]: int(row["reset_index"]) for row in all_results
     }
-    all_winners.sort(key=lambda row: reset_index_by_episode[_winner_episode_id(row)])
-    kept_winners = all_winners[: args.accepted_episodes]
-    if len(kept_winners) < args.accepted_episodes:
-        raise RuntimeError(
-            f"only {len(kept_winners)}/{args.accepted_episodes} winners across shards"
-        )
-    max_reset = reset_index_by_episode[_winner_episode_id(kept_winners[-1])]
-    kept_results = [row for row in all_results if int(row["reset_index"]) <= max_reset]
+    kept_winners, kept_results, max_reset = _select_merged_workload(
+        results=all_results,
+        winners=all_winners,
+        accepted_episodes=args.accepted_episodes,
+        require_max_resets=args.require_max_resets,
+    )
     recovery_events = _kept_recovery_events(all_recovery_events, max_reset=max_reset)
     kept_episodes = {row["episode_id"] for row in kept_results}
     kept_attempts = [row for row in all_attempts if row["episode_id"] in kept_episodes]
