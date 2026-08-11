@@ -363,7 +363,7 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
     )
     assert all(fragment in source for fragment in required_checkpoint_fragments)
     assert '"zero_action": "zero_action_device_cohort_v1"' in source
-    assert '"privileged_teacher": "current_gpu_state_privileged_teacher_v1"' in source
+    assert '"privileged_teacher": "current_gpu_state_privileged_teacher_v2"' in source
     assert '"demo_quality": demo_quality' in source
     assert '"rlpd_demo_quality_qualified": bool(' in source
 
