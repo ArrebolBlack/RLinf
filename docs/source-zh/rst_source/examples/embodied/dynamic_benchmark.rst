@@ -192,9 +192,16 @@ teacher RLPD 中使用都会 fail closed。
 所有 attempt 仍逐条写入 ``episode_ledger.jsonl``；只有真实终态 success lane 的全部有效
 transition 才由 CUDA mask 选中并物理写入 demonstration replay。qualified 数量、唯一 manifest
 覆盖或 replay 完整保留任一门未通过，trainer 都会在 online update 前 fail closed；失败 attempt
-的 transition 不会成为 imitation 数据，任务 evaluator 与科学阈值均不改变。生成的 v0.4
+的 transition 不会成为 imitation 数据，任务 evaluator 与科学阈值均不改变。生成的 v0.5
 checkpoint 可交给 tensor evaluator，
 但只有独立 held-out evaluation 通过后才能声称策略质量达标。
+
+successful-only 门通过后，tensor trainer 可用 ``--actor-bc-pretrain-updates N`` 在 device 上
+先做行为克隆，也可在每次 online actor update 中加入 ``--actor-bc-weight W`` 倍的独立示教
+loss。两项默认均为 0；只有 RLPD、privileged teacher 与 successful-only replay 同时启用时才
+允许非零值，否则 fail closed。配置值、pretrain loss、参数 identity、optimizer state 与 replay
+RNG state 都会写入 checkpoint 并在 resume 时复核。这两项只用于抑制 actor 外推，不能替代独立
+冻结的 held-out evaluation，也不会改变 task/evaluator/科学阈值。
 
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
 ``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、

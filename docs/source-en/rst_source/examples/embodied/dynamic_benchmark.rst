@@ -203,9 +203,18 @@ only every valid transition from lanes with a real terminal success is selected 
 CUDA mask and physically inserted into demonstration replay. The trainer fails before
 online updates unless the qualified count, unique manifest coverage, and full replay
 retention gates all pass. Failed-attempt transitions are never imitation data, and the
-task evaluator and scientific thresholds are unchanged. The resulting v0.4 checkpoint
+task evaluator and scientific thresholds are unchanged. The resulting v0.5 checkpoint
 is evaluation-compatible but is not policy-quality qualified until a separate
 held-out evaluation passes.
+
+After that success-only gate, the tensor trainer can run
+``--actor-bc-pretrain-updates N`` device-only behavior-cloning updates and can add
+``--actor-bc-weight W`` times a separately sampled demonstration loss to each online
+actor update. Both controls default to zero and fail closed unless RLPD uses a
+privileged-teacher success-only replay. Their exact values, pretraining losses,
+parameter identities, optimizer state, and replay RNG state are checkpointed and
+resume-validated. These controls address actor extrapolation; they do not qualify a
+policy without a separately frozen held-out evaluation.
 
 Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
 with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or

@@ -356,6 +356,7 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
         '"log_alpha": log_alpha.detach()',
         '"online_replay": online.state_dict()',
         '"demo_replay": demos.state_dict()',
+        '"actor_bc_pretrain": actor_bc_pretrain',
         '"rng_state": _capture_rng_state()',
         '"manifest_cursor": dict(env.manifest_state_dict())',
         'checkpoint_payload["training_state_sha256"] = _checkpoint_state_sha256(',
@@ -364,7 +365,7 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
     assert all(fragment in source for fragment in required_checkpoint_fragments)
     assert '"zero_action": "zero_action_device_cohort_v1"' in source
     assert '"privileged_teacher": "current_gpu_state_privileged_teacher_v2"' in source
-    assert 'CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.4"' in source
+    assert 'CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.5"' in source
     assert 'DEMO_QUALITY_SCHEMA = "rlinf-gpuenv0-demo-quality-v0.3"' in source
     assert '"demo_quality": demo_quality' in source
     assert '"rlpd_demo_quality_qualified": bool(' in source

@@ -251,6 +251,144 @@ def test_success_only_demo_bank_requires_24_successes_and_explicit_count_gate(
         module._config(sac_args)
 
 
+def test_actor_bc_controls_default_off_and_require_success_only_teacher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+    default = module._config(_arguments(module))
+    assert default.actor_bc_pretrain_updates == 0
+    assert default.actor_bc_weight == 0.0
+
+    enabled = module._config(
+        _arguments(
+            module,
+            "--demo-policy",
+            "privileged_teacher",
+            "--demo-success-only-replay",
+            "--minimum-qualified-demo-episodes",
+            "24",
+            "--actor-bc-pretrain-updates",
+            "4000",
+            "--actor-bc-weight",
+            "100",
+        )
+    )
+    assert enabled.actor_bc_pretrain_updates == 4000
+    assert enabled.actor_bc_weight == pytest.approx(100.0)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        module._config(_arguments(module, "--actor-bc-pretrain-updates", "-1"))
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        module._config(_arguments(module, "--actor-bc-weight", "nan"))
+    with pytest.raises(ValueError, match="success-only replay"):
+        module._config(_arguments(module, "--actor-bc-weight", "1"))
+
+
+def test_actor_bc_pretrain_updates_actor_and_reports_boundary_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+
+    class FakeLoss:
+        def __init__(self, value: float) -> None:
+            self.value = value
+            self.backward_calls = 0
+
+        def backward(self) -> None:
+            self.backward_calls += 1
+
+        def detach(self) -> FakeLoss:
+            return self
+
+        def clone(self) -> FakeLoss:
+            return FakeLoss(self.value)
+
+        def __add__(self, other: FakeLoss) -> FakeLoss:
+            return FakeLoss(self.value + other.value)
+
+        def __truediv__(self, divisor: int) -> FakeLoss:
+            return FakeLoss(self.value / divisor)
+
+        def __float__(self) -> float:
+            return self.value
+
+    class Actor:
+        def __init__(self) -> None:
+            self.version = 0
+            self.training = False
+
+        def state_dict(self) -> dict[str, int]:
+            return {"version": self.version}
+
+        def train(self) -> None:
+            self.training = True
+
+        def sample(
+            self, _observation: object, *, stochastic: bool
+        ) -> tuple[object, object]:
+            assert stochastic is False
+            return object(), object()
+
+        def parameters(self) -> tuple[Any, ...]:
+            return ()
+
+    class Optimizer:
+        def __init__(self, actor: Actor) -> None:
+            self.actor = actor
+            self.zero_grad_calls = 0
+            self.step_calls = 0
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+            self.zero_grad_calls += 1
+
+        def step(self) -> None:
+            self.actor.version += 1
+            self.step_calls += 1
+
+    class Replay:
+        size = 9
+        device = "cuda:0"
+
+        def __init__(self) -> None:
+            self.sample_calls = 0
+
+        def sample(self, batch_size: int) -> SimpleNamespace:
+            assert batch_size == 4
+            self.sample_calls += 1
+            return SimpleNamespace(observation=object(), action=object())
+
+    losses = iter((FakeLoss(0.3), FakeLoss(0.2), FakeLoss(0.1)))
+    monkeypatch.setattr(
+        module.F,
+        "mse_loss",
+        lambda _prediction, _target: next(losses),
+        raising=False,
+    )
+    module.torch.Tensor = type("Tensor", (), {})
+    module.nn.utils = SimpleNamespace(clip_grad_norm_=lambda _parameters, _limit: None)
+    module.torch.cuda = SimpleNamespace(synchronize=lambda device: device == "cuda:0")
+    actor = Actor()
+    optimizer = Optimizer(actor)
+    replay = Replay()
+    evidence = module._actor_bc_pretrain(
+        config=SimpleNamespace(actor_bc_pretrain_updates=3, batch_size=4),
+        actor=actor,
+        actor_optimizer=optimizer,
+        demos=replay,
+    )
+
+    assert actor.training is True
+    assert replay.sample_calls == optimizer.zero_grad_calls == optimizer.step_calls == 3
+    assert evidence["enabled"] is True
+    assert evidence["completed_updates"] == 3
+    assert evidence["first_loss"] == pytest.approx(0.3)
+    assert evidence["last_loss"] == pytest.approx(0.1)
+    assert evidence["mean_loss"] == pytest.approx(0.2)
+    assert evidence["parameters_changed"] is True
+    assert evidence["actor_sha256_before"] != evidence["actor_sha256_after"]
+
+
 def test_success_only_replay_filters_complete_success_lanes_on_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

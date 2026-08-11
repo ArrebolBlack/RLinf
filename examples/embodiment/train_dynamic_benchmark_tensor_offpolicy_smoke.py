@@ -21,7 +21,9 @@ Online-policy host materialization occurs only after synchronized cohort/update
 boundaries for evidence and checkpointing.  RLPD can either retain the mechanical
 zero-action smoke seed or collect quality-gated privileged-teacher demonstrations
 from explicitly materialized current GPU state.  The latter control plane is
-reported separately and never weakens the online device-only path.
+reported separately and never weakens the online device-only path.  Default-off
+actor behavior-cloning warm-start and demonstration regularization can keep RLPD
+away from critic-extrapolated actions without changing the environment contract.
 """
 
 from __future__ import annotations
@@ -50,8 +52,8 @@ from rlinf.data.device_replay_buffer import DeviceReplayBatch, DeviceReplayBuffe
 from rlinf.data.device_transition_buffer import DeviceTransitionBuffer
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import GpuNativeTensorBackendEnv
 
-CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.4"
-REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.4"
+CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.5"
+REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.5"
 DEMO_QUALITY_SCHEMA = "rlinf-gpuenv0-demo-quality-v0.3"
 MINIMUM_SUCCESS_ONLY_DEMO_EPISODES = 24
 DEMO_PRODUCERS = {
@@ -95,6 +97,8 @@ class TensorOffPolicyConfig:
     batch_size: int
     updates_per_cohort: int
     demo_ratio: float
+    actor_bc_pretrain_updates: int
+    actor_bc_weight: float
     demo_policy: str | None
     demo_cohorts: int
     minimum_demo_success_rate: float
@@ -208,6 +212,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--updates-per-cohort", type=int, default=8)
     parser.add_argument("--demo-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--actor-bc-pretrain-updates",
+        type=int,
+        default=0,
+        help=(
+            "Device-only actor behavior-cloning updates after a qualified "
+            "success-only demonstration bank; disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--actor-bc-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of a separately sampled demonstration BC loss in every "
+            "online actor update; disabled by default."
+        ),
+    )
     parser.add_argument(
         "--demo-policy",
         choices=tuple(DEMO_PRODUCERS),
@@ -366,6 +388,8 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         batch_size=args.batch_size,
         updates_per_cohort=args.updates_per_cohort,
         demo_ratio=demo_ratio,
+        actor_bc_pretrain_updates=args.actor_bc_pretrain_updates,
+        actor_bc_weight=args.actor_bc_weight,
         demo_policy=demo_policy,
         demo_cohorts=demo_cohorts,
         minimum_demo_success_rate=minimum_demo_success_rate,
@@ -409,6 +433,10 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         raise ValueError("manifest_size must be at least num_envs")
     if config.warmup_steps < 0:
         raise ValueError("warmup_steps must be non-negative")
+    if config.actor_bc_pretrain_updates < 0:
+        raise ValueError("actor_bc_pretrain_updates must be non-negative")
+    if not math.isfinite(config.actor_bc_weight) or config.actor_bc_weight < 0.0:
+        raise ValueError("actor_bc_weight must be finite and non-negative")
     if config.replay_capacity < config.batch_size:
         raise ValueError("replay_capacity must be at least batch_size")
     if not 0.0 <= config.demo_ratio <= 1.0:
@@ -480,6 +508,15 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
             "demo teacher overrides and success-only replay require RLPD "
             "privileged_teacher demos"
         )
+    if config.actor_bc_pretrain_updates > 0 or config.actor_bc_weight > 0.0:
+        if (
+            config.algorithm != "rlpd"
+            or config.demo_policy != "privileged_teacher"
+            or not config.demo_success_only_replay
+        ):
+            raise ValueError(
+                "actor BC requires RLPD privileged_teacher success-only replay"
+            )
     if not 0.0 <= config.gamma <= 1.0 or not 0.0 < config.tau <= 1.0:
         raise ValueError("gamma/tau are outside their valid ranges")
     if (
@@ -534,6 +571,80 @@ def _mixed_batch(
     )
 
 
+def _actor_bc_pretrain(
+    *,
+    config: TensorOffPolicyConfig,
+    actor: TensorGaussianActor,
+    actor_optimizer: torch.optim.Optimizer,
+    demos: DeviceReplayBuffer,
+) -> dict[str, Any]:
+    """Optionally fit the actor to qualified demonstrations on its CUDA device."""
+
+    before_sha256 = _structured_sha256(actor.state_dict())
+    updates = config.actor_bc_pretrain_updates
+    if updates == 0:
+        return {
+            "enabled": False,
+            "configured_updates": 0,
+            "completed_updates": 0,
+            "demo_rows": demos.size,
+            "device": str(demos.device),
+            "first_loss": None,
+            "last_loss": None,
+            "mean_loss": None,
+            "actor_sha256_before": before_sha256,
+            "actor_sha256_after": before_sha256,
+            "parameters_changed": False,
+        }
+    if demos.size < 1:
+        raise RuntimeError("actor BC pretraining requires a non-empty demo replay")
+
+    actor.train()
+    first_loss: torch.Tensor | None = None
+    last_loss: torch.Tensor | None = None
+    loss_sum: torch.Tensor | None = None
+    for _update in range(updates):
+        batch = demos.sample(config.batch_size)
+        predicted_action, _ = actor.sample(batch.observation, stochastic=False)
+        loss = F.mse_loss(predicted_action, batch.action)
+        actor_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
+        actor_optimizer.step()
+        detached = loss.detach()
+        if first_loss is None:
+            first_loss = detached.clone()
+            loss_sum = detached.clone()
+        else:
+            assert loss_sum is not None
+            loss_sum = loss_sum + detached
+        last_loss = detached
+
+    torch.cuda.synchronize(demos.device)
+    assert first_loss is not None and last_loss is not None and loss_sum is not None
+    losses = {
+        "first_loss": float(first_loss),
+        "last_loss": float(last_loss),
+        "mean_loss": float(loss_sum / updates),
+    }
+    if not all(np.isfinite(value) for value in losses.values()):
+        raise RuntimeError(f"non-finite actor BC pretraining metrics: {losses}")
+    after_sha256 = _structured_sha256(actor.state_dict())
+    if after_sha256 == before_sha256:
+        raise RuntimeError("actor BC pretraining did not change actor parameters")
+    return {
+        "enabled": True,
+        "configured_updates": updates,
+        "completed_updates": updates,
+        "demo_rows": demos.size,
+        "device": str(demos.device),
+        **losses,
+        "actor_sha256_before": before_sha256,
+        "actor_sha256_after": after_sha256,
+        "parameters_changed": True,
+    }
+
+
 def _offpolicy_updates(
     *,
     config: TensorOffPolicyConfig,
@@ -554,6 +665,9 @@ def _offpolicy_updates(
             demos,
             batch_size=config.batch_size,
             demo_ratio=config.demo_ratio,
+        )
+        demo_actor_batch = (
+            demos.sample(config.batch_size) if config.actor_bc_weight > 0.0 else None
         )
         with torch.no_grad():
             next_action, next_log_probability = actor.sample(
@@ -580,7 +694,15 @@ def _offpolicy_updates(
             stochastic=True,
         )
         policy_q = critic(batch.observation, policy_action).min(dim=-1).values
-        actor_loss = (log_alpha.exp().detach() * log_probability - policy_q).mean()
+        actor_sac_loss = (log_alpha.exp().detach() * log_probability - policy_q).mean()
+        actor_bc_loss = actor_sac_loss.new_zeros(())
+        if demo_actor_batch is not None:
+            demo_action, _ = actor.sample(
+                demo_actor_batch.observation,
+                stochastic=False,
+            )
+            actor_bc_loss = F.mse_loss(demo_action, demo_actor_batch.action)
+        actor_loss = actor_sac_loss + config.actor_bc_weight * actor_bc_loss
         actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
@@ -604,6 +726,8 @@ def _offpolicy_updates(
                 (
                     critic_loss.detach(),
                     actor_loss.detach(),
+                    actor_sac_loss.detach(),
+                    actor_bc_loss.detach(),
                     alpha_loss.detach(),
                     log_alpha.exp().detach(),
                     predicted.detach().mean(),
@@ -618,6 +742,8 @@ def _offpolicy_updates(
     names = (
         "critic_loss",
         "actor_loss",
+        "actor_sac_loss",
+        "actor_bc_loss",
         "alpha_loss",
         "alpha",
         "q_data",
@@ -785,6 +911,7 @@ def _load_resume_checkpoint(
         "completed_online_cohorts",
         "completed_demo_cohorts",
         "demo_quality",
+        "actor_bc_pretrain",
         "update_steps",
         "rng_state",
         "parameter_sha256",
@@ -820,6 +947,19 @@ def _load_resume_checkpoint(
         or demo_quality.get("gate_passed") is not True
     ):
         raise ValueError("resume demonstration quality evidence differs from config")
+    actor_bc_pretrain = restored["actor_bc_pretrain"]
+    expected_bc_updates = config.actor_bc_pretrain_updates
+    if (
+        not isinstance(actor_bc_pretrain, Mapping)
+        or int(actor_bc_pretrain.get("configured_updates", -1)) != expected_bc_updates
+        or int(actor_bc_pretrain.get("completed_updates", -1)) != expected_bc_updates
+        or bool(actor_bc_pretrain.get("enabled")) != (expected_bc_updates > 0)
+        or (
+            expected_bc_updates > 0
+            and actor_bc_pretrain.get("parameters_changed") is not True
+        )
+    ):
+        raise ValueError("resume actor BC pretraining evidence differs from config")
     return resolved, sha256, restored
 
 
@@ -1499,6 +1639,7 @@ def main() -> int:
         demo_quality_path = args.output / "demo_quality.json"
         if restored is not None:
             demo_quality = dict(restored["demo_quality"])
+            actor_bc_pretrain = dict(restored["actor_bc_pretrain"])
             _atomic_json(demo_quality_path, demo_quality)
         elif config.algorithm == "rlpd":
             demo_allocated_steps = 0
@@ -1766,6 +1907,14 @@ def main() -> int:
             }
             _atomic_json(demo_quality_path, demo_quality)
 
+        if restored is None:
+            actor_bc_pretrain = _actor_bc_pretrain(
+                config=config,
+                actor=actor,
+                actor_optimizer=actor_optimizer,
+                demos=demos,
+            )
+
         for local_cohort in range(config.cohorts):
             global_cohort = completed_online_before + local_cohort
             reset = next_reset if local_cohort == 0 else env.reset()
@@ -1846,6 +1995,7 @@ def main() -> int:
             "completed_online_cohorts": completed_online_after,
             "completed_demo_cohorts": completed_demo_after,
             "demo_quality": demo_quality,
+            "actor_bc_pretrain": actor_bc_pretrain,
             "update_steps": update_steps,
             "rng_state": _capture_rng_state(),
             "parameter_sha256": parameter_sha256_end,
@@ -1866,6 +2016,8 @@ def main() -> int:
             )
             == completed_demo_after,
             "demo_quality_match": reloaded.get("demo_quality") == demo_quality,
+            "actor_bc_pretrain_match": reloaded.get("actor_bc_pretrain")
+            == actor_bc_pretrain,
             "update_steps_match": int(reloaded.get("update_steps", -1)) == update_steps,
             "manifest_cursor_match": reloaded.get("manifest_cursor")
             == checkpoint_payload["manifest_cursor"],
@@ -1930,6 +2082,8 @@ def main() -> int:
                 "quality_qualified": False,
                 "rlpd_demo_quality_qualified": bool(demo_quality["quality_qualified"]),
                 "rlpd_demo_producer": demo_quality["producer"],
+                "actor_bc_pretrain_enabled": bool(actor_bc_pretrain["enabled"]),
+                "actor_bc_regularization_enabled": config.actor_bc_weight > 0.0,
                 "statement": (
                     (
                         "RLPD demo replay contains only complete terminal-success "
@@ -1997,6 +2151,8 @@ def main() -> int:
                 "demonstration_host_to_device_action_transfers": demo_action_transfers,
                 "demonstration_replay_selection": demo_quality["replay_selection"],
                 "demonstration_selector_host_materializations": 0,
+                "actor_bc_pretrain_device_only": True,
+                "actor_bc_regularization_device_only": True,
                 "cohort_horizon_steps": env.cohort_horizon_steps,
                 "warmup_policy_only_steps": config.warmup_steps,
             },
@@ -2016,6 +2172,7 @@ def main() -> int:
                     demo_quality["replay_selection"]["excluded_attempts"]
                 ),
                 "demo_ratio": config.demo_ratio,
+                "actor_bc_weight": config.actor_bc_weight,
                 "sampling_rng_checkpointed": True,
             },
             "demo_quality": {
@@ -2035,6 +2192,8 @@ def main() -> int:
                 "optimizer_updates_before": update_steps_before,
                 "optimizer_updates_this_invocation": invocation_update_steps,
                 "optimizer_updates_after": update_steps,
+                "actor_bc_pretrain": actor_bc_pretrain,
+                "actor_bc_weight": config.actor_bc_weight,
                 "parameter_sha256_start": parameter_sha256_start,
                 "parameter_sha256_end": parameter_sha256_end,
                 "parameters_changed": parameter_sha256_start != parameter_sha256_end,
