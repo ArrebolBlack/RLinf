@@ -189,9 +189,11 @@ GPU-native RLPD 可在在线训练前追加
 仍活跃 ``mjwarp_gpu_v1`` lane 的当前状态；trainer 会先原子写出
 ``demo_quality.json``，若成功率未达到阈值则在任何在线更新前 fail closed。GPU→host 的
 观测/终态 mask 读取与 host→GPU 的 teacher 动作传输会单独计入 demonstration control
-plane；learned-policy rollout 以及 replay/update 热路径仍保持 device-only。生成的 v0.2
-checkpoint 可交给 tensor evaluator，但只有独立 held-out evaluation 通过后才能声称策略
-质量达标。
+plane；learned-policy rollout 以及 replay/update 热路径仍保持 device-only。可选的
+``--demo-teacher-overrides FILE`` 只接受有界、白名单内的规划器参数 JSON；实际解析字节的
+哈希写入 ``demo_quality.json``，未知/重复键、任务或 evaluator 设置，以及在非 privileged
+teacher RLPD 中使用都会 fail closed。生成的 v0.3 checkpoint 可交给 tensor evaluator，
+但只有独立 held-out evaluation 通过后才能声称策略质量达标。
 
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
 ``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、

@@ -202,8 +202,12 @@ trainer writes ``demo_quality.json`` and fails before online updates when the
 predeclared success threshold is missed. GPU-to-host observation/terminal-mask reads
 and host-to-GPU teacher-action transfers are counted as a separate demonstration
 control plane; the learned-policy rollout and replay/update path remain device-only.
-The resulting v0.2 checkpoint is evaluation-compatible but is not policy-quality
-qualified until a separate held-out evaluation passes.
+An optional ``--demo-teacher-overrides FILE`` accepts a strict, bounded JSON object
+containing only audited planner parameters. The parsed bytes are hash-pinned in
+``demo_quality.json``; unknown or duplicate keys, evaluator/task settings, and use
+outside privileged-teacher RLPD fail closed. The resulting v0.3 checkpoint is
+evaluation-compatible but is not policy-quality qualified until a separate held-out
+evaluation passes.
 
 Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
 with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or

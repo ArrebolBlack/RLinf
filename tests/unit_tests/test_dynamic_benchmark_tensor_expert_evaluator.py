@@ -52,8 +52,8 @@ from examples.embodiment.evaluate_dynamic_benchmark_tensor_expert import (
 )
 
 
-def test_policy_schema_accepts_quality_gated_offpolicy_v02() -> None:
-    assert "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.2" in POLICY_SCHEMAS
+def test_policy_schema_accepts_planner_tuned_offpolicy_v03() -> None:
+    assert "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.3" in POLICY_SCHEMAS
 
 
 def _export_identity() -> dict:

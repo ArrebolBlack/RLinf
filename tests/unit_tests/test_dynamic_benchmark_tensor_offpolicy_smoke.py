@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import sys
 import types
 from contextlib import nullcontext
@@ -147,6 +149,8 @@ def test_privileged_teacher_config_requires_positive_predeclared_gate(
     assert config.demo_policy == "privileged_teacher"
     assert config.demo_cohorts == 4
     assert config.minimum_demo_success_rate == pytest.approx(0.75)
+    assert config.demo_teacher_overrides == {}
+    assert config.demo_teacher_overrides_sha256 is None
 
     with pytest.raises(ValueError, match="positive quality gate"):
         module._config(
@@ -158,6 +162,88 @@ def test_privileged_teacher_config_requires_positive_predeclared_gate(
                 "0",
             )
         )
+
+
+def test_teacher_overrides_are_strict_planner_only_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(monkeypatch)
+    path = tmp_path / "teacher-overrides.json"
+    payload = {
+        "close_retry_steps": 20,
+        "lift_action_z_max": 0.4,
+        "post_hold_settle_steps": 2,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    config = module._config(
+        _arguments(
+            module,
+            "--demo-policy",
+            "privileged_teacher",
+            "--minimum-demo-success-rate",
+            "0.75",
+            "--demo-teacher-overrides",
+            str(path),
+        )
+    )
+    assert config.demo_teacher_overrides == payload
+    assert (
+        config.demo_teacher_overrides_sha256
+        == hashlib.sha256(path.read_bytes()).hexdigest()
+    )
+
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text('{"scientific_resolution": 1.0}', encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported demo teacher override"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--minimum-demo-success-rate",
+                "0.75",
+                "--demo-teacher-overrides",
+                str(unknown),
+            )
+        )
+
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text('{"lookahead_s": 0.3, "lookahead_s": 0.4}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate demo teacher override key"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--minimum-demo-success-rate",
+                "0.75",
+                "--demo-teacher-overrides",
+                str(duplicate),
+            )
+        )
+
+
+def test_empty_teacher_override_file_still_requires_privileged_teacher(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(monkeypatch)
+    path = tmp_path / "empty.json"
+    path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="require privileged_teacher"):
+        module._config(_arguments(module, "--demo-teacher-overrides", str(path)))
+
+
+def test_teacher_override_application_requires_existing_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+    teacher = SimpleNamespace(lookahead_s=0.3)
+    module._apply_demo_teacher_overrides(teacher, {"lookahead_s": 0.4})
+    assert teacher.lookahead_s == pytest.approx(0.4)
+    with pytest.raises(RuntimeError, match="does not expose"):
+        module._apply_demo_teacher_overrides(teacher, {"lift_action_z_max": 0.4})
 
 
 def test_zero_demo_cannot_be_mislabeled_as_quality_gated(

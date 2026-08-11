@@ -50,12 +50,29 @@ from rlinf.data.device_replay_buffer import DeviceReplayBatch, DeviceReplayBuffe
 from rlinf.data.device_transition_buffer import DeviceTransitionBuffer
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import GpuNativeTensorBackendEnv
 
-CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.2"
-REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.2"
+CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.3"
+REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.3"
 DEMO_PRODUCERS = {
     "zero_action": "zero_action_device_cohort_v1",
-    "privileged_teacher": "current_gpu_state_privileged_teacher_v1",
+    "privileged_teacher": "current_gpu_state_privileged_teacher_v2",
 }
+TEACHER_OVERRIDE_FLOAT_RANGES = {
+    "lookahead_s": (0.0, 1.0, True),
+    "contact_lookahead_s": (0.0, 0.5, True),
+    "hover_height_m": (0.0, 0.25, False),
+    "grasp_height_offset_m": (-0.02, 0.04, True),
+    "lift_height_m": (0.05, 0.20, False),
+    "track_to_descend_distance_m": (0.005, 0.15, False),
+    "close_horizontal_tolerance_m": (0.005, 0.08, False),
+    "close_vertical_tolerance_m": (0.005, 0.08, False),
+    "lift_action_z_max": (0.05, 1.0, False),
+}
+TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS = {
+    "close_retry_steps",
+    "lift_contact_loss_retry_steps",
+}
+TEACHER_OVERRIDE_NONNEGATIVE_INTS = {"post_hold_settle_steps"}
+TEACHER_OVERRIDE_BOOLS = {"lift_on_instantaneous_bilateral"}
 
 
 @dataclass(frozen=True)
@@ -79,6 +96,8 @@ class TensorOffPolicyConfig:
     demo_policy: str | None
     demo_cohorts: int
     minimum_demo_success_rate: float
+    demo_teacher_overrides: dict[str, Any]
+    demo_teacher_overrides_sha256: str | None
     gamma: float
     tau: float
     actor_learning_rate: float
@@ -192,6 +211,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--demo-cohorts", type=int, default=1)
     parser.add_argument("--minimum-demo-success-rate", type=float, default=0.0)
+    parser.add_argument(
+        "--demo-teacher-overrides",
+        type=Path,
+        help=(
+            "Strict JSON object of audited privileged-teacher planner overrides; "
+            "task/evaluator thresholds are not configurable here."
+        ),
+    )
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--actor-learning-rate", type=float, default=3e-4)
@@ -213,12 +240,91 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_demo_teacher_overrides(
+    path: Path | None,
+) -> tuple[dict[str, Any], str | None]:
+    """Load a bounded planner-only override object and its exact file identity."""
+
+    if path is None:
+        return {}, None
+    resolved = path.expanduser().resolve(strict=True)
+    raw = resolved.read_bytes()
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate demo teacher override key: {key}")
+            result[key] = value
+        return result
+
+    payload = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    if not isinstance(payload, dict) or any(
+        not isinstance(key, str) for key in payload
+    ):
+        raise ValueError(
+            "demo teacher overrides must be a JSON object with string keys"
+        )
+    allowed = (
+        set(TEACHER_OVERRIDE_FLOAT_RANGES)
+        | TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS
+        | TEACHER_OVERRIDE_NONNEGATIVE_INTS
+        | TEACHER_OVERRIDE_BOOLS
+    )
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported demo teacher override keys: {unknown}")
+    normalized: dict[str, Any] = {}
+    for name in sorted(payload):
+        value = payload[name]
+        if name in TEACHER_OVERRIDE_FLOAT_RANGES:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"demo teacher override {name} must be numeric")
+            numeric = float(value)
+            minimum, maximum, minimum_inclusive = TEACHER_OVERRIDE_FLOAT_RANGES[name]
+            lower_valid = numeric >= minimum if minimum_inclusive else numeric > minimum
+            if not math.isfinite(numeric) or not lower_valid or numeric > maximum:
+                bracket = "[" if minimum_inclusive else "("
+                raise ValueError(
+                    f"demo teacher override {name} must be in {bracket}{minimum}, {maximum}]"
+                )
+            normalized[name] = numeric
+        elif name in TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS:
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= 160
+            ):
+                raise ValueError(
+                    f"demo teacher override {name} must be null or an integer in [1, 160]"
+                )
+            normalized[name] = value
+        elif name in TEACHER_OVERRIDE_NONNEGATIVE_INTS:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 20
+            ):
+                raise ValueError(
+                    f"demo teacher override {name} must be an integer in [0, 20]"
+                )
+            normalized[name] = value
+        else:
+            if not isinstance(value, bool):
+                raise ValueError(f"demo teacher override {name} must be boolean")
+            normalized[name] = value
+    return normalized, hashlib.sha256(raw).hexdigest()
+
+
 def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
     demo_ratio = float(args.demo_ratio) if args.algorithm == "rlpd" else 0.0
     demo_policy = str(args.demo_policy) if args.algorithm == "rlpd" else None
     demo_cohorts = int(args.demo_cohorts) if args.algorithm == "rlpd" else 0
     minimum_demo_success_rate = (
         float(args.minimum_demo_success_rate) if args.algorithm == "rlpd" else 0.0
+    )
+    demo_teacher_overrides, demo_teacher_overrides_sha256 = (
+        _load_demo_teacher_overrides(args.demo_teacher_overrides)
     )
     config = TensorOffPolicyConfig(
         task=args.task,
@@ -240,6 +346,8 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         demo_policy=demo_policy,
         demo_cohorts=demo_cohorts,
         minimum_demo_success_rate=minimum_demo_success_rate,
+        demo_teacher_overrides=demo_teacher_overrides,
+        demo_teacher_overrides_sha256=demo_teacher_overrides_sha256,
         gamma=args.gamma,
         tau=args.tau,
         actor_learning_rate=args.actor_learning_rate,
@@ -303,6 +411,15 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
             raise ValueError(
                 "privileged-teacher demonstrations require a positive quality gate"
             )
+        if (
+            config.demo_policy != "privileged_teacher"
+            and config.demo_teacher_overrides_sha256 is not None
+        ):
+            raise ValueError(
+                "demo teacher overrides require privileged_teacher demonstrations"
+            )
+    elif config.demo_teacher_overrides_sha256 is not None:
+        raise ValueError("demo teacher overrides require RLPD privileged_teacher demos")
     if not 0.0 <= config.gamma <= 1.0 or not 0.0 < config.tau <= 1.0:
         raise ValueError("gamma/tau are outside their valid ranges")
     if (
@@ -875,24 +992,40 @@ def _validated_teacher_action(
     return values.astype(np.float32, copy=True)
 
 
+def _apply_demo_teacher_overrides(teacher: Any, overrides: Mapping[str, Any]) -> None:
+    """Apply already-validated planner parameters without touching task semantics."""
+
+    for name, value in overrides.items():
+        if not hasattr(teacher, name):
+            raise RuntimeError(
+                f"privileged teacher does not expose audited planner parameter {name}"
+            )
+        setattr(teacher, name, value)
+
+
 def _rollout_privileged_teacher_cohort(
     *,
     env: GpuNativeTensorBackendEnv,
     buffer: DeviceTransitionBuffer,
     reset: Any,
+    teacher_overrides: Mapping[str, Any] | None = None,
 ) -> tuple[Any, float, dict[str, Any]]:
     """Collect one demo cohort from current GPU state through the host control plane."""
 
     from se3_wam.benchmark.contracts import ActionMode
     from se3_wam.benchmark.teacher_factory import make_privileged_teacher
 
+    effective_overrides = dict(teacher_overrides or {})
     teachers = []
     teacher_metadata = []
     for _lane in range(env.num_envs):
         teacher, metadata = make_privileged_teacher(env.task_id)
+        _apply_demo_teacher_overrides(teacher, effective_overrides)
         teacher.reset()
         teachers.append(teacher)
-        teacher_metadata.append(dict(metadata))
+        teacher_metadata.append(
+            {**dict(metadata), "runtime_planner_overrides": effective_overrides}
+        )
     if any(metadata != teacher_metadata[0] for metadata in teacher_metadata[1:]):
         raise RuntimeError("privileged teacher metadata differs across cohort lanes")
     observation_audit_calls_before = env.teacher_audit_materializations
@@ -1265,6 +1398,7 @@ def main() -> int:
                         env=env,
                         buffer=transition,
                         reset=reset,
+                        teacher_overrides=config.demo_teacher_overrides,
                     )
                     role = "quality_gated_privileged_teacher_demo"
                 else:
@@ -1320,9 +1454,11 @@ def main() -> int:
                 or demo_success_rate >= config.minimum_demo_success_rate
             )
             demo_quality = {
-                "schema_version": "rlinf-gpuenv0-demo-quality-v0.1",
+                "schema_version": "rlinf-gpuenv0-demo-quality-v0.2",
                 "demo_policy": config.demo_policy,
                 "producer": DEMO_PRODUCERS[config.demo_policy],
+                "teacher_overrides": config.demo_teacher_overrides,
+                "teacher_overrides_sha256": config.demo_teacher_overrides_sha256,
                 "demo_cohorts": config.demo_cohorts,
                 "episodes": demo_episodes,
                 "terminal_successes": demo_successes,
@@ -1345,9 +1481,11 @@ def main() -> int:
             next_reset = env.reset()
         else:
             demo_quality = {
-                "schema_version": "rlinf-gpuenv0-demo-quality-v0.1",
+                "schema_version": "rlinf-gpuenv0-demo-quality-v0.2",
                 "demo_policy": None,
                 "producer": None,
+                "teacher_overrides": {},
+                "teacher_overrides_sha256": None,
                 "demo_cohorts": 0,
                 "episodes": 0,
                 "terminal_successes": 0,
