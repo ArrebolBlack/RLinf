@@ -143,13 +143,21 @@ return 可比较。
 有状态的 planner 实例。``--residual-scale`` 默认 ``0.25``，每个 scale 与 actor-BC
 权重组合都必须登记为独立实验臂。
 
-环境 step 也可使用持久化子进程分片，而非串行或线程 adapter。设置
-``--eval-worker-processes 2``（也可用 ``4``/``8``）可加速冻结 manifest 的 validation，
-``--env-worker-processes`` 则用于分片训练 reset/step。manifest row 仍由主进程分配，
-返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖 worker 完成顺序。每个子进程
-内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``；
-``--process-start-method spawn`` 是跨平台且 CUDA-safe 的默认值。进程数属于执行 provenance，
-checkpoint 恢复时必须使用相同配置。
+精确 CPU process recipe 现在默认开启。没有 YAML 覆盖时，训练和 validation 均使用 32 个
+环境；省略 ``--env-worker-processes`` 或 ``--eval-worker-processes`` 时，进程数自动等于
+对应 vector width。Linux 默认使用 ``forkserver``，其他平台保留可移植的 ``spawn``。
+只要 evaluation process 已开启，默认复用 checkpoint-rewind evaluation worker；
+residual-RLPD 还默认在环境所属子进程内计算 privileged planner。需要显式串行兼容模式时，
+使用自动生成的 ``--no-persistent-eval-workers``、``--no-eval-planner-in-processes``，或将
+两类 process 数都设为 ``0``。sampler/learner overlap 仍默认关闭，因为它会改变 replay 顺序。
+
+manifest row 仍由主进程分配，返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖
+worker 完成顺序。每个子进程内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``。
+worker 继承启动器的 CPU affinity；已测量的 W32 recipe 要求显式限定在同一 NUMA 节点的
+32 个逻辑 CPU（例如使用 ``taskset``），process tree 峰值 RSS 约 47 GiB。trainer 无法安全
+推断哪一个 NUMA 节点与所用 GPU 相邻。process topology 属于执行 provenance，checkpoint
+恢复时必须使用相同配置。使用当前 RLinf 与 SE3-WAM 源码时，task-only manifest、mutable
+``MjModel`` 精确 reset 恢复、v0.3 checkpoint 和有界 process cleanup 无需额外开关。
 
 吞吐 bakeoff 前，应在真实 benchmark checkout 上运行进程正确性 gate。它会比较
 serial/process 的 reset 与 step digest，验证 process 模式 checkpoint/resume 的精确
@@ -174,6 +182,27 @@ matched on-policy 对照使用独立的可恢复 trainer：
 该实现使用 7 维 squashed-Gaussian actor、GAE、clipped PPO、value head、冻结
 validation manifest 与 update-boundary checkpoint/resume。time-limit truncation 会对
 value target 做 bootstrap，但会在 reset 边界停止 advantage 递推。
+
+GPU-native RLPD 可在在线训练前追加
+``--demo-policy privileged_teacher --demo-cohorts N
+--minimum-demo-success-rate P``，对示教质量做预声明门禁。每个 teacher 动作只读取对应
+仍活跃 ``mjwarp_gpu_v1`` lane 的当前状态；trainer 会先原子写出
+``demo_quality.json``，若成功率未达到阈值则在任何在线更新前 fail closed。GPU→host 的
+观测/终态 mask 读取与 host→GPU 的 teacher 动作传输会单独计入 demonstration control
+plane；learned-policy rollout 以及 replay/update 热路径仍保持 device-only。可选的
+``--demo-teacher-overrides FILE`` 只接受有界、白名单内的规划器参数 JSON；实际解析字节的
+哈希写入 ``demo_quality.json``，未知/重复键、任务或 evaluator 设置，以及在非 privileged
+teacher RLPD 中使用都会 fail closed。
+
+如需构建 successful-only GPU 示教库，追加
+``--demo-success-only-replay --minimum-qualified-demo-episodes N``，并保持
+``--minimum-demo-success-rate`` 为 0。``N`` 不得小于 24，也不得超过已配置的 attempt 数。
+所有 attempt 仍逐条写入 ``episode_ledger.jsonl``；只有真实终态 success lane 的全部有效
+transition 才由 CUDA mask 选中并物理写入 demonstration replay。qualified 数量、唯一 manifest
+覆盖或 replay 完整保留任一门未通过，trainer 都会在 online update 前 fail closed；失败 attempt
+的 transition 不会成为 imitation 数据，任务 evaluator 与科学阈值均不改变。生成的 v0.4
+checkpoint 可交给 tensor evaluator，
+但只有独立 held-out evaluation 通过后才能声称策略质量达标。
 
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
 ``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、

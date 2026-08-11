@@ -78,6 +78,46 @@ PLANNER_PARETO_SELECTION_MODE = "planner-pareto"
 SELECTION_MODES = (LEGACY_SELECTION_MODE, PLANNER_PARETO_SELECTION_MODE)
 FIRST_ELIGIBLE_SEARCH_MODE = "first-eligible"
 FULL_POOL_SEARCH_MODE = "full-pool"
+
+
+def select_quality_v4_same_reset_pair(
+    *,
+    planner_attempt: Mapping[str, Any],
+    rl_attempt: Mapping[str, Any],
+    thresholds: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run the Qv4 absolute gates plus same-reset paired-Pareto selector."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        paired_pareto_winner,
+    )
+
+    return paired_pareto_winner(
+        planner_attempt=planner_attempt,
+        rl_attempt=rl_attempt,
+        thresholds=thresholds,
+    )
+
+
+def export_quality_v4_winner(
+    output: Path,
+    *,
+    source: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Write and independently re-gate the selected Qv4 winner's full source."""
+
+    from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+        materialize_quality_v4_winner_export,
+    )
+
+    return materialize_quality_v4_winner_export(
+        output,
+        source=source,
+        attempt=attempt,
+    )
+
+
 CANDIDATE_SEARCH_MODES = (FIRST_ELIGIBLE_SEARCH_MODE, FULL_POOL_SEARCH_MODE)
 PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
 QUALITY_V2_THRESHOLDS_SCHEMA = "se3-wam-trajectory-quality-v2-thresholds-v0.3"

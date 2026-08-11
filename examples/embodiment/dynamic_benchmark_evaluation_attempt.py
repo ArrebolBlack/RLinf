@@ -24,6 +24,7 @@ for policy loading, so a top-level import here would create a module cycle.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,14 @@ def _optimal() -> Any:
     )
 
     return optimal
+
+
+def _quality_v4() -> Any:
+    """Return the parallel Qv4 artifact implementation lazily."""
+
+    from examples.embodiment import dynamic_benchmark_quality_v4
+
+    return dynamic_benchmark_quality_v4
 
 
 def attempt_schema_version() -> str:
@@ -233,6 +242,221 @@ def materialize_evaluation_attempt(
     result["quality_score"] = list(optimal._quality_score(audit_view))
     result["eligible"] = optimal._eligible(audit_view)
     return result
+
+
+def materialize_quality_v4_evaluation_attempt(
+    output: Path,
+    source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recompute and publish one lightweight Qv4 attempt in its new namespace."""
+
+    quality_v4 = _quality_v4()
+    output_root = Path(output)
+    attempt = quality_v4.build_quality_v4_attempt(source)
+    path = quality_v4.write_quality_v4_attempt(output_root, attempt)
+    lightweight_path = quality_v4.write_quality_v4_lightweight_source(
+        output_root,
+        source=source,
+        recorded_attempt=attempt,
+    )
+    lightweight_audit = quality_v4.audit_quality_v4_lightweight_source(lightweight_path)
+    return {
+        "attempt": attempt,
+        "attempt_path": path.relative_to(output_root).as_posix(),
+        "lightweight_source_path": lightweight_path.relative_to(output_root).as_posix(),
+        "lightweight_source_audit": lightweight_audit,
+    }
+
+
+def load_quality_v4_rollout_reference(
+    root: Path,
+    *,
+    task_id: str,
+    episode_id: str,
+    expected_state_schema_sha256: str,
+) -> dict[str, Any]:
+    """Load one pre-registered reset-bound Qv4 path/orientation contract."""
+
+    from se3_wam.benchmark.contracts import stable_sha256
+
+    path = Path(root) / task_id / f"{episode_id}.json"
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Qv4 rollout reference must be a JSON object")
+    if payload.get("task_id") != task_id or payload.get("episode_id") != episode_id:
+        raise ValueError("Qv4 rollout reference identity mismatch")
+    reference_unsigned = dict(payload)
+    reference_sha256 = reference_unsigned.pop("reference_sha256", None)
+    if (
+        not isinstance(reference_sha256, str)
+        or len(reference_sha256) != 64
+        or stable_sha256(reference_unsigned) != reference_sha256
+    ):
+        raise ValueError("Qv4 rollout reference SHA-256 mismatch")
+    field_contract = payload.get("field_contract")
+    if not isinstance(field_contract, Mapping) or (
+        field_contract.get("state_schema_sha256") != expected_state_schema_sha256
+    ):
+        raise ValueError("Qv4 rollout reference state-schema identity mismatch")
+    return dict(payload)
+
+
+def materialize_quality_v4_fresh_replay_attempt(
+    *,
+    output: Path,
+    record: Mapping[str, Any],
+    raw_env: Any,
+    observations: list[Any],
+    actions: np.ndarray,
+    rewards: list[float],
+    outcomes: list[tuple[Any, ...]],
+    physics_samples: list[Any],
+    events: tuple[Any, ...],
+    thresholds: Mapping[str, Any],
+    reference_contract: Mapping[str, Any],
+    base_replay_validation: Mapping[str, Any],
+    replay_capture: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebuild original/replay Qv4 tapes and publish the lightweight candidate."""
+
+    from se3_wam.benchmark.trajectory_quality_v4 import (
+        compare_replayed_observations_v4,
+    )
+
+    quality_v4 = _quality_v4()
+    task_id = str(record["task_id"])
+    task_thresholds = thresholds.get("tasks", {}).get(task_id)
+    if not isinstance(task_thresholds, Mapping) or not isinstance(
+        task_thresholds.get("vision_tolerance"), Mapping
+    ):
+        raise ValueError("Qv4 thresholds have no task-specific vision tolerance")
+    vision_tolerance = task_thresholds["vision_tolerance"]
+    replayed_observations = replay_capture.get("observations")
+    if not isinstance(replayed_observations, tuple):
+        raise ValueError("Qv4 fresh replay did not capture observations")
+    observation_comparison = compare_replayed_observations_v4(
+        observations,
+        replayed_observations,
+        vision_tolerance=vision_tolerance,
+    )
+    placeholder_replay = {
+        "vision_tolerance_sha256": vision_tolerance["tolerance_sha256"]
+    }
+    original_source = quality_v4.build_quality_v4_rollout_source(
+        record=record,
+        raw_env=raw_env,
+        observations=observations,
+        issued_actions=actions,
+        rewards=rewards,
+        outcomes=outcomes,
+        physics_samples=physics_samples,
+        events=events,
+        thresholds=thresholds,
+        reference_contract=reference_contract,
+        replay_validation=placeholder_replay,
+    )
+    replayed_rewards = replay_capture.get("rewards")
+    replayed_outcomes = replay_capture.get("outcomes")
+    replayed_physics = replay_capture.get("physics_samples")
+    replayed_events = replay_capture.get("events")
+    replayed_raw_env = replay_capture.get("raw_env")
+    if (
+        not all(
+            isinstance(value, tuple)
+            for value in (
+                replayed_rewards,
+                replayed_outcomes,
+                replayed_physics,
+                replayed_events,
+            )
+        )
+        or replayed_raw_env is None
+    ):
+        raise ValueError("Qv4 fresh replay source capture is incomplete")
+    replayed_record = dict(record)
+    replayed_record["return"] = float(sum(replayed_rewards))
+    replayed_source = quality_v4.build_quality_v4_rollout_source(
+        record=replayed_record,
+        raw_env=replayed_raw_env,
+        observations=replayed_observations,
+        issued_actions=actions,
+        rewards=replayed_rewards,
+        outcomes=replayed_outcomes,
+        physics_samples=replayed_physics,
+        events=replayed_events,
+        thresholds=thresholds,
+        reference_contract=reference_contract,
+        replay_validation=placeholder_replay,
+    )
+    finalized_source, attempt = quality_v4.finalize_quality_v4_fresh_replay(
+        original_source=original_source,
+        replayed_source=replayed_source,
+        base_replay_validation=base_replay_validation,
+        observation_comparison=observation_comparison,
+    )
+    materialized = materialize_quality_v4_evaluation_attempt(output, finalized_source)
+    if materialized["attempt"] != attempt:
+        raise RuntimeError("Qv4 materialized attempt differs from fresh-replay gate")
+    layer1 = attempt["layer1_gate"]
+    layer2 = attempt["layer2_gate"]
+    return {
+        "schema_version": attempt["schema_version"],
+        "attempt_path": materialized["attempt_path"],
+        "attempt_sha256": attempt["attempt_sha256"],
+        "source_sha256": attempt["source_sha256"],
+        "lightweight_source_path": materialized["lightweight_source_path"],
+        "lightweight_source_audit": materialized["lightweight_source_audit"],
+        "layer1_passed": layer1["passed"],
+        "layer1_reason_codes": layer1["reason_codes"],
+        "layer2_passed": layer2["passed"],
+        "layer2_reason_codes": layer2["reason_codes"],
+        "eligible": attempt["eligible"],
+        "formal_thresholds_frozen": attempt["formal_thresholds_frozen"],
+        "thresholds_sha256": attempt["thresholds_sha256"],
+        "orientation_contract_sha256": attempt["orientation_contract_sha256"],
+        "field_contract_sha256": attempt["field_contract_sha256"],
+        "summary_sha256": attempt["summary"]["summary_sha256"],
+        "fresh_replay_observation_comparison": observation_comparison,
+    }
+
+
+def materialize_quality_v4_winner_export(
+    output: Path,
+    *,
+    source: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Write the selected winner's full HDF5 and independently re-gate it."""
+
+    quality_v4 = _quality_v4()
+    output_root = Path(output)
+    episode_id = attempt.get("episode_id")
+    if not isinstance(episode_id, str) or not episode_id:
+        raise ValueError("Qv4 winner attempt has no episode identity")
+    export_path = (
+        output_root
+        / quality_v4.QUALITY_V4_FULL_EXPORT_SUBDIRECTORY
+        / f"{episode_id}.h5"
+    )
+    quality_v4.write_quality_v4_full_export(
+        export_path,
+        source=source,
+        recorded_attempt=attempt,
+    )
+    full_export_gate = quality_v4.audit_quality_v4_full_export(export_path)
+    gate_path = quality_v4.write_quality_v4_full_export_gate(
+        output_root, full_export_gate
+    )
+    return {
+        "full_export_path": export_path.relative_to(output_root).as_posix(),
+        "full_export_gate_path": gate_path.relative_to(output_root).as_posix(),
+        "full_export_gate": full_export_gate,
+        "dataset_quality_v4_validation": quality_v4.dataset_quality_v4_validation(
+            full_export_gate
+        ),
+    }
 
 
 def recursive_output_checksums(

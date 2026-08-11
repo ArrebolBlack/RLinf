@@ -17,10 +17,11 @@
 
 The environment, transition cohort, online replay, optional demonstration replay,
 sampling RNGs, policy, critics, and optimizer work all remain on one CUDA device.
-Host materialization occurs only after synchronized cohort/update boundaries for
-evidence and checkpointing.  The RLPD demonstration cohort is deliberately a
-mechanical zero-action seed: it validates the mixed-replay infrastructure but is
-not a quality-qualified expert demonstration.
+Online-policy host materialization occurs only after synchronized cohort/update
+boundaries for evidence and checkpointing.  RLPD can either retain the mechanical
+zero-action smoke seed or collect quality-gated privileged-teacher demonstrations
+from explicitly materialized current GPU state.  The latter control plane is
+reported separately and never weakens the online device-only path.
 """
 
 from __future__ import annotations
@@ -49,9 +50,31 @@ from rlinf.data.device_replay_buffer import DeviceReplayBatch, DeviceReplayBuffe
 from rlinf.data.device_transition_buffer import DeviceTransitionBuffer
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import GpuNativeTensorBackendEnv
 
-CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.1"
-REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.1"
-DEMO_PRODUCER = "zero_action_device_cohort_v1"
+CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.4"
+REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.4"
+DEMO_QUALITY_SCHEMA = "rlinf-gpuenv0-demo-quality-v0.3"
+MINIMUM_SUCCESS_ONLY_DEMO_EPISODES = 24
+DEMO_PRODUCERS = {
+    "zero_action": "zero_action_device_cohort_v1",
+    "privileged_teacher": "current_gpu_state_privileged_teacher_v2",
+}
+TEACHER_OVERRIDE_FLOAT_RANGES = {
+    "lookahead_s": (0.0, 1.0, True),
+    "contact_lookahead_s": (0.0, 0.5, True),
+    "hover_height_m": (0.0, 0.25, False),
+    "grasp_height_offset_m": (-0.02, 0.04, True),
+    "lift_height_m": (0.05, 0.20, False),
+    "track_to_descend_distance_m": (0.005, 0.15, False),
+    "close_horizontal_tolerance_m": (0.005, 0.08, False),
+    "close_vertical_tolerance_m": (0.005, 0.08, False),
+    "lift_action_z_max": (0.05, 1.0, False),
+}
+TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS = {
+    "close_retry_steps",
+    "lift_contact_loss_retry_steps",
+}
+TEACHER_OVERRIDE_NONNEGATIVE_INTS = {"post_hold_settle_steps"}
+TEACHER_OVERRIDE_BOOLS = {"lift_on_instantaneous_bilateral"}
 
 
 @dataclass(frozen=True)
@@ -72,6 +95,13 @@ class TensorOffPolicyConfig:
     batch_size: int
     updates_per_cohort: int
     demo_ratio: float
+    demo_policy: str | None
+    demo_cohorts: int
+    minimum_demo_success_rate: float
+    demo_success_only_replay: bool
+    minimum_qualified_demo_episodes: int
+    demo_teacher_overrides: dict[str, Any]
+    demo_teacher_overrides_sha256: str | None
     gamma: float
     tau: float
     actor_learning_rate: float
@@ -178,6 +208,38 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--updates-per-cohort", type=int, default=8)
     parser.add_argument("--demo-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--demo-policy",
+        choices=tuple(DEMO_PRODUCERS),
+        default="zero_action",
+    )
+    parser.add_argument("--demo-cohorts", type=int, default=1)
+    parser.add_argument("--minimum-demo-success-rate", type=float, default=0.0)
+    parser.add_argument(
+        "--demo-success-only-replay",
+        action="store_true",
+        help=(
+            "Insert only full terminal-success privileged-teacher lanes into the "
+            "device demonstration replay; all attempts remain in the ledger."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-qualified-demo-episodes",
+        type=int,
+        default=0,
+        help=(
+            "Minimum successful episodes required by success-only replay; GPUENV0 "
+            f"requires at least {MINIMUM_SUCCESS_ONLY_DEMO_EPISODES}."
+        ),
+    )
+    parser.add_argument(
+        "--demo-teacher-overrides",
+        type=Path,
+        help=(
+            "Strict JSON object of audited privileged-teacher planner overrides; "
+            "task/evaluator thresholds are not configurable here."
+        ),
+    )
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--actor-learning-rate", type=float, default=3e-4)
@@ -199,8 +261,94 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_demo_teacher_overrides(
+    path: Path | None,
+) -> tuple[dict[str, Any], str | None]:
+    """Load a bounded planner-only override object and its exact file identity."""
+
+    if path is None:
+        return {}, None
+    resolved = path.expanduser().resolve(strict=True)
+    raw = resolved.read_bytes()
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate demo teacher override key: {key}")
+            result[key] = value
+        return result
+
+    payload = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    if not isinstance(payload, dict) or any(
+        not isinstance(key, str) for key in payload
+    ):
+        raise ValueError(
+            "demo teacher overrides must be a JSON object with string keys"
+        )
+    allowed = (
+        set(TEACHER_OVERRIDE_FLOAT_RANGES)
+        | TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS
+        | TEACHER_OVERRIDE_NONNEGATIVE_INTS
+        | TEACHER_OVERRIDE_BOOLS
+    )
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported demo teacher override keys: {unknown}")
+    normalized: dict[str, Any] = {}
+    for name in sorted(payload):
+        value = payload[name]
+        if name in TEACHER_OVERRIDE_FLOAT_RANGES:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"demo teacher override {name} must be numeric")
+            numeric = float(value)
+            minimum, maximum, minimum_inclusive = TEACHER_OVERRIDE_FLOAT_RANGES[name]
+            lower_valid = numeric >= minimum if minimum_inclusive else numeric > minimum
+            if not math.isfinite(numeric) or not lower_valid or numeric > maximum:
+                bracket = "[" if minimum_inclusive else "("
+                raise ValueError(
+                    f"demo teacher override {name} must be in {bracket}{minimum}, {maximum}]"
+                )
+            normalized[name] = numeric
+        elif name in TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS:
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= 160
+            ):
+                raise ValueError(
+                    f"demo teacher override {name} must be null or an integer in [1, 160]"
+                )
+            normalized[name] = value
+        elif name in TEACHER_OVERRIDE_NONNEGATIVE_INTS:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 20
+            ):
+                raise ValueError(
+                    f"demo teacher override {name} must be an integer in [0, 20]"
+                )
+            normalized[name] = value
+        else:
+            if not isinstance(value, bool):
+                raise ValueError(f"demo teacher override {name} must be boolean")
+            normalized[name] = value
+    return normalized, hashlib.sha256(raw).hexdigest()
+
+
 def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
     demo_ratio = float(args.demo_ratio) if args.algorithm == "rlpd" else 0.0
+    demo_policy = str(args.demo_policy) if args.algorithm == "rlpd" else None
+    demo_cohorts = int(args.demo_cohorts) if args.algorithm == "rlpd" else 0
+    minimum_demo_success_rate = (
+        float(args.minimum_demo_success_rate) if args.algorithm == "rlpd" else 0.0
+    )
+    demo_success_only_replay = bool(args.demo_success_only_replay)
+    minimum_qualified_demo_episodes = int(args.minimum_qualified_demo_episodes)
+    demo_teacher_overrides, demo_teacher_overrides_sha256 = (
+        _load_demo_teacher_overrides(args.demo_teacher_overrides)
+    )
     config = TensorOffPolicyConfig(
         task=args.task,
         algorithm=args.algorithm,
@@ -218,6 +366,13 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         batch_size=args.batch_size,
         updates_per_cohort=args.updates_per_cohort,
         demo_ratio=demo_ratio,
+        demo_policy=demo_policy,
+        demo_cohorts=demo_cohorts,
+        minimum_demo_success_rate=minimum_demo_success_rate,
+        demo_success_only_replay=demo_success_only_replay,
+        minimum_qualified_demo_episodes=minimum_qualified_demo_episodes,
+        demo_teacher_overrides=demo_teacher_overrides,
+        demo_teacher_overrides_sha256=demo_teacher_overrides_sha256,
         gamma=args.gamma,
         tau=args.tau,
         actor_learning_rate=args.actor_learning_rate,
@@ -260,6 +415,71 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         raise ValueError("demo_ratio must be in [0, 1]")
     if config.algorithm == "rlpd" and not 0.0 < config.demo_ratio < 1.0:
         raise ValueError("RLPD smoke requires demo_ratio strictly between zero and one")
+    if config.algorithm == "rlpd":
+        if config.demo_policy not in DEMO_PRODUCERS:
+            raise ValueError("RLPD requires a supported demo_policy")
+        if config.demo_cohorts < 1:
+            raise ValueError("RLPD requires at least one demonstration cohort")
+        if not 0.0 <= config.minimum_demo_success_rate <= 1.0:
+            raise ValueError("minimum_demo_success_rate must be in [0, 1]")
+        if config.minimum_qualified_demo_episodes < 0:
+            raise ValueError("minimum_qualified_demo_episodes must be non-negative")
+        if (
+            config.demo_policy == "zero_action"
+            and config.minimum_demo_success_rate != 0.0
+        ):
+            raise ValueError(
+                "zero-action mechanical demonstrations cannot carry a quality gate"
+            )
+        if config.demo_success_only_replay:
+            if config.demo_policy != "privileged_teacher":
+                raise ValueError(
+                    "success-only replay requires privileged_teacher demonstrations"
+                )
+            if config.minimum_demo_success_rate != 0.0:
+                raise ValueError(
+                    "success-only replay uses an episode-count gate, not a success-rate gate"
+                )
+            if (
+                config.minimum_qualified_demo_episodes
+                < MINIMUM_SUCCESS_ONLY_DEMO_EPISODES
+            ):
+                raise ValueError(
+                    "success-only replay requires at least "
+                    f"{MINIMUM_SUCCESS_ONLY_DEMO_EPISODES} qualified demo episodes"
+                )
+            attempted_episodes = config.demo_cohorts * config.num_envs
+            if config.minimum_qualified_demo_episodes > attempted_episodes:
+                raise ValueError(
+                    "minimum_qualified_demo_episodes exceeds configured demo attempts"
+                )
+        elif config.minimum_qualified_demo_episodes != 0:
+            raise ValueError(
+                "minimum_qualified_demo_episodes requires success-only replay"
+            )
+        elif (
+            config.demo_policy == "privileged_teacher"
+            and config.minimum_demo_success_rate <= 0.0
+        ):
+            raise ValueError(
+                "privileged-teacher demonstrations require a positive quality gate"
+            )
+        if (
+            config.demo_policy != "privileged_teacher"
+            and config.demo_teacher_overrides_sha256 is not None
+        ):
+            raise ValueError(
+                "demo teacher overrides require privileged_teacher demonstrations"
+            )
+    elif (
+        config.demo_teacher_overrides_sha256 is not None
+        or config.demo_success_only_replay
+        or config.minimum_qualified_demo_episodes != 0
+    ):
+        raise ValueError(
+            "demo teacher overrides and success-only replay require RLPD "
+            "privileged_teacher demos"
+        )
     if not 0.0 <= config.gamma <= 1.0 or not 0.0 < config.tau <= 1.0:
         raise ValueError("gamma/tau are outside their valid ranges")
     if (
@@ -564,6 +784,7 @@ def _load_resume_checkpoint(
         "manifest_cursor",
         "completed_online_cohorts",
         "completed_demo_cohorts",
+        "demo_quality",
         "update_steps",
         "rng_state",
         "parameter_sha256",
@@ -581,10 +802,24 @@ def _load_resume_checkpoint(
     ):
         raise ValueError("resume checkpoint does not contain completed training")
     completed_demo = int(restored["completed_demo_cohorts"])
-    if completed_demo != (1 if config.algorithm == "rlpd" else 0):
+    expected_demo = config.demo_cohorts if config.algorithm == "rlpd" else 0
+    if completed_demo != expected_demo:
         raise ValueError(
             "resume demonstration-cohort counter violates algorithm contract"
         )
+    demo_quality = restored["demo_quality"]
+    if not isinstance(demo_quality, Mapping):
+        raise ValueError("resume demonstration quality evidence is not a mapping")
+    if config.algorithm == "rlpd" and (
+        demo_quality.get("demo_policy") != config.demo_policy
+        or int(demo_quality.get("demo_cohorts", -1)) != config.demo_cohorts
+        or bool(demo_quality.get("success_only_replay"))
+        != config.demo_success_only_replay
+        or int(demo_quality.get("minimum_qualified_episodes", -1))
+        != config.minimum_qualified_demo_episodes
+        or demo_quality.get("gate_passed") is not True
+    ):
+        raise ValueError("resume demonstration quality evidence differs from config")
     return resolved, sha256, restored
 
 
@@ -753,6 +988,8 @@ def _rollout_cohort(
     reset: Any,
     mode: str,
 ) -> tuple[Any, float]:
+    if mode not in {"zero_demo", "online"}:
+        raise ValueError(f"unsupported device-only rollout mode {mode!r}")
     observation = reset.observation
     zero_action = torch.zeros((env.num_envs, 7), dtype=torch.float32, device=env.device)
     buffer.reset_cohort()
@@ -761,7 +998,7 @@ def _rollout_cohort(
     started = time.perf_counter()
     for _step in range(env.cohort_horizon_steps):
         with torch.inference_mode():
-            if mode == "demo":
+            if mode == "zero_demo":
                 action = zero_action
             else:
                 action, _log_probability = actor.sample(
@@ -792,18 +1029,226 @@ def _rollout_cohort(
     return buffer.view(), time.perf_counter() - started
 
 
-def _add_rollout_to_replay(replay: DeviceReplayBuffer, rollout: Any) -> None:
-    horizon, num_envs = rollout.valid.shape
-    rows = horizon * num_envs
-    replay.add_batch(
-        observation=rollout.observation.reshape(rows, -1),
-        action=rollout.action.reshape(rows, 7),
-        reward=rollout.reward.reshape(rows),
-        next_observation=rollout.next_observation.reshape(rows, -1),
-        terminated=rollout.terminated.reshape(rows),
-        truncated=rollout.truncated.reshape(rows),
-        valid=rollout.valid.reshape(rows),
+def _validated_teacher_action(
+    command: Any,
+    observation: Any,
+    *,
+    action_mode: Any,
+) -> np.ndarray:
+    """Return one exact finite E7 teacher action at the observation clock."""
+
+    if getattr(command, "mode", None) is not action_mode:
+        raise RuntimeError("privileged teacher changed the E7 action contract")
+    if getattr(command, "policy_step", None) != observation.policy_step:
+        raise RuntimeError(
+            "privileged teacher action clock differs from GPU observation"
+        )
+    values = np.asarray(getattr(command, "values", None), dtype=np.float64)
+    if (
+        values.shape != (7,)
+        or not np.all(np.isfinite(values))
+        or np.any(values < -1.0)
+        or np.any(values > 1.0)
+    ):
+        raise RuntimeError(
+            "privileged teacher produced an invalid normalized E7 action"
+        )
+    return values.astype(np.float32, copy=True)
+
+
+def _apply_demo_teacher_overrides(teacher: Any, overrides: Mapping[str, Any]) -> None:
+    """Apply already-validated planner parameters without touching task semantics."""
+
+    for name, value in overrides.items():
+        if not hasattr(teacher, name):
+            raise RuntimeError(
+                f"privileged teacher does not expose audited planner parameter {name}"
+            )
+        setattr(teacher, name, value)
+
+
+def _rollout_privileged_teacher_cohort(
+    *,
+    env: GpuNativeTensorBackendEnv,
+    buffer: DeviceTransitionBuffer,
+    reset: Any,
+    teacher_overrides: Mapping[str, Any] | None = None,
+) -> tuple[Any, float, dict[str, Any]]:
+    """Collect one demo cohort from current GPU state through the host control plane."""
+
+    from se3_wam.benchmark.contracts import ActionMode
+    from se3_wam.benchmark.teacher_factory import make_privileged_teacher
+
+    effective_overrides = dict(teacher_overrides or {})
+    teachers = []
+    teacher_metadata = []
+    for _lane in range(env.num_envs):
+        teacher, metadata = make_privileged_teacher(env.task_id)
+        _apply_demo_teacher_overrides(teacher, effective_overrides)
+        teacher.reset()
+        teachers.append(teacher)
+        teacher_metadata.append(
+            {**dict(metadata), "runtime_planner_overrides": effective_overrides}
+        )
+    if any(metadata != teacher_metadata[0] for metadata in teacher_metadata[1:]):
+        raise RuntimeError("privileged teacher metadata differs across cohort lanes")
+    observation_audit_calls_before = env.teacher_audit_materializations
+    observation_audit_lanes = 0
+    terminal_mask_host_materializations = 0
+    host_to_device_action_transfers = 0
+    active = np.ones(env.num_envs, dtype=np.bool_)
+    zero_action = torch.zeros((env.num_envs, 7), dtype=torch.float32, device=env.device)
+    device_observation = reset.observation
+    buffer.reset_cohort()
+    torch.cuda.synchronize(env.device)
+    started = time.perf_counter()
+    for _step in range(env.cohort_horizon_steps):
+        active_lanes = tuple(int(lane) for lane in np.flatnonzero(active))
+        if active_lanes:
+            observations = env.materialize_teacher_observations(active_lanes)
+            if len(observations) != len(active_lanes):
+                raise RuntimeError(
+                    "teacher audit row count differs from active GPU lanes"
+                )
+            host_actions = np.zeros((env.num_envs, 7), dtype=np.float32)
+            for lane, teacher_observation in zip(
+                active_lanes, observations, strict=True
+            ):
+                if (
+                    teacher_observation.episode_id != reset.episode_ids[lane]
+                    or teacher_observation.task_id != env.task_id
+                    or teacher_observation.control_step != _step
+                    or teacher_observation.policy_step != _step
+                ):
+                    raise RuntimeError(
+                        "privileged teacher observation identity/clock drifted"
+                    )
+                command = teachers[lane].act(teacher_observation)
+                host_actions[lane] = _validated_teacher_action(
+                    command,
+                    teacher_observation,
+                    action_mode=ActionMode.E7,
+                )
+            action = torch.as_tensor(
+                host_actions,
+                dtype=torch.float32,
+                device=env.device,
+            ).contiguous()
+            observation_audit_lanes += len(active_lanes)
+            host_to_device_action_transfers += 1
+        else:
+            action = zero_action
+        buffer.begin_step(observation=device_observation, action=action)
+        try:
+            with torch.inference_mode():
+                step = env.step(action)
+            buffer.commit_step(
+                reward=step.reward,
+                next_observation=step.observation,
+                terminated=step.terminated,
+                truncated=step.truncated,
+                success=step.success,
+                event_mask=step.event_mask,
+                terminal_reason=step.terminal_reason,
+                physics_step=step.physics_step,
+            )
+        except BaseException:
+            if buffer.pending:
+                buffer.abort_step()
+            raise
+        device_observation = step.observation
+        if active_lanes:
+            done = np.asarray(
+                step.done.detach().to(device="cpu").numpy(), dtype=np.bool_
+            )
+            if done.shape != (env.num_envs,):
+                raise RuntimeError("GPU terminal mask has the wrong host audit shape")
+            active &= ~done
+            terminal_mask_host_materializations += 1
+    torch.cuda.synchronize(env.device)
+    observation_audit_calls = (
+        env.teacher_audit_materializations - observation_audit_calls_before
     )
+    evidence = {
+        "producer": DEMO_PRODUCERS["privileged_teacher"],
+        "teacher_count": len(teachers),
+        "teacher_metadata": teacher_metadata[0],
+        "observation_audit_calls": observation_audit_calls,
+        "observation_audit_lanes": observation_audit_lanes,
+        "terminal_mask_host_materializations": terminal_mask_host_materializations,
+        "host_to_device_action_transfers": host_to_device_action_transfers,
+        "online_hot_path_host_materializations": 0,
+    }
+    return buffer.view(), time.perf_counter() - started, evidence
+
+
+def _successful_demo_lane_mask(rollout: Any) -> Any:
+    """Return the device-local lanes whose valid terminal transition succeeded."""
+
+    lane_mask = (rollout.success & rollout.done & rollout.valid).any(dim=0)
+    expected_shape = (int(rollout.valid.shape[1]),)
+    if tuple(lane_mask.shape) != expected_shape:
+        raise RuntimeError("successful demo lane mask has the wrong shape")
+    if lane_mask.dtype != torch.bool or lane_mask.device != rollout.valid.device:
+        raise RuntimeError("successful demo lane mask left the rollout CUDA device")
+    return lane_mask.contiguous()
+
+
+def _add_rollout_to_replay(
+    replay: DeviceReplayBuffer,
+    rollout: Any,
+    *,
+    lane_mask: Any | None = None,
+) -> int:
+    """Insert a rollout, optionally retaining only selected lanes on the device."""
+
+    horizon, num_envs = rollout.valid.shape
+    if lane_mask is None:
+        rows = horizon * num_envs
+        observation = rollout.observation.reshape(rows, -1)
+        action = rollout.action.reshape(rows, 7)
+        reward = rollout.reward.reshape(rows)
+        next_observation = rollout.next_observation.reshape(rows, -1)
+        terminated = rollout.terminated.reshape(rows)
+        truncated = rollout.truncated.reshape(rows)
+        valid = rollout.valid.reshape(rows)
+    else:
+        if tuple(lane_mask.shape) != (num_envs,):
+            raise ValueError("replay lane_mask has the wrong shape")
+        if lane_mask.dtype != torch.bool or lane_mask.device != rollout.valid.device:
+            raise ValueError("replay lane_mask must be bool on the rollout device")
+        selector = rollout.valid & lane_mask.unsqueeze(0)
+        observation = rollout.observation[selector].reshape(
+            -1, rollout.observation.shape[-1]
+        )
+        action = rollout.action[selector].reshape(-1, 7)
+        reward = rollout.reward[selector].reshape(-1)
+        next_observation = rollout.next_observation[selector].reshape(
+            -1, rollout.next_observation.shape[-1]
+        )
+        terminated = rollout.terminated[selector].reshape(-1)
+        truncated = rollout.truncated[selector].reshape(-1)
+        valid = rollout.valid[selector].reshape(-1)
+        rows = int(observation.shape[0])
+        if rows == 0:
+            return 0
+        observation = observation.contiguous()
+        action = action.contiguous()
+        reward = reward.contiguous()
+        next_observation = next_observation.contiguous()
+        terminated = terminated.contiguous()
+        truncated = truncated.contiguous()
+        valid = valid.contiguous()
+    replay.add_batch(
+        observation=observation,
+        action=action,
+        reward=reward,
+        next_observation=next_observation,
+        terminated=terminated,
+        truncated=truncated,
+        valid=valid,
+    )
+    return rows
 
 
 def _cohort_evidence(
@@ -928,6 +1373,8 @@ def main() -> int:
         num_envs=config.num_envs,
         export_dir=config.export_dir,
         expected_gpu_uuid=config.expected_gpu_uuid,
+        expected_se3_source_commit=config.se3_commit,
+        expected_se3_source_tree=config.se3_tree,
         device_ordinal=config.device_ordinal,
         image_size=config.image_size,
         split=config.split,
@@ -1049,35 +1496,275 @@ def main() -> int:
         wall_started = time.perf_counter()
         next_reset = initial
         completed_demo_after = completed_demo_before
-        if config.algorithm == "rlpd" and restored is None:
-            demo_rollout, demo_rollout_seconds = _rollout_cohort(
-                env=env,
-                actor=actor,
-                buffer=transition,
-                reset=next_reset,
-                mode="demo",
+        demo_quality_path = args.output / "demo_quality.json"
+        if restored is not None:
+            demo_quality = dict(restored["demo_quality"])
+            _atomic_json(demo_quality_path, demo_quality)
+        elif config.algorithm == "rlpd":
+            demo_allocated_steps = 0
+            demo_valid_steps = 0
+            demo_successes = 0
+            demo_episodes = 0
+            demo_replay_inserted_rows = 0
+            demo_replay_valid_steps = 0
+            demo_attempt_manifest_ordinals: list[int] = []
+            successful_demo_episode_ids: list[str] = []
+            successful_demo_manifest_ordinals: list[int] = []
+            demo_manifest_sha256: str | None = None
+            demo_control_plane = []
+            for demo_cohort in range(config.demo_cohorts):
+                reset = next_reset
+                if config.demo_policy == "privileged_teacher":
+                    (
+                        demo_rollout,
+                        demo_rollout_seconds,
+                        control_plane,
+                    ) = _rollout_privileged_teacher_cohort(
+                        env=env,
+                        buffer=transition,
+                        reset=reset,
+                        teacher_overrides=config.demo_teacher_overrides,
+                    )
+                    role = (
+                        "privileged_teacher_attempt"
+                        if config.demo_success_only_replay
+                        else "quality_gated_privileged_teacher_demo"
+                    )
+                else:
+                    demo_rollout, demo_rollout_seconds = _rollout_cohort(
+                        env=env,
+                        actor=actor,
+                        buffer=transition,
+                        reset=reset,
+                        mode="zero_demo",
+                    )
+                    control_plane = {
+                        "producer": DEMO_PRODUCERS["zero_action"],
+                        "teacher_count": 0,
+                        "teacher_metadata": None,
+                        "observation_audit_calls": 0,
+                        "observation_audit_lanes": 0,
+                        "terminal_mask_host_materializations": 0,
+                        "host_to_device_action_transfers": 0,
+                        "online_hot_path_host_materializations": 0,
+                    }
+                    role = "mechanical_demo"
+                summary, ledger_rows = _cohort_evidence(
+                    config=config,
+                    env=env,
+                    reset=reset,
+                    rollout=demo_rollout,
+                    role=role,
+                    cohort=demo_cohort,
+                    rollout_seconds=demo_rollout_seconds,
+                    update_seconds=0.0,
+                    updates=0,
+                    metrics={},
+                    seen_episode_ids=seen_episode_ids,
+                )
+                observed_manifest_sha256 = str(reset.manifest_sha256)
+                if demo_manifest_sha256 is None:
+                    demo_manifest_sha256 = observed_manifest_sha256
+                elif observed_manifest_sha256 != demo_manifest_sha256:
+                    raise RuntimeError("demo attempt manifest identity drifted")
+                demo_attempt_manifest_ordinals.extend(
+                    int(row["manifest_ordinal"]) for row in ledger_rows
+                )
+                successful_rows = [row for row in ledger_rows if row["success"]]
+                successful_demo_episode_ids.extend(
+                    str(row["episode_id"]) for row in successful_rows
+                )
+                successful_demo_manifest_ordinals.extend(
+                    int(row["manifest_ordinal"]) for row in successful_rows
+                )
+                if config.demo_success_only_replay:
+                    expected_replay_rows = sum(
+                        int(row["valid_steps"]) for row in successful_rows
+                    )
+                    replay_rows = _add_rollout_to_replay(
+                        demos,
+                        demo_rollout,
+                        lane_mask=_successful_demo_lane_mask(demo_rollout),
+                    )
+                    if replay_rows != expected_replay_rows:
+                        raise RuntimeError(
+                            "device success-only selector differs from terminal ledger"
+                        )
+                    for row in ledger_rows:
+                        row["demo_replay_selected"] = bool(row["success"])
+                    selection_mode = "terminal_success_full_lane_device_filter_v1"
+                else:
+                    replay_rows = _add_rollout_to_replay(demos, demo_rollout)
+                    expected_replay_rows = sum(
+                        int(row["valid_steps"]) for row in ledger_rows
+                    )
+                    for row in ledger_rows:
+                        row["demo_replay_selected"] = True
+                    selection_mode = "all_lanes_with_validity_mask_v1"
+                demo_replay_inserted_rows += replay_rows
+                demo_replay_valid_steps += expected_replay_rows
+                control_plane["cohort"] = demo_cohort
+                control_plane["replay_selection"] = {
+                    "mode": selection_mode,
+                    "selector_device": str(demo_rollout.valid.device),
+                    "selector_host_materializations": 0,
+                    "attempted_lanes": len(ledger_rows),
+                    "selected_lanes": (
+                        len(successful_rows)
+                        if config.demo_success_only_replay
+                        else len(ledger_rows)
+                    ),
+                    "inserted_rows": replay_rows,
+                    "selected_valid_rows": expected_replay_rows,
+                }
+                demo_control_plane.append(control_plane)
+                cohort_rows.append(summary)
+                _append_jsonl_rows(ledger_path, ledger_rows)
+                demo_allocated_steps += summary["allocated_steps"]
+                demo_valid_steps += summary["valid_steps"]
+                demo_successes += summary["terminal_successes"]
+                demo_episodes += len(reset.episode_ids)
+                total_allocated_steps += summary["allocated_steps"]
+                total_valid_steps += summary["valid_steps"]
+                total_successes += summary["terminal_successes"]
+                completed_demo_after += 1
+                if demo_cohort + 1 < config.demo_cohorts:
+                    next_reset = env.reset()
+            demo_success_rate = demo_successes / demo_episodes
+            expected_demo_episodes = config.demo_cohorts * config.num_envs
+            attempt_coverage_passed = (
+                demo_episodes == expected_demo_episodes
+                and len(seen_episode_ids) == expected_demo_episodes
+                and len(demo_attempt_manifest_ordinals) == expected_demo_episodes
+                and len(set(demo_attempt_manifest_ordinals)) == expected_demo_episodes
             )
-            _add_rollout_to_replay(demos, demo_rollout)
-            summary, ledger_rows = _cohort_evidence(
-                config=config,
-                env=env,
-                reset=next_reset,
-                rollout=demo_rollout,
-                role="mechanical_demo",
-                cohort=0,
-                rollout_seconds=demo_rollout_seconds,
-                update_seconds=0.0,
-                updates=0,
-                metrics={},
-                seen_episode_ids=seen_episode_ids,
+            replay_retains_all_selected_rows = (
+                demos.inserted_rows == demo_replay_inserted_rows
+                and demos.size == demo_replay_inserted_rows
             )
-            cohort_rows.append(summary)
-            _append_jsonl_rows(ledger_path, ledger_rows)
-            total_allocated_steps += summary["allocated_steps"]
-            total_valid_steps += summary["valid_steps"]
-            total_successes += summary["terminal_successes"]
-            completed_demo_after = 1
+            if config.demo_success_only_replay:
+                if len(successful_demo_episode_ids) != demo_successes:
+                    raise RuntimeError(
+                        "successful demo identity count differs from terminal ledger"
+                    )
+                demo_gate_passed = (
+                    demo_successes >= config.minimum_qualified_demo_episodes
+                    and attempt_coverage_passed
+                    and replay_retains_all_selected_rows
+                    and demo_replay_inserted_rows == demo_replay_valid_steps
+                )
+                gate_mode = "minimum_qualified_episode_count_v1"
+                replay_selected_episodes = demo_successes
+            else:
+                demo_gate_passed = (
+                    config.demo_policy == "zero_action"
+                    or demo_success_rate >= config.minimum_demo_success_rate
+                )
+                gate_mode = (
+                    "mechanical_seed_v1"
+                    if config.demo_policy == "zero_action"
+                    else "minimum_terminal_success_rate_v1"
+                )
+                replay_selected_episodes = demo_episodes
+            demo_quality = {
+                "schema_version": DEMO_QUALITY_SCHEMA,
+                "demo_policy": config.demo_policy,
+                "producer": DEMO_PRODUCERS[config.demo_policy],
+                "teacher_overrides": config.demo_teacher_overrides,
+                "teacher_overrides_sha256": config.demo_teacher_overrides_sha256,
+                "demo_cohorts": config.demo_cohorts,
+                "episodes": demo_episodes,
+                "terminal_successes": demo_successes,
+                "success_rate": demo_success_rate,
+                "minimum_success_rate": config.minimum_demo_success_rate,
+                "success_only_replay": config.demo_success_only_replay,
+                "gate_mode": gate_mode,
+                "minimum_qualified_episodes": (config.minimum_qualified_demo_episodes),
+                "allocated_steps": demo_allocated_steps,
+                "valid_steps": demo_valid_steps,
+                "successful_episode_ids": successful_demo_episode_ids,
+                "attempt_coverage": {
+                    "manifest_sha256": demo_manifest_sha256,
+                    "expected_episodes": expected_demo_episodes,
+                    "observed_episodes": demo_episodes,
+                    "unique_episode_ids": len(seen_episode_ids),
+                    "manifest_ordinals": demo_attempt_manifest_ordinals,
+                    "successful_manifest_ordinals": (successful_demo_manifest_ordinals),
+                    "passed": attempt_coverage_passed,
+                },
+                "replay_selection": {
+                    "mode": selection_mode,
+                    "device_filter": config.demo_success_only_replay,
+                    "selected_episodes": replay_selected_episodes,
+                    "excluded_attempts": demo_episodes - replay_selected_episodes,
+                    "inserted_rows": demo_replay_inserted_rows,
+                    "selected_valid_rows": demo_replay_valid_steps,
+                    "capacity": demos.capacity,
+                    "retains_all_selected_rows": replay_retains_all_selected_rows,
+                    "failed_attempt_transitions_inserted": (
+                        0 if config.demo_success_only_replay else None
+                    ),
+                },
+                "quality_qualified": (
+                    config.demo_policy == "privileged_teacher" and demo_gate_passed
+                ),
+                "gate_passed": demo_gate_passed,
+                "control_plane": demo_control_plane,
+            }
+            _atomic_json(demo_quality_path, demo_quality)
+            if not demo_gate_passed:
+                failure = (
+                    "privileged-teacher success-only demonstration bank failed its "
+                    "predeclared count, coverage, or replay-retention gate"
+                    if config.demo_success_only_replay
+                    else "privileged-teacher demonstration success rate failed its "
+                    "predeclared quality gate"
+                )
+                raise RuntimeError(failure)
             next_reset = env.reset()
+        else:
+            demo_quality = {
+                "schema_version": DEMO_QUALITY_SCHEMA,
+                "demo_policy": None,
+                "producer": None,
+                "teacher_overrides": {},
+                "teacher_overrides_sha256": None,
+                "demo_cohorts": 0,
+                "episodes": 0,
+                "terminal_successes": 0,
+                "success_rate": None,
+                "minimum_success_rate": 0.0,
+                "success_only_replay": False,
+                "gate_mode": "not_applicable",
+                "minimum_qualified_episodes": 0,
+                "allocated_steps": 0,
+                "valid_steps": 0,
+                "successful_episode_ids": [],
+                "attempt_coverage": {
+                    "manifest_sha256": None,
+                    "expected_episodes": 0,
+                    "observed_episodes": 0,
+                    "unique_episode_ids": 0,
+                    "manifest_ordinals": [],
+                    "successful_manifest_ordinals": [],
+                    "passed": True,
+                },
+                "replay_selection": {
+                    "mode": "not_applicable",
+                    "device_filter": False,
+                    "selected_episodes": 0,
+                    "excluded_attempts": 0,
+                    "inserted_rows": 0,
+                    "selected_valid_rows": 0,
+                    "capacity": demos.capacity,
+                    "retains_all_selected_rows": True,
+                    "failed_attempt_transitions_inserted": None,
+                },
+                "quality_qualified": False,
+                "gate_passed": True,
+                "control_plane": [],
+            }
+            _atomic_json(demo_quality_path, demo_quality)
 
         for local_cohort in range(config.cohorts):
             global_cohort = completed_online_before + local_cohort
@@ -1158,6 +1845,7 @@ def main() -> int:
             "manifest_cursor": dict(env.manifest_state_dict()),
             "completed_online_cohorts": completed_online_after,
             "completed_demo_cohorts": completed_demo_after,
+            "demo_quality": demo_quality,
             "update_steps": update_steps,
             "rng_state": _capture_rng_state(),
             "parameter_sha256": parameter_sha256_end,
@@ -1177,6 +1865,7 @@ def main() -> int:
                 reloaded.get("completed_demo_cohorts", -1)
             )
             == completed_demo_after,
+            "demo_quality_match": reloaded.get("demo_quality") == demo_quality,
             "update_steps_match": int(reloaded.get("update_steps", -1)) == update_steps,
             "manifest_cursor_match": reloaded.get("manifest_cursor")
             == checkpoint_payload["manifest_cursor"],
@@ -1206,6 +1895,31 @@ def main() -> int:
             checkpoint_payload["online_replay"]["data"]["valid"].sum()
         )
         demo_valid_rows = int(checkpoint_payload["demo_replay"]["data"]["valid"].sum())
+        if config.demo_success_only_replay and (
+            demo_valid_rows
+            != int(demo_quality["replay_selection"]["selected_valid_rows"])
+        ):
+            raise RuntimeError(
+                "checkpointed demo replay differs from success-only selection evidence"
+            )
+        demo_control_plane = list(demo_quality["control_plane"])
+        demo_observation_audits = sum(
+            int(row["observation_audit_calls"]) for row in demo_control_plane
+        )
+        demo_terminal_mask_reads = sum(
+            int(row["terminal_mask_host_materializations"])
+            for row in demo_control_plane
+        )
+        demo_action_transfers = sum(
+            int(row["host_to_device_action_transfers"]) for row in demo_control_plane
+        )
+        if (
+            restored is None
+            and env.teacher_audit_materializations != demo_observation_audits
+        ):
+            raise RuntimeError(
+                "backend teacher-audit counter differs from demo control-plane evidence"
+            )
         report = {
             "schema_version": REPORT_SCHEMA,
             "status": "passed",
@@ -1214,15 +1928,26 @@ def main() -> int:
                 "algorithm": config.algorithm,
                 "device_tensor_training_smoke": True,
                 "quality_qualified": False,
-                "rlpd_demo_quality_qualified": False,
-                "rlpd_demo_producer": DEMO_PRODUCER
-                if config.algorithm == "rlpd"
-                else None,
+                "rlpd_demo_quality_qualified": bool(demo_quality["quality_qualified"]),
+                "rlpd_demo_producer": demo_quality["producer"],
                 "statement": (
-                    "RLPD demo data is a mechanical real-environment seed used only "
-                    "to validate mixed replay; no expert-quality claim is made."
-                    if config.algorithm == "rlpd"
-                    else "SAC smoke validates mechanics and resume, not policy quality."
+                    (
+                        "RLPD demo replay contains only complete terminal-success "
+                        "GPU lanes and passed its predeclared qualified-count, "
+                        "manifest-coverage, and retention gates; learned-policy "
+                        "quality still requires separate held-out evaluation."
+                        if demo_quality["success_only_replay"]
+                        else "RLPD demo data passed its predeclared current-GPU-state "
+                        "privileged-teacher success-rate gate; learned-policy quality "
+                        "still requires separate held-out evaluation."
+                    )
+                    if demo_quality["quality_qualified"]
+                    else (
+                        "RLPD demo data is a mechanical real-environment seed used "
+                        "only to validate mixed replay; no expert-quality claim is made."
+                        if config.algorithm == "rlpd"
+                        else "SAC smoke validates mechanics and resume, not policy quality."
+                    )
                 ),
             },
             "source_provenance": source_provenance,
@@ -1261,7 +1986,17 @@ def main() -> int:
                     "physical_world_allocation_not_compacted"
                 ),
                 "replay_sampling": "cuda_multinomial_with_cuda_generator",
-                "hot_path_host_materializations": 0,
+                "online_hot_path_host_materializations": 0,
+                "demonstration_control_plane_host_materializations": (
+                    demo_observation_audits + demo_terminal_mask_reads
+                ),
+                "demonstration_observation_audit_calls": demo_observation_audits,
+                "demonstration_terminal_mask_host_materializations": (
+                    demo_terminal_mask_reads
+                ),
+                "demonstration_host_to_device_action_transfers": demo_action_transfers,
+                "demonstration_replay_selection": demo_quality["replay_selection"],
+                "demonstration_selector_host_materializations": 0,
                 "cohort_horizon_steps": env.cohort_horizon_steps,
                 "warmup_policy_only_steps": config.warmup_steps,
             },
@@ -1273,8 +2008,20 @@ def main() -> int:
                 "demo_size": demos.size,
                 "demo_valid_rows": demo_valid_rows,
                 "demo_inserted_rows": demos.inserted_rows,
+                "demo_success_only": bool(demo_quality["success_only_replay"]),
+                "demo_selected_episodes": int(
+                    demo_quality["replay_selection"]["selected_episodes"]
+                ),
+                "demo_excluded_attempts": int(
+                    demo_quality["replay_selection"]["excluded_attempts"]
+                ),
                 "demo_ratio": config.demo_ratio,
                 "sampling_rng_checkpointed": True,
+            },
+            "demo_quality": {
+                **demo_quality,
+                "path": str(demo_quality_path),
+                "sha256": _file_sha256(demo_quality_path),
             },
             "train": {
                 "cohorts": cohort_rows,
