@@ -181,6 +181,18 @@ It uses a squashed-Gaussian 7-D actor, GAE, clipped PPO updates, a value head, f
 validation manifests, and update-boundary checkpoint/resume. Time-limit truncations
 bootstrap the value target but stop advantage recursion across the reset boundary.
 
+GPU-native RLPD can quality-gate demonstrations before online training by adding
+``--demo-policy privileged_teacher --demo-cohorts N
+--minimum-demo-success-rate P`` to
+``train_dynamic_benchmark_tensor_offpolicy_smoke.py``. Each teacher action is computed
+from an explicit current-state audit of its still-active ``mjwarp_gpu_v1`` lane. The
+trainer writes ``demo_quality.json`` and fails before online updates when the
+predeclared success threshold is missed. GPU-to-host observation/terminal-mask reads
+and host-to-GPU teacher-action transfers are counted as a separate demonstration
+control plane; the learned-policy rollout and replay/update path remain device-only.
+The resulting v0.2 checkpoint is evaluation-compatible but is not policy-quality
+qualified until a separate held-out evaluation passes.
+
 Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
 with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or
 regularization arms. Loading fails closed unless the source commits, task, state

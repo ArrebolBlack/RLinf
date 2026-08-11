@@ -17,10 +17,11 @@
 
 The environment, transition cohort, online replay, optional demonstration replay,
 sampling RNGs, policy, critics, and optimizer work all remain on one CUDA device.
-Host materialization occurs only after synchronized cohort/update boundaries for
-evidence and checkpointing.  The RLPD demonstration cohort is deliberately a
-mechanical zero-action seed: it validates the mixed-replay infrastructure but is
-not a quality-qualified expert demonstration.
+Online-policy host materialization occurs only after synchronized cohort/update
+boundaries for evidence and checkpointing.  RLPD can either retain the mechanical
+zero-action smoke seed or collect quality-gated privileged-teacher demonstrations
+from explicitly materialized current GPU state.  The latter control plane is
+reported separately and never weakens the online device-only path.
 """
 
 from __future__ import annotations
@@ -49,9 +50,12 @@ from rlinf.data.device_replay_buffer import DeviceReplayBatch, DeviceReplayBuffe
 from rlinf.data.device_transition_buffer import DeviceTransitionBuffer
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import GpuNativeTensorBackendEnv
 
-CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.1"
-REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.1"
-DEMO_PRODUCER = "zero_action_device_cohort_v1"
+CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.2"
+REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.2"
+DEMO_PRODUCERS = {
+    "zero_action": "zero_action_device_cohort_v1",
+    "privileged_teacher": "current_gpu_state_privileged_teacher_v1",
+}
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,9 @@ class TensorOffPolicyConfig:
     batch_size: int
     updates_per_cohort: int
     demo_ratio: float
+    demo_policy: str | None
+    demo_cohorts: int
+    minimum_demo_success_rate: float
     gamma: float
     tau: float
     actor_learning_rate: float
@@ -178,6 +185,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--updates-per-cohort", type=int, default=8)
     parser.add_argument("--demo-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--demo-policy",
+        choices=tuple(DEMO_PRODUCERS),
+        default="zero_action",
+    )
+    parser.add_argument("--demo-cohorts", type=int, default=1)
+    parser.add_argument("--minimum-demo-success-rate", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--actor-learning-rate", type=float, default=3e-4)
@@ -201,6 +215,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
     demo_ratio = float(args.demo_ratio) if args.algorithm == "rlpd" else 0.0
+    demo_policy = str(args.demo_policy) if args.algorithm == "rlpd" else None
+    demo_cohorts = int(args.demo_cohorts) if args.algorithm == "rlpd" else 0
+    minimum_demo_success_rate = (
+        float(args.minimum_demo_success_rate) if args.algorithm == "rlpd" else 0.0
+    )
     config = TensorOffPolicyConfig(
         task=args.task,
         algorithm=args.algorithm,
@@ -218,6 +237,9 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         batch_size=args.batch_size,
         updates_per_cohort=args.updates_per_cohort,
         demo_ratio=demo_ratio,
+        demo_policy=demo_policy,
+        demo_cohorts=demo_cohorts,
+        minimum_demo_success_rate=minimum_demo_success_rate,
         gamma=args.gamma,
         tau=args.tau,
         actor_learning_rate=args.actor_learning_rate,
@@ -260,6 +282,27 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         raise ValueError("demo_ratio must be in [0, 1]")
     if config.algorithm == "rlpd" and not 0.0 < config.demo_ratio < 1.0:
         raise ValueError("RLPD smoke requires demo_ratio strictly between zero and one")
+    if config.algorithm == "rlpd":
+        if config.demo_policy not in DEMO_PRODUCERS:
+            raise ValueError("RLPD requires a supported demo_policy")
+        if config.demo_cohorts < 1:
+            raise ValueError("RLPD requires at least one demonstration cohort")
+        if not 0.0 <= config.minimum_demo_success_rate <= 1.0:
+            raise ValueError("minimum_demo_success_rate must be in [0, 1]")
+        if (
+            config.demo_policy == "zero_action"
+            and config.minimum_demo_success_rate != 0.0
+        ):
+            raise ValueError(
+                "zero-action mechanical demonstrations cannot carry a quality gate"
+            )
+        if (
+            config.demo_policy == "privileged_teacher"
+            and config.minimum_demo_success_rate <= 0.0
+        ):
+            raise ValueError(
+                "privileged-teacher demonstrations require a positive quality gate"
+            )
     if not 0.0 <= config.gamma <= 1.0 or not 0.0 < config.tau <= 1.0:
         raise ValueError("gamma/tau are outside their valid ranges")
     if (
@@ -564,6 +607,7 @@ def _load_resume_checkpoint(
         "manifest_cursor",
         "completed_online_cohorts",
         "completed_demo_cohorts",
+        "demo_quality",
         "update_steps",
         "rng_state",
         "parameter_sha256",
@@ -581,10 +625,20 @@ def _load_resume_checkpoint(
     ):
         raise ValueError("resume checkpoint does not contain completed training")
     completed_demo = int(restored["completed_demo_cohorts"])
-    if completed_demo != (1 if config.algorithm == "rlpd" else 0):
+    expected_demo = config.demo_cohorts if config.algorithm == "rlpd" else 0
+    if completed_demo != expected_demo:
         raise ValueError(
             "resume demonstration-cohort counter violates algorithm contract"
         )
+    demo_quality = restored["demo_quality"]
+    if not isinstance(demo_quality, Mapping):
+        raise ValueError("resume demonstration quality evidence is not a mapping")
+    if config.algorithm == "rlpd" and (
+        demo_quality.get("demo_policy") != config.demo_policy
+        or int(demo_quality.get("demo_cohorts", -1)) != config.demo_cohorts
+        or demo_quality.get("gate_passed") is not True
+    ):
+        raise ValueError("resume demonstration quality evidence differs from config")
     return resolved, sha256, restored
 
 
@@ -753,6 +807,8 @@ def _rollout_cohort(
     reset: Any,
     mode: str,
 ) -> tuple[Any, float]:
+    if mode not in {"zero_demo", "online"}:
+        raise ValueError(f"unsupported device-only rollout mode {mode!r}")
     observation = reset.observation
     zero_action = torch.zeros((env.num_envs, 7), dtype=torch.float32, device=env.device)
     buffer.reset_cohort()
@@ -761,7 +817,7 @@ def _rollout_cohort(
     started = time.perf_counter()
     for _step in range(env.cohort_horizon_steps):
         with torch.inference_mode():
-            if mode == "demo":
+            if mode == "zero_demo":
                 action = zero_action
             else:
                 action, _log_probability = actor.sample(
@@ -790,6 +846,143 @@ def _rollout_cohort(
         observation = step.observation
     torch.cuda.synchronize(env.device)
     return buffer.view(), time.perf_counter() - started
+
+
+def _validated_teacher_action(
+    command: Any,
+    observation: Any,
+    *,
+    action_mode: Any,
+) -> np.ndarray:
+    """Return one exact finite E7 teacher action at the observation clock."""
+
+    if getattr(command, "mode", None) is not action_mode:
+        raise RuntimeError("privileged teacher changed the E7 action contract")
+    if getattr(command, "policy_step", None) != observation.policy_step:
+        raise RuntimeError(
+            "privileged teacher action clock differs from GPU observation"
+        )
+    values = np.asarray(getattr(command, "values", None), dtype=np.float64)
+    if (
+        values.shape != (7,)
+        or not np.all(np.isfinite(values))
+        or np.any(values < -1.0)
+        or np.any(values > 1.0)
+    ):
+        raise RuntimeError(
+            "privileged teacher produced an invalid normalized E7 action"
+        )
+    return values.astype(np.float32, copy=True)
+
+
+def _rollout_privileged_teacher_cohort(
+    *,
+    env: GpuNativeTensorBackendEnv,
+    buffer: DeviceTransitionBuffer,
+    reset: Any,
+) -> tuple[Any, float, dict[str, Any]]:
+    """Collect one demo cohort from current GPU state through the host control plane."""
+
+    from se3_wam.benchmark.contracts import ActionMode
+    from se3_wam.benchmark.teacher_factory import make_privileged_teacher
+
+    teachers = []
+    teacher_metadata = []
+    for _lane in range(env.num_envs):
+        teacher, metadata = make_privileged_teacher(env.task_id)
+        teacher.reset()
+        teachers.append(teacher)
+        teacher_metadata.append(dict(metadata))
+    if any(metadata != teacher_metadata[0] for metadata in teacher_metadata[1:]):
+        raise RuntimeError("privileged teacher metadata differs across cohort lanes")
+    observation_audit_calls_before = env.teacher_audit_materializations
+    observation_audit_lanes = 0
+    terminal_mask_host_materializations = 0
+    host_to_device_action_transfers = 0
+    active = np.ones(env.num_envs, dtype=np.bool_)
+    zero_action = torch.zeros((env.num_envs, 7), dtype=torch.float32, device=env.device)
+    device_observation = reset.observation
+    buffer.reset_cohort()
+    torch.cuda.synchronize(env.device)
+    started = time.perf_counter()
+    for _step in range(env.cohort_horizon_steps):
+        active_lanes = tuple(int(lane) for lane in np.flatnonzero(active))
+        if active_lanes:
+            observations = env.materialize_teacher_observations(active_lanes)
+            if len(observations) != len(active_lanes):
+                raise RuntimeError(
+                    "teacher audit row count differs from active GPU lanes"
+                )
+            host_actions = np.zeros((env.num_envs, 7), dtype=np.float32)
+            for lane, teacher_observation in zip(
+                active_lanes, observations, strict=True
+            ):
+                if (
+                    teacher_observation.episode_id != reset.episode_ids[lane]
+                    or teacher_observation.task_id != env.task_id
+                    or teacher_observation.control_step != _step
+                    or teacher_observation.policy_step != _step
+                ):
+                    raise RuntimeError(
+                        "privileged teacher observation identity/clock drifted"
+                    )
+                command = teachers[lane].act(teacher_observation)
+                host_actions[lane] = _validated_teacher_action(
+                    command,
+                    teacher_observation,
+                    action_mode=ActionMode.E7,
+                )
+            action = torch.as_tensor(
+                host_actions,
+                dtype=torch.float32,
+                device=env.device,
+            ).contiguous()
+            observation_audit_lanes += len(active_lanes)
+            host_to_device_action_transfers += 1
+        else:
+            action = zero_action
+        buffer.begin_step(observation=device_observation, action=action)
+        try:
+            with torch.inference_mode():
+                step = env.step(action)
+            buffer.commit_step(
+                reward=step.reward,
+                next_observation=step.observation,
+                terminated=step.terminated,
+                truncated=step.truncated,
+                success=step.success,
+                event_mask=step.event_mask,
+                terminal_reason=step.terminal_reason,
+                physics_step=step.physics_step,
+            )
+        except BaseException:
+            if buffer.pending:
+                buffer.abort_step()
+            raise
+        device_observation = step.observation
+        if active_lanes:
+            done = np.asarray(
+                step.done.detach().to(device="cpu").numpy(), dtype=np.bool_
+            )
+            if done.shape != (env.num_envs,):
+                raise RuntimeError("GPU terminal mask has the wrong host audit shape")
+            active &= ~done
+            terminal_mask_host_materializations += 1
+    torch.cuda.synchronize(env.device)
+    observation_audit_calls = (
+        env.teacher_audit_materializations - observation_audit_calls_before
+    )
+    evidence = {
+        "producer": DEMO_PRODUCERS["privileged_teacher"],
+        "teacher_count": len(teachers),
+        "teacher_metadata": teacher_metadata[0],
+        "observation_audit_calls": observation_audit_calls,
+        "observation_audit_lanes": observation_audit_lanes,
+        "terminal_mask_host_materializations": terminal_mask_host_materializations,
+        "host_to_device_action_transfers": host_to_device_action_transfers,
+        "online_hot_path_host_materializations": 0,
+    }
+    return buffer.view(), time.perf_counter() - started, evidence
 
 
 def _add_rollout_to_replay(replay: DeviceReplayBuffer, rollout: Any) -> None:
@@ -1051,35 +1244,122 @@ def main() -> int:
         wall_started = time.perf_counter()
         next_reset = initial
         completed_demo_after = completed_demo_before
-        if config.algorithm == "rlpd" and restored is None:
-            demo_rollout, demo_rollout_seconds = _rollout_cohort(
-                env=env,
-                actor=actor,
-                buffer=transition,
-                reset=next_reset,
-                mode="demo",
+        demo_quality_path = args.output / "demo_quality.json"
+        if restored is not None:
+            demo_quality = dict(restored["demo_quality"])
+            _atomic_json(demo_quality_path, demo_quality)
+        elif config.algorithm == "rlpd":
+            demo_allocated_steps = 0
+            demo_valid_steps = 0
+            demo_successes = 0
+            demo_episodes = 0
+            demo_control_plane = []
+            for demo_cohort in range(config.demo_cohorts):
+                reset = next_reset
+                if config.demo_policy == "privileged_teacher":
+                    (
+                        demo_rollout,
+                        demo_rollout_seconds,
+                        control_plane,
+                    ) = _rollout_privileged_teacher_cohort(
+                        env=env,
+                        buffer=transition,
+                        reset=reset,
+                    )
+                    role = "quality_gated_privileged_teacher_demo"
+                else:
+                    demo_rollout, demo_rollout_seconds = _rollout_cohort(
+                        env=env,
+                        actor=actor,
+                        buffer=transition,
+                        reset=reset,
+                        mode="zero_demo",
+                    )
+                    control_plane = {
+                        "producer": DEMO_PRODUCERS["zero_action"],
+                        "teacher_count": 0,
+                        "teacher_metadata": None,
+                        "observation_audit_calls": 0,
+                        "observation_audit_lanes": 0,
+                        "terminal_mask_host_materializations": 0,
+                        "host_to_device_action_transfers": 0,
+                        "online_hot_path_host_materializations": 0,
+                    }
+                    role = "mechanical_demo"
+                control_plane["cohort"] = demo_cohort
+                demo_control_plane.append(control_plane)
+                _add_rollout_to_replay(demos, demo_rollout)
+                summary, ledger_rows = _cohort_evidence(
+                    config=config,
+                    env=env,
+                    reset=reset,
+                    rollout=demo_rollout,
+                    role=role,
+                    cohort=demo_cohort,
+                    rollout_seconds=demo_rollout_seconds,
+                    update_seconds=0.0,
+                    updates=0,
+                    metrics={},
+                    seen_episode_ids=seen_episode_ids,
+                )
+                cohort_rows.append(summary)
+                _append_jsonl_rows(ledger_path, ledger_rows)
+                demo_allocated_steps += summary["allocated_steps"]
+                demo_valid_steps += summary["valid_steps"]
+                demo_successes += summary["terminal_successes"]
+                demo_episodes += len(reset.episode_ids)
+                total_allocated_steps += summary["allocated_steps"]
+                total_valid_steps += summary["valid_steps"]
+                total_successes += summary["terminal_successes"]
+                completed_demo_after += 1
+                if demo_cohort + 1 < config.demo_cohorts:
+                    next_reset = env.reset()
+            demo_success_rate = demo_successes / demo_episodes
+            demo_gate_passed = (
+                config.demo_policy == "zero_action"
+                or demo_success_rate >= config.minimum_demo_success_rate
             )
-            _add_rollout_to_replay(demos, demo_rollout)
-            summary, ledger_rows = _cohort_evidence(
-                config=config,
-                env=env,
-                reset=next_reset,
-                rollout=demo_rollout,
-                role="mechanical_demo",
-                cohort=0,
-                rollout_seconds=demo_rollout_seconds,
-                update_seconds=0.0,
-                updates=0,
-                metrics={},
-                seen_episode_ids=seen_episode_ids,
-            )
-            cohort_rows.append(summary)
-            _append_jsonl_rows(ledger_path, ledger_rows)
-            total_allocated_steps += summary["allocated_steps"]
-            total_valid_steps += summary["valid_steps"]
-            total_successes += summary["terminal_successes"]
-            completed_demo_after = 1
+            demo_quality = {
+                "schema_version": "rlinf-gpuenv0-demo-quality-v0.1",
+                "demo_policy": config.demo_policy,
+                "producer": DEMO_PRODUCERS[config.demo_policy],
+                "demo_cohorts": config.demo_cohorts,
+                "episodes": demo_episodes,
+                "terminal_successes": demo_successes,
+                "success_rate": demo_success_rate,
+                "minimum_success_rate": config.minimum_demo_success_rate,
+                "allocated_steps": demo_allocated_steps,
+                "valid_steps": demo_valid_steps,
+                "quality_qualified": (
+                    config.demo_policy == "privileged_teacher" and demo_gate_passed
+                ),
+                "gate_passed": demo_gate_passed,
+                "control_plane": demo_control_plane,
+            }
+            _atomic_json(demo_quality_path, demo_quality)
+            if not demo_gate_passed:
+                raise RuntimeError(
+                    "privileged-teacher demonstration success rate failed its "
+                    "predeclared quality gate"
+                )
             next_reset = env.reset()
+        else:
+            demo_quality = {
+                "schema_version": "rlinf-gpuenv0-demo-quality-v0.1",
+                "demo_policy": None,
+                "producer": None,
+                "demo_cohorts": 0,
+                "episodes": 0,
+                "terminal_successes": 0,
+                "success_rate": None,
+                "minimum_success_rate": 0.0,
+                "allocated_steps": 0,
+                "valid_steps": 0,
+                "quality_qualified": False,
+                "gate_passed": True,
+                "control_plane": [],
+            }
+            _atomic_json(demo_quality_path, demo_quality)
 
         for local_cohort in range(config.cohorts):
             global_cohort = completed_online_before + local_cohort
@@ -1160,6 +1440,7 @@ def main() -> int:
             "manifest_cursor": dict(env.manifest_state_dict()),
             "completed_online_cohorts": completed_online_after,
             "completed_demo_cohorts": completed_demo_after,
+            "demo_quality": demo_quality,
             "update_steps": update_steps,
             "rng_state": _capture_rng_state(),
             "parameter_sha256": parameter_sha256_end,
@@ -1179,6 +1460,7 @@ def main() -> int:
                 reloaded.get("completed_demo_cohorts", -1)
             )
             == completed_demo_after,
+            "demo_quality_match": reloaded.get("demo_quality") == demo_quality,
             "update_steps_match": int(reloaded.get("update_steps", -1)) == update_steps,
             "manifest_cursor_match": reloaded.get("manifest_cursor")
             == checkpoint_payload["manifest_cursor"],
@@ -1208,6 +1490,24 @@ def main() -> int:
             checkpoint_payload["online_replay"]["data"]["valid"].sum()
         )
         demo_valid_rows = int(checkpoint_payload["demo_replay"]["data"]["valid"].sum())
+        demo_control_plane = list(demo_quality["control_plane"])
+        demo_observation_audits = sum(
+            int(row["observation_audit_calls"]) for row in demo_control_plane
+        )
+        demo_terminal_mask_reads = sum(
+            int(row["terminal_mask_host_materializations"])
+            for row in demo_control_plane
+        )
+        demo_action_transfers = sum(
+            int(row["host_to_device_action_transfers"]) for row in demo_control_plane
+        )
+        if (
+            restored is None
+            and env.teacher_audit_materializations != demo_observation_audits
+        ):
+            raise RuntimeError(
+                "backend teacher-audit counter differs from demo control-plane evidence"
+            )
         report = {
             "schema_version": REPORT_SCHEMA,
             "status": "passed",
@@ -1216,15 +1516,19 @@ def main() -> int:
                 "algorithm": config.algorithm,
                 "device_tensor_training_smoke": True,
                 "quality_qualified": False,
-                "rlpd_demo_quality_qualified": False,
-                "rlpd_demo_producer": DEMO_PRODUCER
-                if config.algorithm == "rlpd"
-                else None,
+                "rlpd_demo_quality_qualified": bool(demo_quality["quality_qualified"]),
+                "rlpd_demo_producer": demo_quality["producer"],
                 "statement": (
-                    "RLPD demo data is a mechanical real-environment seed used only "
-                    "to validate mixed replay; no expert-quality claim is made."
-                    if config.algorithm == "rlpd"
-                    else "SAC smoke validates mechanics and resume, not policy quality."
+                    "RLPD demo data passed its predeclared current-GPU-state "
+                    "privileged-teacher success gate; learned-policy quality still "
+                    "requires separate held-out evaluation."
+                    if demo_quality["quality_qualified"]
+                    else (
+                        "RLPD demo data is a mechanical real-environment seed used "
+                        "only to validate mixed replay; no expert-quality claim is made."
+                        if config.algorithm == "rlpd"
+                        else "SAC smoke validates mechanics and resume, not policy quality."
+                    )
                 ),
             },
             "source_provenance": source_provenance,
@@ -1263,7 +1567,15 @@ def main() -> int:
                     "physical_world_allocation_not_compacted"
                 ),
                 "replay_sampling": "cuda_multinomial_with_cuda_generator",
-                "hot_path_host_materializations": 0,
+                "online_hot_path_host_materializations": 0,
+                "demonstration_control_plane_host_materializations": (
+                    demo_observation_audits + demo_terminal_mask_reads
+                ),
+                "demonstration_observation_audit_calls": demo_observation_audits,
+                "demonstration_terminal_mask_host_materializations": (
+                    demo_terminal_mask_reads
+                ),
+                "demonstration_host_to_device_action_transfers": demo_action_transfers,
                 "cohort_horizon_steps": env.cohort_horizon_steps,
                 "warmup_policy_only_steps": config.warmup_steps,
             },
@@ -1277,6 +1589,11 @@ def main() -> int:
                 "demo_inserted_rows": demos.inserted_rows,
                 "demo_ratio": config.demo_ratio,
                 "sampling_rng_checkpointed": True,
+            },
+            "demo_quality": {
+                **demo_quality,
+                "path": str(demo_quality_path),
+                "sha256": _file_sha256(demo_quality_path),
             },
             "train": {
                 "cohorts": cohort_rows,

@@ -208,6 +208,36 @@ class _TerminalLedgerBatch:
     rows: tuple[_TerminalLedgerRow, ...]
 
 
+@dataclass(frozen=True)
+class _ObservationBundle:
+    episode_id: str
+    task_id: str
+    physics_step: int
+    control_step: int
+    policy_step: int
+
+
+@dataclass(frozen=True)
+class _AuditRequest:
+    lanes: tuple[int, ...]
+    include_step_result: bool = False
+
+
+@dataclass(frozen=True)
+class _AuditLane:
+    lane: int
+    episode_id: str
+    observation: _ObservationBundle
+    step_result: Any | None = None
+
+
+@dataclass(frozen=True)
+class _AuditBatch:
+    backend_id: str
+    provenance: Any
+    lanes: tuple[_AuditLane, ...]
+
+
 class _FakeEnv:
     backend_id = "mjwarp_gpu_v1"
 
@@ -267,6 +297,8 @@ class _FakeEnv:
         self._pointer = 1000
         self._step_arrays: dict[str, _WarpArray] | None = None
         self.reset_error = False
+        self.control_step = 0
+        self.audit_lane_order_override: tuple[int, ...] | None = None
         self.terminal_outcomes: dict[int, dict[str, Any]] = {}
         self._device_terminal_consumed_lanes: set[int] = set()
 
@@ -283,6 +315,7 @@ class _FakeEnv:
         self.reset_calls.append(tuple(requests))
         self.reset_masks.append(reset_mask)
         self._device_terminal_consumed_lanes.clear()
+        self.control_step = 0
         return SimpleNamespace(
             observation=self._array(self.dtype, 5),
             state=SimpleNamespace(
@@ -295,6 +328,7 @@ class _FakeEnv:
 
     def step_device(self, action: Any) -> Any:
         self.step_calls.append(action)
+        self.control_step += 1
         if self._step_arrays is None:
             self._step_arrays = {
                 "observation": self._array(self.dtype, 5),
@@ -321,6 +355,33 @@ class _FakeEnv:
                 output_ptrs={
                     name: value.ptr for name, value in self._step_arrays.items()
                 },
+            ),
+        )
+
+    def materialize_audit(self, request: Any) -> _AuditBatch:
+        self.materialize_audit_calls.append(request)
+        active_requests = self.reset_calls[-1]
+        lanes = (
+            request.lanes
+            if self.audit_lane_order_override is None
+            else self.audit_lane_order_override
+        )
+        return _AuditBatch(
+            backend_id="mjwarp_gpu_v1",
+            provenance=self.provenance,
+            lanes=tuple(
+                _AuditLane(
+                    lane=lane,
+                    episode_id=active_requests[lane].episode_id,
+                    observation=_ObservationBundle(
+                        episode_id=active_requests[lane].episode_id,
+                        task_id="p0_grasp",
+                        physics_step=25 * self.control_step,
+                        control_step=self.control_step,
+                        policy_step=self.control_step,
+                    ),
+                )
+                for lane in lanes
             ),
         )
 
@@ -501,11 +562,6 @@ def _install_fakes(
     class GpuNativeConsumer(enum.Enum):
         RL = "rl"
 
-    @dataclass(frozen=True)
-    class AuditRequest:
-        lanes: tuple[int, ...]
-        include_step_result: bool = False
-
     env = _FakeEnv(batch_size, device, float32, captured["call_order"])
 
     def make_gpu_native_env(task_id: str, **kwargs: Any) -> _FakeEnv:
@@ -523,7 +579,10 @@ def _install_fakes(
         "clock": {"horizon_steps": 250}
     }
     modules["se3_wam.benchmark.gpu_native.tasks"].GpuNativeConsumer = GpuNativeConsumer
-    modules["se3_wam.benchmark.gpu_native.audit"].AuditRequest = AuditRequest
+    modules["se3_wam.benchmark.api"].ObservationBundle = _ObservationBundle
+    modules["se3_wam.benchmark.gpu_native.audit"].AuditBatch = _AuditBatch
+    modules["se3_wam.benchmark.gpu_native.audit"].AuditLane = _AuditLane
+    modules["se3_wam.benchmark.gpu_native.audit"].AuditRequest = _AuditRequest
     modules[
         "se3_wam.benchmark.gpu_native.audit"
     ].TerminalLedgerBatch = _TerminalLedgerBatch
@@ -1230,6 +1289,64 @@ def test_b1_and_full_cohort_reset_succeed_but_partial_reset_has_zero_writes(
     assert fake_env_b1.reset_write_count == 1
 
 
+def test_teacher_observation_control_plane_is_explicit_ordered_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    _captured, fake_env, device = _install_fakes(monkeypatch)
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+    )
+    with pytest.raises(
+        GpuNativeTensorBackendUnavailableError, match="active reset cohort"
+    ):
+        backend.materialize_teacher_observations()
+    reset = backend.reset()
+    observations = backend.materialize_teacher_observations((2, 0))
+    assert tuple(observation.episode_id for observation in observations) == (
+        reset.episode_ids[2],
+        reset.episode_ids[0],
+    )
+    assert all(observation.policy_step == 0 for observation in observations)
+    assert backend.teacher_audit_materializations == 1
+    assert fake_env.materialize_audit_calls == [
+        _AuditRequest(lanes=(2, 0), include_step_result=False)
+    ]
+
+    action = _Tensor((3, 7), device, 9999, sys.modules["torch"].float32)
+    backend.step_device(action)
+    next_observations = backend.materialize_teacher_observations()
+    assert all(observation.policy_step == 1 for observation in next_observations)
+    assert backend.teacher_audit_materializations == 2
+    with pytest.raises(TypeError, match="immutable tuple"):
+        backend.materialize_teacher_observations([0])  # type: ignore[arg-type]
+
+
+def test_teacher_observation_control_plane_rejects_lane_order_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    _captured, fake_env, _device = _install_fakes(monkeypatch)
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+    )
+    backend.reset()
+    fake_env.audit_lane_order_override = (1, 0)
+    with pytest.raises(GpuNativeTensorBackendUnavailableError, match="lane order"):
+        backend.materialize_teacher_observations((0, 1))
+    assert backend.teacher_audit_materializations == 0
+
+
 def test_steady_state_ast_and_spies_forbid_host_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1259,6 +1376,7 @@ def test_steady_state_ast_and_spies_forbid_host_materialization(
     assert action.host_materialization_calls == []
     assert reset.observation.host_materialization_calls == []
     assert fake_env.materialize_audit_calls == []
+    assert backend.teacher_audit_materializations == 0
     output_ptrs = backend.last_transport_receipt["output_ptrs"]
     for name in output_ptrs:
         tensor = getattr(step, name)

@@ -58,6 +58,7 @@ POLICY_SCHEMAS = frozenset(
     {
         "rlinf-dynamic-benchmark-expert-policy-v0.1",
         "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.1",
+        "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.2",
         "rlinf-gpuenv0-tensor-ppo-smoke-v0.1",
         "rlinf-gpuenv0-tensor-ppo-smoke-v0.2",
     }
@@ -1142,7 +1143,7 @@ def _make_offpolicy_smoke_policy(
     module.eval()
 
     class Adapter:
-        checkpoint_schema = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.1"
+        checkpoint_schema = str(payload["schema_version"])
 
         def __init__(self) -> None:
             self.observation_dim = observation_dim

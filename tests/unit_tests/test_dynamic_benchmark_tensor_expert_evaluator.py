@@ -28,6 +28,7 @@ import pytest
 
 from examples.embodiment.evaluate_dynamic_benchmark_tensor_expert import (
     EPISODE_LEDGER_SCHEMA,
+    POLICY_SCHEMAS,
     SEQUENCE_SCHEMA,
     SOURCE_MANIFEST_SCHEMA,
     WORKER_SPEC_SCHEMA,
@@ -49,6 +50,10 @@ from examples.embodiment.evaluate_dynamic_benchmark_tensor_expert import (
     validate_backend_runtime_identity,
     verify_result_bundle,
 )
+
+
+def test_policy_schema_accepts_quality_gated_offpolicy_v02() -> None:
+    assert "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.2" in POLICY_SCHEMAS
 
 
 def _export_identity() -> dict:

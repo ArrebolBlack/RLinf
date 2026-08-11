@@ -19,7 +19,7 @@ objects for correctness smoke tests.  This module is the separate production
 data plane: policy actions remain PyTorch CUDA tensors, Warp consumes those
 tensors directly, and all outputs are returned as pointer-identical PyTorch
 views of engine-owned Warp arrays.  Host audit and episode summaries belong to
-a low-frequency control plane and are intentionally absent here.
+an explicit control plane and are never reached by :meth:`step_device`.
 """
 
 from __future__ import annotations
@@ -1079,6 +1079,7 @@ class GpuNativeTensorBackendEnv:
         self._active_generation: int | None = None
         self._last_transport_receipt: Mapping[str, Any] | None = None
         self._transport_checks = 0
+        self._teacher_audit_materializations = 0
         self._contract_capabilities = contract_capabilities
         self._env_capabilities = env_capabilities
         task_quality_identity = (
@@ -1195,6 +1196,12 @@ class GpuNativeTensorBackendEnv:
     @property
     def transport_checks(self) -> int:
         return self._transport_checks
+
+    @property
+    def teacher_audit_materializations(self) -> int:
+        """Return successful current-state teacher audit calls for this backend."""
+
+        return self._teacher_audit_materializations
 
     @property
     def manifest_sha256(self) -> str:
@@ -1552,6 +1559,93 @@ class GpuNativeTensorBackendEnv:
             "evaluator_backend_id": evaluator_backend_id,
         }
         self._stable_identity = _freeze_identity(updated)
+
+    def materialize_teacher_observations(
+        self,
+        lanes: tuple[int, ...] | None = None,
+    ) -> tuple[Any, ...]:
+        """Materialize current observations for an explicit teacher control plane.
+
+        This method is intentionally separate from the device-only stepping path.
+        Callers must pass only lanes that remain active; the returned observations
+        preserve the requested lane order and are bound to the active episode and
+        control clock.
+        """
+
+        if self._closed:
+            raise GpuNativeTensorBackendUnavailableError("GPU tensor backend is closed")
+        if self._active_episode_ids is None or self._steps_since_reset is None:
+            raise GpuNativeTensorBackendUnavailableError(
+                "teacher observation materialization requires an active reset cohort"
+            )
+        selected = tuple(range(self._num_envs)) if lanes is None else lanes
+        if not isinstance(selected, tuple):
+            raise TypeError("teacher audit lanes must be an immutable tuple")
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("teacher audit lanes must be non-empty and unique")
+        if any(
+            isinstance(lane, bool)
+            or not isinstance(lane, int)
+            or not 0 <= lane < self._num_envs
+            for lane in selected
+        ):
+            raise ValueError("teacher audit lane is outside the active cohort")
+        try:
+            from se3_wam.benchmark.api import ObservationBundle
+            from se3_wam.benchmark.gpu_native.audit import (
+                AuditBatch,
+                AuditLane,
+                AuditRequest,
+            )
+        except ImportError as exc:
+            raise GpuNativeTensorBackendUnavailableError(
+                "SE3-WAM current-state audit API is unavailable"
+            ) from exc
+        audit = self._env.materialize_audit(
+            AuditRequest(lanes=selected, include_step_result=False)
+        )
+        if (
+            type(audit) is not AuditBatch
+            or audit.backend_id != _GPU_NATIVE_BACKEND_ID
+            or audit.provenance != self._env.provenance
+        ):
+            raise GpuNativeTensorBackendUnavailableError(
+                "teacher audit backend/provenance identity mismatch"
+            )
+        materialized = audit.lanes
+        if (
+            not isinstance(materialized, tuple)
+            or tuple(getattr(row, "lane", None) for row in materialized) != selected
+        ):
+            raise GpuNativeTensorBackendUnavailableError(
+                "teacher audit changed the requested lane order"
+            )
+        observations = []
+        for lane, row in zip(selected, materialized, strict=True):
+            if type(row) is not AuditLane or row.step_result is not None:
+                raise GpuNativeTensorBackendUnavailableError(
+                    "teacher audit row differs from the observation-only public ABI"
+                )
+            observation = row.observation
+            if (
+                row.episode_id != self._active_episode_ids[lane]
+                or type(observation) is not ObservationBundle
+                or observation.episode_id != self._active_episode_ids[lane]
+                or observation.task_id != self._task_id
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "teacher audit changed lane, episode, or task identity"
+                )
+            if (
+                observation.control_step != self._steps_since_reset
+                or observation.policy_step != self._steps_since_reset
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "teacher audit clock differs from the active control boundary"
+                )
+            observations.append(observation)
+        self._teacher_audit_materializations += 1
+        return tuple(observations)
 
     def materialize_terminal_ledger_once(
         self,
