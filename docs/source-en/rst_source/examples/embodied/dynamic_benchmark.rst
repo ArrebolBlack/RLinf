@@ -215,7 +215,7 @@ only every valid transition from lanes with a real terminal success is selected 
 CUDA mask and physically inserted into demonstration replay. The trainer fails before
 online updates unless the qualified count, unique manifest coverage, and full replay
 retention gates all pass. Failed-attempt transitions are never imitation data, and the
-task evaluator and scientific thresholds are unchanged. The resulting v0.5 checkpoint
+task evaluator and scientific thresholds are unchanged. The resulting v0.6 checkpoint
 is evaluation-compatible but is not policy-quality qualified until a separate
 held-out evaluation passes.
 
@@ -227,6 +227,21 @@ privileged-teacher success-only replay. Their exact values, pretraining losses,
 parameter identities, optimizer state, and replay RNG state are checkpointed and
 resume-validated. These controls address actor extrapolation; they do not qualify a
 policy without a separately frozen held-out evaluation.
+
+An explicitly enabled DAgger arm can add ``--dagger-cohorts N
+--dagger-bc-updates-per-cohort U --dagger-correction-ratio R`` after the initial BC
+warm-start. The deterministic actor, not the teacher, executes each action in the
+GPU-native environment. The privileged teacher labels the actor-visited current states;
+those labels enter a separate correction replay and ``dagger_correction.json``. They are
+never counted as terminal-success demonstrations, including labels from successful
+learner episodes. The correction replay stores only observation/action labels and has
+no reward, next-state, or transition semantics. Every learner attempt and terminal
+outcome remains in the episode ledger. All DAgger controls default off and require
+RLPD, privileged-teacher success-only demonstrations, and BC pretraining.
+``--actor-sac-weight`` defaults to
+``1`` and makes any deliberate reduction of the online SAC actor objective explicit;
+the checkpoint and report preserve all values, correction rows, control-plane counts,
+and resume state.
 
 Fresh BC/RLPD runs write ``demo_replay.pt`` after planner collection. Pass that file
 with ``--demo-replay-in`` to reuse demonstrations across matched algorithm or

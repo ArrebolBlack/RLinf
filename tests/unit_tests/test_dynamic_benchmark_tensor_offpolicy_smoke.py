@@ -76,6 +76,7 @@ def _load_module(monkeypatch: pytest.MonkeyPatch) -> Any:
         ),
     }
     replay = stubs["rlinf.data.device_replay_buffer"]
+    replay.DeviceImitationReplayBuffer = type("DeviceImitationReplayBuffer", (), {})
     replay.DeviceReplayBatch = type("DeviceReplayBatch", (), {})
     replay.DeviceReplayBuffer = type("DeviceReplayBuffer", (), {})
     stubs["rlinf.data.device_transition_buffer"].DeviceTransitionBuffer = type(
@@ -282,6 +283,59 @@ def test_actor_bc_controls_default_off_and_require_success_only_teacher(
         module._config(_arguments(module, "--actor-bc-weight", "nan"))
     with pytest.raises(ValueError, match="success-only replay"):
         module._config(_arguments(module, "--actor-bc-weight", "1"))
+
+
+def test_dagger_controls_default_off_and_require_separate_correction_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+    default = module._config(_arguments(module))
+    assert default.dagger_cohorts == 0
+    assert default.dagger_bc_updates_per_cohort == 0
+    assert default.dagger_correction_ratio == pytest.approx(0.5)
+    assert default.actor_sac_weight == pytest.approx(1.0)
+
+    enabled = module._config(
+        _arguments(
+            module,
+            "--demo-policy",
+            "privileged_teacher",
+            "--demo-success-only-replay",
+            "--minimum-qualified-demo-episodes",
+            "24",
+            "--actor-bc-pretrain-updates",
+            "4000",
+            "--actor-bc-weight",
+            "100",
+            "--actor-sac-weight",
+            "0",
+            "--dagger-cohorts",
+            "4",
+            "--dagger-bc-updates-per-cohort",
+            "1000",
+            "--dagger-correction-ratio",
+            "0.75",
+        )
+    )
+    assert enabled.dagger_cohorts == 4
+    assert enabled.dagger_bc_updates_per_cohort == 1000
+    assert enabled.dagger_correction_ratio == pytest.approx(0.75)
+    assert enabled.actor_sac_weight == 0.0
+
+    with pytest.raises(ValueError, match="enabled together"):
+        module._config(_arguments(module, "--dagger-cohorts", "1"))
+    with pytest.raises(ValueError, match="success-only replay and actor BC"):
+        module._config(
+            _arguments(
+                module,
+                "--dagger-cohorts",
+                "1",
+                "--dagger-bc-updates-per-cohort",
+                "1",
+            )
+        )
+    with pytest.raises(ValueError, match="strictly between zero and one"):
+        module._config(_arguments(module, "--dagger-correction-ratio", "1"))
 
 
 def test_actor_bc_pretrain_updates_actor_and_reports_boundary_metrics(
@@ -767,3 +821,166 @@ def test_privileged_teacher_rollout_keeps_device_observations_in_replay(
     assert evidence["observation_audit_lanes"] == 3
     assert evidence["terminal_mask_host_materializations"] == 2
     assert evidence["host_to_device_action_transfers"] == 2
+
+
+def test_dagger_rollout_executes_actor_but_records_teacher_corrections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(monkeypatch)
+
+    class FakeTensor:
+        def __init__(self, values: Any) -> None:
+            self.values = np.asarray(values, dtype=np.float32)
+
+        def contiguous(self) -> FakeTensor:
+            return self
+
+        def detach(self) -> FakeTensor:
+            return self
+
+        def to(self, *, device: str) -> FakeTensor:
+            assert device == "cpu"
+            return self
+
+        def numpy(self) -> np.ndarray:
+            return self.values
+
+    module.torch.float32 = np.float32
+    module.torch.zeros = lambda shape, **_kwargs: FakeTensor(np.zeros(shape))
+    module.torch.as_tensor = lambda values, **_kwargs: FakeTensor(values)
+    module.torch.inference_mode = nullcontext
+    module.torch.cuda = SimpleNamespace(synchronize=lambda _device: None)
+
+    action_mode = SimpleNamespace(E7=object())
+
+    class Teacher:
+        def reset(self) -> None:
+            pass
+
+        def act(self, observation: Any) -> Any:
+            return SimpleNamespace(
+                mode=action_mode.E7,
+                policy_step=observation.policy_step,
+                values=np.full(7, 0.75),
+            )
+
+    contracts = types.ModuleType("se3_wam.benchmark.contracts")
+    contracts.ActionMode = action_mode
+    teacher_factory = types.ModuleType("se3_wam.benchmark.teacher_factory")
+    teacher_factory.make_privileged_teacher = lambda _task: (
+        Teacher(),
+        {"teacher_type": "fixture"},
+    )
+    for name, stub in (
+        ("se3_wam", types.ModuleType("se3_wam")),
+        ("se3_wam.benchmark", types.ModuleType("se3_wam.benchmark")),
+        ("se3_wam.benchmark.contracts", contracts),
+        ("se3_wam.benchmark.teacher_factory", teacher_factory),
+    ):
+        monkeypatch.setitem(sys.modules, name, stub)
+
+    observations = tuple(FakeTensor([[float(index)]]) for index in range(3))
+
+    class Actor:
+        def eval(self) -> None:
+            pass
+
+        def sample(
+            self, _observation: FakeTensor, *, stochastic: bool
+        ) -> tuple[FakeTensor, object]:
+            assert stochastic is False
+            return FakeTensor(np.full((1, 7), 0.25)), object()
+
+    class Env:
+        num_envs = 1
+        cohort_horizon_steps = 2
+        task_id = "p0_grasp"
+        device = "cuda:0"
+        teacher_audit_materializations = 0
+
+        def __init__(self) -> None:
+            self.step_index = 0
+            self.executed_actions: list[np.ndarray] = []
+
+        def materialize_teacher_observations(
+            self, lanes: tuple[int, ...]
+        ) -> tuple[Any, ...]:
+            assert lanes == (0,)
+            self.teacher_audit_materializations += 1
+            return (
+                SimpleNamespace(
+                    episode_id="episode-0",
+                    task_id=self.task_id,
+                    control_step=self.step_index,
+                    policy_step=self.step_index,
+                ),
+            )
+
+        def step(self, action: FakeTensor) -> Any:
+            self.executed_actions.append(action.values.copy())
+            self.step_index += 1
+            return SimpleNamespace(
+                observation=observations[self.step_index],
+                reward=object(),
+                terminated=object(),
+                truncated=object(),
+                success=object(),
+                event_mask=object(),
+                terminal_reason=object(),
+                physics_step=object(),
+                done=FakeTensor([self.step_index == self.cohort_horizon_steps]),
+            )
+
+    class Buffer:
+        pending = False
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.actions: list[np.ndarray] = []
+
+        def reset_cohort(self) -> None:
+            self.actions.clear()
+
+        def begin_step(self, *, observation: Any, action: FakeTensor) -> None:
+            assert observation in observations
+            self.actions.append(action.values.copy())
+            self.pending = True
+
+        def commit_step(self, **_kwargs: Any) -> None:
+            self.pending = False
+
+        def abort_step(self) -> None:
+            self.pending = False
+
+        def view(self) -> str:
+            return self.name
+
+    env = Env()
+    online = Buffer("online")
+    corrections = Buffer("corrections")
+    reset = SimpleNamespace(
+        observation=observations[0],
+        episode_ids=("episode-0",),
+    )
+    online_view, correction_view, elapsed, evidence = (
+        module._rollout_dagger_correction_cohort(
+            env=env,
+            actor=Actor(),
+            online_buffer=online,
+            correction_buffer=corrections,
+            reset=reset,
+        )
+    )
+
+    assert online_view == "online"
+    assert correction_view == "corrections"
+    assert elapsed > 0.0
+    for executed, stored_online, stored_correction in zip(
+        env.executed_actions, online.actions, corrections.actions, strict=True
+    ):
+        np.testing.assert_allclose(executed, 0.25)
+        np.testing.assert_allclose(stored_online, 0.25)
+        np.testing.assert_allclose(stored_correction, 0.75)
+    assert evidence["executed_action_source"] == "deterministic_gpu_actor"
+    assert evidence["labels_are_successful_demonstrations"] is False
+    assert evidence["host_to_device_label_transfers"] == 2

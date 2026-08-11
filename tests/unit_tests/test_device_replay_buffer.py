@@ -32,6 +32,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 DeviceReplayBuffer = _MODULE.DeviceReplayBuffer
+DeviceImitationReplayBuffer = _MODULE.DeviceImitationReplayBuffer
 DeviceReplayContractError = _MODULE.DeviceReplayContractError
 
 
@@ -158,6 +159,17 @@ class _Torch:
         )
         return _Tensor(indices.astype(np.int64), dtype="int64", device=weights.device)
 
+    @staticmethod
+    def randint(
+        high: int,
+        shape: tuple[int, ...],
+        *,
+        device: str,
+        generator: _Generator,
+    ) -> _Tensor:
+        indices = generator._rng.integers(0, high, size=shape, dtype=np.int64)
+        return _Tensor(indices, dtype="int64", device=device)
+
 
 def _tensor(values: Any, *, dtype: Any = "float32", device: str = "cuda:0") -> _Tensor:
     return _Tensor(
@@ -192,6 +204,19 @@ def _add(buffer: Any, values: list[float], valid: list[bool]) -> None:
         terminated=_tensor([False] * rows, dtype="bool"),
         truncated=_tensor([False] * rows, dtype="bool"),
         valid=_tensor(valid, dtype="bool"),
+    )
+
+
+def _imitation_buffer(*, seed: int = 23) -> Any:
+    return DeviceImitationReplayBuffer(
+        capacity=5,
+        observation_shape=(1,),
+        action_shape=(1,),
+        device="cuda:0",
+        seed=seed,
+        observation_dtype="float32",
+        action_dtype="float32",
+        torch_module=_Torch,
     )
 
 
@@ -244,14 +269,43 @@ def test_contract_rejects_cross_device_and_checkpoint_identity_drift() -> None:
         _buffer().load_state_dict(state)
 
 
+def test_imitation_replay_has_only_labels_and_restores_cuda_rng() -> None:
+    buffer = _imitation_buffer()
+    buffer.add_batch(
+        observation=_tensor([[1.0], [2.0], [3.0]]),
+        action=_tensor([[101.0], [102.0], [103.0]]),
+    )
+    state = buffer.state_dict()
+    assert set(state["data"]) == {"observation", "action"}
+    assert "reward" not in state["data"]
+    restored = _imitation_buffer(seed=999)
+    restored.load_state_dict(state)
+
+    first = buffer.sample(64)
+    second = restored.sample(64)
+    np.testing.assert_array_equal(first.observation.values, second.observation.values)
+    np.testing.assert_array_equal(first.action.values, second.action.values)
+    assert first.rows == 64
+    assert set(first.observation.values[:, 0]) <= {1.0, 2.0, 3.0}
+
+    with pytest.raises(DeviceReplayContractError, match="observation is not"):
+        buffer.add_batch(
+            observation=_tensor([[4.0]], device="cuda:1"),
+            action=_tensor([[104.0]]),
+        )
+
+
 def test_replay_hot_methods_forbid_host_materialization_and_cpu_sampling_rng() -> None:
     tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
-    methods = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    hot_nodes = [methods["add_batch"], methods["sample"]]
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    hot_nodes = []
+    for class_name in ("DeviceReplayBuffer", "DeviceImitationReplayBuffer"):
+        methods = {
+            node.name: node
+            for node in classes[class_name].body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        hot_nodes.extend((methods["add_batch"], methods["sample"]))
     calls = [
         call
         for method in hot_nodes
@@ -267,6 +321,7 @@ def test_replay_hot_methods_forbid_host_materialization_and_cpu_sampling_rng() -
     source = _MODULE_PATH.read_text(encoding="utf-8")
     assert "torch.Generator(device=device)" in source
     assert "self._torch.multinomial(" in source
+    assert "self._torch.randint(" in source
 
 
 def test_tensor_offpolicy_rollout_is_two_phase_and_device_only() -> None:
@@ -356,6 +411,9 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
         '"log_alpha": log_alpha.detach()',
         '"online_replay": online.state_dict()',
         '"demo_replay": demos.state_dict()',
+        '"correction_replay": corrections.state_dict()',
+        '"completed_dagger_cohorts": completed_dagger_after',
+        '"dagger_correction": dagger_correction',
         '"actor_bc_pretrain": actor_bc_pretrain',
         '"rng_state": _capture_rng_state()',
         '"manifest_cursor": dict(env.manifest_state_dict())',
@@ -365,8 +423,9 @@ def test_tensor_offpolicy_checkpoint_covers_full_sac_rlpd_resume_state() -> None
     assert all(fragment in source for fragment in required_checkpoint_fragments)
     assert '"zero_action": "zero_action_device_cohort_v1"' in source
     assert '"privileged_teacher": "current_gpu_state_privileged_teacher_v2"' in source
-    assert 'CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.5"' in source
+    assert 'CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.6"' in source
     assert 'DEMO_QUALITY_SCHEMA = "rlinf-gpuenv0-demo-quality-v0.3"' in source
+    assert 'DAGGER_CORRECTION_SCHEMA = "rlinf-gpuenv0-dagger-correction-v0.1"' in source
     assert '"demo_quality": demo_quality' in source
     assert '"rlpd_demo_quality_qualified": bool(' in source
 
@@ -410,6 +469,34 @@ def test_tensor_offpolicy_teacher_control_plane_is_separate_and_accounted() -> N
     assert len(host_transfers(teacher)) == 1
     assert "torch.as_tensor" in teacher_source
     assert "terminal_mask_host_materializations" in teacher_source
+
+
+def test_dagger_executes_actor_action_and_keeps_teacher_labels_separate() -> None:
+    script = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "embodiment"
+        / "train_dynamic_benchmark_tensor_offpolicy_smoke.py"
+    )
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_rollout_dagger_correction_cohort"
+    )
+    source = ast.unparse(method)
+    assert "env.step(learner_action)" in source
+    assert (
+        "online_buffer.begin_step(observation=observation, action=learner_action)"
+        in source
+    )
+    assert (
+        "correction_buffer.begin_step(observation=observation, action=correction_label)"
+        in source
+    )
+    assert "'labels_are_successful_demonstrations': False" in source
+    assert "materialize_teacher_observations" in source
 
 
 def test_success_only_demo_selection_stays_on_the_rollout_device() -> None:

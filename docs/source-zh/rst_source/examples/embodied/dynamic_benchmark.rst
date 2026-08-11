@@ -200,7 +200,7 @@ teacher RLPD 中使用都会 fail closed。
 所有 attempt 仍逐条写入 ``episode_ledger.jsonl``；只有真实终态 success lane 的全部有效
 transition 才由 CUDA mask 选中并物理写入 demonstration replay。qualified 数量、唯一 manifest
 覆盖或 replay 完整保留任一门未通过，trainer 都会在 online update 前 fail closed；失败 attempt
-的 transition 不会成为 imitation 数据，任务 evaluator 与科学阈值均不改变。生成的 v0.5
+的 transition 不会成为 imitation 数据，任务 evaluator 与科学阈值均不改变。生成的 v0.6
 checkpoint 可交给 tensor evaluator，
 但只有独立 held-out evaluation 通过后才能声称策略质量达标。
 
@@ -210,6 +210,17 @@ loss。两项默认均为 0；只有 RLPD、privileged teacher 与 successful-on
 允许非零值，否则 fail closed。配置值、pretrain loss、参数 identity、optimizer state 与 replay
 RNG state 都会写入 checkpoint 并在 resume 时复核。这两项只用于抑制 actor 外推，不能替代独立
 冻结的 held-out evaluation，也不会改变 task/evaluator/科学阈值。
+
+显式 DAgger 实验臂可在初始 BC warm-start 后追加 ``--dagger-cohorts N
+--dagger-bc-updates-per-cohort U --dagger-correction-ratio R``。每一步都由 deterministic GPU
+actor 的动作真正驱动 GPU-native 环境；privileged teacher 只对 actor 实际访问的当前 state 给出
+label。label 写入独立 correction replay 和 ``dagger_correction.json``，即使 learner episode 最终
+成功也绝不计作 terminal-success demonstration。correction replay 只保存 observation/action label，
+没有 reward、next-state 或 transition 语义。每个 learner attempt 与终态仍完整写入 episode ledger。
+全部 DAgger 开关默认关闭，并且只有 RLPD、privileged-teacher successful-only demo 与 BC
+pretrain 同时启用时才合法。``--actor-sac-weight`` 默认值为 ``1``，任何对 online SAC actor 目标的
+降低都必须显式配置；checkpoint/report 会保留全部参数、correction rows、control-plane 计数和
+resume state。
 
 新的 BC/RLPD run 在 planner 收集后写出 ``demo_replay.pt``。matched 算法或正则臂可通过
 ``--demo-replay-in`` 复用该示教；加载时会严格核对源码 commit、task、state schema、seed、

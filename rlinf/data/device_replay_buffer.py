@@ -51,6 +51,18 @@ class DeviceReplayBatch:
         return int(self.observation.shape[0])
 
 
+@dataclass(frozen=True)
+class DeviceImitationBatch:
+    """One sampled observation/action label batch on a single GPU."""
+
+    observation: Any
+    action: Any
+
+    @property
+    def rows(self) -> int:
+        return int(self.observation.shape[0])
+
+
 class DeviceReplayBuffer:
     """Own a fixed-capacity CUDA transition ring and CUDA sampling RNG."""
 
@@ -327,7 +339,225 @@ class DeviceReplayBuffer:
         self._generator.set_state(state["generator_state"])
 
 
+class DeviceImitationReplayBuffer:
+    """Own CUDA-only observation/action labels without transition semantics."""
+
+    FIELDS = ("observation", "action")
+    SCHEMA_VERSION = "rlinf-device-imitation-replay-v0.1"
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        observation_shape: tuple[int, ...],
+        action_shape: tuple[int, ...],
+        device: Any,
+        seed: int,
+        observation_dtype: Any,
+        action_dtype: Any,
+        torch_module: Any | None = None,
+    ) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("capacity must be a positive integer")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        for name, shape in (
+            ("observation_shape", observation_shape),
+            ("action_shape", action_shape),
+        ):
+            if not isinstance(shape, tuple) or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+                for value in shape
+            ):
+                raise ValueError(f"{name} must contain positive integer dimensions")
+        torch = (
+            importlib.import_module("torch") if torch_module is None else torch_module
+        )
+        if str(device).lower().split(":", 1)[0] != "cuda":
+            raise DeviceReplayContractError("device imitation storage requires CUDA")
+
+        self._torch = torch
+        self._capacity = capacity
+        self._observation_shape = observation_shape
+        self._action_shape = action_shape
+        self._device = device
+        self._observation_dtype = observation_dtype
+        self._action_dtype = action_dtype
+        self._cursor = 0
+        self._size = 0
+        self._inserted_rows = 0
+        self._generator = torch.Generator(device=device)
+        self._generator.manual_seed(seed)
+        self._observation = torch.empty(
+            (capacity, *observation_shape), dtype=observation_dtype, device=device
+        )
+        self._action = torch.empty(
+            (capacity, *action_shape), dtype=action_dtype, device=device
+        )
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def cursor(self) -> int:
+        return self._cursor
+
+    @property
+    def inserted_rows(self) -> int:
+        return self._inserted_rows
+
+    @property
+    def device(self) -> Any:
+        return self._device
+
+    def _require_tensor(
+        self,
+        value: Any,
+        *,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: Any,
+    ) -> None:
+        if tuple(value.shape) != shape:
+            raise DeviceReplayContractError(f"{name} must have shape {shape}")
+        if value.dtype != dtype:
+            raise DeviceReplayContractError(f"{name} has the wrong dtype")
+        if value.device != self._device:
+            raise DeviceReplayContractError(f"{name} is not on {self._device}")
+        if not value.is_contiguous():
+            raise DeviceReplayContractError(f"{name} must be contiguous")
+
+    def add_batch(self, *, observation: Any, action: Any) -> None:
+        """Insert already-selected label rows without any host tensor read."""
+
+        rows = int(observation.shape[0])
+        if rows < 1:
+            raise DeviceReplayContractError(
+                "imitation insertion batch must not be empty"
+            )
+        self._require_tensor(
+            observation,
+            name="observation",
+            shape=(rows, *self._observation_shape),
+            dtype=self._observation_dtype,
+        )
+        self._require_tensor(
+            action,
+            name="action",
+            shape=(rows, *self._action_shape),
+            dtype=self._action_dtype,
+        )
+        retained_rows = min(rows, self._capacity)
+        skipped_rows = rows - retained_rows
+        write_cursor = (self._cursor + skipped_rows) % self._capacity
+        first_rows = min(retained_rows, self._capacity - write_cursor)
+        for storage, value in (
+            (self._observation, observation),
+            (self._action, action),
+        ):
+            retained = value[skipped_rows:]
+            storage[write_cursor : write_cursor + first_rows].copy_(
+                retained[:first_rows]
+            )
+            if first_rows < retained_rows:
+                storage[: retained_rows - first_rows].copy_(retained[first_rows:])
+        self._cursor = (self._cursor + rows) % self._capacity
+        self._size = min(self._capacity, self._size + rows)
+        self._inserted_rows += rows
+
+    def sample(self, batch_size: int) -> DeviceImitationBatch:
+        """Sample labels with replacement using only the CUDA RNG."""
+
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size < 1
+        ):
+            raise ValueError("batch_size must be a positive integer")
+        if self._size < 1:
+            raise RuntimeError("cannot sample an empty imitation replay")
+        indices = self._torch.randint(
+            self._size,
+            (batch_size,),
+            device=self._device,
+            generator=self._generator,
+        )
+        return DeviceImitationBatch(
+            observation=self._observation.index_select(0, indices),
+            action=self._action.index_select(0, indices),
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """Copy labels and CUDA RNG state to the host at a checkpoint boundary."""
+
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "capacity": self._capacity,
+            "observation_shape": self._observation_shape,
+            "action_shape": self._action_shape,
+            "cursor": self._cursor,
+            "size": self._size,
+            "inserted_rows": self._inserted_rows,
+            "generator_state": self._generator.get_state().cpu().clone(),
+            "data": {
+                name: getattr(self, f"_{name}")[: self._size].detach().cpu().clone()
+                for name in self.FIELDS
+            },
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore exact labels, rejecting capacity or schema drift."""
+
+        if state.get("schema_version") != self.SCHEMA_VERSION:
+            raise ValueError("imitation replay checkpoint schema mismatch")
+        expected_identity = {
+            "capacity": self._capacity,
+            "observation_shape": self._observation_shape,
+            "action_shape": self._action_shape,
+        }
+        observed_identity = {
+            "capacity": int(state["capacity"]),
+            "observation_shape": tuple(state["observation_shape"]),
+            "action_shape": tuple(state["action_shape"]),
+        }
+        if observed_identity != expected_identity:
+            raise ValueError(
+                "imitation replay checkpoint identity does not match configured ring"
+            )
+        size = int(state["size"])
+        cursor = int(state["cursor"])
+        inserted_rows = int(state["inserted_rows"])
+        if not 0 <= size <= self._capacity:
+            raise ValueError("imitation replay checkpoint size is invalid")
+        if not 0 <= cursor < self._capacity:
+            raise ValueError("imitation replay checkpoint cursor is invalid")
+        if inserted_rows < size:
+            raise ValueError("imitation replay inserted-row counter is invalid")
+        data = state.get("data")
+        if not isinstance(data, dict) or set(data) != set(self.FIELDS):
+            raise ValueError("imitation replay checkpoint data fields drifted")
+        for name in self.FIELDS:
+            target = getattr(self, f"_{name}")[:size]
+            source = data[name].to(device=self._device, dtype=target.dtype)
+            if tuple(source.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"imitation replay checkpoint field {name} has the wrong shape"
+                )
+            target.copy_(source)
+        self._cursor = cursor
+        self._size = size
+        self._inserted_rows = inserted_rows
+        self._generator.set_state(state["generator_state"])
+
+
 __all__ = [
+    "DeviceImitationBatch",
+    "DeviceImitationReplayBuffer",
     "DeviceReplayBatch",
     "DeviceReplayBuffer",
     "DeviceReplayContractError",

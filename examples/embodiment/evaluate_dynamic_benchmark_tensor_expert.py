@@ -62,6 +62,7 @@ POLICY_SCHEMAS = frozenset(
         "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.3",
         "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.4",
         "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.5",
+        "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.6",
         "rlinf-gpuenv0-tensor-ppo-smoke-v0.1",
         "rlinf-gpuenv0-tensor-ppo-smoke-v0.2",
     }

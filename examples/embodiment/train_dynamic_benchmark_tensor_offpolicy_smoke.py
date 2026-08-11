@@ -48,13 +48,18 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Normal
 
-from rlinf.data.device_replay_buffer import DeviceReplayBatch, DeviceReplayBuffer
+from rlinf.data.device_replay_buffer import (
+    DeviceImitationReplayBuffer,
+    DeviceReplayBatch,
+    DeviceReplayBuffer,
+)
 from rlinf.data.device_transition_buffer import DeviceTransitionBuffer
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import GpuNativeTensorBackendEnv
 
-CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.5"
-REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.5"
+CHECKPOINT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-v0.6"
+REPORT_SCHEMA = "rlinf-gpuenv0-tensor-offpolicy-smoke-report-v0.6"
 DEMO_QUALITY_SCHEMA = "rlinf-gpuenv0-demo-quality-v0.3"
+DAGGER_CORRECTION_SCHEMA = "rlinf-gpuenv0-dagger-correction-v0.1"
 MINIMUM_SUCCESS_ONLY_DEMO_EPISODES = 24
 DEMO_PRODUCERS = {
     "zero_action": "zero_action_device_cohort_v1",
@@ -99,6 +104,10 @@ class TensorOffPolicyConfig:
     demo_ratio: float
     actor_bc_pretrain_updates: int
     actor_bc_weight: float
+    actor_sac_weight: float
+    dagger_cohorts: int
+    dagger_bc_updates_per_cohort: int
+    dagger_correction_ratio: float
     demo_policy: str | None
     demo_cohorts: int
     minimum_demo_success_rate: float
@@ -228,6 +237,42 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Weight of a separately sampled demonstration BC loss in every "
             "online actor update; disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--actor-sac-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the SAC objective in each online actor update; defaults to "
+            "one and may be reduced only by an explicitly recorded RLPD arm."
+        ),
+    )
+    parser.add_argument(
+        "--dagger-cohorts",
+        type=int,
+        default=0,
+        help=(
+            "Deterministic learner cohorts whose visited GPU states receive "
+            "privileged-teacher correction labels; disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--dagger-bc-updates-per-cohort",
+        type=int,
+        default=0,
+        help=(
+            "Device-only actor BC updates after each DAgger correction cohort; "
+            "disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--dagger-correction-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Correction-replay fraction of each DAgger/online BC minibatch; the "
+            "remainder comes from terminal-success demonstrations."
         ),
     )
     parser.add_argument(
@@ -390,6 +435,10 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         demo_ratio=demo_ratio,
         actor_bc_pretrain_updates=args.actor_bc_pretrain_updates,
         actor_bc_weight=args.actor_bc_weight,
+        actor_sac_weight=args.actor_sac_weight,
+        dagger_cohorts=args.dagger_cohorts,
+        dagger_bc_updates_per_cohort=args.dagger_bc_updates_per_cohort,
+        dagger_correction_ratio=args.dagger_correction_ratio,
         demo_policy=demo_policy,
         demo_cohorts=demo_cohorts,
         minimum_demo_success_rate=minimum_demo_success_rate,
@@ -437,6 +486,18 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
         raise ValueError("actor_bc_pretrain_updates must be non-negative")
     if not math.isfinite(config.actor_bc_weight) or config.actor_bc_weight < 0.0:
         raise ValueError("actor_bc_weight must be finite and non-negative")
+    if not math.isfinite(config.actor_sac_weight) or config.actor_sac_weight < 0.0:
+        raise ValueError("actor_sac_weight must be finite and non-negative")
+    if config.dagger_cohorts < 0:
+        raise ValueError("dagger_cohorts must be non-negative")
+    if config.dagger_bc_updates_per_cohort < 0:
+        raise ValueError("dagger_bc_updates_per_cohort must be non-negative")
+    if not math.isfinite(config.dagger_correction_ratio) or not (
+        0.0 < config.dagger_correction_ratio < 1.0
+    ):
+        raise ValueError(
+            "dagger_correction_ratio must be finite and strictly between zero and one"
+        )
     if config.replay_capacity < config.batch_size:
         raise ValueError("replay_capacity must be at least batch_size")
     if not 0.0 <= config.demo_ratio <= 1.0:
@@ -517,6 +578,34 @@ def _config(args: argparse.Namespace) -> TensorOffPolicyConfig:
             raise ValueError(
                 "actor BC requires RLPD privileged_teacher success-only replay"
             )
+    dagger_enabled = config.dagger_cohorts > 0
+    if dagger_enabled != (config.dagger_bc_updates_per_cohort > 0):
+        raise ValueError(
+            "dagger_cohorts and dagger_bc_updates_per_cohort must be enabled together"
+        )
+    if dagger_enabled:
+        if (
+            config.algorithm != "rlpd"
+            or config.demo_policy != "privileged_teacher"
+            or not config.demo_success_only_replay
+            or config.actor_bc_pretrain_updates < 1
+        ):
+            raise ValueError(
+                "DAgger correction requires RLPD privileged_teacher success-only "
+                "replay and actor BC pretraining"
+            )
+        if config.batch_size < 2:
+            raise ValueError("DAgger correction requires batch_size at least two")
+    if config.actor_sac_weight != 1.0 and config.algorithm != "rlpd":
+        raise ValueError("non-default actor_sac_weight requires RLPD")
+    if (
+        config.actor_sac_weight == 0.0
+        and config.actor_bc_weight == 0.0
+        and not dagger_enabled
+    ):
+        raise ValueError(
+            "zero actor_sac_weight requires an actor BC or DAgger update path"
+        )
     if not 0.0 <= config.gamma <= 1.0 or not 0.0 < config.tau <= 1.0:
         raise ValueError("gamma/tau are outside their valid ranges")
     if (
@@ -568,6 +657,41 @@ def _mixed_batch(
     permutation = torch.randperm(batch_size, device=online.device)
     return DeviceReplayBatch(
         **{name: value.index_select(0, permutation) for name, value in merged.items()}
+    )
+
+
+def _sample_behavior_cloning_batch(
+    demos: DeviceReplayBuffer,
+    corrections: DeviceImitationReplayBuffer,
+    *,
+    batch_size: int,
+    correction_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Sample successful demos plus separately labelled learner-visited states."""
+
+    correction_rows = 0
+    if corrections.size > 0:
+        correction_rows = max(
+            1,
+            min(batch_size - 1, int(round(batch_size * correction_ratio))),
+        )
+    demo_rows = batch_size - correction_rows
+    if demo_rows < 1 or demos.size < 1:
+        raise RuntimeError("behavior cloning requires successful demonstration rows")
+    demo_batch = demos.sample(demo_rows)
+    if correction_rows == 0:
+        return demo_batch.observation, demo_batch.action, demo_rows, 0
+    correction_batch = corrections.sample(correction_rows)
+    observation = torch.cat(
+        (demo_batch.observation, correction_batch.observation), dim=0
+    )
+    action = torch.cat((demo_batch.action, correction_batch.action), dim=0)
+    permutation = torch.randperm(batch_size, device=demos.device)
+    return (
+        observation.index_select(0, permutation),
+        action.index_select(0, permutation),
+        demo_rows,
+        correction_rows,
     )
 
 
@@ -645,6 +769,81 @@ def _actor_bc_pretrain(
     }
 
 
+def _dagger_bc_updates(
+    *,
+    config: TensorOffPolicyConfig,
+    actor: TensorGaussianActor,
+    actor_optimizer: torch.optim.Optimizer,
+    demos: DeviceReplayBuffer,
+    corrections: DeviceImitationReplayBuffer,
+) -> dict[str, Any]:
+    """Fit the actor to successful demos and learner-state correction labels."""
+
+    updates = config.dagger_bc_updates_per_cohort
+    if updates < 1 or corrections.size < 1:
+        raise RuntimeError("DAgger BC requires configured updates and correction rows")
+    before_sha256 = _structured_sha256(actor.state_dict())
+    actor.train()
+    first_loss: torch.Tensor | None = None
+    last_loss: torch.Tensor | None = None
+    loss_sum: torch.Tensor | None = None
+    sampled_demo_rows = 0
+    sampled_correction_rows = 0
+    for _update in range(updates):
+        observation, target_action, demo_rows, correction_rows = (
+            _sample_behavior_cloning_batch(
+                demos,
+                corrections,
+                batch_size=config.batch_size,
+                correction_ratio=config.dagger_correction_ratio,
+            )
+        )
+        predicted_action, _ = actor.sample(observation, stochastic=False)
+        loss = F.mse_loss(predicted_action, target_action)
+        actor_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
+        actor_optimizer.step()
+        detached = loss.detach()
+        if first_loss is None:
+            first_loss = detached.clone()
+            loss_sum = detached.clone()
+        else:
+            assert loss_sum is not None
+            loss_sum = loss_sum + detached
+        last_loss = detached
+        sampled_demo_rows += demo_rows
+        sampled_correction_rows += correction_rows
+
+    torch.cuda.synchronize(demos.device)
+    assert first_loss is not None and last_loss is not None and loss_sum is not None
+    losses = {
+        "first_loss": float(first_loss),
+        "last_loss": float(last_loss),
+        "mean_loss": float(loss_sum / updates),
+    }
+    if not all(np.isfinite(value) for value in losses.values()):
+        raise RuntimeError(f"non-finite DAgger BC metrics: {losses}")
+    after_sha256 = _structured_sha256(actor.state_dict())
+    if after_sha256 == before_sha256:
+        raise RuntimeError("DAgger BC did not change actor parameters")
+    return {
+        "configured_updates": updates,
+        "completed_updates": updates,
+        "batch_size": config.batch_size,
+        "correction_ratio": config.dagger_correction_ratio,
+        "sampled_demo_rows": sampled_demo_rows,
+        "sampled_correction_rows": sampled_correction_rows,
+        "demo_replay_rows": demos.size,
+        "correction_replay_rows": corrections.size,
+        "device": str(demos.device),
+        **losses,
+        "actor_sha256_before": before_sha256,
+        "actor_sha256_after": after_sha256,
+        "parameters_changed": True,
+    }
+
+
 def _offpolicy_updates(
     *,
     config: TensorOffPolicyConfig,
@@ -657,6 +856,7 @@ def _offpolicy_updates(
     alpha_optimizer: torch.optim.Optimizer,
     online: DeviceReplayBuffer,
     demos: DeviceReplayBuffer,
+    corrections: DeviceImitationReplayBuffer,
 ) -> tuple[dict[str, float], int]:
     metric_rows = []
     for _update in range(config.updates_per_cohort):
@@ -666,8 +866,15 @@ def _offpolicy_updates(
             batch_size=config.batch_size,
             demo_ratio=config.demo_ratio,
         )
-        demo_actor_batch = (
-            demos.sample(config.batch_size) if config.actor_bc_weight > 0.0 else None
+        actor_bc_batch = (
+            _sample_behavior_cloning_batch(
+                demos,
+                corrections,
+                batch_size=config.batch_size,
+                correction_ratio=config.dagger_correction_ratio,
+            )
+            if config.actor_bc_weight > 0.0
+            else None
         )
         with torch.no_grad():
             next_action, next_log_probability = actor.sample(
@@ -696,13 +903,19 @@ def _offpolicy_updates(
         policy_q = critic(batch.observation, policy_action).min(dim=-1).values
         actor_sac_loss = (log_alpha.exp().detach() * log_probability - policy_q).mean()
         actor_bc_loss = actor_sac_loss.new_zeros(())
-        if demo_actor_batch is not None:
+        if actor_bc_batch is not None:
+            bc_observation, bc_target_action, _demo_rows, _correction_rows = (
+                actor_bc_batch
+            )
             demo_action, _ = actor.sample(
-                demo_actor_batch.observation,
+                bc_observation,
                 stochastic=False,
             )
-            actor_bc_loss = F.mse_loss(demo_action, demo_actor_batch.action)
-        actor_loss = actor_sac_loss + config.actor_bc_weight * actor_bc_loss
+            actor_bc_loss = F.mse_loss(demo_action, bc_target_action)
+        actor_loss = (
+            config.actor_sac_weight * actor_sac_loss
+            + config.actor_bc_weight * actor_bc_loss
+        )
         actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
@@ -907,10 +1120,13 @@ def _load_resume_checkpoint(
         "alpha_optimizer",
         "online_replay",
         "demo_replay",
+        "correction_replay",
         "manifest_cursor",
         "completed_online_cohorts",
         "completed_demo_cohorts",
+        "completed_dagger_cohorts",
         "demo_quality",
+        "dagger_correction",
         "actor_bc_pretrain",
         "update_steps",
         "rng_state",
@@ -934,6 +1150,9 @@ def _load_resume_checkpoint(
         raise ValueError(
             "resume demonstration-cohort counter violates algorithm contract"
         )
+    completed_dagger = int(restored["completed_dagger_cohorts"])
+    if completed_dagger != config.dagger_cohorts:
+        raise ValueError("resume DAgger-cohort counter violates config contract")
     demo_quality = restored["demo_quality"]
     if not isinstance(demo_quality, Mapping):
         raise ValueError("resume demonstration quality evidence is not a mapping")
@@ -960,6 +1179,14 @@ def _load_resume_checkpoint(
         )
     ):
         raise ValueError("resume actor BC pretraining evidence differs from config")
+    dagger_correction = restored["dagger_correction"]
+    if (
+        not isinstance(dagger_correction, Mapping)
+        or bool(dagger_correction.get("enabled")) != (config.dagger_cohorts > 0)
+        or int(dagger_correction.get("configured_cohorts", -1)) != config.dagger_cohorts
+        or int(dagger_correction.get("completed_cohorts", -1)) != config.dagger_cohorts
+    ):
+        raise ValueError("resume DAgger correction evidence differs from config")
     return resolved, sha256, restored
 
 
@@ -1322,6 +1549,147 @@ def _rollout_privileged_teacher_cohort(
     return buffer.view(), time.perf_counter() - started, evidence
 
 
+def _rollout_dagger_correction_cohort(
+    *,
+    env: GpuNativeTensorBackendEnv,
+    actor: TensorGaussianActor,
+    online_buffer: DeviceTransitionBuffer,
+    correction_buffer: DeviceTransitionBuffer,
+    reset: Any,
+    teacher_overrides: Mapping[str, Any] | None = None,
+) -> tuple[Any, Any, float, dict[str, Any]]:
+    """Execute the GPU actor while labelling its visited states with the teacher."""
+
+    from se3_wam.benchmark.contracts import ActionMode
+    from se3_wam.benchmark.teacher_factory import make_privileged_teacher
+
+    effective_overrides = dict(teacher_overrides or {})
+    teachers = []
+    teacher_metadata = []
+    for _lane in range(env.num_envs):
+        teacher, metadata = make_privileged_teacher(env.task_id)
+        _apply_demo_teacher_overrides(teacher, effective_overrides)
+        teacher.reset()
+        teachers.append(teacher)
+        teacher_metadata.append(
+            {**dict(metadata), "runtime_planner_overrides": effective_overrides}
+        )
+    if any(metadata != teacher_metadata[0] for metadata in teacher_metadata[1:]):
+        raise RuntimeError("DAgger teacher metadata differs across cohort lanes")
+
+    observation_audit_calls_before = env.teacher_audit_materializations
+    observation_audit_lanes = 0
+    terminal_mask_host_materializations = 0
+    host_to_device_label_transfers = 0
+    active = np.ones(env.num_envs, dtype=np.bool_)
+    zero_label = torch.zeros((env.num_envs, 7), dtype=torch.float32, device=env.device)
+    observation = reset.observation
+    online_buffer.reset_cohort()
+    correction_buffer.reset_cohort()
+    actor.eval()
+    torch.cuda.synchronize(env.device)
+    started = time.perf_counter()
+    for _step in range(env.cohort_horizon_steps):
+        with torch.inference_mode():
+            learner_action, _log_probability = actor.sample(
+                observation,
+                stochastic=False,
+            )
+            learner_action = learner_action.contiguous()
+        active_lanes = tuple(int(lane) for lane in np.flatnonzero(active))
+        if active_lanes:
+            teacher_observations = env.materialize_teacher_observations(active_lanes)
+            if len(teacher_observations) != len(active_lanes):
+                raise RuntimeError(
+                    "DAgger teacher audit row count differs from active GPU lanes"
+                )
+            host_labels = np.zeros((env.num_envs, 7), dtype=np.float32)
+            for lane, teacher_observation in zip(
+                active_lanes, teacher_observations, strict=True
+            ):
+                if (
+                    teacher_observation.episode_id != reset.episode_ids[lane]
+                    or teacher_observation.task_id != env.task_id
+                    or teacher_observation.control_step != _step
+                    or teacher_observation.policy_step != _step
+                ):
+                    raise RuntimeError(
+                        "DAgger teacher observation identity/clock drifted"
+                    )
+                command = teachers[lane].act(teacher_observation)
+                host_labels[lane] = _validated_teacher_action(
+                    command,
+                    teacher_observation,
+                    action_mode=ActionMode.E7,
+                )
+            correction_label = torch.as_tensor(
+                host_labels,
+                dtype=torch.float32,
+                device=env.device,
+            ).contiguous()
+            observation_audit_lanes += len(active_lanes)
+            host_to_device_label_transfers += 1
+        else:
+            correction_label = zero_label
+
+        online_buffer.begin_step(observation=observation, action=learner_action)
+        correction_buffer.begin_step(observation=observation, action=correction_label)
+        try:
+            with torch.inference_mode():
+                step = env.step(learner_action)
+            commit = {
+                "reward": step.reward,
+                "next_observation": step.observation,
+                "terminated": step.terminated,
+                "truncated": step.truncated,
+                "success": step.success,
+                "event_mask": step.event_mask,
+                "terminal_reason": step.terminal_reason,
+                "physics_step": step.physics_step,
+            }
+            online_buffer.commit_step(**commit)
+            correction_buffer.commit_step(**commit)
+        except BaseException:
+            if online_buffer.pending:
+                online_buffer.abort_step()
+            if correction_buffer.pending:
+                correction_buffer.abort_step()
+            raise
+        observation = step.observation
+        if active_lanes:
+            done = np.asarray(
+                step.done.detach().to(device="cpu").numpy(), dtype=np.bool_
+            )
+            if done.shape != (env.num_envs,):
+                raise RuntimeError("GPU terminal mask has the wrong DAgger audit shape")
+            active &= ~done
+            terminal_mask_host_materializations += 1
+
+    torch.cuda.synchronize(env.device)
+    observation_audit_calls = (
+        env.teacher_audit_materializations - observation_audit_calls_before
+    )
+    evidence = {
+        "producer": "learner_visited_gpu_state_privileged_teacher_correction_v1",
+        "executed_action_source": "deterministic_gpu_actor",
+        "label_action_source": DEMO_PRODUCERS["privileged_teacher"],
+        "labels_are_successful_demonstrations": False,
+        "teacher_count": len(teachers),
+        "teacher_metadata": teacher_metadata[0],
+        "observation_audit_calls": observation_audit_calls,
+        "observation_audit_lanes": observation_audit_lanes,
+        "terminal_mask_host_materializations": terminal_mask_host_materializations,
+        "host_to_device_label_transfers": host_to_device_label_transfers,
+        "online_hot_path_host_materializations": 0,
+    }
+    return (
+        online_buffer.view(),
+        correction_buffer.view(),
+        time.perf_counter() - started,
+        evidence,
+    )
+
+
 def _successful_demo_lane_mask(rollout: Any) -> Any:
     """Return the device-local lanes whose valid terminal transition succeeded."""
 
@@ -1387,6 +1755,27 @@ def _add_rollout_to_replay(
         terminated=terminated,
         truncated=truncated,
         valid=valid,
+    )
+    return rows
+
+
+def _add_correction_rollout_to_replay(
+    replay: DeviceImitationReplayBuffer,
+    rollout: Any,
+) -> int:
+    """Insert only valid observation/teacher-action labels on the rollout device."""
+
+    selector = rollout.valid
+    observation = rollout.observation[selector].reshape(
+        -1, rollout.observation.shape[-1]
+    )
+    action = rollout.action[selector].reshape(-1, rollout.action.shape[-1])
+    rows = int(observation.shape[0])
+    if rows == 0:
+        return 0
+    replay.add_batch(
+        observation=observation.contiguous(),
+        action=action.contiguous(),
     )
     return rows
 
@@ -1538,6 +1927,7 @@ def main() -> int:
         )
         completed_online_before = 0
         completed_demo_before = 0
+        completed_dagger_before = 0
         update_steps_before = 0
         restored_manifest_cursor: dict[str, Any] | None = None
         if restored is not None:
@@ -1549,6 +1939,7 @@ def main() -> int:
             env.load_manifest_state_dict(restored_manifest_cursor)
             completed_online_before = int(restored["completed_online_cohorts"])
             completed_demo_before = int(restored["completed_demo_cohorts"])
+            completed_dagger_before = int(restored["completed_dagger_cohorts"])
             update_steps_before = int(restored["update_steps"])
         initial = env.reset()
         observation = initial.observation
@@ -1556,6 +1947,16 @@ def main() -> int:
         if restored is not None and int(restored["observation_dim"]) != observation_dim:
             raise ValueError(
                 "resume observation dimension does not match live environment"
+            )
+        required_correction_capacity = (
+            config.dagger_cohorts * config.num_envs * env.cohort_horizon_steps
+        )
+        if (
+            config.dagger_cohorts > 0
+            and config.replay_capacity < required_correction_capacity
+        ):
+            raise ValueError(
+                "replay_capacity cannot retain every configured DAgger correction row"
             )
 
         actor = TensorGaussianActor(observation_dim, config.hidden_size).to(env.device)
@@ -1597,7 +1998,20 @@ def main() -> int:
             action_dtype=torch.float32,
             reward_dtype=torch.float32,
         )
+        correction_capacity = config.replay_capacity if config.dagger_cohorts > 0 else 1
+        corrections = DeviceImitationReplayBuffer(
+            capacity=correction_capacity,
+            observation_shape=(observation_dim,),
+            action_shape=(7,),
+            device=env.device,
+            seed=config.seed + 23,
+            observation_dtype=observation.dtype,
+            action_dtype=torch.float32,
+        )
         transition = _new_transition_buffer(env, observation_dim, observation.dtype)
+        correction_transition = _new_transition_buffer(
+            env, observation_dim, observation.dtype
+        )
 
         if restored is not None:
             actor.load_state_dict(restored["actor"], strict=True)
@@ -1609,6 +2023,7 @@ def main() -> int:
             alpha_optimizer.load_state_dict(restored["alpha_optimizer"])
             online.load_state_dict(restored["online_replay"])
             demos.load_state_dict(restored["demo_replay"])
+            corrections.load_state_dict(restored["correction_replay"])
             parameter_sha256_start = _parameter_sha256(
                 actor, critic, target_critic, log_alpha
             )
@@ -1915,6 +2330,177 @@ def main() -> int:
                 demos=demos,
             )
 
+        dagger_correction_path = args.output / "dagger_correction.json"
+        completed_dagger_after = completed_dagger_before
+        if restored is not None:
+            dagger_correction = dict(restored["dagger_correction"])
+            _atomic_json(dagger_correction_path, dagger_correction)
+        elif config.dagger_cohorts > 0:
+            dagger_allocated_steps = 0
+            dagger_valid_steps = 0
+            dagger_successes = 0
+            dagger_episodes = 0
+            dagger_replay_inserted_rows = 0
+            dagger_bc_update_steps = 0
+            dagger_control_plane = []
+            dagger_bc_rows = []
+            for dagger_cohort in range(config.dagger_cohorts):
+                reset = next_reset if dagger_cohort == 0 else env.reset()
+                (
+                    dagger_online_rollout,
+                    dagger_label_rollout,
+                    rollout_seconds,
+                    control_plane,
+                ) = _rollout_dagger_correction_cohort(
+                    env=env,
+                    actor=actor,
+                    online_buffer=transition,
+                    correction_buffer=correction_transition,
+                    reset=reset,
+                    teacher_overrides=config.demo_teacher_overrides,
+                )
+                _add_rollout_to_replay(online, dagger_online_rollout)
+                correction_rows = _add_correction_rollout_to_replay(
+                    corrections,
+                    dagger_label_rollout,
+                )
+                actor.train()
+                update_started = time.perf_counter()
+                bc_evidence = _dagger_bc_updates(
+                    config=config,
+                    actor=actor,
+                    actor_optimizer=actor_optimizer,
+                    demos=demos,
+                    corrections=corrections,
+                )
+                update_seconds = time.perf_counter() - update_started
+                summary, ledger_rows = _cohort_evidence(
+                    config=config,
+                    env=env,
+                    reset=reset,
+                    rollout=dagger_online_rollout,
+                    role="dagger_learner_correction",
+                    cohort=dagger_cohort,
+                    rollout_seconds=rollout_seconds,
+                    update_seconds=update_seconds,
+                    updates=int(bc_evidence["completed_updates"]),
+                    metrics={
+                        "dagger_bc_first_loss": float(bc_evidence["first_loss"]),
+                        "dagger_bc_last_loss": float(bc_evidence["last_loss"]),
+                        "dagger_bc_mean_loss": float(bc_evidence["mean_loss"]),
+                    },
+                    seen_episode_ids=seen_episode_ids,
+                )
+                expected_correction_rows = sum(
+                    int(row["valid_steps"]) for row in ledger_rows
+                )
+                if correction_rows != expected_correction_rows:
+                    raise RuntimeError(
+                        "DAgger correction selector differs from learner terminal ledger"
+                    )
+                for row in ledger_rows:
+                    row["demo_replay_selected"] = False
+                    row["dagger_correction_selected"] = True
+                    row["dagger_correction_rows"] = int(row["valid_steps"])
+                    row["executed_action_source"] = "deterministic_gpu_actor"
+                    row["correction_label_source"] = DEMO_PRODUCERS[
+                        "privileged_teacher"
+                    ]
+                control_plane["cohort"] = dagger_cohort
+                control_plane["replay_selection"] = {
+                    "mode": "all_valid_learner_visited_rows_device_filter_v1",
+                    "selector_device": str(dagger_label_rollout.valid.device),
+                    "selector_host_materializations": 0,
+                    "attempted_lanes": len(ledger_rows),
+                    "inserted_rows": correction_rows,
+                    "selected_valid_rows": expected_correction_rows,
+                    "successful_demo_rows": 0,
+                }
+                dagger_control_plane.append(control_plane)
+                dagger_bc_rows.append({"cohort": dagger_cohort, **bc_evidence})
+                cohort_rows.append(summary)
+                _append_jsonl_rows(ledger_path, ledger_rows)
+                dagger_allocated_steps += summary["allocated_steps"]
+                dagger_valid_steps += summary["valid_steps"]
+                dagger_successes += summary["terminal_successes"]
+                dagger_episodes += len(reset.episode_ids)
+                dagger_replay_inserted_rows += correction_rows
+                dagger_bc_update_steps += int(bc_evidence["completed_updates"])
+                total_allocated_steps += summary["allocated_steps"]
+                total_valid_steps += summary["valid_steps"]
+                total_successes += summary["terminal_successes"]
+                completed_dagger_after += 1
+
+            correction_replay_retained = (
+                corrections.inserted_rows == dagger_replay_inserted_rows
+                and corrections.size == dagger_replay_inserted_rows
+                and dagger_replay_inserted_rows == dagger_valid_steps
+            )
+            if not correction_replay_retained:
+                raise RuntimeError(
+                    "DAgger correction replay did not retain every labelled valid row"
+                )
+            dagger_correction = {
+                "schema_version": DAGGER_CORRECTION_SCHEMA,
+                "enabled": True,
+                "configured_cohorts": config.dagger_cohorts,
+                "completed_cohorts": completed_dagger_after,
+                "episodes": dagger_episodes,
+                "terminal_successes": dagger_successes,
+                "allocated_steps": dagger_allocated_steps,
+                "valid_steps": dagger_valid_steps,
+                "executed_action_source": "deterministic_gpu_actor",
+                "label_action_source": DEMO_PRODUCERS["privileged_teacher"],
+                "labels_are_successful_demonstrations": False,
+                "teacher_overrides": config.demo_teacher_overrides,
+                "teacher_overrides_sha256": config.demo_teacher_overrides_sha256,
+                "replay": {
+                    "semantics": "learner_visited_state_teacher_action_labels_v1",
+                    "inserted_rows": dagger_replay_inserted_rows,
+                    "valid_rows": dagger_valid_steps,
+                    "capacity": corrections.capacity,
+                    "retains_all_labelled_rows": correction_replay_retained,
+                    "inserted_into_successful_demo_replay": False,
+                },
+                "bc_updates_per_cohort": config.dagger_bc_updates_per_cohort,
+                "bc_updates": dagger_bc_update_steps,
+                "correction_ratio": config.dagger_correction_ratio,
+                "bc_cohorts": dagger_bc_rows,
+                "control_plane": dagger_control_plane,
+            }
+            _atomic_json(dagger_correction_path, dagger_correction)
+            next_reset = env.reset()
+        else:
+            dagger_correction = {
+                "schema_version": DAGGER_CORRECTION_SCHEMA,
+                "enabled": False,
+                "configured_cohorts": 0,
+                "completed_cohorts": 0,
+                "episodes": 0,
+                "terminal_successes": 0,
+                "allocated_steps": 0,
+                "valid_steps": 0,
+                "executed_action_source": None,
+                "label_action_source": None,
+                "labels_are_successful_demonstrations": False,
+                "teacher_overrides": {},
+                "teacher_overrides_sha256": None,
+                "replay": {
+                    "semantics": "disabled",
+                    "inserted_rows": 0,
+                    "valid_rows": 0,
+                    "capacity": corrections.capacity,
+                    "retains_all_labelled_rows": True,
+                    "inserted_into_successful_demo_replay": False,
+                },
+                "bc_updates_per_cohort": 0,
+                "bc_updates": 0,
+                "correction_ratio": config.dagger_correction_ratio,
+                "bc_cohorts": [],
+                "control_plane": [],
+            }
+            _atomic_json(dagger_correction_path, dagger_correction)
+
         for local_cohort in range(config.cohorts):
             global_cohort = completed_online_before + local_cohort
             reset = next_reset if local_cohort == 0 else env.reset()
@@ -1940,6 +2526,7 @@ def main() -> int:
                 alpha_optimizer=alpha_optimizer,
                 online=online,
                 demos=demos,
+                corrections=corrections,
             )
             update_seconds = time.perf_counter() - update_started
             update_steps += updates
@@ -1991,10 +2578,13 @@ def main() -> int:
             "alpha_optimizer": alpha_optimizer.state_dict(),
             "online_replay": online.state_dict(),
             "demo_replay": demos.state_dict(),
+            "correction_replay": corrections.state_dict(),
             "manifest_cursor": dict(env.manifest_state_dict()),
             "completed_online_cohorts": completed_online_after,
             "completed_demo_cohorts": completed_demo_after,
+            "completed_dagger_cohorts": completed_dagger_after,
             "demo_quality": demo_quality,
+            "dagger_correction": dagger_correction,
             "actor_bc_pretrain": actor_bc_pretrain,
             "update_steps": update_steps,
             "rng_state": _capture_rng_state(),
@@ -2015,7 +2605,13 @@ def main() -> int:
                 reloaded.get("completed_demo_cohorts", -1)
             )
             == completed_demo_after,
+            "completed_dagger_cohorts_match": int(
+                reloaded.get("completed_dagger_cohorts", -1)
+            )
+            == completed_dagger_after,
             "demo_quality_match": reloaded.get("demo_quality") == demo_quality,
+            "dagger_correction_match": reloaded.get("dagger_correction")
+            == dagger_correction,
             "actor_bc_pretrain_match": reloaded.get("actor_bc_pretrain")
             == actor_bc_pretrain,
             "update_steps_match": int(reloaded.get("update_steps", -1)) == update_steps,
@@ -2047,12 +2643,17 @@ def main() -> int:
             checkpoint_payload["online_replay"]["data"]["valid"].sum()
         )
         demo_valid_rows = int(checkpoint_payload["demo_replay"]["data"]["valid"].sum())
+        correction_valid_rows = int(checkpoint_payload["correction_replay"]["size"])
         if config.demo_success_only_replay and (
             demo_valid_rows
             != int(demo_quality["replay_selection"]["selected_valid_rows"])
         ):
             raise RuntimeError(
                 "checkpointed demo replay differs from success-only selection evidence"
+            )
+        if correction_valid_rows != int(dagger_correction["replay"]["valid_rows"]):
+            raise RuntimeError(
+                "checkpointed correction replay differs from DAgger selection evidence"
             )
         demo_control_plane = list(demo_quality["control_plane"])
         demo_observation_audits = sum(
@@ -2065,12 +2666,24 @@ def main() -> int:
         demo_action_transfers = sum(
             int(row["host_to_device_action_transfers"]) for row in demo_control_plane
         )
+        dagger_control_plane = list(dagger_correction["control_plane"])
+        dagger_observation_audits = sum(
+            int(row["observation_audit_calls"]) for row in dagger_control_plane
+        )
+        dagger_terminal_mask_reads = sum(
+            int(row["terminal_mask_host_materializations"])
+            for row in dagger_control_plane
+        )
+        dagger_label_transfers = sum(
+            int(row["host_to_device_label_transfers"]) for row in dagger_control_plane
+        )
         if (
             restored is None
-            and env.teacher_audit_materializations != demo_observation_audits
+            and env.teacher_audit_materializations
+            != demo_observation_audits + dagger_observation_audits
         ):
             raise RuntimeError(
-                "backend teacher-audit counter differs from demo control-plane evidence"
+                "backend teacher-audit counter differs from demo/correction evidence"
             )
         report = {
             "schema_version": REPORT_SCHEMA,
@@ -2084,6 +2697,9 @@ def main() -> int:
                 "rlpd_demo_producer": demo_quality["producer"],
                 "actor_bc_pretrain_enabled": bool(actor_bc_pretrain["enabled"]),
                 "actor_bc_regularization_enabled": config.actor_bc_weight > 0.0,
+                "actor_sac_weight": config.actor_sac_weight,
+                "dagger_correction_enabled": bool(dagger_correction["enabled"]),
+                "dagger_labels_are_successful_demonstrations": False,
                 "statement": (
                     (
                         "RLPD demo replay contains only complete terminal-success "
@@ -2151,13 +2767,27 @@ def main() -> int:
                 "demonstration_host_to_device_action_transfers": demo_action_transfers,
                 "demonstration_replay_selection": demo_quality["replay_selection"],
                 "demonstration_selector_host_materializations": 0,
+                "dagger_control_plane_host_materializations": (
+                    dagger_observation_audits + dagger_terminal_mask_reads
+                ),
+                "dagger_observation_audit_calls": dagger_observation_audits,
+                "dagger_terminal_mask_host_materializations": (
+                    dagger_terminal_mask_reads
+                ),
+                "dagger_host_to_device_label_transfers": dagger_label_transfers,
+                "dagger_correction_selector_host_materializations": 0,
+                "dagger_executed_policy_device_only": bool(
+                    dagger_correction["enabled"]
+                ),
                 "actor_bc_pretrain_device_only": True,
                 "actor_bc_regularization_device_only": True,
+                "dagger_bc_updates_device_only": bool(dagger_correction["enabled"]),
                 "cohort_horizon_steps": env.cohort_horizon_steps,
                 "warmup_policy_only_steps": config.warmup_steps,
             },
             "replay": {
                 "capacity_each": config.replay_capacity,
+                "correction_capacity": corrections.capacity,
                 "online_size": online.size,
                 "online_valid_rows": online_valid_rows,
                 "online_inserted_rows": online.inserted_rows,
@@ -2173,6 +2803,12 @@ def main() -> int:
                 ),
                 "demo_ratio": config.demo_ratio,
                 "actor_bc_weight": config.actor_bc_weight,
+                "actor_sac_weight": config.actor_sac_weight,
+                "correction_size": corrections.size,
+                "correction_valid_rows": correction_valid_rows,
+                "correction_inserted_rows": corrections.inserted_rows,
+                "correction_labels_are_successful_demonstrations": False,
+                "dagger_correction_ratio": config.dagger_correction_ratio,
                 "sampling_rng_checkpointed": True,
             },
             "demo_quality": {
@@ -2180,12 +2816,19 @@ def main() -> int:
                 "path": str(demo_quality_path),
                 "sha256": _file_sha256(demo_quality_path),
             },
+            "dagger_correction": {
+                **dagger_correction,
+                "path": str(dagger_correction_path),
+                "sha256": _file_sha256(dagger_correction_path),
+            },
             "train": {
                 "cohorts": cohort_rows,
                 "completed_online_cohorts_before": completed_online_before,
                 "completed_online_cohorts_after": completed_online_after,
                 "completed_demo_cohorts_before": completed_demo_before,
                 "completed_demo_cohorts_after": completed_demo_after,
+                "completed_dagger_cohorts_before": completed_dagger_before,
+                "completed_dagger_cohorts_after": completed_dagger_after,
                 "total_allocated_steps": total_allocated_steps,
                 "total_valid_steps": total_valid_steps,
                 "terminal_successes": total_successes,
@@ -2194,6 +2837,8 @@ def main() -> int:
                 "optimizer_updates_after": update_steps,
                 "actor_bc_pretrain": actor_bc_pretrain,
                 "actor_bc_weight": config.actor_bc_weight,
+                "actor_sac_weight": config.actor_sac_weight,
+                "dagger_bc_updates": int(dagger_correction["bc_updates"]),
                 "parameter_sha256_start": parameter_sha256_start,
                 "parameter_sha256_end": parameter_sha256_end,
                 "parameters_changed": parameter_sha256_start != parameter_sha256_end,
