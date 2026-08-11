@@ -17,13 +17,20 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing as mp
+import os
 import pickle
+import signal
+import sys
 import time
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
+from se3_wam.benchmark.trajectory_quality_v4 import (
+    QUALITY_V4_PHYSICS_REDUCER_SCHEMA,
+    PhysicsRateEEFReducer,
+)
 
 from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import (
     DynamicBenchmarkEnv,
@@ -74,12 +81,117 @@ def _make_deterministic_handler(
     return _DeterministicHandler(payload, indices)
 
 
+class _ReducerHandler:
+    """Exercise the real Qv4 reducer snapshot across spawned worker boundaries."""
+
+    def __init__(self, payload: dict[str, int], indices: tuple[int, ...]) -> None:
+        del payload
+        self._indices = indices
+        self._reducers = {index: PhysicsRateEEFReducer() for index in indices}
+
+    def ready_metadata(self) -> dict[str, Any]:
+        return {"indices": self._indices}
+
+    @staticmethod
+    def _pose(position_x: float) -> np.ndarray:
+        return np.asarray([position_x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+
+    def handle(
+        self, command: str, items: list[tuple[int, Any]]
+    ) -> list[tuple[int, Any]]:
+        results = []
+        for index, payload in items:
+            if command == "reset":
+                reducer = PhysicsRateEEFReducer()
+                reducer.update(time_s=0.0, eef_pose_xyzw=self._pose(0.0))
+                self._reducers[index] = reducer
+                result = reducer.summary()
+            elif command == "step":
+                time_s, position_x = payload
+                self._reducers[index].update(
+                    time_s=float(time_s),
+                    eef_pose_xyzw=self._pose(float(position_x)),
+                )
+                result = self._reducers[index].summary()
+            elif command == "save":
+                result = self._reducers[index].snapshot()
+            elif command == "restore":
+                self._reducers[index] = PhysicsRateEEFReducer.from_snapshot(payload)
+                result = self._reducers[index].summary()
+            else:
+                raise ValueError(f"unknown reducer command {command}")
+            results.append((index, result))
+        return results
+
+    def close(self) -> None:
+        self._reducers.clear()
+
+
+def _make_reducer_handler(
+    payload: dict[str, int], indices: tuple[int, ...]
+) -> _ReducerHandler:
+    return _ReducerHandler(payload, indices)
+
+
+class _SlowHandler(_DeterministicHandler):
+    def handle(
+        self,
+        command: str,
+        items: list[tuple[int, Any]],
+    ) -> list[tuple[int, Any]]:
+        time.sleep(0.5)
+        return super().handle(command, items)
+
+
+def _make_slow_handler(
+    payload: dict[str, int],
+    indices: tuple[int, ...],
+) -> _SlowHandler:
+    return _SlowHandler(payload, indices)
+
+
+def _make_partially_failing_handler(
+    payload: dict[str, int],
+    indices: tuple[int, ...],
+) -> _DeterministicHandler:
+    if 1 in indices:
+        raise RuntimeError("intentional partial startup failure")
+    return _DeterministicHandler(payload, indices)
+
+
+def _parent_process_with_workers(connection: Any, start_method: str) -> None:
+    processes = OrderedProcessVector(
+        num_envs=4,
+        num_workers=2,
+        handler_factory=_make_deterministic_handler,
+        handler_payload={"offset": 0},
+        start_method=start_method,
+        timeout_s=5.0,
+    )
+    connection.send(processes.worker_pids)
+    connection.close()
+    while True:
+        time.sleep(1.0)
+
+
+def _pid_exists(pid: int) -> bool:
+    return os.path.exists(f"/proc/{pid}")
+
+
 def _start_method() -> str:
     return (
         "spawn"
         if "spawn" in mp.get_all_start_methods()
         else mp.get_all_start_methods()[0]
     )
+
+
+def _failure_start_methods() -> tuple[str, ...]:
+    available = mp.get_all_start_methods()
+    selected = tuple(
+        method for method in ("spawn", "forkserver") if method in available
+    )
+    return selected or (available[0],)
 
 
 def _digest(rows: list[tuple[int, Any]]) -> str:
@@ -130,13 +242,17 @@ def test_process_observation_transport_removes_mapping_proxies() -> None:
 def test_process_restore_installs_checkpoint_observation_in_worker_cache() -> None:
     def observation(*, value: float, with_event: bool) -> SimpleNamespace:
         events = (
-            SimpleNamespace(
-                name="contact",
-                physics_step=7,
-                time_s=0.07,
-                details={"force": 2.5},
-            ),
-        ) if with_event else ()
+            (
+                SimpleNamespace(
+                    name="contact",
+                    physics_step=7,
+                    time_s=0.07,
+                    details={"force": 2.5},
+                ),
+            )
+            if with_event
+            else ()
+        )
         return SimpleNamespace(
             episode_id="episode-restore",
             task_id="t4_sphere",
@@ -181,7 +297,9 @@ def test_process_restore_installs_checkpoint_observation_in_worker_cache() -> No
         [(0, (request, b"env-state", _pack_process_observation(authoritative)))],
     )
     cached = handler._observations[0]
-    assert np.array_equal(cached.privileged["object"], np.asarray([2.0], dtype=np.float32))
+    assert np.array_equal(
+        cached.privileged["object"], np.asarray([2.0], dtype=np.float32)
+    )
     assert cached.events_since_last_observation[0].name == "contact"
     assert restored[0][1]["events_since_last_observation"][0]["name"] == "contact"
 
@@ -191,6 +309,44 @@ def test_process_restore_installs_checkpoint_observation_in_worker_cache() -> No
         saved["observation"]["privileged"]["object"],
         np.asarray([2.0], dtype=np.float32),
     )
+
+
+def test_process_step_transports_terminal_quality_v4_physics_summary() -> None:
+    summary = {
+        "schema_version": QUALITY_V4_PHYSICS_REDUCER_SCHEMA,
+        "sample_count": 4,
+    }
+    step_result = SimpleNamespace(
+        observation=SimpleNamespace(
+            episode_id="episode-qv4",
+            task_id="t4_can",
+            physics_step=3,
+            control_step=1,
+            policy_step=1,
+            time_s=0.006,
+            rgb={},
+            depth_m={},
+            segmentation={},
+            proprio={},
+            privileged={},
+            events_since_last_observation=(),
+            api_version="db-api-v0.1",
+        ),
+        terminated=True,
+        truncated=False,
+        success=True,
+        termination_reason="success",
+        active_stage_progress=1.0,
+        task_quality=None,
+        trajectory_quality_v4_physics=summary,
+    )
+    env = SimpleNamespace(_ledger=SimpleNamespace(events=()))
+
+    payload = _DynamicBenchmarkProcessHandler._pack_step_result(env, step_result)
+
+    assert payload["trajectory_quality_v4_physics"] == summary
+    summary["sample_count"] = 999
+    assert payload["trajectory_quality_v4_physics"]["sample_count"] == 4
 
 
 def test_process_residual_composition_matches_frozen_float32_contract() -> None:
@@ -249,13 +405,50 @@ def test_process_vector_checkpoint_resume_is_exact() -> None:
     assert observed == expected
 
 
-def test_process_vector_worker_failure_terminates_every_shard() -> None:
+def test_process_vector_quality_v4_reducer_checkpoint_resume_is_exact() -> None:
+    common = {
+        "num_envs": 4,
+        "num_workers": 2,
+        "handler_factory": _make_reducer_handler,
+        "handler_payload": {},
+        "start_method": _start_method(),
+    }
+    all_indices = [(index, None) for index in range(4)]
+    first = [(index, (0.002, 0.001 + index * 1.0e-5)) for index in range(4)]
+    second = [(index, (0.004, 0.002 + index * 1.0e-5)) for index in range(4)]
+    third = [(index, (0.006, 0.004 + index * 1.0e-5)) for index in range(4)]
+    fourth = [(index, (0.008, 0.005 + index * 1.0e-5)) for index in range(4)]
+    with OrderedProcessVector(**common) as continuous:
+        continuous.run("reset", all_indices)
+        continuous.run("step", first)
+        continuous.run("step", second)
+        checkpoint = continuous.run("save", all_indices)
+        continuous.run("step", third)
+        expected = continuous.run("step", fourth)
+
+    with OrderedProcessVector(**common) as resumed:
+        resumed.run("restore", checkpoint)
+        resumed.run("step", third)
+        observed = resumed.run("step", fourth)
+
+    assert observed == expected
+    assert all(
+        summary["schema_version"] == QUALITY_V4_PHYSICS_REDUCER_SCHEMA
+        and summary["sample_count"] == 5
+        for _, summary in observed
+    )
+
+
+@pytest.mark.parametrize("start_method", _failure_start_methods())
+def test_process_vector_worker_failure_terminates_every_shard(
+    start_method: str,
+) -> None:
     processes = OrderedProcessVector(
         num_envs=4,
         num_workers=2,
         handler_factory=_make_deterministic_handler,
         handler_payload={"offset": 0},
-        start_method=_start_method(),
+        start_method=start_method,
         timeout_s=5.0,
     )
     pids = processes.worker_pids
@@ -268,3 +461,88 @@ def test_process_vector_worker_failure_terminates_every_shard() -> None:
     assert len(pids) == 2
     time.sleep(0.05)
     assert all(not process.is_alive() for process in processes._processes)
+
+
+@pytest.mark.parametrize("start_method", _failure_start_methods())
+def test_process_vector_timeout_terminates_every_shard(
+    start_method: str,
+) -> None:
+    processes = OrderedProcessVector(
+        num_envs=4,
+        num_workers=2,
+        handler_factory=_make_slow_handler,
+        handler_payload={"offset": 0},
+        start_method=start_method,
+        timeout_s=5.0,
+    )
+    processes.timeout_s = 0.05
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        processes.run("step", [(index, 1) for index in range(4)])
+
+    assert processes.closed
+    assert processes.alive_pids == ()
+
+
+@pytest.mark.parametrize("start_method", _failure_start_methods())
+def test_process_vector_partial_startup_terminates_started_shards(
+    start_method: str,
+) -> None:
+    prior_children = {child.pid for child in mp.active_children()}
+
+    with pytest.raises(RuntimeError, match="partial startup failure"):
+        OrderedProcessVector(
+            num_envs=4,
+            num_workers=2,
+            handler_factory=_make_partially_failing_handler,
+            handler_payload={"offset": 0},
+            start_method=start_method,
+            timeout_s=5.0,
+        )
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        remaining = {
+            child.pid
+            for child in mp.active_children()
+            if child.pid not in prior_children
+        }
+        if not remaining:
+            break
+        time.sleep(0.05)
+    assert not remaining
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux parent-death contract")
+@pytest.mark.parametrize("worker_start_method", _failure_start_methods())
+def test_process_vector_parent_sigkill_leaves_no_workers(
+    worker_start_method: str,
+) -> None:
+    context = mp.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    parent = context.Process(
+        target=_parent_process_with_workers,
+        args=(send_connection, worker_start_method),
+    )
+    parent.start()
+    send_connection.close()
+    worker_pids: tuple[int, ...] = ()
+    try:
+        assert receive_connection.poll(10.0)
+        worker_pids = tuple(int(pid) for pid in receive_connection.recv())
+        assert len(worker_pids) == 2
+        assert all(_pid_exists(pid) for pid in worker_pids)
+        os.kill(int(parent.pid), signal.SIGKILL)
+        parent.join(timeout=5.0)
+        assert not parent.is_alive()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and any(
+            _pid_exists(pid) for pid in worker_pids
+        ):
+            time.sleep(0.05)
+        assert all(not _pid_exists(pid) for pid in worker_pids)
+    finally:
+        receive_connection.close()
+        if parent.is_alive():
+            parent.kill()
+            parent.join(timeout=5.0)

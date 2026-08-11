@@ -24,8 +24,9 @@ import math
 import os
 import time
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any
 
 import h5py
@@ -41,15 +42,20 @@ except ModuleNotFoundError:
 CANDIDATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-candidates-v0.1"
 CANDIDATE_SCHEMA_V2 = "rlinf-dynamic-benchmark-optimal-candidates-v0.2"
 CANDIDATE_SCHEMAS = (CANDIDATE_SCHEMA, CANDIDATE_SCHEMA_V2)
-EVALUATOR_IDENTITY_SCHEMA = (
-    "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
-)
+EVALUATOR_IDENTITY_SCHEMA = "rlinf-dynamic-benchmark-quality-evaluator-identity-v0.1"
 CALIBRATION_EVIDENCE_SCHEMA = (
     "rlinf-dynamic-benchmark-planner-calibration-evidence-v0.1"
 )
 CANDIDATE_RELEASE_SCHEMA = "rlinf-dynamic-benchmark-rld2-candidate-release-v0.2"
 EXPORT_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-v0.1"
-ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.1"
+ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.3"
+HISTORICAL_ATTEMPT_SCHEMAS = frozenset(
+    {
+        "rlinf-dynamic-benchmark-optimal-attempt-v0.1",
+        "rlinf-dynamic-benchmark-optimal-attempt-v0.2",
+    }
+)
+LEGACY_ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-optimal-attempt-v0.1"
 AUDIT_SCHEMA = "rlinf-dynamic-benchmark-optimal-audit-v0.1"
 STATE_SCHEMA = "rlinf-dynamic-benchmark-optimal-export-state-v0.1"
 PROGRESS_SCHEMA = "rlinf-dynamic-benchmark-optimal-progress-v0.1"
@@ -61,12 +67,62 @@ FIRST_ELIGIBLE_SEARCH_MODE = "first-eligible"
 FULL_POOL_SEARCH_MODE = "full-pool"
 CANDIDATE_SEARCH_MODES = (FIRST_ELIGIBLE_SEARCH_MODE, FULL_POOL_SEARCH_MODE)
 PLANNER_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-planner-dominance-v0.1"
+QUALITY_V2_THRESHOLDS_SCHEMA = "se3-wam-trajectory-quality-v2-thresholds-v0.3"
+QUALITY_V2_SUMMARY_SCHEMA = "se3-wam-trajectory-quality-v2"
+QUALITY_V2_GATE_SCHEMA = "se3-wam-trajectory-quality-v2-gate-v0.1"
+QUALITY_V2_DOMINANCE_SCHEMA = "rlinf-dynamic-benchmark-quality-v2-dominance-v0.1"
+QUALITY_V2_CALIBRATION_WAVE_RECEIPT_SCHEMA = (
+    "rld2-qa-planner-calibration-wave-receipt-v0.1"
+)
+QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES = 20
+QUALITY_V2_MINIMUM_SUCCESSFUL_EPISODES = 8
 SELECTION_CONTRACT = (
     "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
 )
 PLANNER_PARETO_SELECTION_CONTRACT = (
-    "success,safety,planner-pareto(trajectory_completion,task_quality.*,"
-    "-completion_time_s,-control_steps,-action_l2_sum);return=diagnostic-only"
+    "success,safety,t5-replan-causal-timing,quality-v2-absolute-gate,"
+    "planner-pareto(trajectory_completion,"
+    "task_quality.*,-completion_time_s,-control_steps,"
+    "quality-v2.threshold-checks,-t5-impact-to-applied-correction-s,"
+    "-action_l2_sum);return=diagnostic-only"
+)
+T5_ACTION_HISTORY_SCHEMA = "se3-wam-t5-issued-applied-action-history-v0.1"
+T5_ACTION_VALUE_SEMANTIC_LABELS = (
+    "arm_translation_x",
+    "arm_translation_y",
+    "arm_translation_z",
+    "arm_rotation_x",
+    "arm_rotation_y",
+    "arm_rotation_z",
+    "gripper",
+)
+T5_TIMING_VALUE_SEMANTIC_LABELS = (
+    "impact_end_time_s",
+    "first_contact_time_s",
+    "control_hz",
+)
+T5_TIMING_COUNT_SEMANTIC_LABELS = (
+    "expected_issued_action_count",
+    "expected_action_delay_steps",
+)
+T5_CAUSAL_TAPE_INVENTORY = frozenset(
+    {
+        "t5_action_history_schema",
+        "action_value_semantic_labels",
+        "issued_action_values",
+        "issued_policy_step",
+        "issued_time_s",
+        "scheduled_apply_policy_step",
+        "scheduled_apply_time_s",
+        "applied_action_values",
+        "applied_issue_policy_step",
+        "actual_apply_policy_step",
+        "actual_apply_time_s",
+        "t5_timing_value_semantic_labels",
+        "t5_timing_values",
+        "t5_timing_count_semantic_labels",
+        "t5_timing_counts",
+    }
 )
 EXACT_TASKS = (
     "p0_grasp",
@@ -92,6 +148,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-dataset-card-sha256", required=True)
     parser.add_argument("--expected-checksums-sha256", required=True)
     parser.add_argument("--expected-candidate-manifest-sha256", required=True)
+    parser.add_argument("--expected-quality-v2-thresholds-sha256", required=True)
     parser.add_argument("--auditor-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -173,6 +230,195 @@ def _safe_dataset_path(root: Path, relative: str) -> Path:
     return target
 
 
+def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        dict(payload),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _quality_v2_calibration_receipt_binding(
+    thresholds: Mapping[str, Any],
+) -> dict[str, str]:
+    wave = thresholds.get("calibration_wave_receipt")
+    if not isinstance(wave, Mapping) or wave.get("binding_status") != "bound":
+        raise ValueError(
+            "quality-v2 threshold has no bound calibration receipt artifact"
+        )
+    relative = wave.get("relative_path")
+    if not isinstance(relative, str):
+        raise ValueError("quality-v2 calibration receipt relative path is missing")
+    pure = PurePosixPath(relative)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or ".." in pure.parts
+        or pure.as_posix() != relative
+        or "\\" in relative
+        or pure.parts[0] != "provenance"
+        or pure.name != "wave_receipt.json"
+    ):
+        raise ValueError(f"unsafe quality-v2 calibration receipt path: {relative!r}")
+    file_sha256 = _expected_sha256(
+        wave.get("file_sha256"),
+        "quality-v2 calibration receipt file SHA-256",
+    )
+    payload_sha256 = _expected_sha256(
+        wave.get("payload_sha256"),
+        "quality-v2 calibration receipt payload SHA-256",
+    )
+    legacy_sha256 = _expected_sha256(
+        wave.get("sha256"),
+        "quality-v2 calibration receipt compatibility SHA-256",
+    )
+    if file_sha256 != payload_sha256 or file_sha256 != legacy_sha256:
+        raise ValueError(
+            "canonical quality-v2 calibration receipt file/payload identities disagree"
+        )
+    return {
+        "relative_path": relative,
+        "file_sha256": file_sha256,
+        "payload_sha256": payload_sha256,
+    }
+
+
+def _audit_quality_v2_calibration_receipt_artifact(
+    root: Path,
+    thresholds: Mapping[str, Any],
+    *,
+    expected_benchmark_commit: str | None = None,
+) -> dict[str, str]:
+    """Reopen the dataset-local receipt instead of trusting threshold metadata."""
+
+    binding = _quality_v2_calibration_receipt_binding(thresholds)
+    receipt_path = _safe_dataset_path(root, binding["relative_path"])
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError(
+            "quality-v2 calibration receipt artifact is missing or symlinked"
+        )
+    receipt_bytes = receipt_path.read_bytes()
+    if hashlib.sha256(receipt_bytes).hexdigest() != binding["file_sha256"]:
+        raise ValueError("quality-v2 calibration receipt file SHA-256 mismatch")
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("quality-v2 calibration receipt is not UTF-8 JSON") from error
+    if not isinstance(receipt, Mapping):
+        raise TypeError("quality-v2 calibration receipt must be a mapping")
+    canonical_bytes = _canonical_json_bytes(receipt)
+    if receipt_bytes != canonical_bytes:
+        raise ValueError("quality-v2 calibration receipt is not canonical JSON")
+    if hashlib.sha256(canonical_bytes).hexdigest() != binding["payload_sha256"]:
+        raise ValueError("quality-v2 calibration receipt payload SHA-256 mismatch")
+
+    wave = thresholds["calibration_wave_receipt"]
+    assert isinstance(wave, Mapping)
+    expected_top_level = {
+        "schema_version": QUALITY_V2_CALIBRATION_WAVE_RECEIPT_SCHEMA,
+        "scientific_partition": "metric_calibration",
+        "transport_split": "validation",
+        "task_count": len(EXACT_TASKS),
+        "episodes_per_task": QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES,
+        "total_reset_count": len(EXACT_TASKS) * QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES,
+        "task_order": list(EXACT_TASKS),
+    }
+    for key, value in expected_top_level.items():
+        if receipt.get(key) != value or wave.get(key) != value:
+            raise ValueError(f"quality-v2 calibration receipt/threshold {key} mismatch")
+    for key in (
+        "manifest_seed",
+        "wave_contract_sha256",
+        "predeclaration_receipt_sha256",
+        "source_identity",
+        "disjointness",
+    ):
+        if wave.get(key) != receipt.get(key):
+            raise ValueError(f"quality-v2 calibration receipt/threshold {key} mismatch")
+    source_identity = receipt.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        raise ValueError("quality-v2 calibration receipt source identity is missing")
+    receipt_benchmark_commit = _full_commit(
+        "quality-v2 calibration receipt benchmark commit",
+        source_identity.get("benchmark_commit"),
+    )
+    if (
+        expected_benchmark_commit is not None
+        and receipt_benchmark_commit
+        != _full_commit(
+            "expected quality-v2 calibration benchmark commit",
+            expected_benchmark_commit,
+        )
+    ):
+        raise ValueError(
+            "quality-v2 calibration receipt benchmark commit differs from the "
+            "authenticated evaluator benchmark commit"
+        )
+    raw_receipt_tasks = receipt.get("tasks")
+    raw_binding_tasks = wave.get("tasks")
+    if (
+        not isinstance(raw_receipt_tasks, list)
+        or not isinstance(raw_binding_tasks, list)
+        or len(raw_receipt_tasks) != len(EXACT_TASKS)
+        or len(raw_binding_tasks) != len(EXACT_TASKS)
+    ):
+        raise ValueError("quality-v2 calibration receipt task inventory is not exact14")
+    identity_keys = (
+        "task_contract_sha256",
+        "task_receipt_sha256",
+        "task_config_sha256",
+        "task_quality_schema_version",
+        "task_quality_schema_sha256",
+        "reset_manifest_relative_path",
+        "reset_manifest_sha256",
+        "reset_identity_set_sha256",
+        "reset_row_set_sha256",
+        "evaluation_relative_path",
+        "evaluation_sha256",
+        "evaluation_payload_sha256",
+    )
+    for ordinal, (task_id, receipt_task, binding_task) in enumerate(
+        zip(EXACT_TASKS, raw_receipt_tasks, raw_binding_tasks, strict=True)
+    ):
+        if not isinstance(receipt_task, Mapping) or not isinstance(
+            binding_task, Mapping
+        ):
+            raise TypeError("quality-v2 calibration receipt task row must be a mapping")
+        if (
+            receipt_task.get("ordinal") != ordinal
+            or binding_task.get("ordinal") != ordinal
+            or receipt_task.get("task_id") != task_id
+            or binding_task.get("task_id") != task_id
+            or receipt_task.get("reset_count") != QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES
+            or binding_task.get("reset_identity_count")
+            != QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES
+        ):
+            raise ValueError("quality-v2 calibration receipt task order/count mismatch")
+        for key in identity_keys:
+            if binding_task.get(key) != receipt_task.get(key):
+                raise ValueError(
+                    f"quality-v2 calibration task {task_id} {key} mismatch"
+                )
+        for key in (
+            "task_contract_sha256",
+            "task_receipt_sha256",
+            "task_config_sha256",
+            "task_quality_schema_sha256",
+            "reset_manifest_sha256",
+            "reset_identity_set_sha256",
+            "reset_row_set_sha256",
+            "evaluation_sha256",
+            "evaluation_payload_sha256",
+        ):
+            _expected_sha256(
+                receipt_task.get(key),
+                f"quality-v2 calibration task {task_id} {key}",
+            )
+    return binding
+
+
 def _verify_root_checksums(root: Path, expected_sha256: str) -> int:
     checksum_path = root / "SHA256SUMS"
     if _sha256(checksum_path) != expected_sha256:
@@ -203,7 +449,9 @@ def _verify_root_checksums(root: Path, expected_sha256: str) -> int:
     if set(declared) != actual:
         missing = sorted(actual - set(declared))
         extra = sorted(set(declared) - actual)
-        raise ValueError(f"root checksum inventory mismatch: missing={missing}, extra={extra}")
+        raise ValueError(
+            f"root checksum inventory mismatch: missing={missing}, extra={extra}"
+        )
     return len(declared)
 
 
@@ -275,7 +523,9 @@ def _candidate_rows(
         if kind not in {"planner", "policy"}:
             raise ValueError(f"candidate {candidate_id!r} has invalid kind")
         if not isinstance(row.get("stochastic", False), bool):
-            raise ValueError(f"candidate {candidate_id!r} stochastic flag is not boolean")
+            raise ValueError(
+                f"candidate {candidate_id!r} stochastic flag is not boolean"
+            )
         seed_offset = row.get("exploration_seed_offset", 0)
         if (
             isinstance(seed_offset, bool)
@@ -297,7 +547,10 @@ def _candidate_rows(
         if schema_version == CANDIDATE_SCHEMA_V2 and provenance is None:
             raise ValueError("candidate schema v0.2 has a provenance gap")
         if kind == "planner":
-            if row.get("policy_path") is not None or row.get("policy_sha256") is not None:
+            if (
+                row.get("policy_path") is not None
+                or row.get("policy_sha256") is not None
+            ):
                 raise ValueError("planner candidate unexpectedly names a policy file")
             if schema_version == CANDIDATE_SCHEMA_V2:
                 assert isinstance(provenance, Mapping)
@@ -328,7 +581,9 @@ def _candidate_rows(
                 checkpoint = provenance.get("checkpoint")
                 benchmark = provenance.get("benchmark")
                 if not isinstance(source_row, Mapping):
-                    raise ValueError(f"candidate {candidate_id!r} provenance has no source")
+                    raise ValueError(
+                        f"candidate {candidate_id!r} provenance has no source"
+                    )
                 policy_source_commits.add(
                     _full_commit(
                         f"candidate {candidate_id!r} source RLinf commit",
@@ -343,9 +598,7 @@ def _candidate_rows(
                     raise ValueError(
                         f"candidate {candidate_id!r} checkpoint provenance mismatch"
                     )
-                if (
-                    not isinstance(benchmark, Mapping)
-                ):
+                if not isinstance(benchmark, Mapping):
                     raise ValueError(
                         f"candidate {candidate_id!r} benchmark provenance is missing"
                     )
@@ -357,7 +610,9 @@ def _candidate_rows(
                 )
             else:
                 if schema_version == CANDIDATE_SCHEMA_V2:
-                    raise ValueError("candidate schema v0.2 policy authority is missing")
+                    raise ValueError(
+                        "candidate schema v0.2 policy authority is missing"
+                    )
         ids.append(candidate_id)
     if len(ids) != len(set(ids)) or planner_count != 1:
         raise ValueError("candidate IDs must be unique and contain exactly one planner")
@@ -366,13 +621,15 @@ def _candidate_rows(
     if schema_version == CANDIDATE_SCHEMA_V2:
         expected_rlinf = sorted(policy_source_commits)
         expected_benchmark = sorted(policy_benchmark_commits)
-        if payload.get("policy_rlinf_commits") != expected_rlinf or source.get(
-            "policy_rlinf_commits"
-        ) != expected_rlinf:
+        if (
+            payload.get("policy_rlinf_commits") != expected_rlinf
+            or source.get("policy_rlinf_commits") != expected_rlinf
+        ):
             raise ValueError("policy RLinf commit inventory does not recompute")
-        if payload.get("policy_benchmark_commits") != expected_benchmark or source.get(
-            "policy_benchmark_commits"
-        ) != expected_benchmark:
+        if (
+            payload.get("policy_benchmark_commits") != expected_benchmark
+            or source.get("policy_benchmark_commits") != expected_benchmark
+        ):
             raise ValueError("policy benchmark commit inventory does not recompute")
         evaluator_identity = payload.get("evaluator_identity")
         if not isinstance(evaluator_identity, Mapping) or (
@@ -403,11 +660,40 @@ def _eligible(record: Mapping[str, Any]) -> bool:
             raise ValueError(f"attempt {key} must be boolean")
     if not isinstance(replay, Mapping) or not isinstance(replay.get("passed"), bool):
         raise ValueError("attempt replay-validation passed flag must be boolean")
+    quality_gate = record.get("quality_v2_gate")
+    if quality_gate is None and record.get("schema_version") == LEGACY_ATTEMPT_SCHEMA:
+        quality_passed = True
+    else:
+        if not isinstance(quality_gate, Mapping) or not isinstance(
+            quality_gate.get("passed"), bool
+        ):
+            raise ValueError("attempt quality-v2 gate passed flag must be boolean")
+        quality_passed = bool(quality_gate["passed"])
+    causal_timing_passed = True
+    if record.get("schema_version") == ATTEMPT_SCHEMA:
+        issued_equals_applied = record.get("issued_equals_applied")
+        if not isinstance(issued_equals_applied, bool):
+            raise ValueError(
+                "attempt issued_equals_applied declaration must be boolean"
+            )
+        if record.get("task_id") == "t5_replan":
+            if issued_equals_applied:
+                raise ValueError(
+                    "T5 Replan must preserve distinct issued/applied histories"
+                )
+            raw_causal_gate = record.get("t5_replan_causal_timing_passed")
+            if not isinstance(raw_causal_gate, bool):
+                raise ValueError("T5 Replan causal-timing gate must be boolean")
+            causal_timing_passed = raw_causal_gate
+        elif not issued_equals_applied:
+            raise ValueError("non-T5 attempt must declare issued_equals_applied=true")
     return bool(
         record.get("success")
         and not record.get("safety_failure")
         and record.get("finite_and_bounded")
         and replay.get("passed")
+        and quality_passed
+        and causal_timing_passed
     )
 
 
@@ -464,7 +750,9 @@ def _metric_contract(
     if drift < 0.0:
         raise ValueError(f"planner-dominance metric {metric_name!r} drift is invalid")
     if resolution <= 0.0:
-        raise ValueError(f"planner-dominance metric {metric_name!r} resolution is invalid")
+        raise ValueError(
+            f"planner-dominance metric {metric_name!r} resolution is invalid"
+        )
     normalized = {
         "direction": direction,
         "max_observed_replay_drift": drift,
@@ -496,7 +784,9 @@ def _metric_contract(
         if metric_name == "control_steps" and resolution < 1.0:
             raise ValueError("control_steps scientific resolution must be at least one")
         if metric_name == "completion_time_s" and resolution != 0.002:
-            raise ValueError("completion_time_s scientific resolution must be one 0.002 s physics step")
+            raise ValueError(
+                "completion_time_s scientific resolution must be one 0.002 s physics step"
+            )
         normalized["numeric_floor"] = floor
     return normalized
 
@@ -510,24 +800,34 @@ def _planner_dominance_contract(
     raw = candidate_payload.get("planner_dominance")
     if selection_mode == LEGACY_SELECTION_MODE:
         if raw is not None:
-            raise ValueError("legacy candidate manifest unexpectedly declares planner dominance")
+            raise ValueError(
+                "legacy candidate manifest unexpectedly declares planner dominance"
+            )
         return None
     if selection_mode != PLANNER_PARETO_SELECTION_MODE or not isinstance(raw, Mapping):
         raise ValueError("planner-pareto candidate manifest has no dominance contract")
-    if set(raw) != {
-        "schema_version",
-        "task",
-        "backend_id",
-        "quality_schema",
-        "calibration",
-        "metrics",
-        "tie_break_order",
-    } or raw.get("schema_version") != PLANNER_DOMINANCE_SCHEMA:
+    if (
+        set(raw)
+        != {
+            "schema_version",
+            "task",
+            "backend_id",
+            "quality_schema",
+            "calibration",
+            "metrics",
+            "tie_break_order",
+        }
+        or raw.get("schema_version") != PLANNER_DOMINANCE_SCHEMA
+    ):
         raise ValueError("planner-dominance schema or field inventory mismatch")
     if raw.get("task") != task:
         raise ValueError("planner-dominance task mismatch")
     backend_id = raw.get("backend_id")
-    if not isinstance(backend_id, str) or not backend_id or backend_id.strip() != backend_id:
+    if (
+        not isinstance(backend_id, str)
+        or not backend_id
+        or backend_id.strip() != backend_id
+    ):
         raise ValueError("planner-dominance backend identity is missing")
     quality_schema = raw.get("quality_schema")
     if not isinstance(quality_schema, Mapping) or set(quality_schema) != {
@@ -557,19 +857,15 @@ def _planner_dominance_contract(
     normalized_components: list[dict[str, Any]] = []
     component_names: set[str] = set()
     for metadata in components:
-        if (
-            not isinstance(metadata, Mapping)
-            or set(metadata)
-            != {
-                "name",
-                "direction",
-                "unit",
-                "scientific_resolution",
-                "reducer",
-                "source",
-                "description",
-            }
-        ):
+        if not isinstance(metadata, Mapping) or set(metadata) != {
+            "name",
+            "direction",
+            "unit",
+            "scientific_resolution",
+            "reducer",
+            "source",
+            "description",
+        }:
             raise ValueError("planner-dominance quality component metadata is invalid")
         name = metadata.get("name")
         if (
@@ -637,8 +933,14 @@ def _planner_dominance_contract(
         raise ValueError("planner-dominance calibration inventory mismatch")
     replay_count = calibration.get("replay_count")
     reset_episode_id = calibration.get("reset_episode_id")
-    if isinstance(replay_count, bool) or not isinstance(replay_count, int) or replay_count < 3:
-        raise ValueError("planner-dominance calibration requires at least three replays")
+    if (
+        isinstance(replay_count, bool)
+        or not isinstance(replay_count, int)
+        or replay_count < 3
+    ):
+        raise ValueError(
+            "planner-dominance calibration requires at least three replays"
+        )
     if not isinstance(reset_episode_id, str) or not reset_episode_id:
         raise ValueError("planner-dominance calibration reset identity is missing")
     evidence_path = calibration.get("evidence_path")
@@ -672,7 +974,9 @@ def _planner_dominance_contract(
         raise ValueError("planner-dominance metric inventory mismatch")
     quality_metrics = metrics.get("task_quality")
     component_index = {row["name"]: row for row in normalized_components}
-    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(component_index):
+    if not isinstance(quality_metrics, Mapping) or set(quality_metrics) != set(
+        component_index
+    ):
         raise ValueError("planner-dominance quality mapping is incomplete")
     normalized_metrics = {
         "trajectory_completion": _metric_contract(
@@ -685,9 +989,7 @@ def _planner_dominance_contract(
                 quality_metrics[name],
                 metric_name=f"task_quality.{name}",
                 direction=(
-                    "max"
-                    if component_index[name]["direction"] == "maximize"
-                    else "min"
+                    "max" if component_index[name]["direction"] == "maximize" else "min"
                 ),
             )
             for name in component_index
@@ -709,9 +1011,10 @@ def _planner_dominance_contract(
         ),
     }
     for name in component_index:
-        if normalized_metrics["task_quality"][name][
-            "scientific_resolution"
-        ] != component_index[name]["scientific_resolution"]:
+        if (
+            normalized_metrics["task_quality"][name]["scientific_resolution"]
+            != component_index[name]["scientific_resolution"]
+        ):
             raise ValueError(
                 f"quality component {name!r} calibration resolution differs from schema"
             )
@@ -768,7 +1071,9 @@ def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
         values = summary.get("components") if isinstance(summary, Mapping) else None
         component_row = values.get(component) if isinstance(values, Mapping) else None
         if not isinstance(component_row, Mapping) or "value" not in component_row:
-            raise ValueError(f"task quality mapping gap: missing component {component!r}")
+            raise ValueError(
+                f"task quality mapping gap: missing component {component!r}"
+            )
         value = _finite_number(
             component_row["value"],
             f"task quality component {component!r} value",
@@ -781,7 +1086,9 @@ def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
                 or not isinstance(raw_value, int)
                 or raw_value < 1
             ):
-                raise ValueError("planner-dominance control_steps must be a positive integer")
+                raise ValueError(
+                    "planner-dominance control_steps must be a positive integer"
+                )
             value = float(raw_value)
         else:
             value = _finite_number(
@@ -791,7 +1098,9 @@ def _metric_value(record: Mapping[str, Any], metric_name: str) -> float:
             if metric_name == "trajectory_completion" and not 0.0 <= value <= 1.0:
                 raise ValueError("trajectory_completion must be in [0, 1]")
             if metric_name in {"completion_time_s", "action_l2_sum"} and value < 0.0:
-                raise ValueError(f"planner-dominance metric {metric_name!r} is negative")
+                raise ValueError(
+                    f"planner-dominance metric {metric_name!r} is negative"
+                )
     return value
 
 
@@ -804,11 +1113,15 @@ def _finite_number(value: Any, name: str) -> float:
     return normalized
 
 
-def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
+def _validate_attempt_quality(
+    record: Mapping[str, Any], contract: Mapping[str, Any]
+) -> None:
     summary = record.get("task_quality")
     schema = contract["quality_schema"]
     if not isinstance(summary, Mapping):
-        raise ValueError("task quality mapping gap: attempt has no task_quality summary")
+        raise ValueError(
+            "task quality mapping gap: attempt has no task_quality summary"
+        )
     if set(summary) != {
         "schema_version",
         "episode_id",
@@ -840,18 +1153,22 @@ def _validate_attempt_quality(record: Mapping[str, Any], contract: Mapping[str, 
     if summary_sha256 != _payload_sha256(summary_payload):
         raise ValueError("task quality summary SHA-256 does not recompute")
     sample_count = summary.get("physics_sample_count")
-    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 1:
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 1
+    ):
         raise ValueError("task quality summary physics sample count is invalid")
     values = summary.get("components")
     schema_components = schema["components"]
     expected_names = [component["name"] for component in schema_components]
     expected = set(expected_names)
     if not isinstance(values, Mapping) or set(values) != expected:
-        missing = sorted(expected - set(values) if isinstance(values, Mapping) else expected)
+        missing = sorted(
+            expected - set(values) if isinstance(values, Mapping) else expected
+        )
         extra = sorted(set(values) - expected if isinstance(values, Mapping) else set())
         raise ValueError(f"task quality mapping gap: missing={missing}, extra={extra}")
-    if list(values) != expected_names:
-        raise ValueError("task quality component order differs from the canonical schema")
     for frozen_schema in schema_components:
         name = frozen_schema["name"]
         component = values[name]
@@ -895,13 +1212,385 @@ def _metric_thresholds(
     return epsilon, strict_margin
 
 
+def _quality_v2_dominance_contract(
+    payload: Mapping[str, Any],
+    *,
+    task: str,
+    thresholds_sha256: str,
+    require_formal_freeze: bool = True,
+) -> dict[str, Any]:
+    """Independently derive paired Qv2 dimensions from the frozen checks."""
+
+    threshold_sha256 = _expected_sha256(
+        thresholds_sha256,
+        "quality-v2 threshold SHA-256",
+    )
+    if payload.get("schema_version") != QUALITY_V2_THRESHOLDS_SCHEMA:
+        raise ValueError(
+            "planner-pareto requires the frozen quality-v2 threshold schema v0.3"
+        )
+    formal_freeze_eligible = payload.get("formal_freeze_eligible")
+    if not isinstance(formal_freeze_eligible, bool):
+        raise ValueError(
+            "quality-v2 threshold formal-freeze eligibility must be boolean"
+        )
+    if require_formal_freeze and not formal_freeze_eligible:
+        raise ValueError(
+            "quality-v2 threshold contract is not eligible for formal freeze"
+        )
+    if require_formal_freeze:
+        minimum_attempted = payload.get("minimum_attempted_episodes")
+        minimum_successful = payload.get("minimum_successful_episodes")
+        wave = payload.get("calibration_wave_receipt")
+        if (
+            payload.get("calibration_status") != "frozen"
+            or isinstance(minimum_attempted, bool)
+            or not isinstance(minimum_attempted, int)
+            or minimum_attempted < QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES
+            or isinstance(minimum_successful, bool)
+            or not isinstance(minimum_successful, int)
+            or minimum_successful < QUALITY_V2_MINIMUM_SUCCESSFUL_EPISODES
+            or not isinstance(wave, Mapping)
+            or wave.get("binding_status") != "bound"
+            or wave.get("schema_version") != QUALITY_V2_CALIBRATION_WAVE_RECEIPT_SCHEMA
+            or wave.get("scientific_partition") != "metric_calibration"
+            or wave.get("task_count") != 14
+            or wave.get("episodes_per_task") != 20
+            or wave.get("total_reset_count") != 280
+        ):
+            raise ValueError(
+                "quality-v2 threshold contract has invalid formal calibration provenance"
+            )
+        _expected_sha256(
+            wave.get("sha256"),
+            "quality-v2 calibration wave receipt SHA-256",
+        )
+    tasks = payload.get("tasks")
+    task_contract = tasks.get(task) if isinstance(tasks, Mapping) else None
+    if not isinstance(task_contract, Mapping):
+        raise ValueError(f"quality-v2 threshold contract has no task {task!r}")
+    if require_formal_freeze:
+        provenance = task_contract.get("provenance")
+        attempted = (
+            provenance.get("attempted_episode_count")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        successful = (
+            provenance.get("successful_episode_count")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        if (
+            not isinstance(provenance, Mapping)
+            or provenance.get("formal_freeze_eligible") is not True
+            or isinstance(attempted, bool)
+            or not isinstance(attempted, int)
+            or attempted < minimum_attempted
+            or isinstance(successful, bool)
+            or not isinstance(successful, int)
+            or successful < minimum_successful
+        ):
+            raise ValueError(
+                f"quality-v2 threshold task {task!r} has invalid formal calibration provenance"
+            )
+    from examples.embodiment import (
+        export_dynamic_benchmark_optimal_trajectories as optimal_exporter,
+    )
+
+    expected_specs, orientation_mode, jaw_axis_mode = (
+        optimal_exporter._quality_v2_expected_check_specs(task_contract)
+    )
+    expected_by_identity = {
+        (spec["phase"], spec["metric"]): spec for spec in expected_specs
+    }
+    raw_checks = task_contract.get("checks")
+    if not isinstance(raw_checks, list) or len(raw_checks) != len(expected_specs):
+        raise ValueError(
+            f"quality-v2 checks for {task!r} must contain exactly "
+            f"{len(expected_specs)} task-derived entries"
+        )
+
+    paired_fields = (
+        "paired_nonworse_absolute_tolerance",
+        "paired_nonworse_relative_tolerance",
+        "paired_strict_improvement_absolute",
+        "paired_strict_improvement_relative",
+    )
+    required_fields = {
+        "phase",
+        "metric",
+        "max",
+        "direction",
+        "paired_comparison_family",
+        *paired_fields,
+    }
+    metrics: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for index, raw_check in enumerate(raw_checks):
+        if not isinstance(raw_check, Mapping) or not required_fields.issubset(
+            raw_check
+        ):
+            raise ValueError(
+                f"quality-v2 check {index} is missing frozen paired-comparison metadata"
+            )
+        phase = raw_check.get("phase")
+        metric = raw_check.get("metric")
+        family = raw_check.get("paired_comparison_family")
+        if (
+            not isinstance(phase, str)
+            or not phase
+            or phase.strip() != phase
+            or "." in phase
+        ):
+            raise ValueError(f"quality-v2 check {index} phase is invalid")
+        if (
+            not isinstance(metric, str)
+            or not metric
+            or metric.strip() != metric
+            or any(not part for part in metric.split("."))
+        ):
+            raise ValueError(f"quality-v2 check {index} metric is invalid")
+        if raw_check.get("direction") != "minimize":
+            raise ValueError(
+                f"quality-v2 check {phase}.{metric} must use direction='minimize'"
+            )
+        if not isinstance(family, str) or not family or family.strip() != family:
+            raise ValueError(
+                f"quality-v2 check {phase}.{metric} comparison family is invalid"
+            )
+        identity = (phase, metric)
+        if identity in identities:
+            raise ValueError(f"duplicate quality-v2 check {phase}.{metric}")
+        identities.add(identity)
+        expected_spec = expected_by_identity.get(identity)
+        if expected_spec is None:
+            raise ValueError(
+                "quality-v2 v0.3 task-derived check inventory mismatch: "
+                f"unexpected={identity!r}"
+            )
+        expected_family = expected_spec["paired_comparison_family"]
+        if family != expected_family:
+            raise ValueError(
+                f"quality-v2 check {phase}.{metric} comparison family "
+                f"must be {expected_family!r}"
+            )
+        maximum = _finite_number(
+            raw_check.get("max"),
+            f"quality-v2 check {phase}.{metric} maximum",
+        )
+        normalized_paired = {
+            name: _finite_number(
+                raw_check.get(name),
+                f"quality-v2 check {phase}.{metric} {name}",
+            )
+            for name in paired_fields
+        }
+        if maximum < 0.0 or any(value < 0.0 for value in normalized_paired.values()):
+            raise ValueError(
+                f"quality-v2 check {phase}.{metric} thresholds must be non-negative"
+            )
+        if (
+            normalized_paired["paired_strict_improvement_absolute"] == 0.0
+            and normalized_paired["paired_strict_improvement_relative"] == 0.0
+        ):
+            raise ValueError(
+                f"quality-v2 check {phase}.{metric} has no strict-improvement resolution"
+            )
+        metrics.append(
+            {
+                "name": f"quality_v2.{phase}.{metric}",
+                "key": expected_spec["key"],
+                "group": expected_spec["group"],
+                "phase": phase,
+                "metric": metric,
+                "maximum": maximum,
+                "direction": "minimize",
+                "paired_comparison_family": expected_family,
+                **normalized_paired,
+            }
+        )
+
+    expected_identities = set(expected_by_identity)
+    if identities != expected_identities:
+        raise ValueError(
+            "quality-v2 v0.3 task-derived check inventory mismatch: "
+            f"missing={sorted(expected_identities - identities)}, "
+            f"extra={sorted(identities - expected_identities)}"
+        )
+    normalized = {
+        "schema_version": QUALITY_V2_DOMINANCE_SCHEMA,
+        "threshold_schema_version": QUALITY_V2_THRESHOLDS_SCHEMA,
+        "threshold_sha256": threshold_sha256,
+        "formal_freeze_eligible": formal_freeze_eligible,
+        "task": task,
+        "orientation_mode": orientation_mode,
+        "jaw_axis_mode": jaw_axis_mode,
+        "metrics": metrics,
+    }
+    normalized["payload_sha256"] = _payload_sha256(normalized)
+    return normalized
+
+
+def _quality_v2_metric_value(
+    record: Mapping[str, Any],
+    spec: Mapping[str, Any],
+) -> float:
+    summary = record.get("quality_v2")
+    if not isinstance(summary, Mapping):
+        raise ValueError("quality-v2 mapping gap: attempt has no quality_v2 summary")
+    phase = str(spec["phase"])
+    if phase == "full_episode":
+        value: Any = summary
+    else:
+        phases = summary.get("phases")
+        value = phases.get(phase) if isinstance(phases, Mapping) else None
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                f"quality-v2 mapping gap: attempt is missing phase {phase!r}"
+            )
+    metric = str(spec["metric"])
+    for part in metric.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            raise ValueError(
+                f"quality-v2 mapping gap: attempt is missing metric {phase}.{metric}"
+            )
+        value = value[part]
+    result = _finite_number(value, f"quality-v2 metric {phase}.{metric}")
+    if result < 0.0:
+        raise ValueError(f"quality-v2 metric {phase}.{metric} must be non-negative")
+    return result
+
+
+def _validate_quality_v2_attempt(
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> dict[str, float]:
+    if record.get("schema_version") != ATTEMPT_SCHEMA:
+        raise ValueError("planner-pareto requires attempt schema v0.3")
+    if record.get("task_id") != contract.get("task"):
+        raise ValueError("quality-v2 attempt task identity mismatch")
+    summary = record.get("quality_v2")
+    if (
+        not isinstance(summary, Mapping)
+        or summary.get("schema_version") != QUALITY_V2_SUMMARY_SCHEMA
+    ):
+        raise ValueError("quality-v2 summary schema mismatch")
+    summary_sha256 = _expected_sha256(
+        record.get("quality_v2_sha256"),
+        "quality-v2 summary SHA-256",
+    )
+    if summary_sha256 != _payload_sha256(summary):
+        raise ValueError("quality-v2 summary SHA-256 does not recompute")
+
+    gate = record.get("quality_v2_gate")
+    expected_gate_keys = {
+        "schema_version",
+        "contract_schema_version",
+        "contract_sha256",
+        "task_id",
+        "passed",
+        "checks",
+    }
+    if not isinstance(gate, Mapping) or set(gate) != expected_gate_keys:
+        raise ValueError("quality-v2 gate field inventory mismatch")
+    if (
+        gate.get("schema_version") != QUALITY_V2_GATE_SCHEMA
+        or gate.get("contract_schema_version")
+        != contract.get("threshold_schema_version")
+        or gate.get("contract_sha256") != contract.get("threshold_sha256")
+        or gate.get("task_id") != contract.get("task")
+        or gate.get("passed") is not True
+    ):
+        raise ValueError("quality-v2 gate identity or absolute decision mismatch")
+    raw_gate_checks = gate.get("checks")
+    metric_specs = contract.get("metrics")
+    if (
+        not isinstance(raw_gate_checks, list)
+        or not isinstance(metric_specs, list)
+        or len(raw_gate_checks) != len(metric_specs)
+    ):
+        raise ValueError("quality-v2 gate check inventory mismatch")
+
+    values: dict[str, float] = {}
+    expected_check_keys = {"metric", "phase", "actual", "max", "passed"}
+    for raw_gate_check, spec in zip(raw_gate_checks, metric_specs, strict=True):
+        if (
+            not isinstance(raw_gate_check, Mapping)
+            or set(raw_gate_check) != expected_check_keys
+        ):
+            raise ValueError("quality-v2 gate check field inventory mismatch")
+        actual = _quality_v2_metric_value(record, spec)
+        gate_actual = _finite_number(
+            raw_gate_check.get("actual"),
+            f"quality-v2 gate actual {spec['name']}",
+        )
+        gate_maximum = _finite_number(
+            raw_gate_check.get("max"),
+            f"quality-v2 gate maximum {spec['name']}",
+        )
+        if (
+            raw_gate_check.get("phase") != spec["phase"]
+            or raw_gate_check.get("metric") != spec["metric"]
+            or gate_actual != actual
+            or gate_maximum != spec["maximum"]
+            or raw_gate_check.get("passed") is not True
+            or actual > float(spec["maximum"])
+        ):
+            raise ValueError(f"quality-v2 gate check {spec['name']} does not recompute")
+        values[str(spec["name"])] = actual
+    return values
+
+
+def _t5_causal_latency(record: Mapping[str, Any]) -> float | None:
+    """Return the required T5 causal latency metric; non-T5 tasks have none."""
+
+    if record.get("task_id") != "t5_replan":
+        if (
+            record.get("impact_end_to_first_qualifying_applied_correction_s")
+            is not None
+        ):
+            raise ValueError("non-T5 attempt cannot declare a T5 causal latency")
+        return None
+    if record.get("t5_replan_causal_timing_passed") is not True:
+        raise ValueError("T5 planner comparison requires a passing causal-timing gate")
+    value = _finite_number(
+        record.get("impact_end_to_first_qualifying_applied_correction_s"),
+        "T5 impact-end-to-applied-correction latency",
+    )
+    if value < 0.0:
+        raise ValueError("T5 causal correction latency must be nonnegative")
+    return value
+
+
+def _quality_v2_metric_thresholds(
+    reference_value: float,
+    spec: Mapping[str, Any],
+) -> tuple[float, float]:
+    tolerance = max(
+        float(spec["paired_nonworse_absolute_tolerance"]),
+        float(spec["paired_nonworse_relative_tolerance"]) * abs(reference_value),
+    )
+    strict_margin = max(
+        float(spec["paired_strict_improvement_absolute"]),
+        float(spec["paired_strict_improvement_relative"]) * abs(reference_value),
+        2.0 * tolerance,
+    )
+    return tolerance, strict_margin
+
+
 def _planner_pareto_dominates(
     record: Mapping[str, Any],
     reference: Mapping[str, Any],
     contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
 ) -> bool:
     _validate_attempt_quality(record, contract)
     _validate_attempt_quality(reference, contract)
+    quality_v2_values = _validate_quality_v2_attempt(record, quality_v2_contract)
+    reference_quality_v2_values = _validate_quality_v2_attempt(
+        reference, quality_v2_contract
+    )
     strictly_better = False
     for metric_name in _metric_names(contract):
         candidate_value = _metric_value(record, metric_name)
@@ -916,18 +1605,43 @@ def _planner_pareto_dominates(
             if candidate_value > reference_value + epsilon:
                 return False
             strictly_better |= candidate_value < reference_value - strict_margin
+    for spec in quality_v2_contract["metrics"]:
+        metric_name = str(spec["name"])
+        candidate_value = quality_v2_values[metric_name]
+        reference_value = reference_quality_v2_values[metric_name]
+        tolerance, strict_margin = _quality_v2_metric_thresholds(
+            reference_value,
+            spec,
+        )
+        if candidate_value > reference_value + tolerance:
+            return False
+        strictly_better |= candidate_value < reference_value - strict_margin
+    candidate_causal_latency = _t5_causal_latency(record)
+    reference_causal_latency = _t5_causal_latency(reference)
+    if candidate_causal_latency is not None:
+        assert reference_causal_latency is not None
+        if candidate_causal_latency > reference_causal_latency + 1.0e-9:
+            return False
+        strictly_better |= candidate_causal_latency < reference_causal_latency - 1.0e-9
     return strictly_better
 
 
 def _frontier(
     records: list[dict[str, Any]],
     contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     return [
         record
         for record in records
         if not any(
-            other is not record and _planner_pareto_dominates(other, record, contract)
+            other is not record
+            and _planner_pareto_dominates(
+                other,
+                record,
+                contract,
+                quality_v2_contract,
+            )
             for other in records
         )
     ]
@@ -936,11 +1650,27 @@ def _frontier(
 def _pareto_tie_key(
     record: Mapping[str, Any],
     contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
 ) -> tuple[float, ...]:
     values = []
+    quality_v2_values = _validate_quality_v2_attempt(record, quality_v2_contract)
+    quality_v2_tie_values = [
+        -quality_v2_values[str(spec["name"])] for spec in quality_v2_contract["metrics"]
+    ]
     for metric_name in contract["tie_break_order"]:
+        if metric_name == "action_l2_sum":
+            # Independently reproduce task utility -> duration -> Qv2
+            # smoothness/path -> aggregate control-effort ordering.
+            values.extend(quality_v2_tie_values)
+            causal_latency = _t5_causal_latency(record)
+            if causal_latency is not None:
+                values.append(-causal_latency)
         value = _metric_value(record, metric_name)
-        values.append(value if _metric_spec(contract, metric_name)["direction"] == "max" else -value)
+        values.append(
+            value
+            if _metric_spec(contract, metric_name)["direction"] == "max"
+            else -value
+        )
     values.append(-float(int(record["candidate_index"])))
     return tuple(values)
 
@@ -950,37 +1680,54 @@ def _selected(
     *,
     selection_mode: str = LEGACY_SELECTION_MODE,
     planner_dominance: Mapping[str, Any] | None = None,
+    quality_v2_dominance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     eligible = [record for record in records if _eligible(record)]
     if not eligible:
         return None
     if selection_mode == LEGACY_SELECTION_MODE:
-        if planner_dominance is not None:
-            raise ValueError("legacy selection unexpectedly declares planner dominance")
+        if planner_dominance is not None or quality_v2_dominance is not None:
+            raise ValueError(
+                "legacy selection unexpectedly declares dominance contracts"
+            )
         return max(
             eligible,
-            key=lambda record: (_quality_score(record), -int(record["candidate_index"])),
+            key=lambda record: (
+                _quality_score(record),
+                -int(record["candidate_index"]),
+            ),
         )
     elif selection_mode == PLANNER_PARETO_SELECTION_MODE:
-        if planner_dominance is None:
-            raise ValueError("planner-pareto selection requires a frozen dominance contract")
+        if planner_dominance is None or quality_v2_dominance is None:
+            raise ValueError(
+                "planner-pareto selection requires frozen task and quality-v2 dominance contracts"
+            )
         planner = next(
             (record for record in records if int(record["candidate_index"]) == 0),
             None,
         )
         if planner is None:
             raise ValueError("planner-pareto selection requires candidate index zero")
-        eligible_rl = [record for record in eligible if int(record["candidate_index"]) != 0]
+        eligible_rl = [
+            record for record in eligible if int(record["candidate_index"]) != 0
+        ]
         for record in eligible_rl:
             _validate_attempt_quality(record, planner_dominance)
+            _validate_quality_v2_attempt(record, quality_v2_dominance)
         if not _eligible(planner):
             selectable = eligible_rl
         else:
             _validate_attempt_quality(planner, planner_dominance)
+            _validate_quality_v2_attempt(planner, quality_v2_dominance)
             selectable = [
                 record
                 for record in eligible_rl
-                if _planner_pareto_dominates(record, planner, planner_dominance)
+                if _planner_pareto_dominates(
+                    record,
+                    planner,
+                    planner_dominance,
+                    quality_v2_dominance,
+                )
             ]
             if not selectable:
                 return planner
@@ -988,7 +1735,14 @@ def _selected(
         raise ValueError(f"unsupported selection mode {selection_mode!r}")
     if not selectable:
         return None
-    return max(_frontier(selectable, planner_dominance), key=lambda record: _pareto_tie_key(record, planner_dominance))
+    return max(
+        _frontier(selectable, planner_dominance, quality_v2_dominance),
+        key=lambda record: _pareto_tie_key(
+            record,
+            planner_dominance,
+            quality_v2_dominance,
+        ),
+    )
 
 
 def _selection_result(
@@ -1017,7 +1771,9 @@ def _selection_result(
         "source_kind": source_kind,
         "planner_eligible": _eligible(planner),
         "winner_candidate_id": None if winner is None else winner["candidate_id"],
-        "winner_candidate_index": None if winner is None else int(winner["candidate_index"]),
+        "winner_candidate_index": None
+        if winner is None
+        else int(winner["candidate_index"]),
     }
 
 
@@ -1025,11 +1781,16 @@ def _planner_metric_relations(
     record: Mapping[str, Any],
     planner: Mapping[str, Any],
     contract: Mapping[str, Any],
+    quality_v2_contract: Mapping[str, Any],
 ) -> dict[str, str]:
     """Classify each accepted expert metric against its eligible planner."""
 
     _validate_attempt_quality(record, contract)
     _validate_attempt_quality(planner, contract)
+    quality_v2_values = _validate_quality_v2_attempt(record, quality_v2_contract)
+    planner_quality_v2_values = _validate_quality_v2_attempt(
+        planner, quality_v2_contract
+    )
     relations: dict[str, str] = {}
     for metric_name in _metric_names(contract):
         value = _metric_value(record, metric_name)
@@ -1045,6 +1806,28 @@ def _planner_metric_relations(
         if regressed:
             relations[metric_name] = "regressed"
         elif improved:
+            relations[metric_name] = "strictly_improved"
+        else:
+            relations[metric_name] = "non_worse_not_strict"
+    for spec in quality_v2_contract["metrics"]:
+        metric_name = str(spec["name"])
+        value = quality_v2_values[metric_name]
+        reference = planner_quality_v2_values[metric_name]
+        tolerance, strict_margin = _quality_v2_metric_thresholds(reference, spec)
+        if value > reference + tolerance:
+            relations[metric_name] = "regressed"
+        elif value < reference - strict_margin:
+            relations[metric_name] = "strictly_improved"
+        else:
+            relations[metric_name] = "non_worse_not_strict"
+    causal_latency = _t5_causal_latency(record)
+    planner_causal_latency = _t5_causal_latency(planner)
+    if causal_latency is not None:
+        assert planner_causal_latency is not None
+        metric_name = "impact_end_to_first_qualifying_applied_correction_s"
+        if causal_latency > planner_causal_latency + 1.0e-9:
+            relations[metric_name] = "regressed"
+        elif causal_latency < planner_causal_latency - 1.0e-9:
             relations[metric_name] = "strictly_improved"
         else:
             relations[metric_name] = "non_worse_not_strict"
@@ -1084,7 +1867,9 @@ def _task_compatibility_inventory(
             continue
         provenance = candidate.get("provenance")
         source = provenance.get("source") if isinstance(provenance, Mapping) else None
-        benchmark = provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        benchmark = (
+            provenance.get("benchmark") if isinstance(provenance, Mapping) else None
+        )
         state_schema = (
             provenance.get("state_schema") if isinstance(provenance, Mapping) else None
         )
@@ -1141,7 +1926,9 @@ def _audit_evaluator_identity(
         if card.get("evaluator_identity") is not None or card.get(
             "compatibility_evidence", []
         ) not in (None, []):
-            raise ValueError("legacy dataset unexpectedly declares v0.2 evaluator identity")
+            raise ValueError(
+                "legacy dataset unexpectedly declares v0.2 evaluator identity"
+            )
         return None
     raw = candidate_payload.get("evaluator_identity")
     if not isinstance(raw, Mapping) or set(raw) != {
@@ -1212,7 +1999,9 @@ def _audit_evaluator_identity(
                 raise ValueError("identical benchmark relation is inconsistent")
         elif relation_name == "checkpoint-compatible":
             if policy_commit == evaluator_benchmark_commit:
-                raise ValueError("identical benchmark commits cannot claim compatibility")
+                raise ValueError(
+                    "identical benchmark commits cannot claim compatibility"
+                )
             digest = _expected_sha256(
                 evidence_sha256,
                 "benchmark compatibility evidence SHA-256",
@@ -1232,13 +2021,18 @@ def _audit_evaluator_identity(
     ):
         raise ValueError("candidate benchmark relations are not canonical or complete")
     if card.get("evaluator_identity") != dict(raw):
-        raise ValueError("dataset-card evaluator identity differs from candidate manifest")
+        raise ValueError(
+            "dataset-card evaluator identity differs from candidate manifest"
+        )
     if card.get("compatibility_evidence") != expected_evidence:
         raise ValueError("dataset-card compatibility evidence inventory mismatch")
     for row in expected_evidence:
         proof_path = _audit_provenance_file(
             root,
-            row,
+            {
+                "relative_path": row["relative_path"],
+                "sha256": row["sha256"],
+            },
             expected_relative_path=row["relative_path"],
             expected_sha256=row["sha256"],
         )
@@ -1269,7 +2063,9 @@ def _audit_evaluator_identity(
             if probe["task"] == candidate_payload["task"]
         ]
         if proof_task_inventory != expected_task_inventory:
-            raise ValueError("compatibility evidence does not cover the task policy pool")
+            raise ValueError(
+                "compatibility evidence does not cover the task policy pool"
+            )
     return dict(raw)
 
 
@@ -1284,7 +2080,9 @@ def _audit_candidate_release_chain(
         if card.get("candidate_release_manifest_sha256") is not None or card.get(
             "candidate_release_provenance", []
         ) not in (None, []):
-            raise ValueError("legacy dataset unexpectedly declares a v0.2 release chain")
+            raise ValueError(
+                "legacy dataset unexpectedly declares a v0.2 release chain"
+            )
         return
     release_sha256 = _expected_sha256(
         card.get("candidate_release_manifest_sha256"),
@@ -1339,7 +2137,9 @@ def _audit_candidate_release_chain(
         or _payload_sha256(release) != release.get("payload_sha256")
         or tuple(release.get("tasks", [])) != EXACT_TASKS
     ):
-        raise ValueError("candidate release manifest is not a production exact-14 release")
+        raise ValueError(
+            "candidate release manifest is not a production exact-14 release"
+        )
     task = str(card["task"])
     task_hashes = release.get("task_manifest_sha256")
     candidate_counts = release.get("candidate_count")
@@ -1417,7 +2217,9 @@ def _audit_calibration_evidence(
 ) -> dict[str, float]:
     if planner_dominance is None:
         if card.get("calibration_evidence") is not None:
-            raise ValueError("legacy dataset unexpectedly declares calibration evidence")
+            raise ValueError(
+                "legacy dataset unexpectedly declares calibration evidence"
+            )
         return {}
     if evaluator_identity is None:
         raise ValueError("planner calibration has no evaluator identity")
@@ -1452,9 +2254,7 @@ def _audit_calibration_evidence(
         or evidence.get("evaluator_identity_sha256")
         != _payload_sha256(
             {
-                "evaluator_rlinf_commit": evaluator_identity[
-                    "evaluator_rlinf_commit"
-                ],
+                "evaluator_rlinf_commit": evaluator_identity["evaluator_rlinf_commit"],
                 "evaluator_benchmark_commit": evaluator_identity[
                     "evaluator_benchmark_commit"
                 ],
@@ -1510,7 +2310,9 @@ def _audit_calibration_evidence(
             or environment_id.strip() != environment_id
             or environment_id in environment_ids
         ):
-            raise ValueError("planner calibration did not use unique fresh environments")
+            raise ValueError(
+                "planner calibration did not use unique fresh environments"
+            )
         environment_ids.add(environment_id)
         episode_id = raw_replay.get("episode_id")
         if episode_id != calibration["reset_episode_id"]:
@@ -1528,7 +2330,9 @@ def _audit_calibration_evidence(
             or raw_replay.get("safety_failure") is not False
             or raw_replay.get("finite_and_bounded") is not True
         ):
-            raise ValueError("planner calibration replay is not successful, safe, and finite")
+            raise ValueError(
+                "planner calibration replay is not successful, safe, and finite"
+            )
         termination_reason = raw_replay.get("termination_reason")
         if not isinstance(termination_reason, str) or not termination_reason:
             raise ValueError("planner calibration termination reason is missing")
@@ -1566,16 +2370,16 @@ def _audit_calibration_evidence(
         if frozen_identity is None:
             frozen_identity = identity
         elif identity != frozen_identity:
-            raise ValueError("planner calibration reset/action/outcome identity drifted")
+            raise ValueError(
+                "planner calibration reset/action/outcome identity drifted"
+            )
         metric_rows.append(replay)
     observed_drifts: dict[str, float] = {}
     for metric_name in _metric_names(planner_dominance):
         values = [_metric_value(row, metric_name) for row in metric_rows]
         observed = max(values) - min(values)
         frozen = float(
-            _metric_spec(planner_dominance, metric_name)[
-                "max_observed_replay_drift"
-            ]
+            _metric_spec(planner_dominance, metric_name)["max_observed_replay_drift"]
         )
         if not math.isclose(observed, frozen, rel_tol=0.0, abs_tol=1.0e-15):
             raise ValueError(
@@ -1610,7 +2414,9 @@ def _render_parity_skip_events(recovery_events: Any) -> dict[int, dict[str, str]
         try:
             reset_index = int(parts[2])
         except ValueError as error:
-            raise ValueError("render-parity recovery reset index is malformed") from error
+            raise ValueError(
+                "render-parity recovery reset index is malformed"
+            ) from error
         episode_id, message = parts[3], parts[4]
         reason = _render_parity_failure_reason(message)
         if reset_index < 0 or not episode_id or reason is None:
@@ -1678,13 +2484,288 @@ def _audit_render_parity_skip(
     return "structured-v0.1"
 
 
+def _audit_t5_replan_causal_history(
+    record: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    *,
+    control_steps: int,
+) -> None:
+    """Reconstruct T5 queue records from split arrays and rerun the validator."""
+
+    from se3_wam.benchmark.config import load_task_config
+    from se3_wam.benchmark.registry import get_task_spec
+    from se3_wam.benchmark.t5_timing_contract import validate_t5_replan_timing
+
+    if record.get("task_id") != "t5_replan":
+        raise ValueError("T5 causal tape is bound to the wrong attempt task")
+    if set(arrays) != set(T5_CAUSAL_TAPE_INVENTORY):
+        raise ValueError("T5 causal tape array inventory mismatch")
+
+    def require_array(
+        name: str,
+        *,
+        dtype: np.dtype[Any],
+        shape: tuple[int, ...],
+    ) -> np.ndarray:
+        value = np.asarray(arrays[name])
+        if value.dtype != dtype or value.shape != shape:
+            raise ValueError(f"T5 causal tape {name} dtype or shape mismatch")
+        return value
+
+    schema = np.asarray(arrays["t5_action_history_schema"])
+    if (
+        schema.shape != ()
+        or schema.dtype != np.dtype(f"<U{len(T5_ACTION_HISTORY_SCHEMA)}")
+        or str(schema.item()) != T5_ACTION_HISTORY_SCHEMA
+    ):
+        raise ValueError("T5 causal tape semantic schema mismatch")
+    action_labels = np.asarray(arrays["action_value_semantic_labels"])
+    timing_value_labels = np.asarray(arrays["t5_timing_value_semantic_labels"])
+    timing_count_labels = np.asarray(arrays["t5_timing_count_semantic_labels"])
+    for labels, expected, expected_dtype, name in (
+        (
+            action_labels,
+            T5_ACTION_VALUE_SEMANTIC_LABELS,
+            np.dtype("<U32"),
+            "action-value",
+        ),
+        (
+            timing_value_labels,
+            T5_TIMING_VALUE_SEMANTIC_LABELS,
+            np.dtype("<U32"),
+            "timing-value",
+        ),
+        (
+            timing_count_labels,
+            T5_TIMING_COUNT_SEMANTIC_LABELS,
+            np.dtype("<U40"),
+            "timing-count",
+        ),
+    ):
+        if (
+            labels.dtype != expected_dtype
+            or labels.shape != (len(expected),)
+            or tuple(str(value) for value in labels.tolist()) != expected
+        ):
+            raise ValueError(f"T5 causal tape {name} semantic labels mismatch")
+
+    timing_counts = require_array(
+        "t5_timing_counts",
+        dtype=np.dtype(np.int64),
+        shape=(2,),
+    )
+    expected_issued_action_count = int(timing_counts[0])
+    expected_action_delay_steps = int(timing_counts[1])
+    if expected_issued_action_count != control_steps:
+        raise ValueError("T5 causal tape issued count differs from control_steps")
+    if expected_action_delay_steps < 0:
+        raise ValueError("T5 causal tape action delay must be nonnegative")
+    timing_values = require_array(
+        "t5_timing_values",
+        dtype=np.dtype(np.float64),
+        shape=(3,),
+    )
+    impact_end_time_s = None if np.isnan(timing_values[0]) else float(timing_values[0])
+    first_contact_time_s = (
+        None if np.isnan(timing_values[1]) else float(timing_values[1])
+    )
+    control_hz = float(timing_values[2])
+    task = get_task_spec("t5_replan")
+    configured_delay_s = float(
+        load_task_config("t5_replan")["latency"]["sensor_to_actuation_delay_s"]
+    )
+    configured_delay_steps = configured_delay_s * task.clock.control_hz
+    if (
+        not math.isfinite(control_hz)
+        or control_hz != float(task.clock.control_hz)
+        or not math.isclose(
+            configured_delay_steps,
+            round(configured_delay_steps),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        )
+        or expected_action_delay_steps != int(round(configured_delay_steps))
+    ):
+        raise ValueError("T5 causal tape control rate or configured delay mismatch")
+    for value, label in (
+        (impact_end_time_s, "impact end"),
+        (first_contact_time_s, "first contact"),
+    ):
+        if value is not None and (not math.isfinite(value) or value < 0.0):
+            raise ValueError(f"T5 causal tape {label} time is invalid")
+
+    issued_action_values = require_array(
+        "issued_action_values",
+        dtype=np.dtype(np.float64),
+        shape=(control_steps, 7),
+    )
+    issued_policy_step = require_array(
+        "issued_policy_step",
+        dtype=np.dtype(np.int64),
+        shape=(control_steps,),
+    )
+    issued_time_s = require_array(
+        "issued_time_s",
+        dtype=np.dtype(np.float64),
+        shape=(control_steps,),
+    )
+    scheduled_apply_policy_step = require_array(
+        "scheduled_apply_policy_step",
+        dtype=np.dtype(np.int64),
+        shape=(control_steps,),
+    )
+    scheduled_apply_time_s = require_array(
+        "scheduled_apply_time_s",
+        dtype=np.dtype(np.float64),
+        shape=(control_steps,),
+    )
+    expected_applied_count = max(0, control_steps - expected_action_delay_steps)
+    applied_action_values = require_array(
+        "applied_action_values",
+        dtype=np.dtype(np.float64),
+        shape=(expected_applied_count, 7),
+    )
+    applied_issue_policy_step = require_array(
+        "applied_issue_policy_step",
+        dtype=np.dtype(np.int64),
+        shape=(expected_applied_count,),
+    )
+    actual_apply_policy_step = require_array(
+        "actual_apply_policy_step",
+        dtype=np.dtype(np.int64),
+        shape=(expected_applied_count,),
+    )
+    actual_apply_time_s = require_array(
+        "actual_apply_time_s",
+        dtype=np.dtype(np.float64),
+        shape=(expected_applied_count,),
+    )
+    expected_issued_steps = np.arange(control_steps, dtype=np.int64)
+    expected_applied_issue_steps = np.arange(expected_applied_count, dtype=np.int64)
+    if not np.array_equal(issued_policy_step, expected_issued_steps):
+        raise ValueError(
+            "T5 causal tape issued policy steps are not exact and contiguous"
+        )
+    if not np.array_equal(
+        scheduled_apply_policy_step,
+        expected_issued_steps + expected_action_delay_steps,
+    ):
+        raise ValueError("T5 causal tape scheduled delay does not match issued steps")
+    if not np.array_equal(applied_issue_policy_step, expected_applied_issue_steps):
+        raise ValueError("T5 causal tape applied rows do not uniquely cover due issues")
+    if not np.array_equal(
+        actual_apply_policy_step,
+        expected_applied_issue_steps + expected_action_delay_steps,
+    ):
+        raise ValueError(
+            "T5 causal tape actual apply steps do not preserve queue delay"
+        )
+    if (
+        not np.allclose(
+            issued_time_s,
+            expected_issued_steps.astype(np.float64) / control_hz,
+            rtol=0.0,
+            atol=1.0e-9,
+        )
+        or not np.allclose(
+            scheduled_apply_time_s,
+            scheduled_apply_policy_step.astype(np.float64) / control_hz,
+            rtol=0.0,
+            atol=1.0e-9,
+        )
+        or not np.allclose(
+            actual_apply_time_s,
+            actual_apply_policy_step.astype(np.float64) / control_hz,
+            rtol=0.0,
+            atol=1.0e-9,
+        )
+    ):
+        raise ValueError("T5 causal tape action times are off the control grid")
+    if (
+        not np.all(np.isfinite(issued_action_values))
+        or not np.all(np.isfinite(applied_action_values))
+        or np.any(np.abs(issued_action_values) > 1.0)
+        or np.any(np.abs(applied_action_values) > 1.0)
+    ):
+        raise ValueError("T5 causal tape actions are not finite bounded E7 values")
+    if not np.array_equal(
+        applied_action_values,
+        issued_action_values[applied_issue_policy_step],
+    ):
+        raise ValueError(
+            "T5 causal tape applied actions do not exactly link to issued values"
+        )
+
+    issued_actions = [
+        {
+            "policy_step": int(issued_policy_step[index]),
+            "issue_time_s": float(issued_time_s[index]),
+            "apply_policy_step": int(scheduled_apply_policy_step[index]),
+            "apply_time_s": float(scheduled_apply_time_s[index]),
+            "values": issued_action_values[index].tolist(),
+        }
+        for index in range(control_steps)
+    ]
+    applied_actions = [
+        {
+            **issued_actions[int(issue_step)],
+            "actual_apply_policy_step": int(actual_apply_policy_step[index]),
+            "actual_apply_time_s": float(actual_apply_time_s[index]),
+        }
+        for index, issue_step in enumerate(applied_issue_policy_step)
+    ]
+    report = validate_t5_replan_timing(
+        issued_actions=issued_actions,
+        applied_actions=applied_actions,
+        impact_end_time_s=impact_end_time_s,
+        first_contact_time_s=first_contact_time_s,
+        expected_issued_action_count=expected_issued_action_count,
+        expected_action_delay_steps=expected_action_delay_steps,
+        control_hz=control_hz,
+    )
+    declared_gate = record.get("t5_replan_causal_timing_passed")
+    if not isinstance(declared_gate, bool) or declared_gate is not report.passed:
+        raise ValueError("T5 Replan causal-timing gate does not recompute from tape")
+    declared_latency = record.get("impact_end_to_first_qualifying_applied_correction_s")
+    if not report.passed:
+        if declared_latency is not None:
+            raise ValueError(
+                "failed T5 causal timing cannot declare a correction latency"
+            )
+        return
+    if impact_end_time_s is None or not report.qualifying_correction_steps:
+        raise ValueError("passing T5 causal timing lacks a qualifying correction")
+    first_qualifying_step = report.qualifying_correction_steps[0]
+    applied_index = int(
+        np.flatnonzero(applied_issue_policy_step == first_qualifying_step)[0]
+    )
+    recomputed_latency = float(actual_apply_time_s[applied_index]) - impact_end_time_s
+    stored_latency = _finite_number(
+        declared_latency,
+        "T5 impact-end-to-applied-correction latency",
+    )
+    if recomputed_latency < 0.0 or not math.isclose(
+        stored_latency,
+        recomputed_latency,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise ValueError("T5 causal correction latency does not recompute from tape")
+
+
 def _audit_attempt_tape(
     root: Path,
     record: Mapping[str, Any],
     *,
     expected_task: str,
+    quality_v2_thresholds: Mapping[str, object] | None = None,
+    quality_v2_thresholds_sha256: str | None = None,
 ) -> None:
-    if record.get("schema_version") != ATTEMPT_SCHEMA:
+    schema_version = record.get("schema_version")
+    if (
+        schema_version != ATTEMPT_SCHEMA
+        and schema_version not in HISTORICAL_ATTEMPT_SCHEMAS
+    ):
         raise ValueError("attempt schema mismatch")
     if record.get("task_id") != expected_task:
         raise ValueError("attempt task mismatch")
@@ -1710,14 +2791,33 @@ def _audit_attempt_tape(
     if _sha256(path) != record.get("attempt_tape_sha256"):
         raise ValueError("attempt tape checksum mismatch")
     with np.load(path, allow_pickle=False) as tape:
-        if set(tape.files) != {
+        base_inventory = {
             "states",
             "policy_actions",
             "actions",
             "rewards",
             "terminated",
             "truncated",
-        }:
+        }
+        quality_inventory = {
+            "eef_pose_xyzw",
+            "fingerpad_closing_axis_world",
+            "object_pose_wxyz",
+            "fingerpad_contact_flags",
+        }
+        inventory = set(tape.files)
+        if schema_version == LEGACY_ATTEMPT_SCHEMA:
+            valid_inventory = frozenset(inventory) in {
+                frozenset(base_inventory),
+                frozenset(base_inventory | quality_inventory),
+            }
+        elif schema_version == ATTEMPT_SCHEMA and expected_task == "t5_replan":
+            valid_inventory = inventory == (
+                base_inventory | quality_inventory | T5_CAUSAL_TAPE_INVENTORY
+            )
+        else:
+            valid_inventory = inventory == base_inventory | quality_inventory
+        if not valid_inventory:
             raise ValueError("attempt tape array inventory mismatch")
         states = np.asarray(tape["states"])
         policy_actions = np.asarray(tape["policy_actions"])
@@ -1725,6 +2825,29 @@ def _audit_attempt_tape(
         rewards = np.asarray(tape["rewards"])
         terminated = np.asarray(tape["terminated"])
         truncated = np.asarray(tape["truncated"])
+        eef_pose_xyzw = (
+            np.asarray(tape["eef_pose_xyzw"]) if "eef_pose_xyzw" in tape.files else None
+        )
+        closing_axis_world = (
+            np.asarray(tape["fingerpad_closing_axis_world"])
+            if "fingerpad_closing_axis_world" in tape.files
+            else None
+        )
+        object_pose_wxyz = (
+            np.asarray(tape["object_pose_wxyz"])
+            if "object_pose_wxyz" in tape.files
+            else None
+        )
+        fingerpad_contact_flags = (
+            np.asarray(tape["fingerpad_contact_flags"])
+            if "fingerpad_contact_flags" in tape.files
+            else None
+        )
+        t5_causal_arrays = (
+            {name: np.asarray(tape[name]) for name in T5_CAUSAL_TAPE_INVENTORY}
+            if T5_CAUSAL_TAPE_INVENTORY <= inventory
+            else None
+        )
     raw_steps = record.get("control_steps")
     if isinstance(raw_steps, bool) or not isinstance(raw_steps, int):
         raise ValueError("attempt control_steps must be an integer")
@@ -1745,7 +2868,33 @@ def _audit_attempt_tape(
     if np.any(terminated[:-1]) or np.any(truncated[:-1]):
         raise ValueError("attempt has a pre-terminal done flag")
     if bool(terminated[-1]) == bool(truncated[-1]):
-        raise ValueError("attempt must terminate or truncate exactly once at its final step")
+        raise ValueError(
+            "attempt must terminate or truncate exactly once at its final step"
+        )
+    if schema_version == ATTEMPT_SCHEMA:
+        if expected_task == "t5_replan":
+            if record.get("issued_equals_applied") is not False:
+                raise ValueError("T5 Replan must declare issued_equals_applied=false")
+            if t5_causal_arrays is None:
+                raise ValueError("T5 Replan attempt is missing its causal history tape")
+            _audit_t5_replan_causal_history(
+                record,
+                t5_causal_arrays,
+                control_steps=steps,
+            )
+        else:
+            if record.get("issued_equals_applied") is not True:
+                raise ValueError(
+                    "non-T5 attempt must declare issued_equals_applied=true"
+                )
+            if (
+                record.get("t5_replan_causal_timing_passed") is not None
+                or record.get("impact_end_to_first_qualifying_applied_correction_s")
+                is not None
+            ):
+                raise ValueError(
+                    "non-T5 attempt cannot declare T5 causal timing evidence"
+                )
     finite = bool(
         np.all(np.isfinite(states))
         and np.all(np.isfinite(policy_actions))
@@ -1757,15 +2906,117 @@ def _audit_attempt_tape(
     if finite != bool(record["finite_and_bounded"]):
         raise ValueError("attempt finite/bounded status does not recompute")
     hashes = {
-        "state_sha256": hashlib.sha256(np.ascontiguousarray(states).tobytes()).hexdigest(),
+        "state_sha256": hashlib.sha256(
+            np.ascontiguousarray(states).tobytes()
+        ).hexdigest(),
         "policy_action_sha256": hashlib.sha256(
             np.ascontiguousarray(policy_actions).tobytes()
         ).hexdigest(),
-        "action_sha256": hashlib.sha256(np.ascontiguousarray(actions).tobytes()).hexdigest(),
-        "reward_sha256": hashlib.sha256(np.ascontiguousarray(rewards).tobytes()).hexdigest(),
+        "action_sha256": hashlib.sha256(
+            np.ascontiguousarray(actions).tobytes()
+        ).hexdigest(),
+        "reward_sha256": hashlib.sha256(
+            np.ascontiguousarray(rewards).tobytes()
+        ).hexdigest(),
     }
     if any(record.get(key) != value for key, value in hashes.items()):
         raise ValueError("attempt array content checksum does not recompute")
+    quality_v2 = record.get("quality_v2")
+    if schema_version != LEGACY_ATTEMPT_SCHEMA and quality_v2 is None:
+        raise ValueError("attempt v0.2/v0.3 requires a quality-v2 summary")
+    if quality_v2 is not None:
+        if not isinstance(quality_v2, Mapping):
+            raise ValueError("attempt quality-v2 summary must be a mapping")
+        quality_v2_sha256 = _expected_sha256(
+            record.get("quality_v2_sha256"),
+            "attempt quality-v2 summary SHA-256",
+        )
+        if _payload_sha256(quality_v2) != quality_v2_sha256:
+            raise ValueError("stored quality-v2 summary checksum does not recompute")
+        if any(
+            value is None
+            for value in (
+                eef_pose_xyzw,
+                closing_axis_world,
+                object_pose_wxyz,
+                fingerpad_contact_flags,
+            )
+        ):
+            raise ValueError("quality-v2 attempt is missing replay source tapes")
+        assert eef_pose_xyzw is not None
+        assert closing_axis_world is not None
+        assert object_pose_wxyz is not None
+        assert fingerpad_contact_flags is not None
+        if (
+            eef_pose_xyzw.shape != (steps + 1, 7)
+            or closing_axis_world.shape != (steps + 1, 3)
+            or object_pose_wxyz.shape != (steps + 1, 7)
+            or fingerpad_contact_flags.shape != (steps + 1, 2)
+        ):
+            raise ValueError("quality-v2 pose tapes do not align with control steps")
+        raw_events = record.get("quality_v2_events_by_observation")
+        if (
+            not isinstance(raw_events, list)
+            or len(raw_events) != steps + 1
+            or any(
+                not isinstance(row, list)
+                or any(not isinstance(name, str) or not name for name in row)
+                for row in raw_events
+            )
+        ):
+            raise ValueError("quality-v2 per-observation event tape is malformed")
+        from se3_wam.benchmark.config import load_task_config
+        from se3_wam.benchmark.trajectory_quality import (
+            evaluate_quality_v2_gate,
+            trajectory_quality_v2_from_observations,
+        )
+
+        observations = [
+            SimpleNamespace(
+                privileged={
+                    "eef_pose_xyzw": eef_pose_xyzw[index],
+                    "fingerpad_closing_axis_world": closing_axis_world[index],
+                    "object_pose_wxyz": object_pose_wxyz[index],
+                    "fingerpad_contact_flags": fingerpad_contact_flags[index],
+                },
+                events_since_last_observation=tuple(
+                    SimpleNamespace(name=name) for name in raw_events[index]
+                ),
+            )
+            for index in range(steps + 1)
+        ]
+        recomputed_quality_v2 = trajectory_quality_v2_from_observations(
+            observations,
+            actions,
+            task_id=expected_task,
+            task_config=load_task_config(expected_task),
+            sample_period_s=0.05,
+            continuous_dimensions=max(1, actions.shape[1] - 1),
+        )
+        if recomputed_quality_v2 != quality_v2:
+            raise ValueError("stored quality-v2 summary differs from the replay tape")
+        if _payload_sha256(recomputed_quality_v2) != quality_v2_sha256:
+            raise ValueError("quality-v2 summary checksum does not recompute")
+        if quality_v2_thresholds is None or quality_v2_thresholds_sha256 is None:
+            raise ValueError("quality-v2 audit requires the frozen threshold contract")
+        recomputed_gate = evaluate_quality_v2_gate(
+            recomputed_quality_v2,
+            quality_v2_thresholds,
+            task_id=expected_task,
+        )
+        recomputed_gate["contract_sha256"] = quality_v2_thresholds_sha256
+        if recomputed_gate != record.get("quality_v2_gate"):
+            raise ValueError("quality-v2 gate does not recompute")
+    elif any(
+        value is not None
+        for value in (
+            eef_pose_xyzw,
+            closing_axis_world,
+            object_pose_wxyz,
+            fingerpad_contact_flags,
+        )
+    ):
+        raise ValueError("quality-v2 pose tapes require a quality-v2 summary")
     attempt_return = _finite_number(record.get("return"), "attempt return")
     if not math.isclose(
         attempt_return,
@@ -1851,21 +3102,27 @@ def _audit_winner_episode(
         or teacher.get("candidate_manifest_sha256") != card["candidate_manifest_sha256"]
         or teacher.get("selection_contract") != _selection_contract(selection_mode)
         or teacher.get("winner_quality_score") != list(_quality_score(attempt))
+        or (
+            attempt.get("quality_v2_sha256") is not None
+            and teacher.get("quality_v2_sha256") != attempt["quality_v2_sha256"]
+        )
         or teacher.get("lightweight_action_sha256") != attempt["action_sha256"]
         or teacher.get("source_identity") != card["source_identity"]
+        or teacher.get("quality_v2_threshold_identity")
+        != card.get("quality_v2_threshold_identity")
         or teacher.get("planner_dominance") != planner_dominance
         or teacher.get("evaluator_identity") != card.get("evaluator_identity")
-        or teacher.get("compatibility_evidence")
-        != card.get("compatibility_evidence")
+        or teacher.get("compatibility_evidence") != card.get("compatibility_evidence")
         or teacher.get("calibration_evidence") != card.get("calibration_evidence")
         or teacher.get("candidate_release_manifest_sha256")
         != card.get("candidate_release_manifest_sha256")
         or teacher.get("selection_result") != winner.get("selection_result")
     ):
         raise ValueError("winner episode selection provenance does not recompute")
-    if "candidate_search_mode" in card and teacher.get(
-        "candidate_search_mode"
-    ) != candidate_search_mode:
+    if (
+        "candidate_search_mode" in card
+        and teacher.get("candidate_search_mode") != candidate_search_mode
+    ):
         raise ValueError("winner episode candidate-search provenance mismatch")
     if "selection_mode" in card and teacher.get("selection_mode") != selection_mode:
         raise ValueError("winner episode selection-mode provenance mismatch")
@@ -1875,7 +3132,9 @@ def _audit_winner_episode(
         np.ascontiguousarray(action_values).tobytes()
     ).hexdigest()
     if rendered_action_sha256 != attempt["action_sha256"]:
-        raise ValueError("winner RGB-D trajectory differs from its selected lightweight action tape")
+        raise ValueError(
+            "winner RGB-D trajectory differs from its selected lightweight action tape"
+        )
 
 
 def _audit_export_state_and_progress(
@@ -1920,16 +3179,20 @@ def _audit_export_state_and_progress(
     expected_selection_contract = _selection_contract(card_selection_mode)
     if card.get("selection_contract") != expected_selection_contract:
         raise ValueError("dataset-card selection contract does not match its mode")
-    if "selection_contract" in state and state.get(
-        "selection_contract"
-    ) != expected_selection_contract:
+    if (
+        "selection_contract" in state
+        and state.get("selection_contract") != expected_selection_contract
+    ):
         raise ValueError("export-state selection contract does not match its mode")
     for payload_name, payload in (("dataset card", card), ("export state", state)):
-        if "candidate_pool_size" in payload and int(payload["candidate_pool_size"]) != len(
-            candidate_rows
-        ):
+        if "candidate_pool_size" in payload and int(
+            payload["candidate_pool_size"]
+        ) != len(candidate_rows):
             raise ValueError(f"{payload_name} candidate pool size mismatch")
-        if card_search_mode == FULL_POOL_SEARCH_MODE and "candidate_pool_size" not in payload:
+        if (
+            card_search_mode == FULL_POOL_SEARCH_MODE
+            and "candidate_pool_size" not in payload
+        ):
             raise ValueError(f"full-pool {payload_name} is missing candidate pool size")
     expected_state_values = {
         "task": card["task"],
@@ -1944,13 +3207,16 @@ def _audit_export_state_and_progress(
         "candidate_manifest_sha256": card["candidate_manifest_sha256"],
         "reset_manifest_sha256": card["reset_manifest_sha256"],
         "source_identity": card["source_identity"],
+        "quality_v2_threshold_identity": card["quality_v2_threshold_identity"],
     }
     if any(state.get(key) != value for key, value in expected_state_values.items()):
         raise ValueError("export-state identity does not match the dataset card")
     if int(state.get("max_resets", -1)) != len(reset_rows):
         raise ValueError("export-state max_resets does not match reset manifest")
     state_candidates = state.get("candidates")
-    if not isinstance(state_candidates, list) or len(state_candidates) != len(candidate_rows):
+    if not isinstance(state_candidates, list) or len(state_candidates) != len(
+        candidate_rows
+    ):
         raise ValueError("export-state candidate inventory mismatch")
     for index, (state_row, manifest_row) in enumerate(
         zip(state_candidates, candidate_rows, strict=True)
@@ -1966,12 +3232,20 @@ def _audit_export_state_and_progress(
             "residual_scale",
             "provenance",
         ):
-            default = False if key == "stochastic" else 0 if key == "exploration_seed_offset" else None
+            default = (
+                False
+                if key == "stochastic"
+                else 0
+                if key == "exploration_seed_offset"
+                else None
+            )
             if state_row.get(key) != manifest_row.get(key, default):
                 raise ValueError(f"export-state candidate {index} differs for {key}")
         policy_path = state_row.get("policy_path")
         if manifest_row["kind"] == "policy" and not isinstance(policy_path, str):
-            raise ValueError(f"export-state candidate {index} has no resolved policy path")
+            raise ValueError(
+                f"export-state candidate {index} has no resolved policy path"
+            )
         if manifest_row["kind"] == "planner" and policy_path is not None:
             raise ValueError("export-state planner unexpectedly has a policy path")
 
@@ -2008,12 +3282,75 @@ def _audit_export_state_and_progress(
             raise ValueError(f"progress boundary does not match final {name}")
 
 
+def _audit_quality_v4_full_exports(
+    root: Path, winner_rows: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Independently re-gate every Qv4 winner HDF5 when the new path exists."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        QUALITY_V4_FULL_EXPORT_SUBDIRECTORY,
+        audit_quality_v4_full_export,
+        dataset_quality_v4_validation,
+    )
+
+    directory = root / QUALITY_V4_FULL_EXPORT_SUBDIRECTORY
+    if not directory.exists():
+        return {
+            "enabled": False,
+            "audited_count": 0,
+            "thresholds_sha256": None,
+            "orientation_contract_sha256": None,
+            "gate_sha256": [],
+        }
+    episode_ids = []
+    for winner in winner_rows:
+        request = winner.get("request")
+        episode_id = request.get("episode_id") if isinstance(request, Mapping) else None
+        if not isinstance(episode_id, str) or not episode_id:
+            raise ValueError("Qv4 winner has no episode identity")
+        episode_ids.append(episode_id)
+    expected_files = {
+        *(f"{episode_id}.h5" for episode_id in episode_ids),
+        *(f"{episode_id}.gate.json" for episode_id in episode_ids),
+    }
+    actual_files = {path.name for path in directory.iterdir() if path.is_file()}
+    if actual_files != expected_files:
+        raise ValueError("Qv4 full-export file inventory mismatch")
+    gate_hashes = []
+    threshold_hashes = set()
+    orientation_hashes = set()
+    for episode_id in episode_ids:
+        export_path = directory / f"{episode_id}.h5"
+        recorded_gate = json.loads(
+            (directory / f"{episode_id}.gate.json").read_text(encoding="utf-8")
+        )
+        recomputed_gate = audit_quality_v4_full_export(export_path)
+        if recorded_gate != recomputed_gate:
+            raise ValueError("Qv4 recorded full-export gate does not recompute")
+        dataset_gate = dataset_quality_v4_validation(recomputed_gate)
+        if not dataset_gate["passed"]:
+            raise ValueError("Qv4 winner is not behavior-cloning eligible")
+        gate_hashes.append(recomputed_gate["gate_sha256"])
+        threshold_hashes.add(recomputed_gate["thresholds_sha256"])
+        orientation_hashes.add(recomputed_gate["orientation_contract_sha256"])
+    if len(threshold_hashes) != 1 or len(orientation_hashes) != 1:
+        raise ValueError("Qv4 winners mix threshold or orientation contracts")
+    return {
+        "enabled": True,
+        "audited_count": len(episode_ids),
+        "thresholds_sha256": next(iter(threshold_hashes)),
+        "orientation_contract_sha256": next(iter(orientation_hashes)),
+        "gate_sha256": gate_hashes,
+    }
+
+
 def _audit_dataset(
     *,
     root: Path,
     expected_card_sha256: str,
     expected_checksums_sha256: str,
     expected_candidate_sha256: str,
+    expected_quality_v2_thresholds_sha256: str,
 ) -> dict[str, Any]:
     if not root.is_dir():
         raise FileNotFoundError(root)
@@ -2033,6 +3370,22 @@ def _audit_dataset(
         raise ValueError("candidate-manifest file identity mismatch")
     if card.get("candidate_manifest_sha256") != expected_candidate_sha256:
         raise ValueError("dataset card candidate-manifest identity mismatch")
+    thresholds_path = root / "quality_v2_thresholds.json"
+    if _sha256(thresholds_path) != expected_quality_v2_thresholds_sha256:
+        raise ValueError("quality-v2 threshold file identity mismatch")
+    quality_v2_thresholds = json.loads(thresholds_path.read_text(encoding="utf-8"))
+    if not isinstance(quality_v2_thresholds, Mapping):
+        raise ValueError("quality-v2 threshold contract must be a mapping")
+    if quality_v2_thresholds.get("formal_freeze_eligible") is not True:
+        raise ValueError(
+            "quality-v2 threshold contract is not eligible for formal freeze"
+        )
+    expected_threshold_identity = {
+        "schema_version": quality_v2_thresholds.get("schema_version"),
+        "sha256": expected_quality_v2_thresholds_sha256,
+    }
+    if card.get("quality_v2_threshold_identity") != expected_threshold_identity:
+        raise ValueError("dataset card quality-v2 threshold identity mismatch")
     candidate_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
     candidates = _candidate_rows(candidate_payload, card=card)
     candidate_search_mode = _candidate_search_mode(card)
@@ -2041,6 +3394,15 @@ def _audit_dataset(
         candidate_payload,
         task=str(card["task"]),
         selection_mode=selection_mode,
+    )
+    quality_v2_dominance = (
+        _quality_v2_dominance_contract(
+            quality_v2_thresholds,
+            task=str(card["task"]),
+            thresholds_sha256=expected_quality_v2_thresholds_sha256,
+        )
+        if selection_mode == PLANNER_PARETO_SELECTION_MODE
+        else None
     )
     if (
         candidate_payload.get("schema_version") == CANDIDATE_SCHEMA_V2
@@ -2054,6 +3416,22 @@ def _audit_dataset(
         card=card,
         candidate_payload=candidate_payload,
         planner_dominance=planner_dominance,
+    )
+    source_identity = card["source_identity"]
+    if not isinstance(source_identity, Mapping):
+        raise ValueError("dataset source identity is missing")
+    calibration_benchmark_commit = (
+        _full_commit(
+            "dataset benchmark commit",
+            source_identity.get("benchmark_commit"),
+        )
+        if evaluator_identity is None
+        else evaluator_identity["evaluator_benchmark_commit"]
+    )
+    calibration_receipt_identity = _audit_quality_v2_calibration_receipt_artifact(
+        root,
+        quality_v2_thresholds,
+        expected_benchmark_commit=calibration_benchmark_commit,
     )
     _audit_candidate_release_chain(
         root,
@@ -2090,7 +3468,10 @@ def _audit_dataset(
     if _sha256(root / "reset_manifest.jsonl") != card.get("reset_manifest_sha256"):
         raise ValueError("reset-manifest identity mismatch")
     attempted_reset_count = int(card["attempted_reset_count"])
-    if len(reset_rows) < attempted_reset_count or len(reset_results) != attempted_reset_count:
+    if (
+        len(reset_rows) < attempted_reset_count
+        or len(reset_results) != attempted_reset_count
+    ):
         raise ValueError("reset manifest/results count mismatch")
     if len(attempt_rows) != int(card["candidate_attempt_count"]):
         raise ValueError("attempt count does not match the dataset card")
@@ -2151,7 +3532,13 @@ def _audit_dataset(
                 raise ValueError(f"attempt reset identity mismatch for {key}")
         if record.get("candidate_manifest_index") != reset.get("candidate_index"):
             raise ValueError("attempt reset candidate-index provenance mismatch")
-        _audit_attempt_tape(root, record, expected_task=str(card["task"]))
+        _audit_attempt_tape(
+            root,
+            record,
+            expected_task=str(card["task"]),
+            quality_v2_thresholds=quality_v2_thresholds,
+            quality_v2_thresholds_sha256=expected_quality_v2_thresholds_sha256,
+        )
         tape = str(record["attempt_tape"])
         if tape in referenced_tapes:
             raise ValueError("multiple attempts reference the same lightweight tape")
@@ -2168,7 +3555,9 @@ def _audit_dataset(
         else set()
     )
     if actual_lightweight_files != referenced_tapes:
-        raise ValueError("lightweight tape inventory contains missing or unreferenced files")
+        raise ValueError(
+            "lightweight tape inventory contains missing or unreferenced files"
+        )
 
     winner_by_episode: dict[str, dict[str, Any]] = {}
     for winner in winner_rows:
@@ -2177,6 +3566,7 @@ def _audit_dataset(
         if not isinstance(episode_id, str) or episode_id in winner_by_episode:
             raise ValueError("winner episode IDs must be non-empty and unique")
         winner_by_episode[episode_id] = winner
+    quality_v4_full_exports = _audit_quality_v4_full_exports(root, winner_rows)
 
     accepted = 0
     render_parity_skips: Counter[str] = Counter()
@@ -2190,7 +3580,10 @@ def _audit_dataset(
     for reset_index, result in enumerate(reset_results):
         reset = reset_rows[reset_index]
         episode_id = reset["episode_id"]
-        if result.get("reset_index") != reset_index or result.get("episode_id") != episode_id:
+        if (
+            result.get("reset_index") != reset_index
+            or result.get("episode_id") != episode_id
+        ):
             raise ValueError("reset-result order or identity mismatch")
         for key in ("source_group_id",):
             if result.get(key) != reset.get(key):
@@ -2200,11 +3593,15 @@ def _audit_dataset(
         budget_used = int(result["budget_used"])
         if candidate_count != budget_used or budget_used not in budgets:
             raise ValueError("reset-result candidate count/budget mismatch")
-        if "candidate_search_mode" in result and result.get(
-            "candidate_search_mode"
-        ) != candidate_search_mode:
+        if (
+            "candidate_search_mode" in result
+            and result.get("candidate_search_mode") != candidate_search_mode
+        ):
             raise ValueError("reset-result candidate-search mode mismatch")
-        if "selection_mode" in result and result.get("selection_mode") != selection_mode:
+        if (
+            "selection_mode" in result
+            and result.get("selection_mode") != selection_mode
+        ):
             raise ValueError("reset-result selection mode mismatch")
         if candidate_search_mode == FULL_POOL_SEARCH_MODE and (
             result.get("candidate_search_mode") != FULL_POOL_SEARCH_MODE
@@ -2213,7 +3610,9 @@ def _audit_dataset(
             raise ValueError("full-pool reset did not attempt every candidate")
         if len(records) != candidate_count:
             raise ValueError("attempt rows do not match reset-result candidate count")
-        if [int(row["candidate_index"]) for row in records] != list(range(candidate_count)):
+        if [int(row["candidate_index"]) for row in records] != list(
+            range(candidate_count)
+        ):
             raise ValueError("attempted candidates are not the frozen pool prefix")
         budget_position = budgets.index(budget_used)
         if candidate_search_mode == FIRST_ELIGIBLE_SEARCH_MODE:
@@ -2223,6 +3622,7 @@ def _audit_dataset(
                         records[:previous_budget],
                         selection_mode=selection_mode,
                         planner_dominance=planner_dominance,
+                        quality_v2_dominance=quality_v2_dominance,
                     )
                     is not None
                 ):
@@ -2233,6 +3633,7 @@ def _audit_dataset(
             records,
             selection_mode=selection_mode,
             planner_dominance=planner_dominance,
+            quality_v2_dominance=quality_v2_dominance,
         )
         expected_selection_result = _selection_result(
             records,
@@ -2256,18 +3657,24 @@ def _audit_dataset(
             if reset_index in skip_events:
                 raise ValueError("render-parity recovery event has no selected attempt")
             if budget_used != budgets[-1] or winner is not None:
-                raise ValueError("rejected reset did not exhaust max_k or unexpectedly has a winner")
-            if result.get("winner_candidate_id") is not None or result.get(
-                "winner_candidate_index"
-            ) is not None:
+                raise ValueError(
+                    "rejected reset did not exhaust max_k or unexpectedly has a winner"
+                )
+            if (
+                result.get("winner_candidate_id") is not None
+                or result.get("winner_candidate_index") is not None
+            ):
                 raise ValueError("rejected reset names a winner")
             continue
         if not accepted_label:
             if winner is not None:
-                raise ValueError("render-parity skipped reset unexpectedly has a winner")
-            if result.get("winner_candidate_id") is not None or result.get(
-                "winner_candidate_index"
-            ) is not None:
+                raise ValueError(
+                    "render-parity skipped reset unexpectedly has a winner"
+                )
+            if (
+                result.get("winner_candidate_id") is not None
+                or result.get("winner_candidate_index") is not None
+            ):
                 raise ValueError("render-parity skipped reset names a winner")
             protocol = _audit_render_parity_skip(
                 result,
@@ -2278,13 +3685,17 @@ def _audit_dataset(
             consumed_skip_events.add(reset_index)
             continue
         if result.get("render_parity_skip") is not None or reset_index in skip_events:
-            raise ValueError("accepted reset unexpectedly carries render-parity skip evidence")
+            raise ValueError(
+                "accepted reset unexpectedly carries render-parity skip evidence"
+            )
         if (
             result.get("winner_candidate_id") != selected["candidate_id"]
-            or int(result.get("winner_candidate_index", -1)) != int(selected["candidate_index"])
+            or int(result.get("winner_candidate_index", -1))
+            != int(selected["candidate_index"])
             or winner is None
             or winner.get("candidate_id") != selected["candidate_id"]
-            or int(winner.get("candidate_index", -1)) != int(selected["candidate_index"])
+            or int(winner.get("candidate_index", -1))
+            != int(selected["candidate_index"])
             or int(winner.get("candidate_count", -1)) != candidate_count
             or int(winner.get("budget_used", -1)) != budget_used
             or winner.get("selection_contract") != selection_contract
@@ -2293,17 +3704,23 @@ def _audit_dataset(
             or winner.get("lightweight_attempt_tape_sha256")
             != selected["attempt_tape_sha256"]
         ):
-            raise ValueError("published winner does not match independently selected attempt")
+            raise ValueError(
+                "published winner does not match independently selected attempt"
+            )
         if (
             selection_mode == PLANNER_PARETO_SELECTION_MODE
             or "selection_result" in winner
         ) and winner.get("selection_result") != expected_selection_result:
             raise ValueError("published winner selection provenance mismatch")
-        if "candidate_search_mode" in winner and winner.get(
-            "candidate_search_mode"
-        ) != candidate_search_mode:
+        if (
+            "candidate_search_mode" in winner
+            and winner.get("candidate_search_mode") != candidate_search_mode
+        ):
             raise ValueError("published winner candidate-search mode mismatch")
-        if "selection_mode" in winner and winner.get("selection_mode") != selection_mode:
+        if (
+            "selection_mode" in winner
+            and winner.get("selection_mode") != selection_mode
+        ):
             raise ValueError("published winner selection mode mismatch")
         if winner.get("planner_dominance") != planner_dominance:
             raise ValueError("published winner planner-dominance contract mismatch")
@@ -2327,6 +3744,7 @@ def _audit_dataset(
                 selected,
                 planner,
                 planner_dominance,
+                quality_v2_dominance,
             )
             if "regressed" in relations.values():
                 raise ValueError("accepted expert regresses an eligible planner metric")
@@ -2371,6 +3789,9 @@ def _audit_dataset(
         "task": card["task"],
         "split": card["split"],
         "source_identity": card["source_identity"],
+        "quality_v2_threshold_identity": expected_threshold_identity,
+        "quality_v2_calibration_wave_receipt_identity": (calibration_receipt_identity),
+        "quality_v4_full_exports": quality_v4_full_exports,
         "accepted_count": accepted,
         "attempted_reset_count": len(reset_results),
         "candidate_attempt_count": len(attempt_rows),
@@ -2412,6 +3833,10 @@ def main() -> None:
         args.expected_candidate_manifest_sha256,
         "expected candidate-manifest SHA-256",
     )
+    expected_quality_v2_thresholds = _expected_sha256(
+        args.expected_quality_v2_thresholds_sha256,
+        "expected quality-v2 threshold SHA-256",
+    )
     started = time.time()
     report: dict[str, Any] = {
         "schema_version": AUDIT_SCHEMA,
@@ -2419,6 +3844,7 @@ def main() -> None:
         "dataset_card_sha256": expected_card,
         "checksums_sha256": expected_checksums,
         "candidate_manifest_sha256": expected_candidate,
+        "quality_v2_thresholds_sha256": expected_quality_v2_thresholds,
         "auditor_commit": auditor_commit,
         "started_unix_s": started,
     }
@@ -2428,6 +3854,7 @@ def main() -> None:
             expected_card_sha256=expected_card,
             expected_checksums_sha256=expected_checksums,
             expected_candidate_sha256=expected_candidate,
+            expected_quality_v2_thresholds_sha256=expected_quality_v2_thresholds,
         )
         report.update(
             status="passed",

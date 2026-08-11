@@ -146,15 +146,27 @@ critic stay in residual-action space, planner demonstrations map to the exact ze
 residual, and checkpoints include the stateful planner instances. ``--residual-scale``
 defaults to ``0.25``; treat each scale and actor-BC weight as a separate arm.
 
-Environment stepping can use persistent subprocess shards instead of the serial or
-threaded adapter. Set ``--eval-worker-processes 2`` (or ``4``/``8``) to accelerate
-the frozen-manifest validation loop, and ``--env-worker-processes`` to shard training
-reset/step calls. The parent process still assigns manifest rows and restores replies
-by environment index, so seed and episode order do not depend on worker completion
-order. Each subprocess is serial internally; keep the corresponding
-``--*-worker-threads`` value at ``1``. ``--process-start-method spawn`` is the
-portable, CUDA-safe default. Process count is execution provenance and therefore a
-checkpoint must be resumed with the same configuration.
+The exact CPU process recipe is enabled by default. Without YAML overrides the trainer
+uses 32 training and validation environments; omitted ``--env-worker-processes`` and
+``--eval-worker-processes`` values expand to their respective vector widths. Linux
+uses ``forkserver`` while other platforms retain the portable ``spawn`` fallback.
+Persistent checkpoint-rewind evaluation is enabled whenever evaluation processes are
+active, and residual-RLPD evaluates its privileged planner in the owning subprocess.
+Use the generated ``--no-persistent-eval-workers`` and
+``--no-eval-planner-in-processes`` switches, or set both process counts to ``0``, for
+an explicit serial compatibility run. Sampler/learner overlap remains disabled because
+it changes replay order.
+
+The parent process still assigns manifest rows and restores replies by environment
+index, so seed and episode order do not depend on worker completion order. Each
+subprocess is serial internally; keep the corresponding ``--*-worker-threads`` value
+at ``1``. Workers inherit the launcher's CPU affinity. The measured W32 recipe requires
+an explicit 32-logical-CPU, single-NUMA cpuset (for example via ``taskset``) and about
+47 GiB peak process-tree RSS; the trainer cannot safely infer GPU-local NUMA placement.
+Process topology is execution provenance and a checkpoint must be resumed with the
+same configuration. Task-local manifests, exact mutable-``MjModel`` reset restoration,
+v0.3 checkpoints, and bounded process cleanup need no extra flag with current RLinf and
+SE3-WAM sources.
 
 Before a throughput bakeoff, run the process correctness gate against the real
 benchmark checkout. It compares serial/process reset and step digests, verifies an
@@ -228,13 +240,50 @@ the replay sampling state, normalizer, and post-collection RNG state are restore
    data, not as deployable vision-policy results. Keep ``--rlinf-commit`` and
    ``--benchmark-commit`` at full 40-character hashes; resume rejects identity drift.
 
-Evaluate the frozen best checkpoint on a deterministic test-ID or test-OOD manifest
-with a separately identified evaluator commit:
+RLD2-QA calibration and formal evaluation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The production evaluation schema is selected by the frozen-threshold arguments.
+Supplying both ``--quality-v2-thresholds`` and
+``--expected-quality-v2-thresholds-sha256`` produces expert evaluation schema
+``rlinf-dynamic-benchmark-expert-evaluation-v0.3`` or planner evaluation schema
+``rlinf-dynamic-benchmark-planner-evaluation-v0.2``. Each record is bound to a
+canonical ``rlinf-dynamic-benchmark-optimal-attempt-v0.3`` tape. The planner-only
+``metric_calibration`` wave deliberately omits those arguments and remains on
+``rlinf-dynamic-benchmark-planner-evaluation-v0.1``; it is a separate scientific
+partition, not a production policy comparison.
+
+Before freezing Qv3 thresholds, run the exact-14 × exact-20 planner wave from a
+clean evaluator checkout. The scheduler must perform the resource conflict check
+before handing one to eight GPU indices to the launcher:
+
+.. code-block:: bash
+
+   RUNTIME_ROOT=/path/to/runtime
+   RUNS_ROOT=/path/to/runs
+   export RLD2_QA_BENCHMARK_SOURCE_ROOT="$RUNTIME_ROOT/SE3-WAM"
+   bash examples/embodiment/rld2_qa_planner_calibration.sh \
+      rld2qa-cal 0,1,2,3 "$PWD" "$RUNTIME_ROOT" \
+      "$RUNS_ROOT" /path/to/tmp
+
+The launcher predeclares all 280 reset identities before any rollout, evaluates
+20 rows for every task in the canonical 14-task order, and verifies the selected
+safe successful planner trajectory in three distinct fresh environments. With the
+default wave ID it writes the canonical receipt at
+``$RUNS_ROOT/RLD2-QA/planner-calibration-metric-v03-s20261350/wave_receipt.json``.
+The frozen ``se3-wam-trajectory-quality-v2-thresholds-v0.3`` contract must bind
+that exact receipt and remain disjoint from validation, review, test-ID, and
+test-OOD manifests.
+
+After the threshold contract is frozen, evaluate a checkpoint on the paired
+20-row validation manifest with a separately identified evaluator commit:
 
 .. code-block:: bash
 
    POLICY=outputs/dynamic_benchmark/t2_rlpd_seed1/best_policy.pt
    POLICY_SHA=$(sha256sum "$POLICY" | cut -d' ' -f1)
+   QUALITY_V2_THRESHOLDS=/path/to/quality_v2_thresholds.json
+   QUALITY_V2_SHA=$(sha256sum "$QUALITY_V2_THRESHOLDS" | cut -d' ' -f1)
    EVALUATOR_COMMIT=$(git rev-parse HEAD)
    python examples/embodiment/evaluate_dynamic_benchmark_expert.py \
       --policy "$POLICY" \
@@ -242,64 +291,136 @@ with a separately identified evaluator commit:
       --evaluator-commit "$EVALUATOR_COMMIT" \
       --rlinf-commit "$RLINF_COMMIT" \
       --benchmark-commit "$BENCHMARK_COMMIT" \
-      --split test_id \
-      --manifest-seed 20261250 \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --split validation \
+      --manifest-seed 20261150 \
       --episodes 20 \
-      --output outputs/dynamic_benchmark/t2_rlpd_seed1/test_id
+      --output outputs/dynamic_benchmark/t2_rlpd_seed1/validation_formal
 
 The evaluator reconstructs BC/SAC/RLPD, residual-RLPD, and PPO policies, verifies the
 checkpoint and source identities, records the reset manifest and executed actions,
-uses separate once-reset raw environments for each rollout and replay, requires exact
-action replay for every episode, and reports deterministic success,
-safety, completion, effort, and decision-latency metrics. Keep test manifests unread
-until validation-based policy and hyperparameter selection is frozen. Use
-``--split validation`` for evaluator engineering smoke tests before that freeze.
+uses separate once-reset raw environments for each rollout and replay, and requires
+exact action replay for every episode. Formal output recursively seals its attempt
+tapes, Qv3 summaries and gates, replay receipts, and source hashes. For T5-Replan the
+tape also records the canonical issued/applied action history and the causal latency
+from impact end to the first qualifying applied correction. Keep test manifests
+unread until validation-based policy and hyperparameter selection is frozen.
 
-Evaluate the privileged planner on the same paired validation manifests before the
-freeze, without loading a learned policy:
+Evaluate the privileged planner on the same paired manifest and threshold identity,
+without loading a learned policy:
 
 .. code-block:: bash
 
    python examples/embodiment/evaluate_dynamic_benchmark_planner.py \
       --evaluator-commit "$EVALUATOR_COMMIT" \
       --benchmark-commit "$BENCHMARK_COMMIT" \
-      --task t1_xyz \
+      --task t2_trans \
       --split validation \
       --manifest-seed 20261150 \
-      --episodes 8 \
-      --output outputs/dynamic_benchmark/t1_xyz_planner/validation_seed1
+      --episodes 20 \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --output outputs/dynamic_benchmark/t2_trans_planner/validation_formal
 
 The planner evaluator stores the same reset identity, executed actions, exact replay
 evidence, task metrics, and decision-latency gate. For every manifest row, both the
 planner rollout and action-tape replay use separately constructed raw environments
 that are reset exactly once. The replay reset also restores task-hidden runtime state
 such as the T5 event tape before exact observation, outcome, and final-state checks.
+The threshold-bearing command above emits planner schema v0.2; planner v0.1 is
+confined to the exact-14 calibration launcher.
 Test-ID/OOD remain available only for the single post-freeze comparison.
 
 Export best-known trajectories
 ------------------------------
 
-After validation freezes the candidate pool, put exactly one planner at candidate
-index zero and the hash-pinned policies after it in a
-``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` JSON manifest. Each policy row
-records its path, SHA-256, stochastic flag, exploration seed offset, and optional
-residual-scale override. Exporters use a frozen 8→16→32 escalation budget and select
-the first stable winner under success, safety, completion, return, control steps, and
-action effort:
+First generate the paired Owner-review subset from an
+``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` review candidate manifest whose
+``review_contract`` has ``full_generation=false``, whose planner is candidate zero,
+and whose learned candidates carry passing v0.2 promotion receipts:
+
+``build_dynamic_benchmark_rld2_promotion.py`` must receive the same calibration
+sidecar for every v0.2 promotion through
+``--quality-v2-calibration-wave-receipt`` and
+``--expected-quality-v2-calibration-wave-receipt-sha256`` in addition to its frozen
+threshold path/SHA and other required inputs. It reopens the sidecar and seals its
+file/payload identity plus dataset-relative binding into both selection evidence and
+the promotion receipt. The review exporter requires and revalidates the same pair.
 
 .. code-block:: bash
 
-   CANDIDATES=outputs/dynamic_benchmark/t2_candidates.json
+   CALIBRATION_RECEIPT="$RUNS_ROOT/RLD2-QA/planner-calibration-metric-v03-s20261350/wave_receipt.json"
+   CALIBRATION_RECEIPT_SHA=$(sha256sum "$CALIBRATION_RECEIPT" | cut -d' ' -f1)
+   REVIEW_CANDIDATES=outputs/dynamic_benchmark/t2_trans_review_candidates.json
+   REVIEW_CANDIDATES_SHA=$(sha256sum "$REVIEW_CANDIDATES" | cut -d' ' -f1)
+   python examples/embodiment/export_dynamic_benchmark_rld2_review.py \
+      --candidate-manifest "$REVIEW_CANDIDATES" \
+      --expected-candidate-manifest-sha256 "$REVIEW_CANDIDATES_SHA" \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --quality-v2-calibration-wave-receipt "$CALIBRATION_RECEIPT" \
+      --expected-quality-v2-calibration-wave-receipt-sha256 "$CALIBRATION_RECEIPT_SHA" \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --evaluator-benchmark-commit "$BENCHMARK_COMMIT" \
+      --partition review --manifest-seed 20261250 --review-resets 20 \
+      --output outputs/dynamic_benchmark/t2_trans_review
+
+The review exporter writes schema
+``rlinf-dynamic-benchmark-rld2-paired-review-v0.2``, evaluates the full candidate
+pool deterministically, and selects six paired categories per task. Its receipts
+always record ``full_generation=false``; review selection is not trajectory
+eligibility.
+
+.. warning::
+
+   Do not start accepted-100 production generation or the full release build before
+   the Owner explicitly approves the paired review for each task. There is no review
+   CLI flag that grants or substitutes for that approval.
+
+After Owner approval, production input is an exact-14
+``rlinf-dynamic-benchmark-rld2-candidate-release-v0.2``. Each task manifest is
+``rlinf-dynamic-benchmark-optimal-candidates-v0.2`` at the canonical
+``<release-root>/<task>/candidate_manifest.json`` path; candidate zero is the planner,
+and every candidate has hash-pinned provenance. Production selection must use the
+full pool and ``planner-pareto``:
+
+.. code-block:: bash
+
+   CANDIDATE_RELEASE_ROOT=outputs/dynamic_benchmark/rld2_candidates
+   CANDIDATES="$CANDIDATE_RELEASE_ROOT/t2_trans/candidate_manifest.json"
+   CANDIDATE_RELEASE="$CANDIDATE_RELEASE_ROOT/release_manifest.json"
    CANDIDATES_SHA=$(sha256sum "$CANDIDATES" | cut -d' ' -f1)
+   CANDIDATE_RELEASE_SHA=$(sha256sum "$CANDIDATE_RELEASE" | cut -d' ' -f1)
    python examples/embodiment/export_dynamic_benchmark_optimal_trajectories.py \
       --candidate-manifest "$CANDIDATES" \
       --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --candidate-release-manifest "$CANDIDATE_RELEASE" \
+      --expected-candidate-release-manifest-sha256 "$CANDIDATE_RELEASE_SHA" \
       --evaluator-commit "$EVALUATOR_COMMIT" \
-      --rlinf-commit "$RLINF_COMMIT" \
-      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --evaluator-benchmark-commit "$BENCHMARK_COMMIT" \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --quality-v2-calibration-wave-receipt "$CALIBRATION_RECEIPT" \
+      --expected-quality-v2-calibration-wave-receipt-sha256 "$CALIBRATION_RECEIPT_SHA" \
       --split train --manifest-seed 20261050 \
       --accepted-episodes 100 --max-resets 200 \
-      --output outputs/dynamic_benchmark/t2_optimal_v1
+      --candidate-search-mode full-pool \
+      --selection-mode planner-pareto \
+      --output outputs/dynamic_benchmark/t2_trans_optimal_v2
+
+The frozen threshold contract derives the per-task 10- or 11-dimension Qv3 comparison
+instead of hard-coding one global phase inventory. A learned attempt may replace the
+same-reset planner only when it passes success, safety, exact replay, the Qv3 absolute
+gate, and the T5 causal gate when applicable; is non-worse on every frozen task/Qv3/
+duration/control/effort/causal dimension; and is strictly better on at least one of
+them. The planner wins an exact tie, and return is diagnostic only.
+
+The exporter requires both the frozen threshold path/SHA and the authoritative
+calibration receipt source path/SHA. It reopens the canonical exact-14 × exact-20
+receipt, cross-checks its task and reset identities with the v0.3 threshold binding,
+and copies it to the safe dataset-relative ``provenance/.../wave_receipt.json`` path
+recorded by that contract.
 
 An interrupted export can repeat the same command with ``--resume``. It verifies the
 immutable source and candidate identities, preserves any uncommitted tail in a
@@ -307,6 +428,14 @@ sibling recovery directory, truncates JSONL files to the last atomically committ
 reset boundary, and reruns that reset. Every attempt keeps a lightweight
 state/action/reward tape and exact replay evidence; each winner additionally keeps
 RGB-D/HDF5 evidence.
+
+For an exact uninterrupted-versus-resumed artifact comparison, pass
+``--execution-receipt-json`` with a path outside the dataset root on every run. The
+external receipt retains execution-only resume/recovery provenance, while the sealed
+dataset keeps only scientific events such as ``render_parity_skip``. The opt-in
+``--phase-profile-json`` argument similarly writes exporter and environment timing to
+an external sidecar and never changes the dataset payload; both sidecars refuse an
+existing destination.
 
 If the independently selected lightweight winner fails canonical render replay, the
 reset is rejected instead of being published. New exports bind a structured
@@ -317,24 +446,36 @@ auditor accepts a skipped reset only when it independently selects the same atte
 finds no published winner, and validates the matching recovery evidence; skipped
 resets never count toward the accepted quota.
 
-Run the independent auditor before consuming the dataset. Pass the final
-``dataset_card.json`` and ``checksums.sha256`` hashes printed by the exporter:
+The merger's default remains accepted-prefix semantics. A campaign whose scientific
+contract fixes the full reset workload must add ``--require-max-resets``. That mode
+keeps every reset through ``export_state.max_resets`` and fails closed unless the
+complete workload contains exactly ``--accepted-episodes`` winners.
+
+Run the independent auditor before consuming the dataset. Hash the final
+``dataset_card.json`` and root ``SHA256SUMS`` files and pass the frozen Qv3 threshold
+identity as well:
 
 .. code-block:: bash
 
+   DATASET_ROOT=outputs/dynamic_benchmark/t2_trans_optimal_v2
+   DATASET_CARD_SHA=$(sha256sum "$DATASET_ROOT/dataset_card.json" | cut -d' ' -f1)
+   CHECKSUMS_SHA=$(sha256sum "$DATASET_ROOT/SHA256SUMS" | cut -d' ' -f1)
    python examples/embodiment/audit_dynamic_benchmark_optimal_trajectories.py \
-      --dataset-root outputs/dynamic_benchmark/t2_optimal_v1 \
+      --dataset-root "$DATASET_ROOT" \
       --expected-dataset-card-sha256 "$DATASET_CARD_SHA" \
       --expected-checksums-sha256 "$CHECKSUMS_SHA" \
       --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
       --auditor-commit "$EVALUATOR_COMMIT" \
-      --output outputs/dynamic_benchmark/t2_optimal_v1.audit.json
+      --output outputs/dynamic_benchmark/t2_trans_optimal_v2.audit.json
 
 The auditor independently recomputes checksums, tape shapes and hashes, scores,
-escalation, winner selection, exact benchmark replay, and HDF5/lightweight action
-parity. Only a passing audit writes ``training_eligible=true``. Here ``optimal`` means
-best-known within the immutable candidate/reset/budget contract, not a proof of
-global continuous-control optimality.
+full-pool Pareto selection, T5 issued/applied causal evidence, exact benchmark replay,
+and HDF5/lightweight action parity. It also reopens the dataset-local calibration
+receipt and verifies its canonical bytes, dataset-relative path, and threshold SHA
+binding. Only a passing audit writes ``training_eligible=true``. Here ``optimal``
+means best-known within the immutable candidate/reset/budget contract, not a proof
+of global continuous-control optimality.
 
 Visualization and Results
 -------------------------

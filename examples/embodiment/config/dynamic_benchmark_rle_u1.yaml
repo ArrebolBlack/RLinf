@@ -1,4 +1,5 @@
-# RLE-U1 utilization-bakeoff reference recipe.
+# Historical RLE-U1 serial utilization-bakeoff reference recipe.
+# Its explicit process=0/spawn values intentionally override the current exact CPU defaults.
 # Keep source commits, demo cache, output, and optional resume explicit on the CLI.
 # Candidate configs may change only the documented utilization fields.
 task: t4_sphere

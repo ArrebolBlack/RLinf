@@ -1,8 +1,8 @@
 # RLOPT shared-infra speed template: 100K env steps with process8 workers.
 # Reuses the RLE-U1 frozen instrumentation line (5e4ed6e9/267e1140) without
 # changing the learner semantics: identical env/reward/state contracts, only
-# the execution topology and budget differ.  Defaults here are the RLE-U1
-# recommended recipe (n8/e8/u4/b1024/pageable_cpu/process8).
+# the execution topology and budget differ. This explicit W8 profile overrides
+# the adaptive W32 CLI default while retaining the exact process lifecycle.
 #
 # Keep --rlinf-commit, --benchmark-commit, --output, and optional --resume on
 # the CLI.  Set task/seed/manifest seeds per arm.  This is a speed arm; every
@@ -21,8 +21,8 @@ eval_worker_processes: 8
 eval_planner_in_processes: true
 persistent_eval_workers: true
 borrow_training_env_for_eval: false
-sampler_learner_overlap: true
-process_start_method: spawn
+sampler_learner_overlap: false
+process_start_method: forkserver
 total_env_steps: 100000
 random_env_steps: 5000
 demo_episodes: 64

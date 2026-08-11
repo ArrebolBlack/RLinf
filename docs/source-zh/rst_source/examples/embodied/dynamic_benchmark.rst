@@ -143,13 +143,21 @@ return 可比较。
 有状态的 planner 实例。``--residual-scale`` 默认 ``0.25``，每个 scale 与 actor-BC
 权重组合都必须登记为独立实验臂。
 
-环境 step 也可使用持久化子进程分片，而非串行或线程 adapter。设置
-``--eval-worker-processes 2``（也可用 ``4``/``8``）可加速冻结 manifest 的 validation，
-``--env-worker-processes`` 则用于分片训练 reset/step。manifest row 仍由主进程分配，
-返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖 worker 完成顺序。每个子进程
-内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``；
-``--process-start-method spawn`` 是跨平台且 CUDA-safe 的默认值。进程数属于执行 provenance，
-checkpoint 恢复时必须使用相同配置。
+精确 CPU process recipe 现在默认开启。没有 YAML 覆盖时，训练和 validation 均使用 32 个
+环境；省略 ``--env-worker-processes`` 或 ``--eval-worker-processes`` 时，进程数自动等于
+对应 vector width。Linux 默认使用 ``forkserver``，其他平台保留可移植的 ``spawn``。
+只要 evaluation process 已开启，默认复用 checkpoint-rewind evaluation worker；
+residual-RLPD 还默认在环境所属子进程内计算 privileged planner。需要显式串行兼容模式时，
+使用自动生成的 ``--no-persistent-eval-workers``、``--no-eval-planner-in-processes``，或将
+两类 process 数都设为 ``0``。sampler/learner overlap 仍默认关闭，因为它会改变 replay 顺序。
+
+manifest row 仍由主进程分配，返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖
+worker 完成顺序。每个子进程内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``。
+worker 继承启动器的 CPU affinity；已测量的 W32 recipe 要求显式限定在同一 NUMA 节点的
+32 个逻辑 CPU（例如使用 ``taskset``），process tree 峰值 RSS 约 47 GiB。trainer 无法安全
+推断哪一个 NUMA 节点与所用 GPU 相邻。process topology 属于执行 provenance，checkpoint
+恢复时必须使用相同配置。使用当前 RLinf 与 SE3-WAM 源码时，task-only manifest、mutable
+``MjModel`` 精确 reset 恢复、v0.3 checkpoint 和有界 process cleanup 无需额外开关。
 
 吞吐 bakeoff 前，应在真实 benchmark checkout 上运行进程正确性 gate。它会比较
 serial/process 的 reset 与 step digest，验证 process 模式 checkpoint/resume 的精确
@@ -214,13 +222,46 @@ manifest、环境数和示教合同，并恢复 replay sampling state、normaliz
    vision policy 的结果。``--rlinf-commit`` 与 ``--benchmark-commit`` 必须使用完整
    40 位哈希；源码 identity 漂移时 resume 会拒绝运行。
 
-冻结 validation 选择后，可用独立标识的 evaluator commit 在确定性的 test-ID 或
-test-OOD manifest 上评测 best checkpoint：
+RLD2-QA 校准与正式评测
+~~~~~~~~~~~~~~~~~~~~~~
+
+是否传入冻结阈值参数决定正式评测 schema。同时提供 ``--quality-v2-thresholds`` 与
+``--expected-quality-v2-thresholds-sha256`` 时，expert 输出
+``rlinf-dynamic-benchmark-expert-evaluation-v0.3``，planner 输出
+``rlinf-dynamic-benchmark-planner-evaluation-v0.2``；每条 record 都绑定 canonical
+``rlinf-dynamic-benchmark-optimal-attempt-v0.3`` tape。仅供 planner 使用的
+``metric_calibration`` 波次会刻意省略这两个参数并保持
+``rlinf-dynamic-benchmark-planner-evaluation-v0.1``；它是独立科学分区，不是生产
+policy 对比。
+
+冻结 Qv3 阈值前，从干净 evaluator checkout 运行 exact-14 × exact-20 planner 波次。
+scheduler 必须先完成资源冲突检查，再向 launcher 交付 1 至 8 个 GPU index：
+
+.. code-block:: bash
+
+   RUNTIME_ROOT=/path/to/runtime
+   RUNS_ROOT=/path/to/runs
+   export RLD2_QA_BENCHMARK_SOURCE_ROOT="$RUNTIME_ROOT/SE3-WAM"
+   bash examples/embodiment/rld2_qa_planner_calibration.sh \
+      rld2qa-cal 0,1,2,3 "$PWD" "$RUNTIME_ROOT" \
+      "$RUNS_ROOT" /path/to/tmp
+
+launcher 会在任何 rollout 前预声明全部 280 个 reset identity，按 canonical 14-task
+顺序为每个任务评测 20 行，并在三个不同的 fresh environment 中验证所选的安全成功
+planner 轨迹。使用默认 wave ID 时，canonical receipt 写到
+``$RUNS_ROOT/RLD2-QA/planner-calibration-metric-v03-s20261350/wave_receipt.json``。
+冻结的 ``se3-wam-trajectory-quality-v2-thresholds-v0.3`` 合同必须绑定这份 exact
+receipt，并与 validation、review、test-ID 和 test-OOD manifest 保持不相交。
+
+阈值合同冻结后，用独立标识的 evaluator commit 在配对的 20-row validation manifest
+上评测 checkpoint：
 
 .. code-block:: bash
 
    POLICY=outputs/dynamic_benchmark/t2_rlpd_seed1/best_policy.pt
    POLICY_SHA=$(sha256sum "$POLICY" | cut -d' ' -f1)
+   QUALITY_V2_THRESHOLDS=/path/to/quality_v2_thresholds.json
+   QUALITY_V2_SHA=$(sha256sum "$QUALITY_V2_THRESHOLDS" | cut -d' ' -f1)
    EVALUATOR_COMMIT=$(git rev-parse HEAD)
    python examples/embodiment/evaluate_dynamic_benchmark_expert.py \
       --policy "$POLICY" \
@@ -228,19 +269,22 @@ test-OOD manifest 上评测 best checkpoint：
       --evaluator-commit "$EVALUATOR_COMMIT" \
       --rlinf-commit "$RLINF_COMMIT" \
       --benchmark-commit "$BENCHMARK_COMMIT" \
-      --split test_id \
-      --manifest-seed 20261250 \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --split validation \
+      --manifest-seed 20261150 \
       --episodes 20 \
-      --output outputs/dynamic_benchmark/t2_rlpd_seed1/test_id
+      --output outputs/dynamic_benchmark/t2_rlpd_seed1/validation_formal
 
 evaluator 会重建 BC/SAC/RLPD、residual-RLPD 与 PPO 策略，核验 checkpoint/源码
 identity，保存 reset manifest 和实际动作；每个 rollout 和 replay 都使用独立新建且只
-reset 一次的 raw environment，并要求每个 episode 的 action replay 精确通过；
-结果包含确定性的成功率、安全失败、完成度、动作能耗与决策延迟。必须先冻结基于 validation
-的策略和超参数选择，之后才能读取 test manifest；冻结前的 evaluator 工程 smoke 使用
-``--split validation``。
+reset 一次的 raw environment，并要求每个 episode 的 action replay 精确通过。正式输出会
+递归封存 attempt tape、Qv3 summary/gate、replay receipt 与源码哈希。T5-Replan tape 还会
+保存 canonical issued/applied action history，以及从 impact 结束到首次合格 applied
+correction 的 causal latency。必须先冻结基于 validation 的策略和超参数选择，之后才能读取
+test manifest。
 
-冻结前用相同 paired validation manifest 独立评测 privileged planner，不加载 learned
+在相同配对 manifest 与阈值 identity 上独立评测 privileged planner，不加载 learned
 policy：
 
 .. code-block:: bash
@@ -248,45 +292,113 @@ policy：
    python examples/embodiment/evaluate_dynamic_benchmark_planner.py \
       --evaluator-commit "$EVALUATOR_COMMIT" \
       --benchmark-commit "$BENCHMARK_COMMIT" \
-      --task t1_xyz \
+      --task t2_trans \
       --split validation \
       --manifest-seed 20261150 \
-      --episodes 8 \
-      --output outputs/dynamic_benchmark/t1_xyz_planner/validation_seed1
+      --episodes 20 \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --output outputs/dynamic_benchmark/t2_trans_planner/validation_formal
 
 planner evaluator 同样保存 reset identity、实际动作、exact replay 证据、任务指标和决策
 延迟门。对每个 manifest row，planner rollout 与 action-tape replay 都各自在独立新建且
 只 reset 一次的 raw environment 上运行；重放 reset 还会先恢复任务隐藏运行态（例如
-T5 event tape），再执行 observation、outcome 与 final state 的 exact 检查。test-ID/OOD
-只用于冻结后的单次比较。
+T5 event tape），再执行 observation、outcome 与 final state 的 exact 检查。上面的带阈值
+命令输出 planner v0.2；planner v0.1 仅限 exact-14 calibration launcher 使用。
+test-ID/OOD 只用于冻结后的单次比较。
 
 导出 best-known 轨迹
 -------------------
 
-基于 validation 冻结候选池后，使用
-``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` JSON manifest：candidate index 0
-必须是唯一 planner，其后是 hash-pinned policies。每个 policy 条目记录路径、SHA-256、
-stochastic 标志、exploration seed offset 与可选 residual-scale override。exporter 使用冻结的
-8→16→32 候选升级预算，并按 success、安全、完成度、return、控制步数、动作能耗的稳定
-词典序选择 winner：
+首先从 ``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` review candidate manifest
+生成配对 Owner-review 子集；其 ``review_contract`` 必须为
+``full_generation=false``，planner 必须是 candidate 0，learned candidate 必须携带通过的
+v0.2 promotion receipt：
+
+``build_dynamic_benchmark_rld2_promotion.py`` 为每个 v0.2 promotion 构建 receipt 时，
+除冻结 threshold path/SHA 与其他必需输入外，还必须通过
+``--quality-v2-calibration-wave-receipt`` 和
+``--expected-quality-v2-calibration-wave-receipt-sha256`` 接收同一 calibration sidecar。
+它会重新打开 sidecar，并把 file/payload identity 与 dataset-relative binding 同时封入
+selection evidence 和 promotion receipt。review exporter 要求并重新验证同一参数对。
 
 .. code-block:: bash
 
-   CANDIDATES=outputs/dynamic_benchmark/t2_candidates.json
+   CALIBRATION_RECEIPT="$RUNS_ROOT/RLD2-QA/planner-calibration-metric-v03-s20261350/wave_receipt.json"
+   CALIBRATION_RECEIPT_SHA=$(sha256sum "$CALIBRATION_RECEIPT" | cut -d' ' -f1)
+   REVIEW_CANDIDATES=outputs/dynamic_benchmark/t2_trans_review_candidates.json
+   REVIEW_CANDIDATES_SHA=$(sha256sum "$REVIEW_CANDIDATES" | cut -d' ' -f1)
+   python examples/embodiment/export_dynamic_benchmark_rld2_review.py \
+      --candidate-manifest "$REVIEW_CANDIDATES" \
+      --expected-candidate-manifest-sha256 "$REVIEW_CANDIDATES_SHA" \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --quality-v2-calibration-wave-receipt "$CALIBRATION_RECEIPT" \
+      --expected-quality-v2-calibration-wave-receipt-sha256 "$CALIBRATION_RECEIPT_SHA" \
+      --evaluator-commit "$EVALUATOR_COMMIT" \
+      --evaluator-benchmark-commit "$BENCHMARK_COMMIT" \
+      --partition review --manifest-seed 20261250 --review-resets 20 \
+      --output outputs/dynamic_benchmark/t2_trans_review
+
+review exporter 输出 ``rlinf-dynamic-benchmark-rld2-paired-review-v0.2`` schema，以
+deterministic 方式评估完整 candidate pool，并为每个任务输出六类配对样本。其 receipt 始终
+记录 ``full_generation=false``；入选 review 不等于轨迹可用。
+
+.. warning::
+
+   Owner 对每个任务的配对 review 给出明确批准前，禁止启动 accepted-100 生产生成或 full
+   release build。不存在可授予或替代该批准的 review CLI 参数。
+
+Owner 批准后，生产输入是 exact-14
+``rlinf-dynamic-benchmark-rld2-candidate-release-v0.2``。每个任务的 manifest schema 为
+``rlinf-dynamic-benchmark-optimal-candidates-v0.2``，并位于 canonical
+``<release-root>/<task>/candidate_manifest.json``；candidate 0 是 planner，所有 candidate
+都带 hash-pinned provenance。生产选择必须使用完整 pool 与 ``planner-pareto``：
+
+.. code-block:: bash
+
+   CANDIDATE_RELEASE_ROOT=outputs/dynamic_benchmark/rld2_candidates
+   CANDIDATES="$CANDIDATE_RELEASE_ROOT/t2_trans/candidate_manifest.json"
+   CANDIDATE_RELEASE="$CANDIDATE_RELEASE_ROOT/release_manifest.json"
    CANDIDATES_SHA=$(sha256sum "$CANDIDATES" | cut -d' ' -f1)
+   CANDIDATE_RELEASE_SHA=$(sha256sum "$CANDIDATE_RELEASE" | cut -d' ' -f1)
    python examples/embodiment/export_dynamic_benchmark_optimal_trajectories.py \
       --candidate-manifest "$CANDIDATES" \
       --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --candidate-release-manifest "$CANDIDATE_RELEASE" \
+      --expected-candidate-release-manifest-sha256 "$CANDIDATE_RELEASE_SHA" \
       --evaluator-commit "$EVALUATOR_COMMIT" \
-      --rlinf-commit "$RLINF_COMMIT" \
-      --benchmark-commit "$BENCHMARK_COMMIT" \
+      --evaluator-benchmark-commit "$BENCHMARK_COMMIT" \
+      --quality-v2-thresholds "$QUALITY_V2_THRESHOLDS" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
+      --quality-v2-calibration-wave-receipt "$CALIBRATION_RECEIPT" \
+      --expected-quality-v2-calibration-wave-receipt-sha256 "$CALIBRATION_RECEIPT_SHA" \
       --split train --manifest-seed 20261050 \
       --accepted-episodes 100 --max-resets 200 \
-      --output outputs/dynamic_benchmark/t2_optimal_v1
+      --candidate-search-mode full-pool \
+      --selection-mode planner-pareto \
+      --output outputs/dynamic_benchmark/t2_trans_optimal_v2
+
+冻结阈值合同会按任务动态派生 10 或 11 个 Qv3 配对维度，而不是硬编码一套全局 phase inventory。
+learned attempt 只有满足以下全部条件，才可替换同 reset planner：通过 success、安全、exact
+replay、Qv3 absolute gate，以及适用时的 T5 causal gate；在所有冻结 task/Qv3/时长/
+控制/能耗/causal 维度上 non-worse；并至少在一个维度上达到 strict improvement。exact tie
+由 planner 获胜，return 仅用于诊断。
+
+exporter 同时要求冻结 threshold path/SHA 与权威 calibration receipt source path/SHA。它会
+重新打开 canonical exact-14 × exact-20 receipt，与 v0.3 阈值绑定逐项核对 task/reset
+identity，再按合同记录的安全 dataset-relative ``provenance/.../wave_receipt.json`` 路径将其
+复制进数据集。
 
 中断后可用相同命令追加 ``--resume``。恢复前会严格核验源码/候选 identity，把未提交尾部保存在
 同级 recovery 目录，将 JSONL 截断到最后一次原子提交的 reset 边界，并重跑该 reset。每次
 attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据；winner 额外保存 RGB-D/HDF5。
+
+若要逐项比较 uninterrupted 与 resumed 最终 artifact，每次运行都应把
+``--execution-receipt-json`` 指向 dataset root 之外的路径。执行专属的 resume/recovery provenance
+只进入该 sidecar，sealed dataset 仅保留 ``render_parity_skip`` 等科学事件。
+``--phase-profile-json`` 同样是 opt-in 外部 sidecar，只记录 exporter 与 environment 分段时间，
+不改变 dataset payload；两个 sidecar 都拒绝覆盖已有目标。
 
 如果独立选出的轻量 winner 未通过 canonical render replay，该 reset 会被拒绝而不是发布。新导出
 会把结构化 ``render_parity_skip`` 证据绑定到被选 attempt，并在 sealed recovery log 中保留
@@ -294,22 +406,32 @@ attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据；winne
 仍被保留。auditor 只有在独立选出同一 attempt、确认没有发布 winner、并校验匹配的 recovery
 证据后才接受 skip；skip reset 永远不计入 accepted 配额。
 
-消费数据集前必须运行独立 auditor，并传入 exporter 最终打印的 ``dataset_card.json`` 与
-``checksums.sha256`` 哈希：
+merger 默认仍采用 accepted-prefix 语义。若 campaign 的科学合同固定完整 reset 工作量，必须增加
+``--require-max-resets``；该模式保留到 ``export_state.max_resets`` 的全部 reset，并在完整工作量
+的 winner 数不恰好等于 ``--accepted-episodes`` 时 fail closed。
+
+消费数据集前必须运行独立 auditor。计算最终 ``dataset_card.json`` 与根目录
+``SHA256SUMS`` 的哈希，并同时传入冻结的 Qv3 threshold identity：
 
 .. code-block:: bash
 
+   DATASET_ROOT=outputs/dynamic_benchmark/t2_trans_optimal_v2
+   DATASET_CARD_SHA=$(sha256sum "$DATASET_ROOT/dataset_card.json" | cut -d' ' -f1)
+   CHECKSUMS_SHA=$(sha256sum "$DATASET_ROOT/SHA256SUMS" | cut -d' ' -f1)
    python examples/embodiment/audit_dynamic_benchmark_optimal_trajectories.py \
-      --dataset-root outputs/dynamic_benchmark/t2_optimal_v1 \
+      --dataset-root "$DATASET_ROOT" \
       --expected-dataset-card-sha256 "$DATASET_CARD_SHA" \
       --expected-checksums-sha256 "$CHECKSUMS_SHA" \
       --expected-candidate-manifest-sha256 "$CANDIDATES_SHA" \
+      --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
       --auditor-commit "$EVALUATOR_COMMIT" \
-      --output outputs/dynamic_benchmark/t2_optimal_v1.audit.json
+      --output outputs/dynamic_benchmark/t2_trans_optimal_v2.audit.json
 
-auditor 会独立复算根目录 checksum、tape shape/hash、score、升级预算、winner 选择、benchmark
-exact replay 与 HDF5/轻量 action parity。只有全部通过才写入 ``training_eligible=true``。
-这里的 ``optimal`` 指冻结 candidate/reset/budget 合同内的 best-known，不代表连续控制全局最优证明。
+auditor 会独立复算根目录 checksum、tape shape/hash、score、full-pool Pareto 选择、T5
+issued/applied causal 证据、benchmark exact replay 与 HDF5/轻量 action parity；还会重新打开
+dataset-local calibration receipt，核对 canonical bytes、dataset-relative 路径与 threshold
+SHA 绑定。只有全部通过才写入 ``training_eligible=true``。这里的 ``optimal`` 指冻结
+candidate/reset/budget 合同内的 best-known，不代表连续控制全局最优证明。
 
 可视化与结果
 ------------

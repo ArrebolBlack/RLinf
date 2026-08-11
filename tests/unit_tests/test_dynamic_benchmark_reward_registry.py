@@ -25,6 +25,7 @@ from rlinf.envs.dynamic_benchmark.reward_registry import (
 def _inputs(**overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
         "action_l2": 1.0,
+        "action_delta_l2": 0.4,
         "completion": 0.95,
         "stage_progress": 0.6,
         "geodesic_error_rad": 0.25,
@@ -53,6 +54,7 @@ def test_each_component_is_recomputable_below_1e_7() -> None:
         "r_ori_geodesic": {"weight": 2.0, "scale_rad": 1.0},
         "r_rel_pose": {"weight": 3.0, "scale_pos_m": 0.1, "scale_rot_rad": 1.0},
         "r_effort": {"weight": 0.005},
+        "r_action_rate": {"weight": 0.25, "scale": 1.0},
         "r_completion_shaping": {"weight": 1.0, "near_threshold": 0.9},
         "r_vel_align": {"weight": 0.5, "speed_scale_m_s": 1.0},
         "r_timing": {
@@ -147,3 +149,20 @@ def test_identity_changes_with_weights_and_parameters() -> None:
     )
     assert base.identity_sha256() != heavier.identity_sha256()
     assert base.identity_sha256() != timed.identity_sha256()
+
+
+def test_action_rate_uses_only_the_previous_action_and_is_recomputable() -> None:
+    registry = RewardRegistry.from_config(
+        {"r_action_rate": {"weight": 2.0, "scale": 0.5}}
+    )
+    total, values, recorded = registry.step(_inputs(action_delta_l2=0.25))
+
+    assert values["r_action_rate"] == pytest.approx(-1.0)
+    recomputed_total, recomputed_values = RewardRegistry.recompute(
+        registry.components, recorded
+    )
+    assert recomputed_total == pytest.approx(total)
+    assert recomputed_values["r_action_rate"] == pytest.approx(-1.0)
+    missing_total, missing_values, _ = registry.step(_inputs(action_delta_l2=None))
+    assert missing_values["r_action_rate"] == 0.0
+    assert missing_total == 0.0

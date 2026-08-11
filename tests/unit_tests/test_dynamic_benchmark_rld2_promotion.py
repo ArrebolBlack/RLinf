@@ -1,0 +1,2088 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import hashlib
+import json
+from copy import deepcopy
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import pytest
+import test_dynamic_benchmark_checkpoint_selection_outcome as outcome_fixtures
+import torch
+
+from examples.embodiment import (
+    audit_dynamic_benchmark_optimal_trajectories as optimal_auditor,
+)
+from examples.embodiment import build_dynamic_benchmark_rld2_promotion as promotion
+from examples.embodiment import export_dynamic_benchmark_optimal_trajectories as optimal
+from examples.embodiment import export_dynamic_benchmark_rld2_review as review_exporter
+from examples.embodiment import train_dynamic_benchmark_expert as expert_trainer
+from examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome import (
+    write_checkpoint_selection_outcome,
+)
+from examples.embodiment.dynamic_benchmark_checkpoint_admission import (
+    CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+    checkpoint_selection_outcome_versioned_path,
+    validate_selected_learned_policy,
+)
+from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+    recursive_output_checksums,
+)
+
+TASK = "t1_xyz"
+RLINF_COMMIT = "1" * 40
+BENCHMARK_COMMIT = "2" * 40
+EVALUATOR_COMMIT = "3" * 40
+IMAGE_SHA256 = "4" * 64
+FORMAL_POLICY_VALIDATION_MANIFEST_SEED = 20261150
+CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED = 20261450
+
+
+@pytest.fixture
+def tmp_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep two-full-commit outcome paths below Windows MAX_PATH in tests."""
+
+    return tmp_path_factory.mktemp("p")
+
+
+def _write_json(path: Path, value: dict) -> None:
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _seal(value: dict) -> dict:
+    value["payload_sha256"] = promotion._payload_sha256(value)
+    return value
+
+
+def _write_checkpoint_selection_outcome(
+    root: Path,
+    *,
+    config: dict,
+    run_identity: dict,
+    summary: dict,
+    manifest: dict,
+) -> Path:
+    infra_identity_sha256 = expert_trainer._canonical_json_sha256(
+        summary["infra_identity"]
+    )
+
+    def outcome_policy(identity: dict) -> dict:
+        return {
+            **identity,
+            "schema_version": promotion.POLICY_SCHEMA,
+            "infra_identity_sha256": infra_identity_sha256,
+        }
+
+    def source_identity(module: str, filename: str) -> dict:
+        source_path = (
+            Path(__file__).resolve().parents[2] / "examples" / "embodiment" / filename
+        )
+        return {
+            "module": module,
+            "repository_path": f"examples/embodiment/{filename}",
+            "sha256": promotion._sha256(source_path),
+        }
+
+    metric_names = (
+        "success_rate",
+        "safety_failure_rate",
+        "mean_completion",
+        "mean_return",
+        "mean_duration_steps",
+        "mean_action_l2_sum",
+    )
+    enriched_rows = []
+    for row in manifest["evaluated_snapshots"]:
+        selector_metrics = {
+            name: row["validation_metrics"][name] for name in metric_names
+        }
+        enriched_rows.append(
+            {
+                **row,
+                "policy": outcome_policy(row["policy"]),
+                "selector_metrics": selector_metrics,
+                "selector_metrics_sha256": promotion._value_sha256(selector_metrics),
+                "validation_evidence": {
+                    "metrics_path": "metrics.jsonl",
+                    "line_number": 2,
+                    "event_payload_sha256": "5" * 64,
+                    "validation_metrics_sha256": row["validation_metrics_sha256"],
+                    "role": "final",
+                    "checkpoint_selection_manifest_payload_sha256": None,
+                    "checkpoint_snapshot_identity": manifest["selection"][
+                        "selected_snapshot_identity"
+                    ],
+                },
+            }
+        )
+    baseline = manifest["matched_planner_baseline"]
+    baseline_metrics = baseline["validation_metrics"]
+    selection = manifest["selection"]
+    outcome = {
+        "schema_version": CHECKPOINT_SELECTION_OUTCOME_SCHEMA,
+        "source_identity": {
+            "task": config["task"],
+            "algorithm": config["algorithm"],
+            "training_seed": config["seed"],
+            "validation_manifest_seed": config["validation_manifest_seed"],
+            "eval_episodes": config["eval_episodes"],
+            "eval_num_envs": config["eval_num_envs"],
+            "policy_rlinf_commit": config["rlinf_commit"],
+            "verifier_rlinf_commit": EVALUATOR_COMMIT,
+            "evaluator_rlinf_commit": EVALUATOR_COMMIT,
+            "benchmark_commit": config["benchmark_commit"],
+            "infra_identity_sha256": infra_identity_sha256,
+            "trainer_source": source_identity(
+                "examples.embodiment.train_dynamic_benchmark_expert",
+                "train_dynamic_benchmark_expert.py",
+            ),
+            "verifier_source": source_identity(
+                "examples.embodiment.dynamic_benchmark_checkpoint_admission",
+                "dynamic_benchmark_checkpoint_admission.py",
+            ),
+            "builder_source": source_identity(
+                "examples.embodiment.build_dynamic_benchmark_checkpoint_selection_outcome",
+                "build_dynamic_benchmark_checkpoint_selection_outcome.py",
+            ),
+            "evaluator_source": source_identity(
+                "examples.embodiment.evaluate_dynamic_benchmark_expert",
+                "evaluate_dynamic_benchmark_expert.py",
+            ),
+        },
+        "run_identity": run_identity,
+        "trainer_artifacts": {
+            "summary": {
+                "path": "summary.json",
+                "sha256": promotion._sha256(root / "summary.json"),
+                "schema_version": summary["schema_version"],
+                "payload_sha256": summary["payload_sha256"],
+                "status": "complete",
+                "env_steps": summary["env_steps"],
+                "update_steps": summary["update_steps"],
+                "best_validation_metrics_sha256": promotion._value_sha256(
+                    summary["best_validation"]
+                ),
+                "best_selection_score": summary["best_score"],
+                "final_validation_metrics_sha256": promotion._value_sha256(
+                    summary["final_validation"]
+                ),
+            },
+            "checkpoint_selection": {
+                "path": "checkpoint_selection.json",
+                "sha256": promotion._sha256(root / "checkpoint_selection.json"),
+                "schema_version": manifest["schema_version"],
+                "payload_sha256": manifest["payload_sha256"],
+            },
+            "config": {
+                "path": "config.json",
+                "sha256": promotion._sha256(root / "config.json"),
+                "payload_sha256": promotion._value_sha256(config),
+            },
+            "metrics": {
+                "path": "metrics.jsonl",
+                "sha256": "6" * 64,
+                "format": "jsonl",
+                "validation_event_count": len(enriched_rows) + 1,
+                "validation_event_inventory_sha256": "7" * 64,
+            },
+        },
+        "selector": manifest["selector"],
+        "matched_planner_baseline": {
+            "source": baseline["source"],
+            "safety_failure_rate_ceiling": baseline["safety_failure_rate_ceiling"],
+            "validation_metrics": baseline_metrics,
+            "validation_metrics_sha256": baseline["validation_metrics_sha256"],
+            "selector_metrics": {name: baseline_metrics[name] for name in metric_names},
+            "selector_metrics_sha256": promotion._value_sha256(
+                {name: baseline_metrics[name] for name in metric_names}
+            ),
+            "policy": outcome_policy(baseline["policy"]),
+            "validation_evidence": {"metrics_path": "metrics.jsonl"},
+        },
+        "evaluated_snapshots": enriched_rows,
+        "selection": {
+            **selection,
+            "best_policy": outcome_policy(selection["best_policy"]),
+            "planner_fallback_policy": outcome_policy(
+                selection["planner_fallback_policy"]
+            ),
+        },
+    }
+    outcome["payload_sha256"] = promotion._payload_sha256(outcome)
+    path = root / "checkpoint_selection_outcome.json"
+    _write_json(path, outcome)
+    return path
+
+
+def _task_quality(
+    episode_id: str, schema: dict, value: float = 1.0, *, task: str = TASK
+) -> dict:
+    summary = {
+        "schema_version": schema["schema_version"],
+        "episode_id": episode_id,
+        "task_id": task,
+        "evaluator_backend_id": "mujoco311-rs140-v1-rld2-quality",
+        "schema_sha256": schema["schema_sha256"],
+        "physics_sample_count": 10,
+        "terminal": True,
+        "components": {
+            component["name"]: {
+                "value": value,
+                "direction": component["direction"],
+                "unit": component["unit"],
+                "scientific_resolution": component["scientific_resolution"],
+                "reducer": component["reducer"],
+            }
+            for component in schema["components"]
+        },
+    }
+    summary["summary_sha256"] = promotion._value_sha256(summary)
+    return summary
+
+
+Q_METRICS = (
+    (
+        "full_episode",
+        "action.action_second_difference_l2_mean_per_transition",
+        "action_l2",
+    ),
+    ("full_episode", "action.action_max_second_difference_l2", "action_l2"),
+    (
+        "full_episode",
+        "action.action_total_variation_l2_mean_per_transition",
+        "action_l2",
+    ),
+    (
+        "full_episode",
+        "eef_motion.eef_translation_path_length_m",
+        "translation_path_m",
+    ),
+    (
+        "full_episode",
+        "eef_motion.eef_rotation_path_length_rad",
+        "rotation_or_orientation_rad",
+    ),
+    (
+        "full_episode",
+        "eef_motion.eef_angular_jerk_max_rad_s3",
+        "angular_jerk_rad_s3",
+    ),
+    (
+        "full_episode",
+        "eef_motion.eef_linear_jerk_max_m_s3",
+        "linear_jerk_m_s3",
+    ),
+    (
+        "full_episode",
+        "eef_motion.eef_angular_jerk_rms_rad_s3",
+        "angular_jerk_rad_s3",
+    ),
+    (
+        "full_episode",
+        "eef_motion.eef_linear_jerk_rms_m_s3",
+        "linear_jerk_m_s3",
+    ),
+    (
+        "acquisition_window",
+        "approach_axis.approach_axis_error_max_rad",
+        "rotation_or_orientation_rad",
+    ),
+    (
+        "acquisition_window",
+        "jaw_axis.jaw_axis_error_max_rad",
+        "rotation_or_orientation_rad",
+    ),
+)
+
+
+def _set_nested(root: dict, dotted: str, value: float) -> None:
+    current = root
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+    current[parts[-1]] = value
+
+
+def _quality(values: dict[tuple[str, str], float] | None = None) -> dict:
+    values = values or {}
+    summary: dict = {
+        "schema_version": promotion.QUALITY_V2_SUMMARY_SCHEMA,
+        "phases": {},
+    }
+    for phase, metric, _ in Q_METRICS:
+        target = (
+            summary
+            if phase == "full_episode"
+            else summary["phases"].setdefault(phase, {})
+        )
+        _set_nested(target, metric, values.get((phase, metric), 1.0))
+    return summary
+
+
+def _gate(
+    quality: dict, checks: list[dict], threshold_sha: str, *, task: str = TASK
+) -> dict:
+    rows = []
+    for check in checks:
+        target = (
+            quality
+            if check["phase"] == "full_episode"
+            else quality["phases"][check["phase"]]
+        )
+        current = target
+        for part in check["metric"].split("."):
+            current = current[part]
+        rows.append(
+            {
+                "phase": check["phase"],
+                "metric": check["metric"],
+                "actual": current,
+                "max": check["max"],
+                "passed": current <= check["max"],
+            }
+        )
+    return {
+        "schema_version": promotion.QUALITY_V2_GATE_SCHEMA,
+        "contract_schema_version": promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+        "contract_sha256": threshold_sha,
+        "task_id": task,
+        "passed": all(row["passed"] for row in rows),
+        "checks": rows,
+    }
+
+
+def _record(
+    reset: dict,
+    *,
+    schema: dict,
+    checks: list[dict],
+    threshold_sha: str,
+    quality_values: dict[tuple[str, str], float] | None = None,
+    success: bool = True,
+    safety_failure: bool = False,
+) -> dict:
+    actions = np.zeros((2, 7), dtype=np.float64)
+    quality = _quality(quality_values)
+    return {
+        "episode_id": reset["episode_id"],
+        "task_id": reset["task_id"],
+        "seed": reset["seed"],
+        "factors": reset["factors"],
+        "source_group_id": reset["source_group_id"],
+        "pair_id": reset["pair_id"],
+        "pair_member_id": reset["pair_member_id"],
+        "candidate_index": reset["candidate_index"],
+        "success": success,
+        "safety_failure": safety_failure,
+        "termination_reason": "success" if success else "timeout",
+        "trajectory_completion": 1.0 if success else 0.5,
+        "completion_time_s": 1.0 if success else None,
+        "return": 1.0,
+        "control_steps": len(actions),
+        "action_l2_sum": 0.0,
+        "task_quality": _task_quality(
+            reset["episode_id"], schema, task=str(reset["task_id"])
+        ),
+        "action_sha256": hashlib.sha256(
+            np.ascontiguousarray(actions).tobytes()
+        ).hexdigest(),
+        "actions": actions.tolist(),
+        "quality_v2": quality,
+        "quality_v2_sha256": promotion._payload_sha256(quality),
+        "quality_v2_gate": _gate(
+            quality, checks, threshold_sha, task=str(reset["task_id"])
+        ),
+        "replay_validation": {
+            "passed": True,
+            "final_state_exact": True,
+            "outcomes_exact": True,
+            "task_quality_exact": True,
+        },
+        "events": ["success"] if success else [],
+    }
+
+
+def _selector(schema: dict, *, task: str = TASK) -> dict:
+    components = {row["name"]: row for row in schema["components"]}
+
+    def metric(direction: str, resolution: float, *, control: bool = False) -> dict:
+        return {
+            "direction": direction,
+            "max_observed_replay_drift": 0.0,
+            "scientific_resolution": resolution,
+            "numeric_floor": 0.0 if control else 1.0e-6,
+        }
+
+    return {
+        "schema_version": promotion.SELECTOR_SCHEMA,
+        "task": task,
+        "backend_id": "mujoco311-rs140-v1-rld2-quality",
+        "quality_schema": schema,
+        "calibration": {
+            "replay_count": 3,
+            "reset_episode_id": "selector-calibration",
+            "reset_manifest_sha256": "a" * 64,
+            "evidence_path": "selector_calibration.json",
+            "evidence_sha256": "b" * 64,
+        },
+        "metrics": {
+            "trajectory_completion": metric("max", 1.0e-6),
+            "task_quality": {
+                name: metric(
+                    "max" if component["direction"] == "maximize" else "min",
+                    component["scientific_resolution"],
+                )
+                for name, component in components.items()
+            },
+            "completion_time_s": metric("min", 0.002),
+            "control_steps": metric("min", 1.0, control=True),
+            "action_l2_sum": {
+                "direction": "min",
+                "max_observed_replay_drift": 0.0,
+                "scientific_resolution": 1.0e-6,
+                "numeric_floor_absolute": 1.0e-6,
+                "numeric_floor_relative": 1.0e-6,
+            },
+        },
+        "tie_break_order": [
+            "trajectory_completion",
+            *(f"task_quality.{name}" for name in components),
+            "completion_time_s",
+            "control_steps",
+            "action_l2_sum",
+        ],
+    }
+
+
+def _thresholds(*, task: str = TASK) -> dict:
+    checks = [
+        {
+            "phase": phase,
+            "metric": metric,
+            "max": 2.0,
+            "direction": "minimize",
+            "paired_comparison_family": family,
+            "paired_nonworse_absolute_tolerance": 0.01,
+            "paired_nonworse_relative_tolerance": 0.0,
+            "paired_strict_improvement_absolute": 0.02,
+            "paired_strict_improvement_relative": 0.0,
+        }
+        for phase, metric, family in Q_METRICS
+    ]
+    return {
+        "schema_version": promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+        "formal_freeze_eligible": True,
+        "calibration_status": "frozen",
+        "minimum_attempted_episodes": 20,
+        "minimum_successful_episodes": 8,
+        "calibration_wave_receipt": {
+            "binding_status": "bound",
+            "schema_version": "rld2-qa-planner-calibration-wave-receipt-v0.1",
+            "scientific_partition": "metric_calibration",
+            "task_count": 14,
+            "episodes_per_task": 20,
+            "total_reset_count": 280,
+            "sha256": "c" * 64,
+            "file_sha256": "c" * 64,
+            "payload_sha256": "c" * 64,
+            "relative_path": "provenance/calibration_wave/wave_receipt.json",
+            "source_identity": {"benchmark_commit": BENCHMARK_COMMIT},
+        },
+        "tasks": {
+            task: {
+                "checks": checks,
+                "orientation_mode": "world_down_tool_axis",
+                "jaw_axis_mode": "object_xy_teacher_offset_mod_pi",
+                "provenance": {
+                    "formal_freeze_eligible": True,
+                    "attempted_episode_count": 20,
+                    "successful_episode_count": 20,
+                },
+            }
+        },
+    }
+
+
+class Fixture:
+    def __init__(self, root: Path, *, tie: bool = False, task: str = TASK) -> None:
+        from se3_wam.benchmark.task_quality import task_quality_schema_manifest
+
+        self.root = root
+        self.task = task
+        self.root.mkdir(parents=True, exist_ok=True)
+        source_base = root.parent / f"{root.name}-source-roots"
+        embodiment = Path(expert_trainer.__file__).resolve().parent
+        self.policy_source_root, self.rlinf_commit = outcome_fixtures._source_checkout(
+            source_base / "policy",
+            {
+                embodiment / "train_dynamic_benchmark_expert.py": (
+                    "examples/embodiment/train_dynamic_benchmark_expert.py"
+                )
+            },
+            message="promotion policy source",
+        )
+        self.evaluator_source_root, self.evaluator_commit = (
+            outcome_fixtures._source_checkout(
+                source_base / "evaluator",
+                {
+                    embodiment / "dynamic_benchmark_checkpoint_admission.py": (
+                        "examples/embodiment/dynamic_benchmark_checkpoint_admission.py"
+                    ),
+                    embodiment
+                    / "build_dynamic_benchmark_checkpoint_selection_outcome.py": (
+                        "examples/embodiment/"
+                        "build_dynamic_benchmark_checkpoint_selection_outcome.py"
+                    ),
+                    embodiment / "evaluate_dynamic_benchmark_expert.py": (
+                        "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+                    ),
+                    embodiment / "evaluate_dynamic_benchmark_planner.py": (
+                        "examples/embodiment/evaluate_dynamic_benchmark_planner.py"
+                    ),
+                },
+                message="promotion evaluator source",
+            )
+        )
+        self.schema = task_quality_schema_manifest(task)
+        self.thresholds = _thresholds(task=task)
+        self.calibration_receipt_path = root / "wave_receipt.json"
+        self.calibration_receipt_path.write_bytes(
+            promotion._canonical_json(
+                {
+                    "schema_version": ("rld2-qa-planner-calibration-wave-receipt-v0.1"),
+                    "task_count": 14,
+                    "episodes_per_task": 20,
+                    "total_reset_count": 280,
+                    "source_identity": {"benchmark_commit": BENCHMARK_COMMIT},
+                }
+            ).encode("utf-8")
+        )
+        self.calibration_receipt_sha = promotion._sha256(self.calibration_receipt_path)
+        for key in ("sha256", "file_sha256", "payload_sha256"):
+            self.thresholds["calibration_wave_receipt"][key] = (
+                self.calibration_receipt_sha
+            )
+        self.threshold_path = root / "quality_v2_thresholds.json"
+        _write_json(self.threshold_path, self.thresholds)
+        self.threshold_sha = promotion._sha256(self.threshold_path)
+        self.checks = self.thresholds["tasks"][task]["checks"]
+        self.selector_path = root / "selector.json"
+        _write_json(self.selector_path, _selector(self.schema, task=task))
+        self.reset_path = root / "reset_manifest.jsonl"
+        self.resets = [
+            {
+                "task_id": task,
+                "split": "validation",
+                "episode_id": f"validation-{index:02d}",
+                "seed": 1000 + index,
+                "action_mode": "E7",
+                "observation_track": "hybrid",
+                "object_mode": "asym_t",
+                "reset_mode": "default",
+                "factors": {"initial_x_m": index / 100.0},
+                "source_group_id": f"group-{index // 2}",
+                "pair_id": f"pair-{index // 2}",
+                "pair_member_id": index % 2,
+                "candidate_index": index,
+            }
+            for index in range(promotion.RESET_COUNT)
+        ]
+        self.reset_path.write_text(
+            "".join(promotion._canonical_json(row) + "\n" for row in self.resets),
+            encoding="utf-8",
+        )
+        self.reset_sha = promotion._sha256(self.reset_path)
+        config = expert_trainer._config(
+            expert_trainer._parse_args(
+                [
+                    "--task",
+                    task,
+                    "--algorithm",
+                    "residual_rlpd",
+                    "--seed",
+                    "7",
+                    "--validation-manifest-seed",
+                    str(CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED),
+                    "--rlinf-commit",
+                    self.rlinf_commit,
+                    "--benchmark-commit",
+                    BENCHMARK_COMMIT,
+                    "--output",
+                    str(root),
+                ]
+            )
+        )
+        self.config = asdict(config)
+        config_path = root / "config.json"
+        expert_trainer._atomic_json(config_path, self.config)
+        config_file_sha256 = expert_trainer._file_sha256(config_path)
+        config_payload_sha256 = expert_trainer._canonical_json_sha256(self.config)
+        self.state_schema = {"state_dim": 2, "mask_dim": 0}
+        planner_validation = {
+            "episodes": config.eval_episodes,
+            "success_rate": 0.5,
+            "safety_failure_rate": 0.0,
+            "mean_completion": 0.5,
+            "mean_return": 0.5,
+            "mean_duration_steps": 20.0,
+            "mean_action_l2_sum": 5.0,
+        }
+        self.validation = {
+            **planner_validation,
+            "success_rate": 1.0,
+            "mean_completion": 1.0,
+            "mean_return": 1.0,
+        }
+        model = torch.nn.Linear(2, 7)
+        normalizer = expert_trainer.RunningNormalizer(2, 0)
+        initial_policy = root / "initial_policy.pt"
+        expert_trainer._save_policy(
+            initial_policy,
+            config,
+            model,
+            normalizer,
+            self.state_schema,
+            planner_validation,
+            0,
+        )
+        run_identity = expert_trainer._checkpoint_selection_run_identity(
+            config,
+            self.state_schema,
+            config_file_sha256,
+        )
+        ledger = expert_trainer._CheckpointSelectionLedger.create(
+            root,
+            run_identity,
+            planner_validation,
+            initial_policy,
+        )
+        self.metrics_path = root / "metrics.jsonl"
+        expert_trainer._append_jsonl(
+            self.metrics_path,
+            {
+                "event": "validation",
+                "env_steps": 0,
+                "checkpoint_selection_role": "matched_planner_safety_ceiling",
+                "validation_metrics_sha256": expert_trainer._canonical_json_sha256(
+                    planner_validation
+                ),
+                "checkpoint_selection_manifest_payload_sha256": ledger.manifest[
+                    "payload_sha256"
+                ],
+                **planner_validation,
+            },
+        )
+        snapshot_path = root / "policy_snapshots" / "policy_step_000000000100.pt"
+        snapshot_path.parent.mkdir()
+        expert_trainer._save_policy(
+            snapshot_path,
+            config,
+            model,
+            normalizer,
+            self.state_schema,
+            self.validation,
+            100,
+        )
+        selected_row = ledger.record_existing_snapshot(
+            snapshot_path, self.validation, 100
+        )
+        expert_trainer._append_jsonl(
+            self.metrics_path,
+            {
+                "event": "validation",
+                "env_steps": 100,
+                "checkpoint_snapshot_identity": (
+                    expert_trainer._CheckpointSelectionLedger._snapshot_identity(
+                        selected_row
+                    )
+                ),
+                "validation_role": "final",
+                **self.validation,
+            },
+        )
+        self.policy_path = root / "best_policy.pt"
+        self.policy_sha = promotion._sha256(self.policy_path)
+        self.checkpoint_selection_path = ledger.manifest_path
+        self.metadata_path = root / "summary.json"
+        summary = {
+            "schema_version": promotion.POLICY_METADATA_SCHEMA,
+            "status": "complete",
+            "config": self.config,
+            "infra_identity": expert_trainer._infra_identity(config),
+            "demo_source": {"fixture": True},
+            "best_validation": ledger.best_metrics,
+            "best_score": ledger.best_score,
+            "final_validation": self.validation,
+            "env_steps": 100,
+            "update_steps": 1,
+            "config_sha256": config_payload_sha256,
+            "config_file_sha256": config_file_sha256,
+            "checkpoint_selection": ledger.summary_reference(),
+        }
+        summary["payload_sha256"] = expert_trainer._canonical_json_sha256(summary)
+        expert_trainer._atomic_json(self.metadata_path, summary)
+        self.checkpoint_selection_outcome_path = write_checkpoint_selection_outcome(
+            run_root=root,
+            output_path=checkpoint_selection_outcome_versioned_path(
+                root, self.evaluator_commit, self.evaluator_commit
+            ),
+            policy_rlinf_source_root=self.policy_source_root,
+            verifier_rlinf_source_root=self.evaluator_source_root,
+            evaluator_rlinf_source_root=self.evaluator_source_root,
+            expected_policy_rlinf_commit=self.rlinf_commit,
+            expected_verifier_rlinf_commit=self.evaluator_commit,
+            expected_evaluator_rlinf_commit=self.evaluator_commit,
+            expected_benchmark_commit=BENCHMARK_COMMIT,
+            expected_summary_sha256=promotion._sha256(self.metadata_path),
+            expected_checkpoint_selection_sha256=promotion._sha256(
+                self.checkpoint_selection_path
+            ),
+            expected_config_sha256=promotion._sha256(config_path),
+            expected_metrics_sha256=promotion._sha256(self.metrics_path),
+            expected_initial_policy_sha256=promotion._sha256(initial_policy),
+            expected_best_policy_sha256=self.policy_sha,
+        )
+        self.checkpoint_selection_outcome_sha = promotion._sha256(
+            self.checkpoint_selection_outcome_path
+        )
+        self.learned_policy_admission = validate_selected_learned_policy(
+            trainer_run_root=root,
+            policy_path=self.policy_path,
+            trainer_summary_path=self.metadata_path,
+            checkpoint_selection_path=self.checkpoint_selection_path,
+            checkpoint_selection_outcome_path=(self.checkpoint_selection_outcome_path),
+            policy_rlinf_source_root=self.policy_source_root,
+            verifier_rlinf_source_root=self.evaluator_source_root,
+            evaluator_rlinf_source_root=self.evaluator_source_root,
+            expected_checkpoint_selection_outcome_sha256=(
+                self.checkpoint_selection_outcome_sha
+            ),
+            expected_rlinf_commit=self.rlinf_commit,
+            expected_benchmark_commit=BENCHMARK_COMMIT,
+            expected_verifier_rlinf_commit=self.evaluator_commit,
+            expected_evaluator_rlinf_commit=self.evaluator_commit,
+        )
+        improved = (
+            {}
+            if tie
+            else {("full_episode", "eef_motion.eef_translation_path_length_m"): 0.5}
+        )
+        self.policy_records = [
+            _record(
+                reset,
+                schema=self.schema,
+                checks=self.checks,
+                threshold_sha=self.threshold_sha,
+                quality_values=improved,
+            )
+            for reset in self.resets
+        ]
+        self.planner_records = [
+            _record(
+                reset,
+                schema=self.schema,
+                checks=self.checks,
+                threshold_sha=self.threshold_sha,
+            )
+            for reset in self.resets
+        ]
+        for index, record in enumerate(self.policy_records):
+            self._bind_attempt_tape(record, role="policy", index=index)
+        for index, record in enumerate(self.planner_records):
+            self._bind_attempt_tape(record, role="planner", index=index)
+        self.policy_evaluation_path = root / "policy_evaluation" / "evaluation.json"
+        self.planner_evaluation_path = root / "planner_evaluation" / "evaluation.json"
+        self.policy_evaluation_path.parent.mkdir(exist_ok=True)
+        self.planner_evaluation_path.parent.mkdir(exist_ok=True)
+        self._write_evaluations()
+        examples = self.evaluator_source_root / "examples" / "embodiment"
+        self.policy_evaluator_source = examples / "evaluate_dynamic_benchmark_expert.py"
+        self.planner_evaluator_source = (
+            examples / "evaluate_dynamic_benchmark_planner.py"
+        )
+
+    def _bind_attempt_tape(self, record: dict, *, role: str, index: int) -> None:
+        bundle_root = self.root / f"{role}_evaluation"
+        tape_dir = bundle_root / "tapes"
+        tape_dir.mkdir(parents=True, exist_ok=True)
+        actions = np.asarray(record["actions"], dtype=np.float64)
+        steps = len(actions)
+        arrays = {
+            "states": np.zeros((steps + 1, 2), dtype=np.float64),
+            "policy_actions": actions.copy(),
+            "actions": actions.copy(),
+            "rewards": np.asarray([0.5, 0.5], dtype=np.float64),
+            "terminated": np.asarray([False, True], dtype=np.bool_),
+            "truncated": np.zeros(steps, dtype=np.bool_),
+            "eef_pose_xyzw": np.zeros((steps + 1, 7), dtype=np.float64),
+            "fingerpad_closing_axis_world": np.zeros((steps + 1, 3), dtype=np.float64),
+            "object_pose_wxyz": np.zeros((steps + 1, 7), dtype=np.float64),
+            "fingerpad_contact_flags": np.zeros((steps + 1, 2), dtype=np.bool_),
+        }
+        tape_path = tape_dir / f"{role}-{index:02d}.npz"
+        np.savez(tape_path, **arrays)
+        record.update(
+            {
+                "attempt_schema_version": optimal_auditor.ATTEMPT_SCHEMA,
+                "attempt_tape": tape_path.relative_to(bundle_root).as_posix(),
+                "attempt_tape_sha256": promotion._sha256(tape_path),
+                "finite_and_bounded": True,
+                "state_sha256": hashlib.sha256(
+                    np.ascontiguousarray(arrays["states"]).tobytes()
+                ).hexdigest(),
+                "policy_action_sha256": hashlib.sha256(
+                    np.ascontiguousarray(arrays["policy_actions"]).tobytes()
+                ).hexdigest(),
+                "reward_sha256": hashlib.sha256(
+                    np.ascontiguousarray(arrays["rewards"]).tobytes()
+                ).hexdigest(),
+                "replay_validation_sha256": optimal._payload_sha256(
+                    record["replay_validation"]
+                ),
+                "quality_v2_events_by_observation": [[] for _ in range(steps + 1)],
+                "issued_equals_applied": self.task != "t5_replan",
+                "t5_replan_causal_timing_passed": (
+                    True if self.task == "t5_replan" else None
+                ),
+                "impact_end_to_first_qualifying_applied_correction_s": (
+                    0.05 if self.task == "t5_replan" else None
+                ),
+            }
+        )
+        audit_record = {**record, "schema_version": optimal_auditor.ATTEMPT_SCHEMA}
+        record["quality_score"] = list(optimal._quality_score(audit_record))
+        record["eligible"] = optimal._eligible(audit_record)
+
+    def _write_evaluations(self) -> None:
+        policy = _seal(
+            {
+                "schema_version": promotion.POLICY_EVALUATION_SCHEMA,
+                "policy_identity": {
+                    "path": str(self.policy_path.resolve()),
+                    "sha256": self.policy_sha,
+                    "schema_version": promotion.POLICY_SCHEMA,
+                    "task": self.task,
+                    "algorithm": self.config["algorithm"],
+                    "training_seed": self.config["seed"],
+                    "training_env_steps": 100,
+                    "validation": self.validation,
+                    "checkpoint_role": "best",
+                },
+                "learned_policy_admission": self.learned_policy_admission,
+                "source_identity": {
+                    "evaluator_rlinf_commit": self.evaluator_commit,
+                    "policy_rlinf_commit": self.rlinf_commit,
+                    "benchmark_commit": BENCHMARK_COMMIT,
+                    "evaluator_source": {
+                        "module": (
+                            "examples.embodiment.evaluate_dynamic_benchmark_expert"
+                        ),
+                        "repository_path": (
+                            "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+                        ),
+                        "sha256": promotion._sha256(
+                            self.evaluator_source_root
+                            / "examples/embodiment/evaluate_dynamic_benchmark_expert.py"
+                        ),
+                    },
+                },
+                "task_quality_identity": {
+                    "evaluator_backend_id": "mujoco311-rs140-v1-rld2-quality",
+                    "task_quality_schema": self.schema,
+                    "task_quality_schema_sha256": self.schema["schema_sha256"],
+                },
+                "quality_v2_threshold_identity": {
+                    "schema_version": promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+                    "sha256": self.threshold_sha,
+                },
+                "split": "validation",
+                "manifest_seed": FORMAL_POLICY_VALIDATION_MANIFEST_SEED,
+                "reset_manifest_sha256": self.reset_sha,
+                "episodes": promotion.RESET_COUNT,
+                "device": "cpu",
+                "state_schema": self.state_schema,
+                "records": self.policy_records,
+                "task_summary": {self.task: {}},
+                "decision_latency": {"p95_meets_20hz": True},
+                "all_replays_passed": True,
+                "all_successful_quality_v2_gates_passed": all(
+                    not record["success"] or record["quality_v2_gate"]["passed"]
+                    for record in self.policy_records
+                ),
+                "started_unix_s": 1.0,
+                "finished_unix_s": 2.0,
+            }
+        )
+        planner = _seal(
+            {
+                "schema_version": promotion.PLANNER_EVALUATION_SCHEMA,
+                "planner_identity": {
+                    "task": self.task,
+                    "kind": "privileged_teacher",
+                },
+                "source_identity": {
+                    "evaluator_rlinf_commit": self.evaluator_commit,
+                    "benchmark_commit": BENCHMARK_COMMIT,
+                },
+                "split": "validation",
+                "manifest_seed": FORMAL_POLICY_VALIDATION_MANIFEST_SEED,
+                "reset_manifest_sha256": self.reset_sha,
+                "episodes": promotion.RESET_COUNT,
+                "records": self.planner_records,
+                "task_summary": {self.task: {}},
+                "decision_latency": {"p95_meets_20hz": True},
+                "all_replays_passed": True,
+                "started_unix_s": 1.0,
+                "finished_unix_s": 2.0,
+            }
+        )
+        _write_json(self.policy_evaluation_path, policy)
+        _write_json(self.planner_evaluation_path, planner)
+        self._write_source_snapshot_receipt(
+            policy["source_identity"]["evaluator_source"]
+        )
+        self._write_evaluation_sha256sums()
+
+    def _write_source_snapshot_receipt(self, evaluator_source: dict[str, str]) -> None:
+        source_rows = {
+            "policy_rlinf": [
+                {
+                    "path": "examples/embodiment/train_dynamic_benchmark_expert.py",
+                    "mode": "100644",
+                    "git_blob_sha1": "4" * 40,
+                    "sha256": "4" * 64,
+                }
+            ],
+            "evaluator_rlinf": [
+                {
+                    "path": evaluator_source["repository_path"],
+                    "mode": "100644",
+                    "git_blob_sha1": "5" * 40,
+                    "sha256": evaluator_source["sha256"],
+                }
+            ],
+            "benchmark": [
+                {
+                    "path": "src/se3_wam/benchmark/contracts.py",
+                    "mode": "100644",
+                    "git_blob_sha1": "6" * 40,
+                    "sha256": "6" * 64,
+                }
+            ],
+        }
+        source_identities = {
+            "policy_rlinf": {
+                "root": "/opt/rld2-source-snapshot/source/policy_rlinf",
+                "commit": self.rlinf_commit,
+                "tree": "1" * 40,
+                "inventory_sha256": promotion._value_sha256(
+                    source_rows["policy_rlinf"]
+                ),
+            },
+            "evaluator_rlinf": {
+                "root": "/opt/rld2-source-snapshot/source/evaluator_rlinf",
+                "commit": self.evaluator_commit,
+                "tree": "2" * 40,
+                "inventory_sha256": promotion._value_sha256(
+                    source_rows["evaluator_rlinf"]
+                ),
+            },
+            "benchmark": {
+                "root": "/opt/rld2-source-snapshot/source/benchmark",
+                "commit": BENCHMARK_COMMIT,
+                "tree": "3" * 40,
+                "inventory_sha256": promotion._value_sha256(source_rows["benchmark"]),
+            },
+        }
+        manifest = _seal(
+            {
+                "schema_version": promotion.SOURCE_SNAPSHOT_SCHEMA,
+                "base_image_id": "sha256:" + IMAGE_SHA256,
+                "sources": {
+                    role: {**identity, "files": source_rows[role]}
+                    for role, identity in source_identities.items()
+                },
+                "runtime_dependencies": {
+                    "portable": {
+                        "root": "/opt/rld2-source-snapshot/runtime/pydeps-portable-v1",
+                        "inventory_sha256": "7" * 64,
+                    },
+                    "a800_core": {
+                        "root": "/opt/rld2-source-snapshot/runtime/pydeps-a800-core-v1",
+                        "inventory_sha256": "8" * 64,
+                    },
+                },
+            }
+        )
+        manifest_path = self.policy_evaluation_path.parent / "source_manifest.json"
+        _write_json(manifest_path, manifest)
+        receipt = _seal(
+            {
+                "schema_version": promotion.SOURCE_SNAPSHOT_RECEIPT_SCHEMA,
+                "base_image_id": "sha256:" + IMAGE_SHA256,
+                "source_snapshot_image_id": "sha256:" + "9" * 64,
+                "source_manifest": {
+                    "path": "source_manifest.json",
+                    "sha256": promotion._sha256(manifest_path),
+                    "schema_version": promotion.SOURCE_SNAPSHOT_SCHEMA,
+                    "payload_sha256": manifest["payload_sha256"],
+                },
+                "sources": source_identities,
+                "evaluator_source": evaluator_source,
+            }
+        )
+        _write_json(
+            self.policy_evaluation_path.parent / "source_snapshot.json", receipt
+        )
+
+    def _write_evaluation_sha256sums(self) -> None:
+        self.policy_evaluation_sha256sums_path = (
+            self.policy_evaluation_path.parent / "SHA256SUMS"
+        )
+        self.planner_evaluation_sha256sums_path = (
+            self.planner_evaluation_path.parent / "SHA256SUMS"
+        )
+        admission_external = tuple(
+            (
+                self.learned_policy_admission[name]["sha256"],
+                self.learned_policy_admission[name]["path"],
+            )
+            for name in (
+                "policy",
+                "trainer_summary",
+                "checkpoint_selection",
+                "checkpoint_selection_outcome",
+                "config",
+            )
+        )
+        self.policy_evaluation_sha256sums_path.write_text(
+            recursive_output_checksums(
+                self.policy_evaluation_path.parent,
+                extra_entries=admission_external,
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        self.planner_evaluation_sha256sums_path.write_text(
+            recursive_output_checksums(self.planner_evaluation_path.parent),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    def build(self) -> dict:
+        return promotion.build_selection_evidence(
+            candidate_id="learned-s7",
+            run_tag="cycle1-s7",
+            trainer_run_root=self.root,
+            policy_path=self.policy_path,
+            policy_metadata_path=self.metadata_path,
+            checkpoint_selection_path=self.checkpoint_selection_path,
+            checkpoint_selection_outcome_path=(self.checkpoint_selection_outcome_path),
+            policy_rlinf_source_root=self.policy_source_root,
+            policy_evaluation_path=self.policy_evaluation_path,
+            policy_evaluation_sha256sums_path=(self.policy_evaluation_sha256sums_path),
+            planner_evaluation_path=self.planner_evaluation_path,
+            planner_evaluation_sha256sums_path=(
+                self.planner_evaluation_sha256sums_path
+            ),
+            reset_manifest_path=self.reset_path,
+            quality_v2_thresholds_path=self.threshold_path,
+            quality_v2_calibration_wave_receipt_path=(self.calibration_receipt_path),
+            selector_contract_path=self.selector_path,
+            policy_evaluator_source_path=self.policy_evaluator_source,
+            planner_evaluator_source_path=self.planner_evaluator_source,
+            image_reference="runtime:test",
+            image_sha256=IMAGE_SHA256,
+            expected_residual_scale=float(self.config["residual_scale"]),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _canonical_attempt_auditor_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep selection tests focused while proving every tape reaches the auditor."""
+
+    def audit(
+        root: Path,
+        record: dict,
+        *,
+        expected_task: str,
+        quality_v2_thresholds: dict,
+        quality_v2_thresholds_sha256: str,
+    ) -> None:
+        assert root.is_dir()
+        assert record["schema_version"] == optimal_auditor.ATTEMPT_SCHEMA
+        assert record["task_id"] == expected_task
+        assert quality_v2_thresholds["schema_version"] == (
+            promotion.QUALITY_V2_THRESHOLD_SCHEMA
+        )
+        assert quality_v2_thresholds_sha256
+
+    monkeypatch.setattr(optimal_auditor, "_audit_attempt_tape", audit)
+
+    def validate_receipt(
+        thresholds: dict,
+        receipt_path: Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_benchmark_commit: str | None = None,
+    ) -> optimal.ProvenanceFile:
+        actual = promotion._sha256(receipt_path)
+        binding = thresholds["calibration_wave_receipt"]
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if (
+            expected_sha256 != actual
+            or binding["file_sha256"] != actual
+            or binding["payload_sha256"] != actual
+        ):
+            raise ValueError("calibration wave receipt SHA-256 mismatch")
+        if (
+            expected_benchmark_commit != BENCHMARK_COMMIT
+            or binding.get("source_identity") != receipt.get("source_identity")
+            or receipt.get("source_identity", {}).get("benchmark_commit")
+            != expected_benchmark_commit
+        ):
+            raise ValueError(
+                "calibration receipt benchmark commit differs from authenticated commit"
+            )
+        return optimal.ProvenanceFile(
+            source_path=receipt_path.resolve(),
+            relative_path=binding["relative_path"],
+            sha256=actual,
+        )
+
+    monkeypatch.setattr(
+        optimal, "_validate_quality_v2_calibration_receipt_artifact", validate_receipt
+    )
+
+
+def test_happy_path_promotes_and_review_recomputation_reopens_every_artifact(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    evidence = fixture.build()
+    evidence_path = tmp_path / "selection_evidence.json"
+    receipt_path = tmp_path / "promotion_receipt.json"
+
+    receipt = promotion.write_promotion_artifacts(
+        evidence=evidence,
+        evidence_path=evidence_path,
+        receipt_path=receipt_path,
+        require_promote=True,
+    )
+
+    assert evidence["selection"]["decision"] == "promote"
+    assert evidence["selection"]["reason"] == ("strict_planner_nonworse_improvement")
+    assert evidence["selection"]["rejection_reasons"] == []
+    assert evidence["aggregate"]["counts"]["both_success"] == 20
+    assert evidence["aggregate"]["success"]["policy"]["wilson_95"]["low"] > 0.8
+    assert receipt["schema_version"] == promotion.PROMOTION_SCHEMA
+    assert set(receipt["selection"]) == {
+        "decision",
+        "reason",
+        "planner_nonworse_all_dimensions",
+        "strict_improvement_dimensions",
+        "rejection_reasons",
+        "selector_contract_path",
+        "selector_contract_sha256",
+        "planner_evaluation_path",
+        "planner_evaluation_sha256",
+        "planner_evaluation_payload_sha256",
+        "attempt_artifacts_payload_sha256",
+        "evidence_path",
+        "evidence_sha256",
+        "evidence_payload_sha256",
+    }
+    assert receipt["selection"]["evidence_sha256"] == promotion._sha256(evidence_path)
+    assert (
+        receipt["validation_receipt"]["attempt_schema_version"]
+        == optimal_auditor.ATTEMPT_SCHEMA
+    )
+    assert receipt["selection"]["planner_evaluation_sha256"] == promotion._sha256(
+        fixture.planner_evaluation_path
+    )
+    assert receipt["quality_v2_calibration_wave_receipt"]["sha256"] == (
+        fixture.calibration_receipt_sha
+    )
+    assert (
+        receipt["quality_v2_calibration_wave_receipt"]["dataset_relative_path"]
+        == "provenance/calibration_wave/wave_receipt.json"
+    )
+    assert promotion.validate_selection_evidence_artifacts(evidence) == evidence
+    assert (
+        review_exporter._validate_promotion_receipt_payload(
+            receipt,
+            task=TASK,
+            candidate_id="learned-s7",
+            policy_path=str(fixture.policy_path.resolve()),
+            policy_sha256=fixture.policy_sha,
+            residual_scale=float(fixture.config["residual_scale"]),
+            rlinf_commit=fixture.rlinf_commit,
+            benchmark_commit=BENCHMARK_COMMIT,
+            threshold_schema=promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+            threshold_sha256=fixture.threshold_sha,
+            calibration_receipt_identity={
+                "relative_path": "provenance/calibration_wave/wave_receipt.json",
+                "file_sha256": fixture.calibration_receipt_sha,
+                "payload_sha256": fixture.calibration_receipt_sha,
+            },
+            evaluator_rlinf_commit=fixture.evaluator_commit,
+            evaluator_source_sha256=promotion._sha256(fixture.policy_evaluator_source),
+        )
+        == receipt
+    )
+    assert (
+        evidence["inputs"]["checkpoint_selection"]
+        == (fixture.learned_policy_admission["checkpoint_selection"])
+    )
+    assert (
+        evidence["inputs"]["policy_metadata"]
+        == (fixture.learned_policy_admission["trainer_summary"])
+    )
+    assert (
+        evidence["inputs"]["checkpoint_selection_outcome"]
+        == (fixture.learned_policy_admission["checkpoint_selection_outcome"])
+    )
+    assert set(evidence["inputs"]["policy_rlinf_source"]) == {
+        "path",
+        "commit",
+        "trainer_source_sha256",
+    }
+    assert set(evidence["inputs"]["policy_evaluation_sha256sums"]) == {
+        "path",
+        "sha256",
+    }
+    assert set(evidence["inputs"]["planner_evaluation_sha256sums"]) == {
+        "path",
+        "sha256",
+    }
+    assert "checkpoint_selection_outcome" not in receipt
+    tape = evidence["per_reset"][0]["policy"]["attempt_tape"]
+    assert tape["path"] == "tapes/policy-00.npz"
+    assert len(tape["sha256"]) == 64
+    assert len(tape["payload_sha256"]) == 64
+    with pytest.raises(FileExistsError, match="overwrite"):
+        promotion.write_promotion_artifacts(
+            evidence=evidence,
+            evidence_path=evidence_path,
+            receipt_path=receipt_path,
+            require_promote=True,
+        )
+
+
+def test_formal_policy_validation_is_independent_from_checkpoint_selection(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+
+    evidence = fixture.build()
+
+    assert (
+        fixture.config["validation_manifest_seed"]
+        == CHECKPOINT_SELECTION_VALIDATION_MANIFEST_SEED
+    )
+    assert evidence["inputs"]["reset_manifest"]["manifest_seed"] == (
+        FORMAL_POLICY_VALIDATION_MANIFEST_SEED
+    )
+
+
+def test_promotion_rejects_checkpoint_selection_manifest_reuse(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    for evaluation_path in (
+        fixture.policy_evaluation_path,
+        fixture.planner_evaluation_path,
+    ):
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        evaluation["manifest_seed"] = fixture.config["validation_manifest_seed"]
+        evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+        _write_json(evaluation_path, evaluation)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises(ValueError, match="checkpoint-selection validation manifest"):
+        fixture.build()
+
+
+def test_promotion_rejects_resealed_checkpoint_selection_tampering(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    manifest = json.loads(fixture.checkpoint_selection_path.read_text(encoding="utf-8"))
+    manifest["evaluated_snapshots"][0]["eligible"] = False
+    manifest.pop("payload_sha256")
+    manifest["payload_sha256"] = expert_trainer._canonical_json_sha256(manifest)
+    expert_trainer._atomic_json(fixture.checkpoint_selection_path, manifest)
+    summary = json.loads(fixture.metadata_path.read_text(encoding="utf-8"))
+    summary["checkpoint_selection"]["manifest_payload_sha256"] = manifest[
+        "payload_sha256"
+    ]
+    summary.pop("payload_sha256")
+    summary["payload_sha256"] = expert_trainer._canonical_json_sha256(summary)
+    expert_trainer._atomic_json(fixture.metadata_path, summary)
+
+    with pytest.raises(ValueError, match="eligible snapshot count|select exactly"):
+        fixture.build()
+
+
+def test_promotion_requires_evaluator_admission_identity(tmp_path: Path) -> None:
+    fixture = Fixture(tmp_path)
+    evaluation = json.loads(fixture.policy_evaluation_path.read_text(encoding="utf-8"))
+    evaluation["learned_policy_admission"]["policy"]["env_steps"] = 0
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(fixture.policy_evaluation_path, evaluation)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises(ValueError, match="learned-policy admission identity mismatch"):
+        fixture.build()
+
+
+@pytest.mark.parametrize(
+    "bundle, mutation",
+    [
+        ("policy", "missing"),
+        ("policy", "tampered"),
+        ("planner", "missing"),
+        ("planner", "tampered"),
+    ],
+)
+def test_promotion_requires_exact_evaluation_sha256sums(
+    tmp_path: Path, bundle: str, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    sums_path = getattr(fixture, f"{bundle}_evaluation_sha256sums_path")
+    if mutation == "missing":
+        sums_path.unlink()
+    else:
+        sums_path.write_bytes(sums_path.read_bytes() + b"f" * 64 + b"  forged\n")
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        fixture.build()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "unsealed",
+        "image_drift",
+        "same_as_base",
+        "root_drift",
+        "manifest_drift",
+    ],
+)
+def test_promotion_requires_bound_source_snapshot_receipt(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    receipt_path = fixture.policy_evaluation_path.parent / "source_snapshot.json"
+    if mutation == "missing":
+        receipt_path.unlink()
+    else:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if mutation == "unsealed":
+            receipt["sources"]["policy_rlinf"]["tree"] = "f" * 40
+        elif mutation == "image_drift":
+            receipt["source_snapshot_image_id"] = "mutable:latest"
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        elif mutation == "same_as_base":
+            receipt["source_snapshot_image_id"] = receipt["base_image_id"]
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        elif mutation == "root_drift":
+            receipt["sources"]["policy_rlinf"]["root"] = "/tmp/forged-policy"
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        else:
+            receipt["source_manifest"]["schema_version"] = "forged-v9"
+            receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        _write_json(receipt_path, receipt)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises(ValueError, match="source snapshot"):
+        fixture.build()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "tampered", "resealed_evaluator_blob", "resealed_base_image"],
+)
+def test_promotion_reopens_bound_source_snapshot_manifest(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    manifest_path = fixture.policy_evaluation_path.parent / "source_manifest.json"
+    receipt_path = fixture.policy_evaluation_path.parent / "source_snapshot.json"
+    if mutation == "missing":
+        manifest_path.unlink()
+    elif mutation == "tampered":
+        manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if mutation == "resealed_evaluator_blob":
+            rows = manifest["sources"]["evaluator_rlinf"]["files"]
+            rows[0]["sha256"] = "f" * 64
+            manifest["sources"]["evaluator_rlinf"]["inventory_sha256"] = (
+                promotion._value_sha256(rows)
+            )
+            receipt["sources"]["evaluator_rlinf"]["inventory_sha256"] = manifest[
+                "sources"
+            ]["evaluator_rlinf"]["inventory_sha256"]
+        else:
+            manifest["base_image_id"] = "sha256:" + "f" * 64
+            receipt["base_image_id"] = manifest["base_image_id"]
+        manifest["payload_sha256"] = promotion._payload_sha256(manifest)
+        _write_json(manifest_path, manifest)
+        receipt["source_manifest"]["sha256"] = promotion._sha256(manifest_path)
+        receipt["source_manifest"]["payload_sha256"] = manifest["payload_sha256"]
+        receipt["payload_sha256"] = promotion._payload_sha256(receipt)
+        _write_json(receipt_path, receipt)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises((FileNotFoundError, ValueError), match="source snapshot"):
+        fixture.build()
+
+
+def test_promotion_rejects_formal_evaluator_source_mismatch(tmp_path: Path) -> None:
+    fixture = Fixture(tmp_path)
+    evaluation = json.loads(fixture.policy_evaluation_path.read_text(encoding="utf-8"))
+    evaluation["source_identity"]["evaluator_source"]["sha256"] = "f" * 64
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(fixture.policy_evaluation_path, evaluation)
+    fixture._write_evaluation_sha256sums()
+
+    with pytest.raises(ValueError, match="does not match outcome and evaluation"):
+        fixture.build()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "mutated"])
+def test_promotion_recomputation_rejects_missing_or_mutated_outcome(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    evidence = fixture.build()
+    if mutation == "missing":
+        fixture.checkpoint_selection_outcome_path.unlink()
+    else:
+        fixture.checkpoint_selection_outcome_path.write_bytes(
+            fixture.checkpoint_selection_outcome_path.read_bytes() + b"\n"
+        )
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        promotion.validate_selection_evidence_artifacts(evidence)
+
+
+@pytest.mark.parametrize(
+    "input_name",
+    [
+        "policy_rlinf_source",
+        "policy_evaluation_sha256sums",
+        "planner_evaluation_sha256sums",
+    ],
+)
+def test_promotion_recomputation_rejects_extra_identity_keys(
+    tmp_path: Path, input_name: str
+) -> None:
+    fixture = Fixture(tmp_path)
+    evidence = fixture.build()
+    evidence["inputs"][input_name]["extra"] = True
+    evidence["payload_sha256"] = promotion._payload_sha256(evidence)
+
+    with pytest.raises(ValueError, match="keys do not match its canonical schema"):
+        promotion.validate_selection_evidence_artifacts(evidence)
+
+
+def test_promotion_rejects_resealed_cross_run_or_source_drift_outcome(
+    tmp_path: Path,
+) -> None:
+    first = Fixture(tmp_path / "first")
+    second = Fixture(tmp_path / "second")
+    first.checkpoint_selection_outcome_path.write_bytes(
+        second.checkpoint_selection_outcome_path.read_bytes()
+    )
+    with pytest.raises(ValueError, match="authoritative producer replay"):
+        first.build()
+
+    drift = Fixture(tmp_path / "drift")
+    outcome = json.loads(
+        drift.checkpoint_selection_outcome_path.read_text(encoding="utf-8")
+    )
+    outcome["source_identity"]["verifier_source"]["sha256"] = "f" * 64
+    outcome["payload_sha256"] = promotion._payload_sha256(outcome)
+    _write_json(drift.checkpoint_selection_outcome_path, outcome)
+    with pytest.raises(ValueError, match="authoritative producer replay"):
+        drift.build()
+
+
+def test_every_evaluator_tape_is_sent_to_the_canonical_auditor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = Fixture(tmp_path)
+    calls: list[tuple[Path, str, str]] = []
+
+    def audit(root: Path, record: dict, *, expected_task: str, **_: object) -> None:
+        calls.append((root, record["schema_version"], expected_task))
+
+    monkeypatch.setattr(optimal_auditor, "_audit_attempt_tape", audit)
+    fixture.build()
+
+    assert calls == [
+        call
+        for _ in range(promotion.RESET_COUNT)
+        for call in (
+            (
+                fixture.policy_evaluation_path.parent.resolve(),
+                optimal_auditor.ATTEMPT_SCHEMA,
+                TASK,
+            ),
+            (
+                fixture.planner_evaluation_path.parent.resolve(),
+                optimal_auditor.ATTEMPT_SCHEMA,
+                TASK,
+            ),
+        )
+    ]
+
+
+def test_t5_scientific_regressions_are_sealed_but_malformed_history_throws(
+    tmp_path: Path,
+) -> None:
+    false_gate = Fixture(tmp_path / "false-gate", task="t5_replan")
+    false_gate.policy_records[0]["t5_replan_causal_timing_passed"] = False
+    false_gate.policy_records[0][
+        "impact_end_to_first_qualifying_applied_correction_s"
+    ] = None
+    false_gate._write_evaluations()
+    gate_evidence = false_gate.build()
+    assert gate_evidence["selection"]["decision"] == "keep_planner"
+    assert gate_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert gate_evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    assert gate_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "successful_policy_gate_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_gates": ["t5_causal_timing"],
+        }
+    ]
+    assert (
+        gate_evidence["per_reset"][0]["rejection_reasons"]
+        == (gate_evidence["selection"]["rejection_reasons"])
+    )
+
+    wrong_history = Fixture(tmp_path / "issued", task="t5_replan")
+    wrong_history.policy_records[0]["issued_equals_applied"] = True
+    wrong_history._write_evaluations()
+    with pytest.raises(ValueError, match="distinct issued/applied"):
+        wrong_history.build()
+
+    latency_regression = Fixture(tmp_path / "latency", task="t5_replan")
+    latency_regression.policy_records[0][
+        "impact_end_to_first_qualifying_applied_correction_s"
+    ] = 0.06
+    latency_regression._write_evaluations()
+    latency_evidence = latency_regression.build()
+    assert latency_evidence["selection"]["decision"] == "keep_planner"
+    assert latency_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert latency_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "both_success_metric_nonworse_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_dimensions": [
+                "causal.impact_end_to_first_qualifying_applied_correction_s"
+            ],
+        }
+    ]
+
+
+def test_t5_causal_latency_can_supply_the_required_strict_improvement(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path, tie=True, task="t5_replan")
+    fixture.policy_records[0]["impact_end_to_first_qualifying_applied_correction_s"] = (
+        0.04
+    )
+    fixture._write_evaluations()
+
+    evidence = fixture.build()
+
+    assert evidence["selection"]["decision"] == "promote"
+    assert (
+        "causal.impact_end_to_first_qualifying_applied_correction_s"
+        in evidence["selection"]["strict_improvement_dimensions"]
+    )
+
+
+def test_tampered_attempt_tape_fails_before_selection(tmp_path: Path) -> None:
+    fixture = Fixture(tmp_path)
+    tape_path = (
+        fixture.policy_evaluation_path.parent
+        / fixture.policy_records[0]["attempt_tape"]
+    )
+    tape_path.write_bytes(tape_path.read_bytes() + b"tamper")
+
+    with pytest.raises(ValueError, match="SHA256SUMS exact inventory mismatch"):
+        fixture.build()
+
+
+def test_tampered_calibration_wave_receipt_fails_before_selection(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    fixture.calibration_receipt_path.write_bytes(
+        fixture.calibration_receipt_path.read_bytes() + b"\n"
+    )
+
+    with pytest.raises(ValueError, match="calibration wave receipt SHA-256 mismatch"):
+        fixture.build()
+
+
+def test_calibration_wave_receipt_benchmark_mismatch_fails_before_selection(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    wrong_commit = "f" * 40
+    receipt = json.loads(fixture.calibration_receipt_path.read_text(encoding="utf-8"))
+    receipt["source_identity"]["benchmark_commit"] = wrong_commit
+    fixture.calibration_receipt_path.write_bytes(
+        promotion._canonical_json(receipt).encode("utf-8")
+    )
+    receipt_sha = promotion._sha256(fixture.calibration_receipt_path)
+    fixture.thresholds["calibration_wave_receipt"]["source_identity"] = receipt[
+        "source_identity"
+    ]
+    for key in ("sha256", "file_sha256", "payload_sha256"):
+        fixture.thresholds["calibration_wave_receipt"][key] = receipt_sha
+    _write_json(fixture.threshold_path, fixture.thresholds)
+
+    with pytest.raises(ValueError, match="benchmark commit differs"):
+        fixture.build()
+
+
+def test_exact_tie_keeps_planner_and_require_promote_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    evidence = Fixture(tmp_path, tie=True).build()
+    evidence_path = tmp_path / "selection_evidence.json"
+    receipt_path = tmp_path / "promotion_receipt.json"
+
+    assert evidence["selection"] == {
+        "decision": "keep_planner",
+        "reason": "no_strict_improvement",
+        "planner_nonworse_all_dimensions": True,
+        "strict_improvement_dimensions": [],
+        "rejection_reasons": [],
+        "exact_aggregate_tie": True,
+        "rule": evidence["selection"]["rule"],
+    }
+    with pytest.raises(RuntimeError, match="require-promote"):
+        promotion.write_promotion_artifacts(
+            evidence=evidence,
+            evidence_path=evidence_path,
+            receipt_path=receipt_path,
+            require_promote=True,
+        )
+    assert not evidence_path.exists()
+    assert not receipt_path.exists()
+
+
+def test_safety_and_success_regressions_seal_keep_planner_decisions(
+    tmp_path: Path,
+) -> None:
+    safety = Fixture(tmp_path / "safety")
+    safety.policy_records[0]["success"] = False
+    safety.policy_records[0]["safety_failure"] = True
+    safety.policy_records[0]["completion_time_s"] = None
+    safety.planner_records[0]["success"] = False
+    safety.planner_records[0]["completion_time_s"] = None
+    safety._write_evaluations()
+    safety_evidence = safety.build()
+    assert safety_evidence["selection"]["decision"] == "keep_planner"
+    assert safety_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert safety_evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    assert safety_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "aggregate_policy_safety_count_worse",
+            "scope": "aggregate",
+            "policy_failure_count": 1,
+            "planner_failure_count": 0,
+        }
+    ]
+    assert safety_evidence["per_reset"][0]["rejection_reasons"] == []
+
+    regression = Fixture(tmp_path / "success")
+    regression.policy_records[0]["success"] = False
+    regression.policy_records[0]["completion_time_s"] = None
+    regression._write_evaluations()
+    regression_evidence = regression.build()
+    expected_reason = {
+        "code": "planner_success_policy_failure",
+        "scope": "reset",
+        "reset_index": 0,
+        "episode_id": "validation-00",
+    }
+    assert regression_evidence["selection"]["decision"] == "keep_planner"
+    assert regression_evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert regression_evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    assert regression_evidence["selection"]["rejection_reasons"] == [expected_reason]
+    assert regression_evidence["per_reset"][0]["rejection_reasons"] == [expected_reason]
+
+    evidence_path = regression.root / "selection_evidence.json"
+    receipt_path = regression.root / "promotion_receipt.json"
+    with pytest.raises(RuntimeError, match="formal_gate_rejection"):
+        promotion.write_promotion_artifacts(
+            evidence=regression_evidence,
+            evidence_path=evidence_path,
+            receipt_path=receipt_path,
+            require_promote=True,
+        )
+    assert not evidence_path.exists()
+    assert not receipt_path.exists()
+
+    receipt = promotion.write_promotion_artifacts(
+        evidence=regression_evidence,
+        evidence_path=evidence_path,
+        receipt_path=receipt_path,
+        require_promote=False,
+    )
+    assert receipt["selection"]["decision"] == "keep_planner"
+    assert receipt["selection"]["reason"] == "formal_gate_rejection"
+    assert receipt["selection"]["rejection_reasons"] == [expected_reason]
+    with pytest.raises(ValueError, match="no promote decision"):
+        review_exporter._validate_promotion_receipt_payload(
+            receipt,
+            task=TASK,
+            candidate_id="learned-s7",
+            policy_path=str(regression.policy_path.resolve()),
+            policy_sha256=regression.policy_sha,
+            residual_scale=float(regression.config["residual_scale"]),
+            rlinf_commit=regression.rlinf_commit,
+            benchmark_commit=BENCHMARK_COMMIT,
+            threshold_schema=promotion.QUALITY_V2_THRESHOLD_SCHEMA,
+            threshold_sha256=regression.threshold_sha,
+            calibration_receipt_identity={
+                "relative_path": "provenance/calibration_wave/wave_receipt.json",
+                "file_sha256": regression.calibration_receipt_sha,
+                "payload_sha256": regression.calibration_receipt_sha,
+            },
+            evaluator_rlinf_commit=regression.evaluator_commit,
+            evaluator_source_sha256=promotion._sha256(
+                regression.policy_evaluator_source
+            ),
+        )
+    assert promotion.validate_selection_evidence_artifacts(regression_evidence) == (
+        regression_evidence
+    )
+
+
+def test_successful_policy_safety_and_qv3_gate_failures_are_structured(
+    tmp_path: Path,
+) -> None:
+    safety = Fixture(tmp_path / "successful-safety")
+    safety.policy_records[0]["safety_failure"] = True
+    safety.planner_records[0]["safety_failure"] = True
+    safety._write_evaluations()
+
+    safety_evidence = safety.build()
+    assert safety_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "successful_policy_gate_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_gates": ["safety"],
+        }
+    ]
+    assert safety_evidence["selection"]["reason"] == "formal_gate_rejection"
+
+    qv3 = Fixture(tmp_path / "successful-qv3")
+    phase, metric, _ = Q_METRICS[0]
+    for record in (qv3.policy_records[0], qv3.planner_records[0]):
+        quality = record["quality_v2"]
+        target = quality if phase == "full_episode" else quality["phases"][phase]
+        _set_nested(target, metric, 3.0)
+        record["quality_v2_sha256"] = promotion._payload_sha256(quality)
+        record["quality_v2_gate"] = _gate(quality, qv3.checks, qv3.threshold_sha)
+    qv3._write_evaluations()
+
+    qv3_evidence = qv3.build()
+    assert qv3_evidence["selection"]["rejection_reasons"] == [
+        {
+            "code": "successful_policy_gate_failure",
+            "scope": "reset",
+            "reset_index": 0,
+            "episode_id": "validation-00",
+            "failed_gates": ["quality_v3"],
+        }
+    ]
+    assert (
+        qv3_evidence["aggregate"]["all_successful_policy_quality_v3_gates_passed"]
+        is False
+    )
+
+
+def test_malformed_nonfinite_and_replay_evidence_still_throws(
+    tmp_path: Path,
+) -> None:
+    aggregate = Fixture(tmp_path / "aggregate")
+    evaluation = json.loads(
+        aggregate.policy_evaluation_path.read_text(encoding="utf-8")
+    )
+    evaluation["all_successful_quality_v2_gates_passed"] = False
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(aggregate.policy_evaluation_path, evaluation)
+    aggregate._write_evaluation_sha256sums()
+    with pytest.raises(ValueError, match="aggregate disagrees"):
+        aggregate.build()
+
+    gate = Fixture(tmp_path / "gate")
+    gate.policy_records[0]["quality_v2_gate"]["passed"] = False
+    gate._write_evaluations()
+    with pytest.raises(ValueError, match="recorded Qv3 gate does not recompute"):
+        gate.build()
+
+    nonfinite = Fixture(tmp_path / "nonfinite")
+    evaluation = json.loads(
+        nonfinite.policy_evaluation_path.read_text(encoding="utf-8")
+    )
+    evaluation["records"][0]["completion_time_s"] = float("inf")
+    _write_json(nonfinite.policy_evaluation_path, evaluation)
+    with pytest.raises(ValueError, match="Out of range float values|finite"):
+        nonfinite.build()
+
+    replay = Fixture(tmp_path / "replay")
+    replay.policy_records[0]["replay_validation"]["passed"] = False
+    replay.policy_records[0]["replay_validation_sha256"] = optimal._payload_sha256(
+        replay.policy_records[0]["replay_validation"]
+    )
+    replay._write_evaluations()
+    with pytest.raises(ValueError, match="replay did not pass"):
+        replay.build()
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        ("full_episode", "action.action_total_variation_l2_mean_per_transition"),
+        ("full_episode", "eef_motion.eef_translation_path_length_m"),
+        ("acquisition_window", "approach_axis.approach_axis_error_max_rad"),
+        ("full_episode", "eef_motion.eef_linear_jerk_max_m_s3"),
+    ],
+)
+def test_qv3_tv_path_orientation_and_jerk_degradation_seals_formal_rejection(
+    tmp_path: Path, identity: tuple[str, str]
+) -> None:
+    fixture = Fixture(tmp_path)
+    policy = fixture.policy_records[0]
+    quality = policy["quality_v2"]
+    target = (
+        quality if identity[0] == "full_episode" else quality["phases"][identity[0]]
+    )
+    _set_nested(target, identity[1], 1.5)
+    policy["quality_v2_sha256"] = promotion._payload_sha256(quality)
+    policy["quality_v2_gate"] = _gate(quality, fixture.checks, fixture.threshold_sha)
+    fixture._write_evaluations()
+
+    evidence = fixture.build()
+
+    assert evidence["selection"]["decision"] == "keep_planner"
+    assert evidence["selection"]["reason"] == "formal_gate_rejection"
+    assert evidence["selection"]["planner_nonworse_all_dimensions"] is False
+    expected_reason = {
+        "code": "both_success_metric_nonworse_failure",
+        "scope": "reset",
+        "reset_index": 0,
+        "episode_id": "validation-00",
+        "failed_dimensions": [f"quality_v3.{identity[0]}.{identity[1]}"],
+    }
+    assert evidence["selection"]["rejection_reasons"] == [expected_reason]
+    assert evidence["per_reset"][0]["rejection_reasons"] == [expected_reason]
+
+
+def test_missing_or_tampered_evidence_evaluation_reset_and_sha_fail_closed(
+    tmp_path: Path,
+) -> None:
+    fixture = Fixture(tmp_path)
+    evidence = fixture.build()
+    evidence_path = tmp_path / "selection_evidence.json"
+    receipt_path = tmp_path / "promotion_receipt.json"
+    receipt = promotion.write_promotion_artifacts(
+        evidence=evidence,
+        evidence_path=evidence_path,
+        receipt_path=receipt_path,
+        require_promote=True,
+    )
+    assert receipt["selection"]["evidence_sha256"] == promotion._sha256(evidence_path)
+
+    resealed_selection_tamper = deepcopy(evidence)
+    resealed_selection_tamper["selection"]["reason"] = "formal_gate_rejection"
+    resealed_selection_tamper["payload_sha256"] = promotion._payload_sha256(
+        resealed_selection_tamper
+    )
+    with pytest.raises(ValueError, match="artifact-level recomputation"):
+        promotion.validate_selection_evidence_artifacts(resealed_selection_tamper)
+    tampered_evidence_path = tmp_path / "tampered_selection_evidence.json"
+    tampered_receipt_path = tmp_path / "tampered_promotion_receipt.json"
+    with pytest.raises(ValueError, match="artifact-level recomputation"):
+        promotion.write_promotion_artifacts(
+            evidence=resealed_selection_tamper,
+            evidence_path=tampered_evidence_path,
+            receipt_path=tampered_receipt_path,
+            require_promote=False,
+        )
+    assert not tampered_evidence_path.exists()
+    assert not tampered_receipt_path.exists()
+
+    fixture.policy_evaluation_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        promotion.validate_selection_evidence_artifacts(evidence)
+    fixture._write_evaluations()
+    fixture.reset_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        promotion.validate_selection_evidence_artifacts(evidence)
+
+    tampered = deepcopy(evidence)
+    tampered["selection"]["decision"] = "keep_planner"
+    with pytest.raises(ValueError, match="payload SHA-256"):
+        promotion.validate_selection_evidence_artifacts(tampered)
+    with pytest.raises(ValueError, match="policy SHA-256 mismatch"):
+        promotion.build_selection_evidence(
+            candidate_id="learned-s7",
+            run_tag="cycle1-s7",
+            trainer_run_root=fixture.root,
+            policy_path=fixture.policy_path,
+            policy_metadata_path=fixture.metadata_path,
+            checkpoint_selection_path=fixture.checkpoint_selection_path,
+            checkpoint_selection_outcome_path=(
+                fixture.checkpoint_selection_outcome_path
+            ),
+            policy_rlinf_source_root=fixture.policy_source_root,
+            policy_evaluation_path=fixture.policy_evaluation_path,
+            policy_evaluation_sha256sums_path=(
+                fixture.policy_evaluation_sha256sums_path
+            ),
+            planner_evaluation_path=fixture.planner_evaluation_path,
+            planner_evaluation_sha256sums_path=(
+                fixture.planner_evaluation_sha256sums_path
+            ),
+            reset_manifest_path=fixture.reset_path,
+            quality_v2_thresholds_path=fixture.threshold_path,
+            quality_v2_calibration_wave_receipt_path=(fixture.calibration_receipt_path),
+            selector_contract_path=fixture.selector_path,
+            policy_evaluator_source_path=fixture.policy_evaluator_source,
+            planner_evaluator_source_path=fixture.planner_evaluator_source,
+            image_reference="runtime:test",
+            image_sha256=IMAGE_SHA256,
+            expected_sha256={
+                "policy": "0" * 64,
+                "policy_metadata": promotion._sha256(fixture.metadata_path),
+                "policy_evaluation": promotion._sha256(fixture.policy_evaluation_path),
+                "planner_evaluation": promotion._sha256(
+                    fixture.planner_evaluation_path
+                ),
+                "reset_manifest": promotion._sha256(fixture.reset_path),
+                "quality_v2_thresholds": promotion._sha256(fixture.threshold_path),
+                "selector_contract": promotion._sha256(fixture.selector_path),
+                "policy_evaluator_source": promotion._sha256(
+                    fixture.policy_evaluator_source
+                ),
+                "planner_evaluator_source": promotion._sha256(
+                    fixture.planner_evaluator_source
+                ),
+            },
+        )
+
+
+def test_provisional_thresholds_are_rejected(tmp_path: Path) -> None:
+    fixture = Fixture(tmp_path)
+    fixture.thresholds["formal_freeze_eligible"] = False
+    _write_json(fixture.threshold_path, fixture.thresholds)
+    with pytest.raises(ValueError, match="formal freeze"):
+        fixture.build()
+
+
+def test_promotion_rejects_same_count_qv3_identity_substitution() -> None:
+    thresholds = _thresholds()
+    next(
+        check
+        for check in thresholds["tasks"][TASK]["checks"]
+        if check["metric"] == "eef_motion.eef_linear_jerk_rms_m_s3"
+    )["metric"] = "eef_motion.eef_linear_jerk_peak_m_s3"
+
+    with pytest.raises(ValueError, match="inventory mismatch"):
+        promotion._quality_contract(thresholds, task=TASK, sha256="f" * 64)
+
+
+def test_zero_step_final_and_test_exposure_are_rejected(tmp_path: Path) -> None:
+    zero = Fixture(tmp_path / "zero")
+    payload = torch.load(zero.policy_path, map_location="cpu", weights_only=False)
+    payload["env_steps"] = 0
+    torch.save(payload, zero.policy_path)
+    zero.policy_sha = promotion._sha256(zero.policy_path)
+    zero._write_evaluations()
+    with pytest.raises(ValueError, match="env_steps"):
+        zero.build()
+
+    final = Fixture(tmp_path / "final")
+    final_policy = final.root / "final_policy.pt"
+    final.policy_path.rename(final_policy)
+    final.policy_path = final_policy
+    final.policy_sha = promotion._sha256(final_policy)
+    final._write_evaluations()
+    with pytest.raises(ValueError, match="best_policy"):
+        final.build()
+
+    exposed = Fixture(tmp_path / "test")
+    evaluation = json.loads(exposed.policy_evaluation_path.read_text(encoding="utf-8"))
+    evaluation["split"] = "test_id"
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(exposed.policy_evaluation_path, evaluation)
+    exposed._write_evaluation_sha256sums()
+    with pytest.raises(ValueError, match="validation split"):
+        exposed.build()
+
+    calibration = Fixture(tmp_path / "calibration")
+    evaluation = json.loads(
+        calibration.policy_evaluation_path.read_text(encoding="utf-8")
+    )
+    evaluation["manifest_seed"] = promotion.CALIBRATION_MANIFEST_SEED
+    evaluation["payload_sha256"] = promotion._payload_sha256(evaluation)
+    _write_json(calibration.policy_evaluation_path, evaluation)
+    calibration._write_evaluation_sha256sums()
+    with pytest.raises(ValueError, match="review/calibration/test manifest seed"):
+        calibration.build()
+
+    training_exposed = Fixture(tmp_path / "training-exposed")
+    checkpoint = torch.load(
+        training_exposed.policy_path, map_location="cpu", weights_only=False
+    )
+    checkpoint["config"]["validation_manifest_seed"] = promotion.REVIEW_MANIFEST_SEED
+    torch.save(checkpoint, training_exposed.policy_path)
+    training_exposed.config = checkpoint["config"]
+    training_exposed.policy_sha = promotion._sha256(training_exposed.policy_path)
+    summary = json.loads(training_exposed.metadata_path.read_text(encoding="utf-8"))
+    summary["config"] = training_exposed.config
+    summary["config_sha256"] = promotion._value_sha256(training_exposed.config)
+    summary["payload_sha256"] = promotion._payload_sha256(summary)
+    _write_json(training_exposed.metadata_path, summary)
+    training_exposed._write_evaluations()
+    with pytest.raises(ValueError, match="checkpoint selection reused"):
+        training_exposed.build()
