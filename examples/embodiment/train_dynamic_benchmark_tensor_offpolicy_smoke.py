@@ -75,13 +75,24 @@ TEACHER_OVERRIDE_FLOAT_RANGES = {
     "close_horizontal_tolerance_m": (0.005, 0.08, False),
     "close_vertical_tolerance_m": (0.005, 0.08, False),
     "lift_action_z_max": (0.05, 1.0, False),
+    "adaptive_lookahead_speed_gain_s_per_mps": (0.0, 5.0, True),
+    "adaptive_lookahead_max_s": (0.0, 1.0, False),
 }
 TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS = {
     "close_retry_steps",
     "lift_contact_loss_retry_steps",
 }
-TEACHER_OVERRIDE_NONNEGATIVE_INTS = {"post_hold_settle_steps"}
-TEACHER_OVERRIDE_BOOLS = {"lift_on_instantaneous_bilateral"}
+TEACHER_OVERRIDE_POSITIVE_INTS = {"hold_confirmation_steps"}
+TEACHER_OVERRIDE_NONNEGATIVE_INTS = {
+    "post_hold_settle_steps",
+    "lift_ramp_steps",
+    "lift_recovery_steps",
+    "max_regrasp_attempts",
+}
+TEACHER_OVERRIDE_BOOLS = {
+    "lift_on_instantaneous_bilateral",
+    "contact_anchor_on_first_touch",
+}
 
 
 @dataclass(frozen=True)
@@ -356,6 +367,7 @@ def _load_demo_teacher_overrides(
     allowed = (
         set(TEACHER_OVERRIDE_FLOAT_RANGES)
         | TEACHER_OVERRIDE_OPTIONAL_POSITIVE_INTS
+        | TEACHER_OVERRIDE_POSITIVE_INTS
         | TEACHER_OVERRIDE_NONNEGATIVE_INTS
         | TEACHER_OVERRIDE_BOOLS
     )
@@ -397,10 +409,28 @@ def _load_demo_teacher_overrides(
                     f"demo teacher override {name} must be an integer in [0, 20]"
                 )
             normalized[name] = value
+        elif name in TEACHER_OVERRIDE_POSITIVE_INTS:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= 20
+            ):
+                raise ValueError(
+                    f"demo teacher override {name} must be an integer in [1, 20]"
+                )
+            normalized[name] = value
         else:
             if not isinstance(value, bool):
                 raise ValueError(f"demo teacher override {name} must be boolean")
             normalized[name] = value
+    if (
+        "adaptive_lookahead_max_s" in normalized
+        and "lookahead_s" in normalized
+        and normalized["adaptive_lookahead_max_s"] < normalized["lookahead_s"]
+    ):
+        raise ValueError(
+            "demo teacher override adaptive_lookahead_max_s must be at least lookahead_s"
+        )
     return normalized, hashlib.sha256(raw).hexdigest()
 
 

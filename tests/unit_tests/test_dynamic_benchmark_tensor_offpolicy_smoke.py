@@ -568,9 +568,17 @@ def test_teacher_overrides_are_strict_planner_only_identity(
     module = _load_module(monkeypatch)
     path = tmp_path / "teacher-overrides.json"
     payload = {
+        "adaptive_lookahead_max_s": 0.75,
+        "adaptive_lookahead_speed_gain_s_per_mps": 2.0,
         "close_retry_steps": 20,
+        "contact_anchor_on_first_touch": True,
+        "hold_confirmation_steps": 2,
         "lift_action_z_max": 0.4,
+        "lift_ramp_steps": 4,
+        "lift_recovery_steps": 6,
+        "max_regrasp_attempts": 0,
         "post_hold_settle_steps": 2,
+        "lookahead_s": 0.4,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     config = module._config(
@@ -589,6 +597,24 @@ def test_teacher_overrides_are_strict_planner_only_identity(
         config.demo_teacher_overrides_sha256
         == hashlib.sha256(path.read_bytes()).hexdigest()
     )
+
+    invalid_adaptive = tmp_path / "invalid-adaptive.json"
+    invalid_adaptive.write_text(
+        '{"lookahead_s": 0.6, "adaptive_lookahead_max_s": 0.5}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="must be at least lookahead_s"):
+        module._config(
+            _arguments(
+                module,
+                "--demo-policy",
+                "privileged_teacher",
+                "--minimum-demo-success-rate",
+                "0.75",
+                "--demo-teacher-overrides",
+                str(invalid_adaptive),
+            )
+        )
 
     unknown = tmp_path / "unknown.json"
     unknown.write_text(
