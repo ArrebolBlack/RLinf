@@ -47,7 +47,7 @@ from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import (
     GpuNativeTensorBackendEnv,
     GpuNativeVisualPolicyObservation,
 )
-from rlinf.models.embodiment.direct_ppo_visual_actor_critic import (
+from rlinf.algorithms.direct_ppo_visual_actor_critic import (
     DirectPPOVisualActorCritic,
 )
 
