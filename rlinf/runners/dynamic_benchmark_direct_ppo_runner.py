@@ -791,9 +791,17 @@ class DirectPPORunner:
             for row, decomposition in zip(ledger, decompositions, strict=True):
                 lane = row.lane
                 expected_reason = 0 if row.truncated else terminal_reason_host[lane]
+                # The device step returns the end of the 20 Hz control interval;
+                # the canonical terminal ledger latches the exact 500 Hz event
+                # clock inside that interval.  Reconcile the two clocks without
+                # discarding the more precise ledger timestamp.
+                interval_end = terminal_physics_host[lane]
+                terminal_clock_in_interval = (
+                    interval_end - 25 < row.physics_step <= interval_end
+                )
                 if (
                     row.success != terminal_success_host[lane]
-                    or row.physics_step != terminal_physics_host[lane]
+                    or not terminal_clock_in_interval
                     or (not row.truncated and expected_reason == 0)
                 ):
                     raise RuntimeError(
