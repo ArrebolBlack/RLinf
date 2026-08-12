@@ -796,7 +796,17 @@ class DirectPPORunner:
                     or row.physics_step != terminal_physics_host[lane]
                     or (not row.truncated and expected_reason == 0)
                 ):
-                    raise RuntimeError("terminal ledger differs from device terminal signals")
+                    raise RuntimeError(
+                        "terminal ledger differs from device terminal signals: "
+                        f"lane={lane}, ledger_success={row.success}, "
+                        f"device_success={terminal_success_host[lane]}, "
+                        f"ledger_physics_step={row.physics_step}, "
+                        f"device_physics_step={terminal_physics_host[lane]}, "
+                        f"ledger_terminated={row.terminated}, "
+                        f"ledger_truncated={row.truncated}, "
+                        f"ledger_reason={row.termination_reason!r}, "
+                        f"device_reason={terminal_reason_host[lane]}"
+                    )
                 quality = None if row.task_quality is None else row.task_quality.to_dict()
                 episode_rows.append(
                     {
