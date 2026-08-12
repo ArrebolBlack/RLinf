@@ -80,6 +80,17 @@ _P0_STATE_ENV_CAPABILITIES = MappingProxyType(
         "device_terminal_mask": True,
     }
 )
+_P0_STATE_ENV_VISUAL_CAPABILITIES = MappingProxyType(
+    {
+        **_P0_STATE_ENV_CAPABILITIES,
+        # RGB/depth/segmentation are auxiliary GPU audit outputs.  The public
+        # RL observation track remains STATE, but enabling the visual audit
+        # legitimately advertises these engine-side capabilities.
+        "rgb": True,
+        "depth": True,
+        "segmentation": True,
+    }
+)
 _EXPORT_DIGEST_ATTRIBUTES = MappingProxyType(
     {
         "request_sha256": "request_identity_sha256",
@@ -275,7 +286,10 @@ def _validate_public_contract(
         raise GpuNativeTensorBackendUnavailableError(
             "SE3-WAM P0 STATE contract capability values differ from clean v0.2"
         )
-    if env_capabilities != _P0_STATE_ENV_CAPABILITIES:
+    if env_capabilities not in (
+        _P0_STATE_ENV_CAPABILITIES,
+        _P0_STATE_ENV_VISUAL_CAPABILITIES,
+    ):
         raise GpuNativeTensorBackendUnavailableError(
             "SE3-WAM P0 STATE engine capability values differ from clean v0.2"
         )
