@@ -23,11 +23,11 @@ explicit audit seam.  Reward, termination, success, and timeout stay inside
 the backend; RLinf keeps its own reward shaping on top of the materialized
 events and stage progress.
 
-The GPU backend currently requires every lane to reuse the one frozen export
-identity (task/seed/split/factors/...); only episode_id and the selected
-non-oracle observation track are free. This adapter therefore sources reset
-requests from the frozen export artifact and never falls back to the CPU
-make_mujoco_env path.
+The GPU backend accepts either one homogeneous frozen export identity or a
+lane-local tuple of frozen export artifacts. The latter is the D32 path: each
+lane keeps its own task/seed/split/factors identity while every physics,
+rendering, and observation operation remains on MJWarp CUDA. Neither path
+falls back to the CPU ``make_mujoco_env`` environment.
 
 ``se3_wam`` imports are deliberately lazy so this module (and the tests that
 exercise its request mapping) can be imported on machines without the SE3-WAM
@@ -185,6 +185,12 @@ class GpuNativeBackendEnv:
     def frozen_request(self) -> Any:
         return self._frozen_request
 
+    @property
+    def frozen_requests(self) -> tuple[Any, ...]:
+        """Return the export-bound request for each homogeneous lane."""
+
+        return tuple(self._frozen_request for _ in range(self._num_envs))
+
     def next_request(self) -> Any:
         """Return the frozen export request with a fresh per-lane episode id.
 
@@ -314,6 +320,204 @@ class GpuNativeBackendEnv:
         raise TypeError("GpuNativeBackendEnv is device-resident and not picklable")
 
 
+class GpuNativeMultiExportBackendEnv:
+    """Run lane-local frozen exports on one CUDA device.
+
+    The canonical MJWarp engine currently admits only a full-batch reset and
+    one artifact identity per engine. D32 still needs distinct reset factors per
+    episode, so this wrapper owns one batch-size-one GPU engine per lane and
+    presents the same lane-oriented adapter surface to the live Planner. This
+    is deliberately a composition of GPU-native engines, never a CPU physics
+    or CPU environment fallback.
+    """
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        export_dirs: Sequence[str],
+        device_ordinal: int = 0,
+        image_size: int = 64,
+        observation_track: Any = "hybrid",
+        task_quality_evaluator_backend_id: str | None = None,
+        task_quality_schema_version: str | None = None,
+    ) -> None:
+        dirs = tuple(export_dirs)
+        if not dirs:
+            raise ValueError("GPU-native multi-export backend requires at least one export")
+        if any(not isinstance(path, str) or not path.strip() for path in dirs):
+            raise ValueError("GPU-native multi-export paths must be non-empty strings")
+        if len(set(dirs)) != len(dirs):
+            raise ValueError("GPU-native multi-export paths must be unique")
+        self._task_id = task_id
+        self._export_dirs = dirs
+        self._backends: list[GpuNativeBackendEnv] = []
+        try:
+            self._backends = [
+                GpuNativeBackendEnv(
+                    task_id=task_id,
+                    num_envs=1,
+                    export_dir=path,
+                    device_ordinal=device_ordinal,
+                    image_size=image_size,
+                    observation_track=observation_track,
+                    task_quality_evaluator_backend_id=task_quality_evaluator_backend_id,
+                    task_quality_schema_version=task_quality_schema_version,
+                )
+                for path in dirs
+            ]
+        except BaseException:
+            for backend in reversed(self._backends):
+                backend.close()
+            raise
+        self._frozen_requests = tuple(
+            backend.frozen_request for backend in self._backends
+        )
+        provenance = self._backends[0].provenance
+        identity = (
+            getattr(provenance, "physical_device_uuid", None),
+            getattr(provenance, "physical_device_pci_bus_id", None),
+            getattr(provenance, "device_ordinal", None),
+        )
+        for backend in self._backends[1:]:
+            other = backend.provenance
+            if (
+                getattr(other, "physical_device_uuid", None),
+                getattr(other, "physical_device_pci_bus_id", None),
+                getattr(other, "device_ordinal", None),
+            ) != identity:
+                self.close()
+                raise GpuNativeBackendUnavailableError(
+                    "lane-local GPU exports resolved to different physical devices"
+                )
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    @property
+    def num_envs(self) -> int:
+        return len(self._backends)
+
+    @property
+    def export_dirs(self) -> tuple[str, ...]:
+        return self._export_dirs
+
+    @property
+    def backend_id(self) -> str:
+        return self._backends[0].backend_id
+
+    @property
+    def observation_track(self) -> Any:
+        return self._backends[0].observation_track
+
+    @property
+    def provenance(self) -> Any:
+        return self._backends[0].provenance
+
+    @property
+    def frozen_requests(self) -> tuple[Any, ...]:
+        return self._frozen_requests
+
+    def next_request(self) -> Any:
+        """Return an exact export-bound request for compatibility callers."""
+
+        index = getattr(self, "_next_request_index", 0)
+        request = self._frozen_requests[index % self.num_envs]
+        self._next_request_index = index + 1
+        return request
+
+    def reset(self, requests: Sequence[Any]) -> tuple[Any, ...]:
+        request_tuple = tuple(requests)
+        if len(request_tuple) != self.num_envs:
+            raise ValueError("GPU-native multi-export reset requires one request per lane")
+        observations = []
+        for backend, request in zip(self._backends, request_tuple, strict=True):
+            lane_observations = backend.reset((request,))
+            if len(lane_observations) != 1:
+                raise RuntimeError("lane-local GPU reset changed its cardinality")
+            observations.append(lane_observations[0])
+        return tuple(observations)
+
+    def step(
+        self,
+        commands: Sequence[Any | None],
+        *,
+        active_mask: Any | None = None,
+    ) -> tuple[Any | None, ...]:
+        command_tuple = tuple(commands)
+        if len(command_tuple) != self.num_envs:
+            raise ValueError("GPU-native multi-export step requires one command per lane")
+        if active_mask is None:
+            mask = np.ones(self.num_envs, dtype=np.bool_)
+        else:
+            mask = np.asarray(active_mask)
+            if mask.shape != (self.num_envs,) or mask.dtype != np.bool_:
+                raise ValueError(
+                    f"active_mask must be bool shape ({self.num_envs},)"
+                )
+        results: list[Any | None] = [None] * self.num_envs
+        for lane, (backend, command, active) in enumerate(
+            zip(self._backends, command_tuple, mask, strict=True)
+        ):
+            if not active:
+                if command is not None:
+                    raise ValueError(f"inactive GPU lane {lane} must carry None")
+                continue
+            lane_results = backend.step(
+                (command,),
+                active_mask=np.asarray([True], dtype=np.bool_),
+            )
+            if len(lane_results) != 1:
+                raise RuntimeError("lane-local GPU step changed its cardinality")
+            results[lane] = lane_results[0]
+        return tuple(results)
+
+    def materialize_terminal_ledger(
+        self,
+        lanes: Sequence[int],
+        episode_ids: Sequence[str],
+    ) -> Any:
+        from dataclasses import replace as dataclass_replace
+
+        from se3_wam.benchmark.gpu_native.audit import TerminalLedgerBatch
+
+        lane_tuple = tuple(int(lane) for lane in lanes)
+        episode_tuple = tuple(str(episode_id) for episode_id in episode_ids)
+        if len(lane_tuple) != len(episode_tuple) or not lane_tuple:
+            raise ValueError("terminal ledger lanes and episode IDs must be aligned")
+        rows = []
+        for lane, episode_id in zip(lane_tuple, episode_tuple, strict=True):
+            if not 0 <= lane < self.num_envs:
+                raise ValueError(f"terminal ledger lane {lane} is outside the multi-export batch")
+            batch = self._backends[lane].materialize_terminal_ledger(
+                (0,), (episode_id,)
+            )
+            if len(batch.rows) != 1:
+                raise RuntimeError("lane-local terminal ledger changed its cardinality")
+            rows.append(dataclass_replace(batch.rows[0], lane=lane))
+        return TerminalLedgerBatch(
+            backend_id=self.backend_id,
+            provenance=self.provenance,
+            rows=tuple(rows),
+        )
+
+    def mark_done(self, done_mask: Any) -> None:
+        mask = np.asarray(done_mask)
+        if mask.shape != (self.num_envs,) or mask.dtype != np.bool_:
+            raise ValueError(f"done_mask must be bool shape ({self.num_envs},)")
+        for lane, backend in enumerate(self._backends):
+            if mask[lane]:
+                backend.mark_done(np.asarray([True], dtype=np.bool_))
+
+    def close(self) -> None:
+        for backend in reversed(self._backends):
+            backend.close()
+
+    def __getstate__(self) -> Mapping[str, Any]:
+        raise TypeError("GpuNativeMultiExportBackendEnv is device-resident and not picklable")
+
+
 @dataclass(frozen=True)
 class PlannerTapeReplay:
     """Explicit open-loop diagnostic replay result, never a live Planner mode."""
@@ -337,7 +541,8 @@ class GpuNativePlannerAdapter:
         *,
         task_id: str,
         num_envs: int,
-        export_dir: str,
+        export_dir: str | None = None,
+        export_dirs: Sequence[str] | None = None,
         device_ordinal: int = 0,
         image_size: int = 64,
         observation_track: Any = "hybrid",
@@ -345,18 +550,38 @@ class GpuNativePlannerAdapter:
         schema_version: str | None = None,
     ) -> None:
         self._task_id = task_id
-        self._backend = GpuNativeBackendEnv(
-            task_id=task_id,
-            num_envs=num_envs,
-            export_dir=export_dir,
-            device_ordinal=device_ordinal,
-            image_size=image_size,
-            observation_track=observation_track,
-            task_quality_evaluator_backend_id=evaluator_backend_id,
-            task_quality_schema_version=schema_version
+        if (export_dir is None) == (export_dirs is None):
+            raise ValueError("provide exactly one of export_dir or export_dirs")
+        quality_schema = (
+            schema_version
             if schema_version is not None
-            else "db0-episode-task-quality-v1",
+            else "db0-episode-task-quality-v1"
         )
+        if export_dirs is not None:
+            export_dirs = tuple(export_dirs)
+            if len(export_dirs) != num_envs:
+                raise ValueError("export_dirs length must equal num_envs")
+            self._backend = GpuNativeMultiExportBackendEnv(
+                task_id=task_id,
+                export_dirs=export_dirs,
+                device_ordinal=device_ordinal,
+                image_size=image_size,
+                observation_track=observation_track,
+                task_quality_evaluator_backend_id=evaluator_backend_id,
+                task_quality_schema_version=quality_schema,
+            )
+        else:
+            assert export_dir is not None
+            self._backend = GpuNativeBackendEnv(
+                task_id=task_id,
+                num_envs=num_envs,
+                export_dir=export_dir,
+                device_ordinal=device_ordinal,
+                image_size=image_size,
+                observation_track=observation_track,
+                task_quality_evaluator_backend_id=evaluator_backend_id,
+                task_quality_schema_version=quality_schema,
+            )
         self._teachers: tuple[Any, ...] = ()
         self._teacher_metadata: tuple[Mapping[str, Any], ...] = ()
         self._requests: tuple[Any, ...] = ()
@@ -427,6 +652,12 @@ class GpuNativePlannerAdapter:
             allow_nan=False,
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def frozen_requests(self) -> tuple[Any, ...]:
+        """Return the exact request identity bound by each export artifact."""
+
+        return tuple(self._backend.frozen_requests)
 
     def next_request(self) -> Any:
         return self._backend.next_request()
