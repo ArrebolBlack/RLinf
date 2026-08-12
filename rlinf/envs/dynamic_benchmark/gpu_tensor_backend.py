@@ -726,6 +726,7 @@ class GpuNativeTensorBackendEnv:
         expected_se3_source_tree: str,
         device_ordinal: int = 0,
         image_size: int = 64,
+        render_visual: bool = False,
         split: str = "train",
         manifest_seed: int = 20261050,
         manifest_size: int | None = None,
@@ -762,6 +763,8 @@ class GpuNativeTensorBackendEnv:
             or image_size < 1
         ):
             raise ValueError("image_size must be a positive integer")
+        if not isinstance(render_visual, bool):
+            raise ValueError("render_visual must be a bool")
         if (
             isinstance(manifest_seed, bool)
             or not isinstance(manifest_seed, int)
@@ -822,6 +825,7 @@ class GpuNativeTensorBackendEnv:
         self._expected_se3_source_tree = expected_se3_source_tree
         self._device_ordinal = device_ordinal
         self._device = device
+        self._render_visual = render_visual
         self._torch = torch
         self._warp = warp
         self._stream_from_torch = stream_from_torch
@@ -942,6 +946,14 @@ class GpuNativeTensorBackendEnv:
             raise GpuNativeTensorBackendUnavailableError(
                 "frozen export request differs from the exact P0 STATE/E7 contract"
             )
+        engine_kwargs = {
+            "expected_device_uuid": expected_gpu_uuid,
+            "expected_model_sha256": export_identity_start["model_sha256"],
+            "expected_source_commit": expected_se3_source_commit,
+            "expected_source_tree": expected_se3_source_tree,
+        }
+        if render_visual:
+            engine_kwargs["enable_visual"] = True
         env = make_gpu_native_env(
             task_id,
             consumer=self._consumer,
@@ -950,12 +962,7 @@ class GpuNativeTensorBackendEnv:
             export_dir=export_dir,
             device_ordinal=device_ordinal,
             image_size=image_size,
-            engine_kwargs={
-                "expected_device_uuid": expected_gpu_uuid,
-                "expected_model_sha256": export_identity_start["model_sha256"],
-                "expected_source_commit": expected_se3_source_commit,
-                "expected_source_tree": expected_se3_source_tree,
-            },
+            engine_kwargs=engine_kwargs,
         )
         try:
             contract_capabilities, env_capabilities = _validate_public_contract(
@@ -1111,6 +1118,7 @@ class GpuNativeTensorBackendEnv:
                     "sha256": observed_manifest_sha256,
                 },
                 "task_quality": task_quality_identity,
+                "render_visual": render_visual,
                 "device_identity": dict(vars(device_identity_start)),
             }
         )
@@ -1128,12 +1136,20 @@ class GpuNativeTensorBackendEnv:
         return self._task_id
 
     @property
+    def backend_id(self) -> str:
+        return _GPU_NATIVE_BACKEND_ID
+
+    @property
     def num_envs(self) -> int:
         return self._num_envs
 
     @property
     def device(self) -> Any:
         return self._device
+
+    @property
+    def render_visual(self) -> bool:
+        return self._render_visual
 
     @property
     def cohort_horizon_steps(self) -> int:
