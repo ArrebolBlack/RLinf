@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,6 +72,9 @@ from examples.embodiment.dynamic_benchmark_quality_v4 import (
     write_quality_v4_attempt,
     write_quality_v4_full_export,
     write_quality_v4_lightweight_source,
+)
+from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
+    attach_quality_v4_winner_validation,
 )
 
 _REPRESENTATIVE_TASKS = (
@@ -511,6 +515,38 @@ def test_qv4_artifacts_use_parallel_paths_and_full_hdf5_is_regated(
     assert not winner["dataset_quality_v4_validation"]["passed"]
 
 
+@pytest.mark.parametrize(
+    ("group", "field", "message"),
+    (
+        ("field_tape", "physics", "physics/clock source mappings"),
+        ("physics", "contact_impulse_n_s", "physics/contact source fields"),
+        ("action", "applied", "issued/applied actions"),
+    ),
+)
+def test_qv4_full_export_fails_closed_on_missing_production_source_fields(
+    tmp_path: Path,
+    group: str,
+    field: str,
+    message: str,
+) -> None:
+    source = _source("p0_grasp", build_provisional_thresholds())
+    attempt = build_quality_v4_attempt(source)
+    tampered = copy.deepcopy(source)
+    field_tape = tampered["field_tape"]
+    if group == "field_tape":
+        field_tape.pop(field)
+    else:
+        field_tape[group].pop(field)
+    export_path = tmp_path / f"missing-{group}-{field}.h5"
+    write_quality_v4_full_export(
+        export_path,
+        source=tampered,
+        recorded_attempt=attempt,
+    )
+    with pytest.raises(ValueError, match=message):
+        audit_quality_v4_full_export(export_path)
+
+
 def test_qv4_attempt_rejects_task_vision_tolerance_identity_drift() -> None:
     thresholds = build_provisional_thresholds()
     source = _source("t4_can", thresholds)
@@ -786,6 +822,12 @@ def test_qv4_same_reset_pareto_uses_absolute_gates_and_ignores_return() -> None:
     )
 
 
+@dataclass(frozen=True)
+class _TraceFixture:
+    request: object
+    quality_v4_validation: dict[str, object] | None = None
+
+
 def test_qv4_optimal_audit_and_exact14_release_readiness_recompute_full_gates(
     tmp_path: Path,
 ) -> None:
@@ -793,6 +835,18 @@ def test_qv4_optimal_audit_and_exact14_release_readiness_recompute_full_gates(
     source = _source("p0_grasp", thresholds)
     attempt = build_quality_v4_attempt(source)
     assert attempt["eligible"]
+    attached_trace, production_export = attach_quality_v4_winner_validation(
+        tmp_path / "production",
+        trace=_TraceFixture(
+            request=SimpleNamespace(episode_id="p0_grasp-episode"),
+        ),
+        source=source,
+        attempt=attempt,
+    )
+    assert attached_trace.quality_v4_validation["passed"]
+    assert production_export["full_export_path"] == (
+        "quality_v4/full_exports/p0_grasp-episode.h5"
+    )
     exported = materialize_quality_v4_winner_export(
         tmp_path,
         source=source,

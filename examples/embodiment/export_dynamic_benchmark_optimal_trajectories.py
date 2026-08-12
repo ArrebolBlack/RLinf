@@ -31,7 +31,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -51,6 +51,7 @@ from examples.embodiment.evaluate_dynamic_benchmark_expert import (
     _load_inference_policy,
     _manifest_row,
     _sha256,
+    _task_quality_identity,
     _validate_policy_payload,
 )
 from examples.embodiment.train_dynamic_benchmark_expert import (
@@ -116,6 +117,29 @@ def export_quality_v4_winner(
         source=source,
         attempt=attempt,
     )
+
+
+def attach_quality_v4_winner_validation(
+    output: Path,
+    *,
+    trace: Any,
+    source: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Materialize the winner gate and attach it before dataset publication."""
+
+    if getattr(trace, "quality_v4_validation", None) is not None:
+        raise ValueError("winner EpisodeTrace already has Qv4 validation")
+    request = getattr(trace, "request", None)
+    if getattr(request, "episode_id", None) != attempt.get("episode_id"):
+        raise ValueError("winner EpisodeTrace and Qv4 attempt identities differ")
+    exported = export_quality_v4_winner(output, source=source, attempt=attempt)
+    validation = exported.get("dataset_quality_v4_validation")
+    if not isinstance(validation, Mapping) or validation.get("passed") is not True:
+        raise RuntimeError(
+            "selected winner failed its independent Qv4 full-export gate"
+        )
+    return replace(trace, quality_v4_validation=dict(validation)), exported
 
 
 CANDIDATE_SEARCH_MODES = (FIRST_ELIGIBLE_SEARCH_MODE, FULL_POOL_SEARCH_MODE)
@@ -418,6 +442,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-quality-v2-calibration-wave-receipt-sha256",
         required=True,
+    )
+    parser.add_argument(
+        "--quality-v4-thresholds",
+        type=Path,
+        required=True,
+        help="Owner-reviewed frozen Qv4 threshold contract.",
+    )
+    parser.add_argument(
+        "--expected-quality-v4-thresholds-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--quality-v4-reference-root",
+        type=Path,
+        required=True,
+        help="Reset-bound Qv4 field/path/orientation reference tree.",
     )
     parser.add_argument("--split", choices=("train", "validation"), required=True)
     parser.add_argument("--manifest-seed", type=int, required=True)
@@ -2974,6 +3014,8 @@ def _recover_partial_output(
             (
                 output / "lightweight" / episode_id,
                 output / "episodes" / task / split / episode_id,
+                output / "quality_v4" / "full_exports" / f"{episode_id}.h5",
+                output / "quality_v4" / "full_exports" / f"{episode_id}.gate.json",
             )
         )
     for path in dirty_paths:
@@ -3239,6 +3281,9 @@ def _rollout(
     replay_actions_array: np.ndarray | None = None,
     quality_v2_thresholds: Mapping[str, object] | None = None,
     quality_v2_thresholds_sha256: str | None = None,
+    quality_v4_thresholds: Mapping[str, Any] | None = None,
+    quality_v4_reference: Mapping[str, Any] | None = None,
+    quality_v4_capture: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray], Any | None]:
     from se3_wam.benchmark.api import StepResult
     from se3_wam.benchmark.dataset import EpisodeTrace
@@ -3256,6 +3301,21 @@ def _rollout(
         raise RuntimeError("optimal-trajectory environment is not initialized")
     row = _manifest_row(env, request.episode_id)
     raw_env = env.envs[0]
+    quality_v4_arguments = (
+        quality_v4_thresholds,
+        quality_v4_reference,
+        quality_v4_capture,
+    )
+    if any(value is not None for value in quality_v4_arguments) and not all(
+        value is not None for value in quality_v4_arguments
+    ):
+        raise ValueError("Qv4 rollout arguments must be supplied together")
+    quality_v4_enabled = all(value is not None for value in quality_v4_arguments)
+    physics_samples = (
+        [raw_env.quality_v4_current_physics_source_sample()]
+        if quality_v4_enabled
+        else []
+    )
     task = env._get_task_spec(request.task_id)
     teacher = None
     residual = False
@@ -3348,6 +3408,8 @@ def _rollout(
         actions.append(action)
         policy_actions.append(np.asarray(policy_action[0], dtype=np.float32))
         rewards.append(float(reward[0]))
+        if quality_v4_enabled:
+            physics_samples.extend(raw_env.quality_v4_last_physics_trace())
         terminated_rows.append(terminated_value)
         truncated_rows.append(truncated_value)
         outcomes.append(
@@ -3411,14 +3473,36 @@ def _rollout(
         else None
     )
     with _profile_phase("rollout.replay_validation"):
-        replay_validation = replay_actions(
-            _ArmedResetReplayEnv(env, raw_env),
-            request=request,
-            expected_observations=tuple(observations),
-            actions=tuple(actions),
-            expected_outcomes=tuple(outcomes),
-            expected_final_state=final_state,
-        )
+        if quality_v4_enabled:
+            from examples.embodiment.evaluate_dynamic_benchmark_planner import (
+                _replay_actions_on_fresh_env,
+            )
+
+            replay_result = _replay_actions_on_fresh_env(
+                vector_env=env,
+                task_id=request.task_id,
+                request=request,
+                expected_observations=tuple(observations),
+                actions=tuple(actions),
+                expected_outcomes=tuple(outcomes),
+                expected_final_state=final_state,
+                expected_task_quality=result_info.get("task_quality"),
+                task_quality_identity=_task_quality_identity(request.task_id),
+                capture_quality_v4=True,
+            )
+            if not isinstance(replay_result, tuple) or len(replay_result) != 2:
+                raise RuntimeError("Qv4 fresh replay did not return its source capture")
+            replay_validation, replay_capture = replay_result
+        else:
+            replay_validation = replay_actions(
+                _ArmedResetReplayEnv(env, raw_env),
+                request=request,
+                expected_observations=tuple(observations),
+                actions=tuple(actions),
+                expected_outcomes=tuple(outcomes),
+                expected_final_state=final_state,
+            )
+            replay_capture = None
     action_array = np.stack([action.values for action in actions]).astype(np.float64)
     policy_action_array = np.stack(policy_actions).astype(np.float32)
     state_array = np.stack(states).astype(np.float32)
@@ -3478,6 +3562,7 @@ def _rollout(
         "residual_scale": residual_scale,
         "success": result_info["success"],
         "safety_failure": result_info["termination_reason"] in safety_failures,
+        "reward_schema_safety_failures": sorted(safety_failures),
         "termination_reason": result_info["termination_reason"],
         "trajectory_completion": completion,
         "task_quality": result_info.get("task_quality"),
@@ -3510,6 +3595,30 @@ def _rollout(
         "events": [event.name for event in events],
         **causal_record_fields,
     }
+    if quality_v4_enabled:
+        from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+            build_quality_v4_fresh_replay_attempt,
+        )
+
+        assert quality_v4_thresholds is not None
+        assert quality_v4_reference is not None
+        assert quality_v4_capture is not None
+        assert replay_capture is not None
+        built = build_quality_v4_fresh_replay_attempt(
+            record=record,
+            raw_env=raw_env,
+            observations=observations,
+            actions=action_array,
+            rewards=rewards,
+            outcomes=outcomes,
+            physics_samples=physics_samples,
+            events=events,
+            thresholds=quality_v4_thresholds,
+            reference_contract=quality_v4_reference,
+            base_replay_validation=replay_validation,
+            replay_capture=replay_capture,
+        )
+        quality_v4_capture.update(built)
     arrays = {
         "states": state_array,
         "policy_actions": policy_action_array,
@@ -3859,6 +3968,22 @@ def main() -> None:
         "schema_version": quality_v2_thresholds.get("schema_version"),
         "sha256": quality_v2_thresholds_sha256,
     }
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        load_quality_v4_thresholds,
+    )
+
+    if args.quality_v4_reference_root.is_symlink() or not (
+        args.quality_v4_reference_root.is_dir()
+    ):
+        raise FileNotFoundError(args.quality_v4_reference_root)
+    quality_v4_thresholds, quality_v4_threshold_identity = load_quality_v4_thresholds(
+        args.quality_v4_thresholds,
+        expected_file_sha256=_expected_sha256(
+            args.expected_quality_v4_thresholds_sha256,
+            "expected quality-v4 threshold file SHA-256",
+        ),
+        require_formal_freeze=True,
+    )
     if (
         args.shard_count < 1
         or args.shard_index < 0
@@ -4158,6 +4283,7 @@ def main() -> None:
             "reset_manifest_sha256": reset_manifest_sha256,
             "source_identity": source_identity,
             "quality_v2_threshold_identity": quality_v2_threshold_identity,
+            "quality_v4_threshold_identity": quality_v4_threshold_identity,
             "state_schema": json.loads(
                 json.dumps(light_env.state_schema, allow_nan=False)
             ),
@@ -4187,6 +4313,11 @@ def main() -> None:
                 != quality_v2_thresholds_sha256
             ):
                 raise ValueError("resume quality-v2 threshold copy checksum mismatch")
+            if (
+                _sha256(run_output / "quality_v4_thresholds.json")
+                != quality_v4_threshold_identity["file_sha256"]
+            ):
+                raise ValueError("resume quality-v4 threshold copy checksum mismatch")
             _copy_provenance_file(
                 run_output,
                 quality_v2_calibration_receipt.source_path,
@@ -4277,6 +4408,10 @@ def main() -> None:
             shutil.copyfile(
                 args.quality_v2_thresholds,
                 run_output / "quality_v2_thresholds.json",
+            )
+            shutil.copyfile(
+                args.quality_v4_thresholds,
+                run_output / "quality_v4_thresholds.json",
             )
             _copy_provenance_file(
                 run_output,
@@ -4415,6 +4550,19 @@ def main() -> None:
                 tape_path = run_output / winner["attempt_tape"]
                 replay_actions_array = np.load(tape_path)["actions"]
                 try:
+                    from examples.embodiment.dynamic_benchmark_evaluation_attempt import (
+                        load_quality_v4_rollout_reference,
+                    )
+
+                    quality_v4_reference = load_quality_v4_rollout_reference(
+                        args.quality_v4_reference_root,
+                        task_id=task,
+                        episode_id=row.request.episode_id,
+                        expected_state_schema_sha256=_payload_sha256(
+                            winner_render_env.state_schema
+                        ),
+                    )
+                    quality_v4_capture: dict[str, Any] = {}
                     render_record, _, trace = _rollout(
                         env=winner_render_env,
                         candidate=candidate,
@@ -4423,6 +4571,9 @@ def main() -> None:
                         replay_actions_array=replay_actions_array,
                         quality_v2_thresholds=quality_v2_thresholds,
                         quality_v2_thresholds_sha256=quality_v2_thresholds_sha256,
+                        quality_v4_thresholds=quality_v4_thresholds,
+                        quality_v4_reference=quality_v4_reference,
+                        quality_v4_capture=quality_v4_capture,
                         trace_metadata={
                             "candidate_manifest_sha256": candidate_manifest_sha256,
                             "budget_used": budget_used,
@@ -4442,6 +4593,10 @@ def main() -> None:
                             "quality_v2_sha256": winner["quality_v2_sha256"],
                             "quality_v2_gate": winner.get("quality_v2_gate"),
                             "quality_v2_threshold_identity": quality_v2_threshold_identity,
+                            "quality_v4_threshold_identity": quality_v4_threshold_identity,
+                            "quality_v4_rollout_reference_sha256": (
+                                quality_v4_reference["reference_sha256"]
+                            ),
                             "lightweight_action_sha256": winner["action_sha256"],
                             "source_identity": source_identity,
                         },
@@ -4469,6 +4624,13 @@ def main() -> None:
                     for key in parity_keys:
                         if render_record[key] != winner[key]:
                             raise RuntimeError(f"winner render parity failed for {key}")
+                    with _profile_phase("serialization.quality_v4_winner_export"):
+                        trace, quality_v4_export = attach_quality_v4_winner_validation(
+                            run_output,
+                            trace=trace,
+                            source=quality_v4_capture["source"],
+                            attempt=quality_v4_capture["attempt"],
+                        )
                     with _profile_phase("serialization.winner_episode_write"):
                         episode_record = write_episode_atomic(run_output, trace)
                     winner_row = {
@@ -4492,6 +4654,15 @@ def main() -> None:
                         "quality_v2": winner["quality_v2"],
                         "quality_v2_sha256": winner["quality_v2_sha256"],
                         "quality_v2_gate": winner.get("quality_v2_gate"),
+                        "quality_v4_full_export_path": quality_v4_export[
+                            "full_export_path"
+                        ],
+                        "quality_v4_full_export_gate_path": quality_v4_export[
+                            "full_export_gate_path"
+                        ],
+                        "quality_v4_full_export_gate_sha256": quality_v4_export[
+                            "full_export_gate"
+                        ]["gate_sha256"],
                         "lightweight_attempt_tape": winner["attempt_tape"],
                         "lightweight_attempt_tape_sha256": winner[
                             "attempt_tape_sha256"
@@ -4552,6 +4723,11 @@ def main() -> None:
 
         if _sha256(args.candidate_manifest) != candidate_manifest_sha256:
             raise RuntimeError("candidate manifest changed during export")
+        if (
+            _sha256(args.quality_v4_thresholds)
+            != quality_v4_threshold_identity["file_sha256"]
+        ):
+            raise RuntimeError("quality-v4 threshold file changed during export")
         for candidate in candidates:
             if candidate.spec.kind != "policy":
                 continue
@@ -4651,6 +4827,7 @@ def main() -> None:
             "recovery_events": artifact_recovery_events,
             "source_identity": source_identity,
             "quality_v2_threshold_identity": quality_v2_threshold_identity,
+            "quality_v4_threshold_identity": quality_v4_threshold_identity,
             "image_size": args.image_size,
             "device": str(device),
             "started_unix_s": started,

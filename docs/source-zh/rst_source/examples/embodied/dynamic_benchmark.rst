@@ -361,6 +361,9 @@ selection evidence 和 promotion receipt。review exporter 要求并重新验证
       --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
       --quality-v2-calibration-wave-receipt "$CALIBRATION_RECEIPT" \
       --expected-quality-v2-calibration-wave-receipt-sha256 "$CALIBRATION_RECEIPT_SHA" \
+      --quality-v4-thresholds "$QUALITY_V4_THRESHOLDS" \
+      --expected-quality-v4-thresholds-sha256 "$QUALITY_V4_SHA" \
+      --quality-v4-reference-root "$QUALITY_V4_REFERENCE_ROOT" \
       --evaluator-commit "$EVALUATOR_COMMIT" \
       --evaluator-benchmark-commit "$BENCHMARK_COMMIT" \
       --partition review --manifest-seed 20261250 --review-resets 20 \
@@ -418,7 +421,12 @@ identity，再按合同记录的安全 dataset-relative ``provenance/.../wave_re
 
 中断后可用相同命令追加 ``--resume``。恢复前会严格核验源码/候选 identity，把未提交尾部保存在
 同级 recovery 目录，将 JSONL 截断到最后一次原子提交的 reset 边界，并重跑该 reset。每次
-attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据；winner 额外保存 RGB-D/HDF5。
+attempt 都保存轻量 state/action/reward tape 与 exact-replay 证据。每个 winner 还会把单调的
+physics-rate EEF tape、具名 contact impulse，以及 issued/applied action 写入
+``quality_v4/full_exports/<episode>.h5``。exporter 会独立重算相邻的
+``<episode>.gate.json``，并在原子发布 episode 前把得到的 Qv4 validation 写入
+``EpisodeTrace``。缺 physics、contact 或 action source 时 fail closed；非 T5 显式记录
+``applied=issued``，T5 使用 canonical queue history。
 
 若要逐项比较 uninterrupted 与 resumed 最终 artifact，每次运行都应把
 ``--execution-receipt-json`` 指向 dataset root 之外的路径。执行专属的 resume/recovery provenance
