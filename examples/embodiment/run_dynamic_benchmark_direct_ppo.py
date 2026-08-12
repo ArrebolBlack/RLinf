@@ -515,8 +515,16 @@ def main() -> int:
                     for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
                 ]
                 break
-        if observed_uuid is None or os.getpid() not in nvml_pids:
-            raise RuntimeError("runner PID is absent from the leased GPU NVML process list")
+        if observed_uuid is None or len(nvml_pids) != 1:
+            raise RuntimeError(
+                "leased GPU must have exactly one NVML process after the exclusive transition"
+            )
+        nvml_pid = nvml_pids[0]
+        pid_identity_mode = (
+            "direct_pid_match"
+            if nvml_pid == os.getpid()
+            else "exclusive_uuid_transition_pid_namespace_hidden"
+        )
     finally:
         pynvml.nvmlShutdown()
     _atomic_json(
@@ -524,7 +532,8 @@ def main() -> int:
         {
             "schema_version": "gpuenv0-direct-ppo-cuda-ready-v1",
             "control_pid": os.getpid(),
-            "nvml_pid": os.getpid(),
+            "nvml_pid": nvml_pid,
+            "pid_identity_mode": pid_identity_mode,
             "physical_gpu_uuid": observed_uuid,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "science_started": False,
@@ -575,7 +584,8 @@ def main() -> int:
                 "sha256": args.runtime_manifest_sha256,
             },
             "control_pid": os.getpid(),
-            "nvml_pid": os.getpid(),
+            "nvml_pid": nvml_pid,
+            "pid_identity_mode": pid_identity_mode,
             "physical_gpu_uuid": observed_uuid,
         }
         _seed_all(int(contract["canary"]["num_envs"]) + 20261201)
