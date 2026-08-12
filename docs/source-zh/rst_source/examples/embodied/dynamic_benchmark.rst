@@ -428,6 +428,14 @@ physics-rate EEF tape、具名 contact impulse，以及 issued/applied action �
 ``EpisodeTrace``。缺 physics、contact 或 action source 时 fail closed；非 T5 显式记录
 ``applied=issued``，T5 使用 canonical queue history。
 
+Qv4 将数值与证据完整的 ``formal_candidate`` 和 Owner 批准后的生产冻结明确分开。
+``validate_quality_v4_threshold_candidate`` 在 ``owner_review.approved`` 仍为 false 时核对 exact-14
+指标全集、每个 hard bound/paired tolerance/strict margin 的值级 evidence、冻结的 task-specific
+vision tolerance 与共享 exact-segmentation 合同。生产选择和 full-export 准入仍调用
+``validate_quality_v4_thresholds(..., require_formal_freeze=True)``；只有 Owner 填入 reviewer、时间和
+decision record 并显式把 artifact 标为 frozen 后才能通过。三类校准 evidence 任一不完整时，候选
+evidence assessor 只输出 blocker，不分配任何数值。
+
 若要逐项比较 uninterrupted 与 resumed 最终 artifact，每次运行都应把
 ``--execution-receipt-json`` 指向 dataset root 之外的路径。执行专属的 resume/recovery provenance
 只进入该 sidecar，sealed dataset 仅保留 ``render_parity_skip`` 等科学事件。

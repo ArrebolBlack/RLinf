@@ -55,6 +55,9 @@ QUALITY_V4_DATASET_VALIDATION_SCHEMA = (
 QUALITY_V4_VISION_TOLERANCE_SCHEMA = (
     "rlinf-dynamic-benchmark-quality-v4-vision-tolerance-v0.1"
 )
+QUALITY_V4_SEGMENTATION_CONTRACT_SCHEMA = (
+    "rlinf-dynamic-benchmark-quality-v4-segmentation-contract-v0.1"
+)
 QUALITY_V4_ROLLOUT_REFERENCE_SCHEMA = (
     "rlinf-dynamic-benchmark-quality-v4-rollout-reference-v0.1"
 )
@@ -77,6 +80,14 @@ _CALIBRATION_SOURCE_KEYS = frozenset(
     }
 )
 _FORBIDDEN_TUNING_SPLITS = frozenset({"test_id", "test_ood"})
+_QUALITY_V4_CHECK_VALUE_EVIDENCE_KEYS = frozenset(
+    {
+        "hard_bound_sha256",
+        "good_bad_discriminability_sha256",
+        "paired_non_worse_tolerance_sha256",
+        "strict_improvement_margin_sha256",
+    }
+)
 _QUALITY_V4_FULL_EPISODE_METRICS = (
     "action.issued.continuous_first_difference_l2_sum",
     "action.issued.continuous_first_difference_l2_mean",
@@ -224,6 +235,36 @@ def _stable_sha256(payload: Mapping[str, Any]) -> str:
     from se3_wam.benchmark.contracts import stable_sha256
 
     return str(stable_sha256(dict(payload)))
+
+
+def quality_v4_segmentation_contract() -> dict[str, Any]:
+    """Return the frozen exact-segmentation replay contract.
+
+    Segmentation remains part of the structured observation component digest, so
+    replay requires byte-derived component identity with no tolerance or label remap.
+    """
+
+    quality = _se3_quality()
+    evidence_sha256 = _stable_sha256(
+        {
+            "field_contract_schema": quality.QUALITY_V4_FIELD_CONTRACT_SCHEMA,
+            "field": "observation.segmentation",
+            "comparison": "structured_component_sha256_exact",
+        }
+    )
+    payload: dict[str, Any] = {
+        "schema_version": QUALITY_V4_SEGMENTATION_CONTRACT_SCHEMA,
+        "calibration_status": "frozen",
+        "comparison": "component_sha256_exact",
+        "exact": True,
+        "shape_exact": True,
+        "dtype_exact": True,
+        "label_remap_allowed": False,
+        "task_ids": list(quality.EXACT14_ORIENTATION_CONTRACT),
+        "evidence_sha256": evidence_sha256,
+    }
+    payload["contract_sha256"] = _stable_sha256(payload)
+    return payload
 
 
 def _canonical_json(payload: Any) -> str:
@@ -892,8 +933,10 @@ def validate_quality_v4_thresholds(
     all_checks_numeric = True
     all_check_statuses_frozen = True
     all_check_evidence_bound = True
+    all_check_values_evidence_bound = True
     all_vision_tolerances_frozen = True
     all_vision_evidence_bound = True
+    vision_segmentation_contract_sha256s: set[str] = set()
     expected_check_inventory = quality_v4_threshold_check_inventory()
     for task_id, orientation_table in quality.EXACT14_ORIENTATION_CONTRACT.items():
         task_contract = tasks[task_id]
@@ -920,6 +963,13 @@ def validate_quality_v4_thresholds(
             and isinstance(vision_tolerance.get("evidence_sha256"), str)
             and _SHA256.fullmatch(str(vision_tolerance["evidence_sha256"])) is not None
         )
+        vision_segmentation_contract_sha256 = vision_tolerance.get(
+            "segmentation_contract_sha256"
+        )
+        if isinstance(vision_segmentation_contract_sha256, str):
+            vision_segmentation_contract_sha256s.add(
+                vision_segmentation_contract_sha256
+            )
         for name in (
             "rgb_max_abs_lsb",
             "rgb_max_changed_fraction_per_frame",
@@ -974,6 +1024,19 @@ def validate_quality_v4_thresholds(
                 and isinstance(check.get("evidence_sha256"), str)
                 and _SHA256.fullmatch(str(check["evidence_sha256"])) is not None
             )
+            value_evidence = check.get("value_evidence")
+            check_values_evidence_bound = bool(
+                isinstance(value_evidence, Mapping)
+                and set(value_evidence) == _QUALITY_V4_CHECK_VALUE_EVIDENCE_KEYS
+                and all(
+                    isinstance(value, str) and _SHA256.fullmatch(value) is not None
+                    for value in value_evidence.values()
+                )
+                and check.get("evidence_sha256") == _stable_sha256(value_evidence)
+            )
+            all_check_values_evidence_bound = bool(
+                all_check_values_evidence_bound and check_values_evidence_bound
+            )
             for label, value in (
                 ("bound", bound),
                 ("strict_improvement_margin", margin),
@@ -1011,6 +1074,36 @@ def validate_quality_v4_thresholds(
             )
         task_check_count += len(checks)
 
+    segmentation_contract = payload.get("segmentation_contract")
+    segmentation_contract_frozen = False
+    segmentation_contract_sha256: str | None = None
+    if isinstance(segmentation_contract, Mapping):
+        segmentation_unsigned = dict(segmentation_contract)
+        segmentation_contract_sha256 = segmentation_unsigned.pop(
+            "contract_sha256", None
+        )
+        _sha256_value(
+            "Qv4 exact segmentation contract SHA-256",
+            segmentation_contract_sha256,
+        )
+        segmentation_contract_frozen = bool(
+            segmentation_contract.get("schema_version")
+            == QUALITY_V4_SEGMENTATION_CONTRACT_SCHEMA
+            and segmentation_contract.get("calibration_status") == "frozen"
+            and segmentation_contract.get("comparison") == "component_sha256_exact"
+            and segmentation_contract.get("exact") is True
+            and segmentation_contract.get("shape_exact") is True
+            and segmentation_contract.get("dtype_exact") is True
+            and segmentation_contract.get("label_remap_allowed") is False
+            and segmentation_contract.get("task_ids")
+            == list(quality.EXACT14_ORIENTATION_CONTRACT)
+            and isinstance(segmentation_contract.get("evidence_sha256"), str)
+            and _SHA256.fullmatch(str(segmentation_contract["evidence_sha256"]))
+            is not None
+            and segmentation_contract_sha256 == _stable_sha256(segmentation_unsigned)
+            and vision_segmentation_contract_sha256s == {segmentation_contract_sha256}
+        )
+
     owner_review = payload.get("owner_review")
     if not isinstance(owner_review, Mapping):
         raise ValueError("Qv4 thresholds have no owner-review record")
@@ -1029,23 +1122,48 @@ def validate_quality_v4_thresholds(
             for name in ("reviewer", "reviewed_at", "decision_record")
         )
     )
-    frozen = bool(
-        payload.get("calibration_status") == "frozen"
-        and payload.get("formal_freeze_eligible") is True
+    owner_review_pending = bool(
+        owner_review.get("approved") is False
+        and all(
+            owner_review.get(name) is None
+            for name in ("reviewer", "reviewed_at", "decision_record")
+        )
+    )
+    numeric_evidence_candidate = bool(
+        payload.get("calibration_status") in {"formal_candidate", "frozen"}
         and "metric_calibration" in normalized_splits
         and source_evidence_complete
-        and owner_review_complete
         and all_checks_numeric
         and all_check_statuses_frozen
         and all_check_evidence_bound
+        and all_check_values_evidence_bound
         and all_vision_tolerances_frozen
         and all_vision_evidence_bound
+        and segmentation_contract_frozen
+    )
+    formal_candidate = bool(
+        numeric_evidence_candidate
+        and payload.get("calibration_status") == "formal_candidate"
+        and payload.get("formal_freeze_eligible") is False
+        and owner_review_pending
+    )
+    frozen = bool(
+        numeric_evidence_candidate
+        and payload.get("calibration_status") == "frozen"
+        and payload.get("formal_freeze_eligible") is True
+        and owner_review_complete
     )
     if (
         payload.get("calibration_status") == "provisional"
         and payload.get("formal_freeze_eligible") is not False
     ):
         raise ValueError("provisional Qv4 thresholds cannot be formal-freeze eligible")
+    if payload.get("calibration_status") == "formal_candidate" and not formal_candidate:
+        raise ValueError(
+            "Qv4 thresholds claim a formal candidate without numeric value-level "
+            "evidence, frozen vision/segmentation contracts, complete calibration "
+            "receipts, split isolation, or a pending owner review"
+        )
     if (
         payload.get("calibration_status") == "frozen"
         or payload.get("formal_freeze_eligible") is True
@@ -1063,10 +1181,34 @@ def validate_quality_v4_thresholds(
         "orientation_contract_sha256": orientation["contract_sha256"],
         "task_count": 14,
         "check_count": task_check_count,
+        "formal_candidate_validated": bool(formal_candidate or frozen),
         "formal_freeze_eligible": frozen,
+        "owner_review_complete": owner_review_complete,
         "calibration_status": payload.get("calibration_status"),
         "test_splits_read": sorted(normalized_splits & _FORBIDDEN_TUNING_SPLITS),
     }
+
+
+def validate_quality_v4_threshold_candidate(
+    payload: Mapping[str, Any],
+    *,
+    expected_thresholds_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate a numeric evidence-bound candidate without approving release.
+
+    This validation is deliberately separate from ``require_formal_freeze=True``.
+    A candidate may pass here with a pending Owner review, while every production
+    export remains blocked until the same artifact is Owner-approved, marked
+    ``calibration_status=frozen``, and passes the formal-freeze validator.
+    """
+
+    validation = validate_quality_v4_thresholds(
+        payload,
+        expected_thresholds_sha256=expected_thresholds_sha256,
+    )
+    if not validation["formal_candidate_validated"]:
+        raise ValueError("Qv4 thresholds are not a numeric evidence-bound candidate")
+    return validation
 
 
 def load_quality_v4_thresholds(

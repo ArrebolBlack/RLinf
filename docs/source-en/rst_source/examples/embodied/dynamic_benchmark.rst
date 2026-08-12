@@ -468,6 +468,17 @@ validation into ``EpisodeTrace`` before atomically publishing the dataset episod
 Missing physics, contact, or action sources fail closed. Non-T5 applied actions are
 explicitly identical to issued actions; T5 uses the canonical queue history.
 
+Qv4 distinguishes a numeric, evidence-bound ``formal_candidate`` from an
+Owner-approved production freeze. ``validate_quality_v4_threshold_candidate`` checks
+the exact-14 metric inventory, value-level evidence for every hard bound, paired
+tolerance, and strict margin, frozen task-specific vision tolerances, and the shared
+exact-segmentation contract while ``owner_review.approved`` is still false. Production
+selection and full-export admission continue to call
+``validate_quality_v4_thresholds(..., require_formal_freeze=True)`` and therefore fail
+closed until the Owner supplies a reviewer, timestamp, and decision record and the
+artifact is explicitly marked frozen. The candidate-evidence assessor emits blockers
+instead of assigning values when any of the three calibration sources is incomplete.
+
 For an exact uninterrupted-versus-resumed artifact comparison, pass
 ``--execution-receipt-json`` with a path outside the dataset root on every run. The
 external receipt retains execution-only resume/recovery provenance, while the sealed

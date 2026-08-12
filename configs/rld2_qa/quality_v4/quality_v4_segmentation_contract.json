@@ -1,0 +1,27 @@
+{
+  "calibration_status": "frozen",
+  "comparison": "component_sha256_exact",
+  "contract_sha256": "3b598bcbd3e3295cc16ad81c53c74d0199d597cae84d7d8c53fbd7424f18c4f7",
+  "dtype_exact": true,
+  "evidence_sha256": "f7802de31138ef7d766b1f49f47a3c8b27a48ae355686f601b0bb4d8b0bb709d",
+  "exact": true,
+  "label_remap_allowed": false,
+  "schema_version": "rlinf-dynamic-benchmark-quality-v4-segmentation-contract-v0.1",
+  "shape_exact": true,
+  "task_ids": [
+    "p0_grasp",
+    "t1_belt",
+    "t1_xyz",
+    "t1_so3",
+    "t1_occ",
+    "t2_trans",
+    "t2_se3",
+    "t3_phase",
+    "t3_full",
+    "t4_sphere",
+    "t4_slider",
+    "t4_can",
+    "t5_replan",
+    "t4_sphere_tabletop"
+  ]
+}

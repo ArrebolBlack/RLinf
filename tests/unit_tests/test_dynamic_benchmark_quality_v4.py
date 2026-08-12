@@ -45,6 +45,9 @@ from examples.embodiment.audit_dynamic_benchmark_rld2_release import (
     ReleaseAuditError,
     quality_v4_release_readiness,
 )
+from examples.embodiment.build_dynamic_benchmark_quality_v4_candidate import (
+    assess_candidate_evidence,
+)
 from examples.embodiment.build_dynamic_benchmark_quality_v4_provisional import (
     build_provisional_thresholds,
 )
@@ -60,6 +63,7 @@ from examples.embodiment.dynamic_benchmark_quality_v4 import (
     QUALITY_V4_FULL_EXPORT_SUBDIRECTORY,
     QUALITY_V4_LIGHTWEIGHT_SUBDIRECTORY,
     QUALITY_V4_ROLLOUT_REFERENCE_SCHEMA,
+    QUALITY_V4_SEGMENTATION_CONTRACT_SCHEMA,
     QUALITY_V4_T5_ACTION_HISTORY_SCHEMA,
     _quality_v4_applied_history,
     audit_quality_v4_full_export,
@@ -70,6 +74,8 @@ from examples.embodiment.dynamic_benchmark_quality_v4 import (
     finalize_quality_v4_fresh_replay,
     load_quality_v4_thresholds,
     paired_pareto_winner,
+    quality_v4_segmentation_contract,
+    validate_quality_v4_threshold_candidate,
     validate_quality_v4_thresholds,
     write_quality_v4_attempt,
     write_quality_v4_full_export,
@@ -348,6 +354,8 @@ def _frozen_thresholds(provisional: dict[str, object]) -> dict[str, object]:
     for source_name, source in frozen["calibration_sources"].items():
         source["status"] = "complete"
         source["evidence_sha256"] = stable_sha256({"source": source_name})
+    segmentation_contract = quality_v4_segmentation_contract()
+    frozen["segmentation_contract"] = segmentation_contract
     for task in frozen["tasks"].values():
         vision_tolerance = task["vision_tolerance"]
         vision_tolerance.pop("tolerance_sha256")
@@ -355,19 +363,50 @@ def _frozen_thresholds(provisional: dict[str, object]) -> dict[str, object]:
         vision_tolerance["evidence_sha256"] = stable_sha256(
             {"vision": vision_tolerance["task_id"]}
         )
+        vision_tolerance["segmentation_contract_sha256"] = segmentation_contract[
+            "contract_sha256"
+        ]
         vision_tolerance["tolerance_sha256"] = stable_sha256(vision_tolerance)
         for check in task["checks"]:
             check["max"] = 1.0e20
             check["paired_non_worse_tolerance"] = 0.0
             check["strict_improvement_margin"] = 0.0
             check["calibration_status"] = "frozen"
-            check["evidence_sha256"] = stable_sha256(
-                {"phase": check["phase"], "metric": check["metric"]}
-            )
+            identity = {"phase": check["phase"], "metric": check["metric"]}
+            check["value_evidence"] = {
+                "hard_bound_sha256": stable_sha256({**identity, "value": "bound"}),
+                "good_bad_discriminability_sha256": stable_sha256(
+                    {**identity, "value": "good_bad"}
+                ),
+                "paired_non_worse_tolerance_sha256": stable_sha256(
+                    {**identity, "value": "tolerance"}
+                ),
+                "strict_improvement_margin_sha256": stable_sha256(
+                    {**identity, "value": "margin"}
+                ),
+            }
+            check["evidence_sha256"] = stable_sha256(check["value_evidence"])
     frozen.pop("thresholds_sha256")
     frozen["thresholds_sha256"] = stable_sha256(frozen)
     validate_quality_v4_thresholds(frozen, require_formal_freeze=True)
     return frozen
+
+
+def _formal_candidate_thresholds(
+    provisional: dict[str, object],
+) -> dict[str, object]:
+    candidate = _frozen_thresholds(provisional)
+    candidate["calibration_status"] = "formal_candidate"
+    candidate["formal_freeze_eligible"] = False
+    candidate["owner_review"] = {
+        "approved": False,
+        "reviewer": None,
+        "reviewed_at": None,
+        "decision_record": None,
+    }
+    candidate.pop("thresholds_sha256")
+    candidate["thresholds_sha256"] = stable_sha256(candidate)
+    return candidate
 
 
 def test_qv4_provisional_inventory_is_exact14_unfrozen_and_not_test_tuned(
@@ -403,6 +442,101 @@ def test_qv4_provisional_inventory_is_exact14_unfrozen_and_not_test_tuned(
     loaded, receipt = load_quality_v4_thresholds(path, expected_file_sha256=file_sha256)
     assert loaded == thresholds
     assert receipt["file_sha256"] == file_sha256
+
+
+def test_qv4_formal_candidate_is_validated_but_production_freeze_stays_blocked() -> (
+    None
+):
+    candidate = _formal_candidate_thresholds(build_provisional_thresholds())
+    validation = validate_quality_v4_threshold_candidate(candidate)
+
+    assert validation["formal_candidate_validated"]
+    assert not validation["formal_freeze_eligible"]
+    assert not validation["owner_review_complete"]
+    with pytest.raises(ValueError, match="formally frozen"):
+        validate_quality_v4_thresholds(candidate, require_formal_freeze=True)
+
+    missing_margin_evidence = copy.deepcopy(candidate)
+    first_check = missing_margin_evidence["tasks"]["p0_grasp"]["checks"][0]
+    first_check["value_evidence"].pop("strict_improvement_margin_sha256")
+    first_check["evidence_sha256"] = stable_sha256(first_check["value_evidence"])
+    missing_margin_evidence.pop("thresholds_sha256")
+    missing_margin_evidence["thresholds_sha256"] = stable_sha256(
+        missing_margin_evidence
+    )
+    with pytest.raises(ValueError, match="formal candidate"):
+        validate_quality_v4_threshold_candidate(missing_margin_evidence)
+
+
+def test_qv4_exact_segmentation_contract_is_frozen_and_hash_bound() -> None:
+    contract = quality_v4_segmentation_contract()
+    unsigned = dict(contract)
+    recorded = unsigned.pop("contract_sha256")
+
+    assert contract["schema_version"] == QUALITY_V4_SEGMENTATION_CONTRACT_SCHEMA
+    assert contract["calibration_status"] == "frozen"
+    assert contract["comparison"] == "component_sha256_exact"
+    assert contract["exact"] is True
+    assert contract["label_remap_allowed"] is False
+    assert contract["task_ids"] == list(EXACT14_ORIENTATION_CONTRACT)
+    assert recorded == stable_sha256(unsigned)
+
+
+def test_qv4_candidate_evidence_assessment_reports_current_blockers() -> None:
+    planner = {
+        "schema_version": "se3-wam-qv4-planner-calibration-aggregator-manifest-v0.1",
+        "status": "complete_calibration_evidence",
+        "scientific_partition": "metric_calibration",
+        "task_count": 14,
+        "episodes_per_task": 20,
+        "expected_reset_count": 280,
+        "complete_reset_count": 280,
+        "source_tape_count": 280,
+    }
+    good_bad = {
+        "schema_version": "se3-wam-qv4-known-good-bad-evidence-v0.1",
+        "classification": [
+            {"expected_label": label}
+            for label in (
+                "known_good",
+                "issued_action_jitter",
+                "applied_action_jitter",
+                "physics_rate_jerk",
+                "path_detour",
+                "path_backtrack",
+                "orientation_drift",
+                "object_tilt_or_slip",
+            )
+        ],
+        "acceptance": {
+            "known_good_retained": True,
+            "all_corresponding_bad_rejected": True,
+        },
+        "scientific_boundary": {
+            "source_runtime_split": "validation",
+            "may_set_or_freeze_absolute_qv4_thresholds": False,
+        },
+    }
+    readiness = assess_candidate_evidence(
+        planner=planner,
+        good_bad=good_bad,
+        rl_pairs=None,
+        evidence_files={
+            "exact14x20_planner": "1" * 64,
+            "known_good_bad_trajectories": "2" * 64,
+            "fresh_deterministic_rl_pilot": None,
+        },
+    )
+
+    assert not readiness["formal_candidate_ready"]
+    assert not readiness["formal_freeze_eligible"]
+    assert readiness["owner_review"]["approved"] is False
+    assert "RL_PAIR_EVIDENCE_MISSING" in readiness["blockers"]
+    assert (
+        "GOOD_BAD_NOT_FORMAL_EXACT14_METRIC_CALIBRATION_EVIDENCE"
+        in readiness["blockers"]
+    )
+    assert "PLANNER_TASK_CHECK_HARD_BOUND_EVIDENCE_MISSING" in readiness["blockers"]
 
 
 @pytest.mark.parametrize("task_id", _REPRESENTATIVE_TASKS)
@@ -929,9 +1063,9 @@ def test_qv4_shard_merge_independent_audit_end_to_end_fixture(
     tmp_path: Path,
 ) -> None:
     thresholds = _frozen_thresholds(build_provisional_thresholds())
-    threshold_bytes = (
-        json.dumps(thresholds, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+    threshold_bytes = (json.dumps(thresholds, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
     threshold_file_sha256 = hashlib.sha256(threshold_bytes).hexdigest()
     receipt = {
         "schema_version": "se3wam-quality-v4-owner-review-receipt-v0.1",
@@ -1000,9 +1134,7 @@ def test_qv4_shard_merge_independent_audit_end_to_end_fixture(
         merged,
         expected_threshold_file_sha256=identity["file_sha256"],
         expected_threshold_payload_sha256=identity["payload_sha256"],
-        expected_receipt_file_sha256=identity["owner_review_receipt"][
-            "file_sha256"
-        ],
+        expected_receipt_file_sha256=identity["owner_review_receipt"]["file_sha256"],
         expected_receipt_payload_sha256=identity["owner_review_receipt"][
             "payload_sha256"
         ],
