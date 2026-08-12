@@ -94,7 +94,7 @@ def _load_cohort_manifest(
     cohort_index: int,
     requested_num_envs: int | None,
 ) -> tuple[tuple[Path, ...], tuple[dict[str, Any], ...], dict[str, Any]]:
-    """Resolve and validate one frozen D32 cohort without resampling rows."""
+    """Resolve and validate one frozen D32/MC64 cohort without resampling rows."""
 
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -103,12 +103,17 @@ def _load_cohort_manifest(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError("export manifest must be a JSON object")
-    if payload.get("schema_version") != "gpup-plan-t4-slider-d32-export-manifest-v1":
-        raise ValueError("export manifest schema is not the frozen t4 D32 schema")
+    schema_version = payload.get("schema_version")
+    supported_schemas = {
+        "gpup-plan-t4-slider-d32-export-manifest-v1",
+        "gpup-plan-t4-slider-mc64-export-manifest-v1",
+    }
+    if schema_version not in supported_schemas:
+        raise ValueError("export manifest schema is not a frozen t4 D32/MC64 schema")
     if payload.get("task_id") != task_id:
         raise ValueError("export manifest task_id does not match the runner task")
     if payload.get("split") != "test_id":
-        raise ValueError("t4 D32 GPU Planner requires the registered test_id split")
+        raise ValueError("t4 GPU Planner requires the registered test_id split")
     declared_payload_sha = payload.get("payload_sha256")
     unsigned_payload = dict(payload)
     unsigned_payload.pop("payload_sha256", None)
@@ -146,8 +151,23 @@ def _load_cohort_manifest(
         raise ValueError("export manifest candidate index list drifted from rows")
     if episode_ids != [row.get("episode_id") for row in rows]:
         raise ValueError("export manifest episode ID list drifted from rows")
-    if candidate_indices != list(range(1, episode_count + 1)):
-        raise ValueError("t4 D32 candidate indices must be the E0-disjoint rows 1..32")
+    if schema_version == "gpup-plan-t4-slider-d32-export-manifest-v1":
+        expected_candidate_indices = list(range(1, episode_count + 1))
+    else:
+        disjoint_from = payload.get("disjoint_from")
+        expected_candidate_indices = list(range(33, 97))
+        if (
+            episode_count != 64
+            or cohort_size != 32
+            or cohort_count != 2
+            or not isinstance(disjoint_from, Mapping)
+            or disjoint_from.get("manifest_sha256")
+            != "af3639533b665a0c2e3475ddf16d28c85017f0c718012816b31b539e3530c2b4"
+            or disjoint_from.get("candidate_indices") != list(range(1, 33))
+        ):
+            raise ValueError("MC64 manifest is not the frozen D32-disjoint 33..96 surface")
+    if candidate_indices != expected_candidate_indices:
+        raise ValueError("frozen t4 candidate indices drifted from the phase surface")
     selected = rows[cohort_index * cohort_size : (cohort_index + 1) * cohort_size]
     if len(selected) != cohort_size:
         raise ValueError("frozen export manifest cohort is incomplete")
