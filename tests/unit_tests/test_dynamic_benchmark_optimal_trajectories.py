@@ -17,10 +17,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pytest
 from se3_wam.benchmark.trajectory_quality import (
@@ -33,6 +35,7 @@ from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
     _audit_quality_v2_calibration_receipt_artifact,
     _audit_render_parity_skip,
     _audit_t5_replan_causal_history,
+    _audit_winner_episode,
     _render_parity_skip_events,
 )
 from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
@@ -1477,6 +1480,51 @@ def _write_sharded_quality_merge_fixture(
         separators=(",", ":"),
     ).encode("utf-8")
     threshold_sha256 = hashlib.sha256(threshold_bytes).hexdigest()
+    quality_v4_thresholds = {
+        "schema_version": "se3-wam-trajectory-quality-v4-thresholds-v0.1",
+        "calibration_status": "frozen",
+        "formal_freeze_eligible": True,
+        "owner_review": {
+            "approved": True,
+            "reviewer": "fixture-owner",
+            "reviewed_at": "2026-08-13T00:00:00Z",
+            "decision_record": "fixture",
+        },
+        "thresholds_sha256": "1" * 64,
+    }
+    quality_v4_threshold_bytes = json.dumps(
+        quality_v4_thresholds,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    quality_v4_threshold_file_sha256 = hashlib.sha256(
+        quality_v4_threshold_bytes
+    ).hexdigest()
+    quality_v4_receipt = {
+        "schema_version": "se3wam-quality-v4-owner-review-receipt-v0.1",
+        "threshold_schema_version": quality_v4_thresholds["schema_version"],
+        "threshold_file_sha256": quality_v4_threshold_file_sha256,
+        "threshold_payload_sha256": quality_v4_thresholds["thresholds_sha256"],
+        "owner_review": quality_v4_thresholds["owner_review"],
+    }
+    quality_v4_receipt["payload_sha256"] = _audit_payload_sha256(
+        quality_v4_receipt
+    )
+    quality_v4_receipt_bytes = json.dumps(
+        quality_v4_receipt,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    quality_v4_identity = {
+        "schema_version": quality_v4_thresholds["schema_version"],
+        "file_sha256": quality_v4_threshold_file_sha256,
+        "payload_sha256": quality_v4_thresholds["thresholds_sha256"],
+        "owner_review_receipt": {
+            "relative_path": "provenance/quality_v4/owner_review_receipt.json",
+            "file_sha256": hashlib.sha256(quality_v4_receipt_bytes).hexdigest(),
+            "payload_sha256": quality_v4_receipt["payload_sha256"],
+        },
+    }
     candidate_bytes = b'{"schema_version":"unit-test-candidates"}'
     candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
     reset_rows = [{"episode_id": f"fixture-{index:05d}-s1"} for index in range(2)]
@@ -1524,12 +1572,16 @@ def _write_sharded_quality_merge_fixture(
                 "benchmark_commit": _CALIBRATION_BENCHMARK_COMMIT,
             },
             "quality_v2_threshold_identity": quality_identity,
+            "quality_v4_threshold_identity": quality_v4_identity,
             "state_schema": {"fixture": True},
             "candidates": [{"candidate_id": "planner"}],
         }
         export_state["payload_sha256"] = _audit_payload_sha256(export_state)
         (shard / "candidate_manifest.json").write_bytes(candidate_bytes)
         (shard / "quality_v2_thresholds.json").write_bytes(threshold_bytes)
+        (shard / "quality_v4_thresholds.json").write_bytes(
+            quality_v4_threshold_bytes
+        )
         (shard / "reset_manifest.jsonl").write_bytes(reset_bytes)
         (shard / "export_state.json").write_text(
             json.dumps(export_state, sort_keys=True), encoding="utf-8"
@@ -1537,6 +1589,11 @@ def _write_sharded_quality_merge_fixture(
         receipt_target = shard / thresholds["calibration_wave_receipt"]["relative_path"]
         receipt_target.parent.mkdir(parents=True)
         receipt_target.write_bytes(receipt_path.read_bytes())
+        qv4_receipt_target = (
+            shard / "provenance/quality_v4/owner_review_receipt.json"
+        )
+        qv4_receipt_target.parent.mkdir(parents=True)
+        qv4_receipt_target.write_bytes(quality_v4_receipt_bytes)
 
         episode_id = reset["episode_id"]
         result = {
@@ -1600,7 +1657,87 @@ def _write_sharded_quality_merge_fixture(
         lightweight_dir = shard / "lightweight" / episode_id
         lightweight_dir.mkdir(parents=True)
         (lightweight_dir / "candidate-00.npz").write_bytes(b"fixture-tape")
+        qv4_attempt = {
+            "schema_version": "rlinf-dynamic-benchmark-quality-v4-attempt-v0.1",
+            "episode_id": episode_id,
+            "task_id": "t2_trans",
+            "source_sha256": hashlib.sha256(f"source:{episode_id}".encode()).hexdigest(),
+            "thresholds_sha256": quality_v4_identity["payload_sha256"],
+        }
+        qv4_attempt["attempt_sha256"] = hashlib.sha256(
+            json.dumps(
+                qv4_attempt,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        qv4_root = shard / "quality_v4"
+        (qv4_root / "attempts").mkdir(parents=True)
+        (qv4_root / "attempts" / f"{episode_id}.json").write_text(
+            json.dumps(qv4_attempt, sort_keys=True), encoding="utf-8"
+        )
+        (qv4_root / "lightweight_sources").mkdir()
+        (qv4_root / "lightweight_sources" / f"{episode_id}.h5").write_bytes(
+            f"lightweight:{episode_id}".encode()
+        )
+        (qv4_root / "full_exports").mkdir()
+        qv4_export = qv4_root / "full_exports" / f"{episode_id}.h5"
+        qv4_export.write_bytes(f"physics:{episode_id}".encode())
+        qv4_gate = {
+            "schema_version": (
+                "rlinf-dynamic-benchmark-quality-v4-full-export-gate-v0.1"
+            ),
+            "episode_id": episode_id,
+            "task_id": "t2_trans",
+            "attempt_sha256": qv4_attempt["attempt_sha256"],
+            "thresholds_sha256": quality_v4_identity["payload_sha256"],
+            "export_file_sha256": hashlib.sha256(qv4_export.read_bytes()).hexdigest(),
+            "formal_thresholds_frozen": True,
+            "owner_review_complete": True,
+            "passed": True,
+            "eligible_for_behavior_cloning": True,
+        }
+        qv4_gate["gate_sha256"] = hashlib.sha256(
+            json.dumps(
+                qv4_gate,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        (qv4_root / "full_exports" / f"{episode_id}.gate.json").write_text(
+            json.dumps(qv4_gate, sort_keys=True), encoding="utf-8"
+        )
     return root, thresholds, threshold_sha256, receipt_sha256
+
+
+def _patch_qv4_merge_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.embodiment import dynamic_benchmark_quality_v4 as quality_v4
+
+    def validate_thresholds(payload: dict, **_: object) -> dict:
+        return {
+            "schema_version": payload["schema_version"],
+            "thresholds_sha256": payload["thresholds_sha256"],
+            "formal_freeze_eligible": True,
+        }
+
+    def audit_lightweight(path: Path) -> dict:
+        episode_id = path.stem
+        attempt = json.loads(
+            (path.parent.parent / "attempts" / f"{episode_id}.json").read_text()
+        )
+        return {
+            "episode_id": episode_id,
+            "task_id": attempt["task_id"],
+            "attempt_sha256": attempt["attempt_sha256"],
+            "source_sha256": attempt["source_sha256"],
+        }
+
+    monkeypatch.setattr(quality_v4, "validate_quality_v4_thresholds", validate_thresholds)
+    monkeypatch.setattr(
+        quality_v4,
+        "audit_quality_v4_lightweight_source",
+        audit_lightweight,
+    )
 
 
 def test_shard_merge_preserves_qv3_receipt_for_independent_auditor(
@@ -1610,6 +1747,7 @@ def test_shard_merge_preserves_qv3_receipt_for_independent_auditor(
     root, thresholds, threshold_sha256, receipt_sha256 = (
         _write_sharded_quality_merge_fixture(tmp_path)
     )
+    _patch_qv4_merge_contract(monkeypatch)
     output = tmp_path / "merged"
     monkeypatch.setattr(
         sys,
@@ -1649,6 +1787,8 @@ def test_shard_merge_preserves_qv3_receipt_for_independent_auditor(
     checksum_inventory = (output / "SHA256SUMS").read_text(encoding="utf-8")
     assert "quality_v2_thresholds.json" in checksum_inventory
     assert "provenance/calibration_wave/wave_receipt.json" in checksum_inventory
+    assert "quality_v4/full_exports/fixture-00000-s1.h5" in checksum_inventory
+    assert "quality_v4/full_exports/fixture-00001-s1.gate.json" in checksum_inventory
 
 
 def test_projection_shards_merge_and_reaudit_with_actual_projection_identity(
@@ -1656,6 +1796,7 @@ def test_projection_shards_merge_and_reaudit_with_actual_projection_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, thresholds, _, _ = _write_sharded_quality_merge_fixture(tmp_path)
+    _patch_qv4_merge_contract(monkeypatch)
     projection_bytes = _projection_json_bytes(
         projection_payload(
             thresholds["calibration_wave_receipt"],
@@ -1712,6 +1853,7 @@ def test_shard_merge_rejects_qv3_identity_or_receipt_drift(
     message: str,
 ) -> None:
     root, _, _, _ = _write_sharded_quality_merge_fixture(tmp_path)
+    _patch_qv4_merge_contract(monkeypatch)
     shard = root / "shard-01"
     state_path = shard / "export_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1754,6 +1896,189 @@ def test_shard_merge_rejects_qv3_identity_or_receipt_drift(
 
     with pytest.raises(ValueError, match=message):
         _merge_shards_main()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    (
+        ("missing_directory", "missing the required Qv4 directory"),
+        ("physics", "winner gate .* identity drift"),
+        ("gate", "winner gate .* identity drift"),
+        ("identity", "Qv4 frozen threshold identity mismatch"),
+    ),
+)
+def test_shard_merge_rejects_missing_or_tampered_qv4(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    message: str,
+) -> None:
+    root, _, _, _ = _write_sharded_quality_merge_fixture(tmp_path)
+    _patch_qv4_merge_contract(monkeypatch)
+    shard = root / "shard-01"
+    episode_id = "fixture-00001-s1"
+    if tamper == "missing_directory":
+        shutil.rmtree(shard / "quality_v4")
+    elif tamper == "physics":
+        (shard / "quality_v4/full_exports" / f"{episode_id}.h5").write_bytes(
+            b"tampered-physics"
+        )
+    elif tamper == "gate":
+        gate_path = shard / "quality_v4/full_exports" / f"{episode_id}.gate.json"
+        gate = json.loads(gate_path.read_text())
+        gate["passed"] = False
+        gate.pop("gate_sha256")
+        gate["gate_sha256"] = hashlib.sha256(
+            json.dumps(gate, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        gate_path.write_text(json.dumps(gate, sort_keys=True))
+    else:
+        state_path = shard / "export_state.json"
+        state = json.loads(state_path.read_text())
+        state["quality_v4_threshold_identity"]["payload_sha256"] = "2" * 64
+        state["payload_sha256"] = _audit_payload_sha256(state)
+        state_path.write_text(json.dumps(state, sort_keys=True))
+    output = tmp_path / "merged-qv4-tamper"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "merge_optimal_export_shards.py",
+            "--root",
+            str(root),
+            "--output",
+            str(output),
+            "--accepted-episodes",
+            "2",
+        ],
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _merge_shards_main()
+
+
+def test_winner_episode_requires_behavior_cloning_eligible_qv4_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from se3_wam.benchmark import dataset as dataset_module
+
+    episode_id = "episode-eligible"
+    relative = f"episodes/p0_grasp/train/{episode_id}"
+    episode_dir = tmp_path / relative
+    episode_dir.mkdir(parents=True)
+    actions = np.zeros((2, 7), dtype=np.float64)
+    action_sha256 = hashlib.sha256(actions.tobytes()).hexdigest()
+    with h5py.File(episode_dir / "trajectory.h5", "w") as handle:
+        handle.create_dataset("actions/values", data=actions)
+    reset = {
+        "episode_id": episode_id,
+        "task_id": "p0_grasp",
+        "split": "train",
+        "seed": 1,
+        "action_mode": "eef_delta",
+        "observation_track": "privileged",
+        "object_mode": "single",
+        "reset_mode": "exact",
+        "factors": {},
+    }
+    quality_v4_validation = {"passed": True, "fixture": "recomputed-full-export"}
+    card = {
+        "candidate_manifest_sha256": "a" * 64,
+        "source_identity": {"fixture": True},
+        "quality_v2_threshold_identity": {"sha256": "b" * 64},
+        "quality_v4_threshold_identity": {"payload_sha256": "c" * 64},
+        "evaluator_identity": None,
+        "compatibility_evidence": None,
+        "calibration_evidence": None,
+        "candidate_release_manifest_sha256": None,
+    }
+    attempt = {
+        "episode_id": episode_id,
+        "candidate_id": "planner",
+        "candidate_index": 0,
+        "success": True,
+        "safety_failure": False,
+        "finite_and_bounded": True,
+        "replay_validation": {"passed": True},
+        "quality_v2_gate": {"passed": True},
+        "trajectory_completion": 1.0,
+        "return": 1.0,
+        "control_steps": 2,
+        "action_l2_sum": 0.0,
+        "action_sha256": action_sha256,
+    }
+    selection_result = {
+        "source_kind": "legacy",
+        "planner_eligible": True,
+        "winner_candidate_id": "planner",
+        "winner_candidate_index": 0,
+    }
+    metadata = {
+        "request": reset,
+        "metrics": {"eligible_for_behavior_cloning": True},
+        "quality_v4_validation": quality_v4_validation,
+        "teacher_preparation": {
+            "method": "rlinf_best_known_candidate_selection",
+            "candidate": {"candidate_id": "planner"},
+            "candidate_index": 0,
+            "budget_used": 1,
+            "candidate_manifest_sha256": card["candidate_manifest_sha256"],
+            "selection_contract": (
+                "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
+            ),
+            "winner_quality_score": list(_quality_score(attempt)),
+            "lightweight_action_sha256": action_sha256,
+            "source_identity": card["source_identity"],
+            "quality_v2_threshold_identity": card["quality_v2_threshold_identity"],
+            "quality_v4_threshold_identity": card["quality_v4_threshold_identity"],
+            "planner_dominance": None,
+            "evaluator_identity": None,
+            "compatibility_evidence": None,
+            "calibration_evidence": None,
+            "candidate_release_manifest_sha256": None,
+            "selection_result": selection_result,
+        },
+    }
+    winner = {
+        **metadata,
+        "relative_episode_dir": relative,
+        "budget_used": 1,
+        "selection_result": selection_result,
+    }
+    (episode_dir / "episode.json").write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setattr(
+        dataset_module,
+        "audit_episode",
+        lambda _: {
+            "episode_id": episode_id,
+            "success": True,
+            "eligible_for_behavior_cloning": True,
+        },
+    )
+    _audit_winner_episode(
+        tmp_path,
+        winner,
+        attempt,
+        reset,
+        card,
+        None,
+        quality_v4_validation,
+    )
+
+    metadata["metrics"]["eligible_for_behavior_cloning"] = False
+    winner["metrics"] = metadata["metrics"]
+    (episode_dir / "episode.json").write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="passing independently recomputed Qv4 gate"):
+        _audit_winner_episode(
+            tmp_path,
+            winner,
+            attempt,
+            reset,
+            card,
+            None,
+            quality_v4_validation,
+        )
 
 
 def test_attempt_tape_round_trip_recomputes_shapes_hashes_and_score(

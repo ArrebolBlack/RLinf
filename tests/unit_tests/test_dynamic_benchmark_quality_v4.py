@@ -34,7 +34,9 @@ from se3_wam.benchmark.trajectory_quality_v4 import (
 )
 
 from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
+    _audit_quality_v4_contract,
     _audit_quality_v4_full_exports,
+    _audit_quality_v4_source_inventory,
 )
 from examples.embodiment.audit_dynamic_benchmark_rld2_release import (
     ACCEPTED_PER_TASK,
@@ -71,6 +73,11 @@ from examples.embodiment.dynamic_benchmark_quality_v4 import (
     write_quality_v4_attempt,
     write_quality_v4_full_export,
     write_quality_v4_lightweight_source,
+)
+from examples.embodiment.merge_optimal_export_shards import (
+    _copy_quality_v4_artifacts,
+    _validate_quality_v4_artifacts,
+    _validate_quality_v4_shard_contract,
 )
 
 _REPRESENTATIVE_TASKS = (
@@ -803,6 +810,7 @@ def test_qv4_optimal_audit_and_exact14_release_readiness_recompute_full_gates(
     task_audit = _audit_quality_v4_full_exports(
         tmp_path,
         [{"request": {"episode_id": "p0_grasp-episode"}}],
+        threshold_identity={"payload_sha256": thresholds["thresholds_sha256"]},
     )
     assert task_audit["enabled"]
     assert task_audit["audited_count"] == 1
@@ -830,3 +838,133 @@ def test_qv4_optimal_audit_and_exact14_release_readiness_recompute_full_gates(
     drifted[EXACT_TASKS[0]]["quality_v4_full_exports"]["thresholds_sha256"] = "0" * 64
     with pytest.raises(ReleaseAuditError, match="mixes threshold"):
         quality_v4_release_readiness(drifted)
+
+
+def test_qv4_optimal_audit_rejects_missing_directory_and_tampered_gate(
+    tmp_path: Path,
+) -> None:
+    thresholds = _frozen_thresholds(build_provisional_thresholds())
+    identity = {"payload_sha256": thresholds["thresholds_sha256"]}
+    winners = [{"request": {"episode_id": "p0_grasp-episode"}}]
+    with pytest.raises(ValueError, match="full-export directory is missing"):
+        _audit_quality_v4_full_exports(
+            tmp_path,
+            winners,
+            threshold_identity=identity,
+        )
+    source = _source("p0_grasp", thresholds)
+    attempt = build_quality_v4_attempt(source)
+    exported = materialize_quality_v4_winner_export(
+        tmp_path,
+        source=source,
+        attempt=attempt,
+    )
+    gate_path = tmp_path / exported["full_export_gate_path"]
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    gate["passed"] = False
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not recompute"):
+        _audit_quality_v4_full_exports(
+            tmp_path,
+            winners,
+            threshold_identity=identity,
+        )
+
+
+def test_qv4_shard_merge_independent_audit_end_to_end_fixture(
+    tmp_path: Path,
+) -> None:
+    thresholds = _frozen_thresholds(build_provisional_thresholds())
+    threshold_bytes = (
+        json.dumps(thresholds, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    threshold_file_sha256 = hashlib.sha256(threshold_bytes).hexdigest()
+    receipt = {
+        "schema_version": "se3wam-quality-v4-owner-review-receipt-v0.1",
+        "threshold_schema_version": thresholds["schema_version"],
+        "threshold_file_sha256": threshold_file_sha256,
+        "threshold_payload_sha256": thresholds["thresholds_sha256"],
+        "owner_review": thresholds["owner_review"],
+    }
+    receipt["payload_sha256"] = stable_sha256(receipt)
+    receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    identity = {
+        "schema_version": thresholds["schema_version"],
+        "file_sha256": threshold_file_sha256,
+        "payload_sha256": thresholds["thresholds_sha256"],
+        "owner_review_receipt": {
+            "relative_path": "provenance/quality_v4/owner_review_receipt.json",
+            "file_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            "payload_sha256": receipt["payload_sha256"],
+        },
+    }
+    shard = tmp_path / "shard-00"
+    shard.mkdir()
+    (shard / "quality_v4_thresholds.json").write_bytes(threshold_bytes)
+    receipt_path = shard / identity["owner_review_receipt"]["relative_path"]
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_bytes(receipt_bytes)
+    source = _source("p0_grasp", thresholds)
+    attempt = build_quality_v4_attempt(source)
+    write_quality_v4_attempt(shard, attempt)
+    write_quality_v4_lightweight_source(
+        shard,
+        source=source,
+        recorded_attempt=attempt,
+    )
+    materialize_quality_v4_winner_export(
+        shard,
+        source=source,
+        attempt=attempt,
+    )
+    episode_id = str(attempt["episode_id"])
+    state = {"quality_v4_threshold_identity": identity}
+    assert _validate_quality_v4_shard_contract(shard, state) == identity
+    _validate_quality_v4_artifacts(
+        shard,
+        task="p0_grasp",
+        threshold_identity=identity,
+        reset_episode_ids=[episode_id],
+        winner_episode_ids=[episode_id],
+    )
+
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "quality_v4_thresholds.json").write_bytes(threshold_bytes)
+    merged_receipt = merged / identity["owner_review_receipt"]["relative_path"]
+    merged_receipt.parent.mkdir(parents=True)
+    merged_receipt.write_bytes(receipt_bytes)
+    _copy_quality_v4_artifacts(
+        shard_dirs=[shard],
+        output=merged,
+        reset_episode_ids=[episode_id],
+        winner_episode_ids=[episode_id],
+    )
+    _, audited_identity = _audit_quality_v4_contract(
+        merged,
+        expected_threshold_file_sha256=identity["file_sha256"],
+        expected_threshold_payload_sha256=identity["payload_sha256"],
+        expected_receipt_file_sha256=identity["owner_review_receipt"][
+            "file_sha256"
+        ],
+        expected_receipt_payload_sha256=identity["owner_review_receipt"][
+            "payload_sha256"
+        ],
+    )
+    assert audited_identity == identity
+    _audit_quality_v4_source_inventory(
+        merged,
+        task="p0_grasp",
+        reset_episode_ids=[episode_id],
+        winner_episode_ids=[episode_id],
+        threshold_identity=identity,
+    )
+    summary = _audit_quality_v4_full_exports(
+        merged,
+        [{"request": {"episode_id": episode_id}}],
+        threshold_identity=identity,
+    )
+    assert summary["audited_count"] == 1
+    assert summary["thresholds_sha256"] == thresholds["thresholds_sha256"]
