@@ -243,6 +243,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-gpu-uuid", required=True)
     parser.add_argument("--resource-unit", required=True)
     parser.add_argument("--container-name", required=True)
+    parser.add_argument("--runtime-ledger-job-id", required=True)
     parser.add_argument("--research-commit", required=True)
     parser.add_argument("--research-tree", required=True)
     parser.add_argument("--expected-se3-commit", required=True)
@@ -422,7 +423,7 @@ def _run(args: argparse.Namespace) -> int:
                 "driver_version": gpu["driver_version"],
                 "gpu_query_row": gpu["query_row"],
                 "resource_unit": args.resource_unit,
-                "runtime_ledger_job_id": "GPUPLAN0/t3-phase-e0-v1",
+                "runtime_ledger_job_id": args.runtime_ledger_job_id,
                 "container_name": args.container_name,
                 "source_root": str(source_root),
                 "export_dir": str(export_dir),
