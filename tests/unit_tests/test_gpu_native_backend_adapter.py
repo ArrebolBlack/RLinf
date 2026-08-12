@@ -36,6 +36,7 @@ from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkE
 from rlinf.envs.dynamic_benchmark.gpu_backend import (
     GpuNativeBackendEnv,
     GpuNativeBackendUnavailableError,
+    GpuNativePlannerAdapter,
 )
 
 
@@ -150,6 +151,7 @@ def fake_se3_wam(monkeypatch: pytest.MonkeyPatch) -> _FakeSe3Wam:
     package_names = (
         "se3_wam",
         "se3_wam.benchmark",
+        "se3_wam.benchmark.api",
         "se3_wam.benchmark.contracts",
         "se3_wam.benchmark.gpu_native",
         "se3_wam.benchmark.gpu_native.factory",
@@ -373,3 +375,145 @@ def test_next_request_bypasses_manifest(fake_se3_wam: _FakeSe3Wam) -> None:
     assert request.seed == 7
     assert request.episode_id.startswith("p0_grasp-gpu-")
     assert request.observation_track.value == "state"
+
+
+def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
+    fake_se3_wam: _FakeSe3Wam,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rlinf.envs.dynamic_benchmark.gpu_backend as gpu_backend
+
+    class _ActionMode(enum.Enum):
+        E7 = "E7"
+
+    @dataclass(frozen=True)
+    class _ActionCommand:
+        mode: _ActionMode
+        values: np.ndarray
+        policy_step: int
+
+    class _Teacher:
+        def __init__(self, request: _FakeRequest) -> None:
+            self.request = request
+            self.calls = 0
+
+        def reset(self) -> None:
+            pass
+
+        def act(self, observation: Any) -> _ActionCommand:
+            self.calls += 1
+            return _ActionCommand(
+                mode=_ActionMode.E7,
+                values=np.zeros(7, dtype=np.float64),
+                policy_step=observation.policy_step,
+            )
+
+    teacher_requests: list[str] = []
+    teachers: list[_Teacher] = []
+    teacher_factory = types.ModuleType("se3_wam.benchmark.teacher_factory")
+
+    def _make_teacher(task_id: str, *, request: _FakeRequest) -> tuple[Any, dict[str, Any]]:
+        assert task_id == "t4_slider"
+        teacher_requests.append(request.episode_id)
+        teacher = _Teacher(request)
+        teachers.append(teacher)
+        return teacher, {"teacher_type": "fake"}
+
+    teacher_factory.make_privileged_teacher = _make_teacher
+    monkeypatch.setitem(sys.modules, "se3_wam.benchmark.teacher_factory", teacher_factory)
+    fake_se3_wam.factory.ActionCommand = _ActionCommand
+    fake_se3_wam.factory.ActionMode = _ActionMode
+    sys.modules["se3_wam.benchmark.api"].ActionCommand = _ActionCommand
+    sys.modules["se3_wam.benchmark.contracts"].ActionMode = _ActionMode
+
+    @dataclass(frozen=True)
+    class _FakeObservation:
+        episode_id: str
+        task_id: str
+        policy_step: int
+
+    @dataclass(frozen=True)
+    class _FakeResult:
+        observation: _FakeObservation
+        terminated: bool
+        truncated: bool
+
+    class _PlannerBackend:
+        def __init__(self, **kwargs: Any) -> None:
+            self.num_envs = kwargs["num_envs"]
+            self.backend_id = "mjwarp_gpu_v1"
+            self.observation_track = _ObservationTrack.HYBRID
+            self.provenance = SimpleNamespace(device_platform="cuda")
+            self._active = np.ones(self.num_envs, dtype=np.bool_)
+            self._clock = 0
+
+        def next_request(self) -> _FakeRequest:
+            return _FakeRequest(episode_id=f"planner-{self._clock}")
+
+        def reset(self, requests: Any) -> tuple[_FakeObservation, ...]:
+            self._requests = tuple(requests)
+            self._clock = 0
+            self._active[:] = True
+            return tuple(
+                _FakeObservation(request.episode_id, "t4_slider", 0)
+                for request in self._requests
+            )
+
+        def step(self, commands: Any, *, active_mask: Any) -> tuple[Any, ...]:
+            assert np.array_equal(active_mask, self._active)
+            self._clock += 1
+            results = []
+            for lane, active in enumerate(self._active):
+                if not active:
+                    results.append(None)
+                    continue
+                results.append(
+                    _FakeResult(
+                        observation=_FakeObservation(
+                            self._requests[lane].episode_id,
+                            "t4_slider",
+                            self._clock,
+                        ),
+                        terminated=(lane == 0 and self._clock == 1)
+                        or (lane == 1 and self._clock == 2),
+                        truncated=False,
+                    )
+                )
+            return tuple(results)
+
+        def materialize_terminal_ledger(
+            self,
+            lanes: tuple[int, ...],
+            episode_ids: tuple[str, ...],
+        ) -> Any:
+            return SimpleNamespace(
+                rows=tuple(
+                    SimpleNamespace(lane=lane, episode_id=episode_id)
+                    for lane, episode_id in zip(lanes, episode_ids, strict=True)
+                )
+            )
+
+        def mark_done(self, done_mask: Any) -> None:
+            self._active &= ~np.asarray(done_mask, dtype=np.bool_)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(gpu_backend, "GpuNativeBackendEnv", _PlannerBackend)
+    adapter = GpuNativePlannerAdapter(
+        task_id="t4_slider",
+        num_envs=2,
+        export_dir="/tmp/export",
+        evaluator_backend_id="fake-quality",
+    )
+    requests = (adapter.next_request(), adapter.next_request())
+    adapter.reset(requests)
+    first = adapter.step()
+    second = adapter.step()
+    assert first[0].terminated and first[1] is not None
+    assert second[0] is None and second[1].terminated
+    assert adapter.replay is False
+    assert [len(tape) for tape in adapter.action_tapes] == [1, 2]
+    assert teacher_requests == [request.episode_id for request in requests]
+    assert all(teacher.calls > 0 for teacher in teachers)
+    adapter.close()
