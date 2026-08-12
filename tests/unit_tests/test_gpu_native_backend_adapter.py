@@ -195,6 +195,26 @@ def test_adapter_validates_constructor_arguments() -> None:
         )
 
 
+def test_online_planner_requires_manifest_and_evaluator_identity() -> None:
+    with pytest.raises(ValueError, match="runtime_manifest_path"):
+        GpuNativeBackendEnv(
+            task_id="t1_belt",
+            num_envs=1,
+            export_dir="/tmp/export",
+            planner_mode="online_privileged_teacher_v1",
+            evaluator_backend_id="gpu-eval-v1",
+        )
+    with pytest.raises(ValueError, match="evaluator_backend_id"):
+        GpuNativeBackendEnv(
+            task_id="t1_belt",
+            num_envs=1,
+            export_dir="/tmp/export",
+            planner_mode="online_privileged_teacher_v1",
+            runtime_manifest_path="/tmp/surface.json",
+            runtime_manifest_sha256="a" * 64,
+        )
+
+
 def test_adapter_raises_without_se3_wam(monkeypatch: pytest.MonkeyPatch) -> None:
     import builtins
 
