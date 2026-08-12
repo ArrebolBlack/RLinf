@@ -31,7 +31,7 @@ import time
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,6 +41,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--export-dir", type=Path, required=True)
     parser.add_argument("--expected-gpu-uuid", required=True)
+    parser.add_argument("--expected-nvml-process-count", type=_positive_int, default=1)
     parser.add_argument("--se3-source", type=Path, required=True)
     parser.add_argument("--se3-commit", required=True)
     parser.add_argument("--se3-tree", required=True)
@@ -64,6 +65,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--explore-encoder-batch-size", type=int)
     parser.add_argument("--explore-cohorts", type=int, default=3)
     return parser
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
 
 
 def _file_sha256(path: Path) -> str:
@@ -147,6 +155,83 @@ def _wait_for_release(path: Path, timeout_s: float, heartbeat: Path, phase: str)
             },
         )
         time.sleep(0.25)
+
+
+def _wait_for_expected_nvml_processes(
+    *,
+    query_pids: Callable[[], list[int]],
+    expected_count: int,
+    timeout_s: float,
+    heartbeat: Path | None,
+    poll_interval_s: float = 0.25,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[int]:
+    """Wait until the leased GPU exposes the complete expected process set."""
+    if expected_count < 1:
+        raise ValueError("expected NVML process count must be positive")
+    started = monotonic()
+    while True:
+        pids = sorted(int(pid) for pid in query_pids())
+        if any(pid < 1 for pid in pids) or len(set(pids)) != len(pids):
+            raise RuntimeError("NVML returned an invalid compute PID set")
+        if len(pids) > expected_count:
+            raise RuntimeError(
+                "leased GPU has more NVML compute processes than admitted: "
+                f"expected={expected_count}, observed={len(pids)}"
+            )
+        if len(pids) == expected_count:
+            return pids
+        if monotonic() - started >= timeout_s:
+            raise TimeoutError(
+                "timed out waiting for all admitted NVML compute processes: "
+                f"expected={expected_count}, observed={len(pids)}"
+            )
+        if heartbeat is not None:
+            _atomic_json(
+                heartbeat,
+                {
+                    "schema_version": "gpuenv0-direct-ppo-heartbeat-v1",
+                    "pid": os.getpid(),
+                    "phase": "cuda_admission",
+                    "expected_nvml_process_count": expected_count,
+                    "observed_nvml_pids": pids,
+                    "time_epoch_s": time.time(),
+                },
+            )
+        sleep(poll_interval_s)
+
+
+def _pid_namespace_ids(path: Path = Path("/proc/self/status")) -> tuple[int, ...]:
+    """Return Linux PID namespace IDs, or an empty tuple when unavailable."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ()
+    for line in lines:
+        if line.startswith("NSpid:"):
+            try:
+                return tuple(int(value) for value in line.split()[1:])
+            except ValueError:
+                return ()
+    return ()
+
+
+def _compatible_nvml_pid(
+    nvml_pids: list[int], *, control_pid: int, namespace_pids: tuple[int, ...]
+) -> tuple[int, str]:
+    """Map this runner to one NVML PID while retaining the legacy scalar field."""
+    if control_pid in nvml_pids:
+        return control_pid, "direct_pid_match"
+    if len(nvml_pids) == 1:
+        return nvml_pids[0], "exclusive_uuid_transition_pid_namespace_hidden"
+    matches = sorted(set(nvml_pids).intersection(namespace_pids))
+    if len(matches) == 1:
+        return matches[0], "pid_namespace_mapping"
+    # Container PID namespaces may hide every host NVML PID.  The complete,
+    # sorted ``nvml_pids`` set is the compound-job identity; retain its first
+    # member only as a deterministic compatibility scalar for older reports.
+    return nvml_pids[0], "compound_nvml_pid_set"
 
 
 class ResourceMonitor:
@@ -491,6 +576,7 @@ def main() -> int:
             "sources": source_payload,
             "cpuset": sorted(cpus),
             "cuda_initialized": False,
+            "expected_nvml_process_count": args.expected_nvml_process_count,
         },
     )
     _wait_for_release(
@@ -508,8 +594,8 @@ def main() -> int:
     torch.cuda.synchronize(0)
     pynvml.nvmlInit()
     try:
-        nvml_pids = []
         observed_uuid = None
+        nvml_handle = None
         for index in range(pynvml.nvmlDeviceGetCount()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)
             value = pynvml.nvmlDeviceGetUUID(handle)
@@ -517,20 +603,23 @@ def main() -> int:
                 value = value.decode()
             if value.lower() == args.expected_gpu_uuid.lower():
                 observed_uuid = value
-                nvml_pids = [
-                    int(process.pid)
-                    for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                ]
+                nvml_handle = handle
                 break
-        if observed_uuid is None or len(nvml_pids) != 1:
-            raise RuntimeError(
-                "leased GPU must have exactly one NVML process after the exclusive transition"
-            )
-        nvml_pid = nvml_pids[0]
-        pid_identity_mode = (
-            "direct_pid_match"
-            if nvml_pid == os.getpid()
-            else "exclusive_uuid_transition_pid_namespace_hidden"
+        if observed_uuid is None or nvml_handle is None:
+            raise RuntimeError("NVML cannot find the leased physical GPU UUID")
+        nvml_pids = _wait_for_expected_nvml_processes(
+            query_pids=lambda: [
+                int(process.pid)
+                for process in pynvml.nvmlDeviceGetComputeRunningProcesses(nvml_handle)
+            ],
+            expected_count=args.expected_nvml_process_count,
+            timeout_s=args.hold_timeout_s,
+            heartbeat=args.heartbeat,
+        )
+        nvml_pid, pid_identity_mode = _compatible_nvml_pid(
+            nvml_pids,
+            control_pid=os.getpid(),
+            namespace_pids=_pid_namespace_ids(),
         )
     finally:
         pynvml.nvmlShutdown()
@@ -540,9 +629,11 @@ def main() -> int:
             "schema_version": "gpuenv0-direct-ppo-cuda-ready-v1",
             "control_pid": os.getpid(),
             "nvml_pid": nvml_pid,
+            "nvml_pids": nvml_pids,
             "pid_identity_mode": pid_identity_mode,
             "physical_gpu_uuid": observed_uuid,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "expected_nvml_process_count": args.expected_nvml_process_count,
             "science_started": False,
         },
     )
@@ -629,6 +720,8 @@ def main() -> int:
                 "sources": source_payload,
                 "control_pid": os.getpid(),
                 "nvml_pid": nvml_pid,
+                "nvml_pids": nvml_pids,
+                "pid_identity_mode": pid_identity_mode,
                 "physical_gpu_uuid": observed_uuid,
                 "warmup_cohorts": 1,
                 "measurement_cohorts": len(measured),
@@ -665,6 +758,7 @@ def main() -> int:
             },
             "control_pid": os.getpid(),
             "nvml_pid": nvml_pid,
+            "nvml_pids": nvml_pids,
             "pid_identity_mode": pid_identity_mode,
             "physical_gpu_uuid": observed_uuid,
         }
