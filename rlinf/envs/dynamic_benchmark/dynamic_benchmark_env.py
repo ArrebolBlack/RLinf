@@ -600,6 +600,17 @@ class DynamicBenchmarkEnv(gym.Env):
                     "gpu_planner_evaluator_backend_id",
                     self.task_quality_evaluator_backend_id,
                 ),
+                expected_gpu_uuid=_cfg_get(cfg, "gpu_native_expected_gpu_uuid", None),
+                expected_se3_source_commit=_cfg_get(
+                    cfg, "gpu_native_expected_se3_source_commit", None
+                ),
+                expected_se3_source_tree=_cfg_get(
+                    cfg, "gpu_native_expected_se3_source_tree", None
+                ),
+                observation_track=str(
+                    _cfg_get(cfg, "gpu_native_observation_track", "state")
+                ),
+                **task_quality_kwargs,
             )
             self.envs = []
             self._executor = None
