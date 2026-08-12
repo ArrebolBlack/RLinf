@@ -542,6 +542,19 @@ class DynamicBenchmarkEnv(gym.Env):
             "task_quality_evaluator_backend_id"
         )
         self.auto_reset = bool(_cfg_get(cfg, "auto_reset", True))
+        self.gpu_native_planner_mode = _cfg_get(
+            cfg,
+            "gpu_native_planner_mode",
+            _cfg_get(cfg, "gpu_planner_mode", None),
+        )
+        self.gpu_native_runtime_manifest_path = _cfg_get(
+            cfg,
+            "gpu_native_runtime_manifest_path",
+            _cfg_get(cfg, "gpu_native_runtime_manifest", None),
+        )
+        self.gpu_native_runtime_manifest_sha256 = _cfg_get(
+            cfg, "gpu_native_runtime_manifest_sha256", None
+        )
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
         self.worker_threads = int(_cfg_get(cfg, "worker_threads", 1))
         if self.worker_threads < 1:
@@ -563,9 +576,25 @@ class DynamicBenchmarkEnv(gym.Env):
         if self.process_residual_planner and not self.worker_processes:
             raise ValueError("process residual planner requires process workers")
         self.gpu_native = bool(_cfg_get(cfg, "gpu_native", False))
-        self.gpu_planner_mode = _cfg_get(cfg, "gpu_planner_mode", None)
+        self.gpu_planner_mode = self.gpu_native_planner_mode
         if self.gpu_planner_mode is not None and not self.gpu_native:
             raise ValueError("gpu_planner_mode requires gpu_native=true")
+        if self.gpu_planner_mode is not None:
+            if self.auto_reset:
+                raise ValueError("online GPU Planner mode requires auto_reset=False")
+            if self.task_quality_schema_version is None:
+                raise ValueError(
+                    "online GPU Planner mode requires task-quality schema identity"
+                )
+            if (
+                not isinstance(self.gpu_native_runtime_manifest_path, str)
+                or not self.gpu_native_runtime_manifest_path.strip()
+                or not isinstance(self.gpu_native_runtime_manifest_sha256, str)
+                or not self.gpu_native_runtime_manifest_sha256.strip()
+            ):
+                raise ValueError(
+                    "online GPU Planner mode requires a hash-pinned runtime manifest"
+                )
         self._gpu_backend = None
         if self.gpu_native:
             if self.worker_processes:
@@ -591,10 +620,8 @@ class DynamicBenchmarkEnv(gym.Env):
                 image_size=self.image_size,
                 camera_observations=self.camera_observations,
                 planner_mode=self.gpu_planner_mode,
-                runtime_manifest_path=_cfg_get(cfg, "gpu_native_runtime_manifest", None),
-                runtime_manifest_sha256=_cfg_get(
-                    cfg, "gpu_native_runtime_manifest_sha256", None
-                ),
+                runtime_manifest_path=self.gpu_native_runtime_manifest_path,
+                runtime_manifest_sha256=self.gpu_native_runtime_manifest_sha256,
                 evaluator_backend_id=_cfg_get(
                     cfg,
                     "gpu_planner_evaluator_backend_id",

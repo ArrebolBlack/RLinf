@@ -104,13 +104,22 @@ class GpuNativeBackendEnv:
         if planner_mode not in {None, "online_privileged_teacher_v1"}:
             raise ValueError("planner_mode is not a registered GPU Planner mode")
         planner_enabled = planner_mode is not None
-        if planner_enabled and task_id not in {"t1_belt", "t1_occ"}:
-            raise ValueError("online privileged Planner mode is registered only for surface T1 tasks")
+        if planner_enabled and task_id not in {"t1_belt", "t1_occ", "t5_replan"}:
+            raise ValueError(
+                "online privileged Planner mode is registered only for surface T1 or t5_replan"
+            )
         if planner_enabled:
             if not isinstance(runtime_manifest_path, str) or not runtime_manifest_path.strip():
                 raise ValueError("online Planner mode requires runtime_manifest_path")
             if not isinstance(runtime_manifest_sha256, str) or not runtime_manifest_sha256.strip():
                 raise ValueError("online Planner mode requires runtime_manifest_sha256")
+            if task_id == "t5_replan" and (
+                not isinstance(task_quality_schema_version, str)
+                or not task_quality_schema_version.strip()
+            ):
+                raise ValueError(
+                    "online T5 Planner mode requires task_quality_schema_version"
+                )
             if not isinstance(evaluator_backend_id, str) or not evaluator_backend_id.strip():
                 raise ValueError("online Planner mode requires evaluator_backend_id")
         try:
@@ -226,17 +235,28 @@ class GpuNativeBackendEnv:
             self._task_quality_enabled = True
         if planner_enabled:
             try:
-                from se3_wam.benchmark.gpu_native.surface_planner import (
-                    SurfaceCapturePlanner,
-                )
+                if task_id == "t5_replan":
+                    from se3_wam.benchmark.gpu_native.keyed_puck_planner import (
+                        KeyedPuckReplanPlanner,
+                    )
 
-                self._planner = SurfaceCapturePlanner(
-                    gpu_env=self._env,
-                    task_id=task_id,
-                    image_size=image_size,
-                    runtime_manifest_sha256=runtime_manifest_sha256,
-                    runtime_device_uuid=runtime_evidence[0].device_uuid,
-                )
+                    self._planner = KeyedPuckReplanPlanner(
+                        gpu_env=self._env,
+                        task_id=task_id,
+                        image_size=image_size,
+                    )
+                else:
+                    from se3_wam.benchmark.gpu_native.surface_planner import (
+                        SurfaceCapturePlanner,
+                    )
+
+                    self._planner = SurfaceCapturePlanner(
+                        gpu_env=self._env,
+                        task_id=task_id,
+                        image_size=image_size,
+                        runtime_manifest_sha256=runtime_manifest_sha256,
+                        runtime_device_uuid=runtime_evidence[0].device_uuid,
+                    )
             except Exception as exc:
                 raise GpuNativeBackendUnavailableError(
                     "online Planner mode could not establish the GPU quality/Planner seam"
@@ -397,6 +417,46 @@ class GpuNativeBackendEnv:
             dtype=np.int64,
         ).copy()
 
+    def _arm_t5_event_tapes(self, requests: tuple[Any, ...]) -> None:
+        """Arm benchmark-owned T5 intervention tapes before the first step."""
+
+        if self._task_id != "t5_replan":
+            return
+        try:
+            from se3_wam.benchmark.config import load_task_config
+            from se3_wam.benchmark.keyed_puck import T5EventTape
+
+            from .t5_runtime import t5_branch_for_episode
+        except ImportError as exc:
+            raise GpuNativeBackendUnavailableError(
+                "T5 GPU event-tape support requires the keyed-puck runtime"
+            ) from exc
+        arm_event_tapes = getattr(self._env, "arm_event_tapes", None)
+        if not callable(arm_event_tapes):
+            raise GpuNativeBackendUnavailableError(
+                "T5 GPU event-tape support requires the canonical GPU event-tape seam"
+            )
+        config = load_task_config(self._task_id)
+        try:
+            trigger_gate_y_m = float(config["event"]["default_trigger_gate_y_m"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GpuNativeBackendUnavailableError(
+                "T5 task config lacks the frozen event trigger gate"
+            ) from exc
+        arm_event_tapes(
+            tuple(
+                T5EventTape(
+                    event_id=(
+                        f"rlinf-{request.split.value}-{request.episode_id}-"
+                        f"{t5_branch_for_episode(request.episode_id)}"
+                    ),
+                    branch=t5_branch_for_episode(request.episode_id),
+                    trigger_gate_y_m=trigger_gate_y_m,
+                )
+                for request in requests
+            )
+        )
+
     def reset(self, requests: Any) -> tuple[Any, ...]:
         """Reset the whole batch and materialize every active lane."""
         requests_tuple = tuple(requests)
@@ -407,6 +467,7 @@ class GpuNativeBackendEnv:
         from se3_wam.benchmark.gpu_native.audit import AuditRequest
 
         self._env.reset(requests_tuple)
+        self._arm_t5_event_tapes(requests_tuple)
         audit = self._env.materialize_audit(
             AuditRequest(lanes=tuple(range(self._num_envs)), include_step_result=False)
         )
@@ -594,6 +655,66 @@ class GpuNativeBackendEnv:
         if self._planner is None:
             raise GpuNativeBackendUnavailableError("online Planner mode is not enabled")
         return self._planner.tape()
+
+    def planner_media(self) -> tuple[tuple[dict[str, Any], ...], ...]:
+        """Return copied GPU-rendered scene/wrist frames for review packaging."""
+        if self._planner is None:
+            raise GpuNativeBackendUnavailableError("online Planner mode is not enabled")
+        return self._planner.media()
+
+    def planner_tape_sha256(self) -> str:
+        """Return the hash of the complete structured Planner audit tape."""
+        if self._planner is None:
+            raise GpuNativeBackendUnavailableError("online Planner mode is not enabled")
+        return self._planner.tape_sha256()
+
+    def planner_media_sha256(self) -> tuple[str, ...]:
+        """Return hashes of the captured GPU-rendered scene/wrist frames."""
+        if self._planner is None:
+            raise GpuNativeBackendUnavailableError("online Planner mode is not enabled")
+        return self._planner.media_sha256()
+
+    def planner_replay_audit(
+        self,
+        *,
+        request: Any,
+        tape: Any,
+        diagnostic_only: bool = False,
+        require_terminal: bool = True,
+    ) -> Any:
+        """Replay a completed T5 tape only through the explicit audit boundary."""
+        if self._planner is None:
+            raise GpuNativeBackendUnavailableError("online Planner mode is not enabled")
+        try:
+            from se3_wam.benchmark.gpu_native.keyed_puck_replay import (
+                replay_frozen_t5_action_tape,
+            )
+        except ImportError as exc:
+            raise GpuNativeBackendUnavailableError(
+                "T5 Planner replay audit requires the keyed-puck replay seam"
+            ) from exc
+        return replay_frozen_t5_action_tape(
+            gpu_env=self._env,
+            request=request,
+            tape=tape,
+            diagnostic_only=diagnostic_only,
+            require_terminal=require_terminal,
+        )
+
+    def materialize_current_observations(self) -> tuple[Any, ...]:
+        """Return live GPU observations for a CPU Planner control boundary."""
+
+        materializer = getattr(self._env, "materialize_planner_observations", None)
+        if not callable(materializer):
+            raise GpuNativeBackendUnavailableError(
+                "SE3-WAM GPU backend lacks the current-state Planner adapter"
+            )
+        observations = tuple(materializer())
+        if len(observations) != self._num_envs:
+            raise GpuNativeBackendUnavailableError(
+                "GPU Planner adapter returned an incomplete cohort"
+            )
+        return observations
 
     def replay_planner_tape_diagnostic(
         self,
