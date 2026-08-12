@@ -76,6 +76,14 @@ QUALITY_V2_CALIBRATION_WAVE_RECEIPT_SCHEMA = (
 )
 QUALITY_V2_MINIMUM_ATTEMPTED_EPISODES = 20
 QUALITY_V2_MINIMUM_SUCCESSFUL_EPISODES = 8
+QUALITY_V4_THRESHOLDS_FILENAME = "quality_v4_thresholds.json"
+QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH = (
+    "provenance/quality_v4/owner_review_receipt.json"
+)
+QUALITY_V4_OWNER_REVIEW_RECEIPT_SCHEMA = (
+    "se3wam-quality-v4-owner-review-receipt-v0.1"
+)
+QUALITY_V4_ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-quality-v4-attempt-v0.1"
 SELECTION_CONTRACT = (
     "success,safety,trajectory_completion,return,-control_steps,-action_l2_sum"
 )
@@ -149,6 +157,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-checksums-sha256", required=True)
     parser.add_argument("--expected-candidate-manifest-sha256", required=True)
     parser.add_argument("--expected-quality-v2-thresholds-sha256", required=True)
+    parser.add_argument(
+        "--expected-quality-v4-thresholds-file-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-quality-v4-thresholds-payload-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-quality-v4-owner-review-receipt-file-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-quality-v4-owner-review-receipt-payload-sha256",
+        required=True,
+    )
     parser.add_argument("--auditor-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -197,6 +221,12 @@ def _payload_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _identity_sha256(payload: Mapping[str, Any], field: str) -> str:
+    unsigned = dict(payload)
+    unsigned.pop(field, None)
+    return hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -228,6 +258,93 @@ def _safe_dataset_path(root: Path, relative: str) -> Path:
     if not target.resolve().is_relative_to(root.resolve()):
         raise ValueError(f"dataset-relative path escapes the root: {relative!r}")
     return target
+
+
+def _audit_quality_v4_contract(
+    root: Path,
+    *,
+    expected_threshold_file_sha256: str,
+    expected_threshold_payload_sha256: str,
+    expected_receipt_file_sha256: str,
+    expected_receipt_payload_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reopen the frozen Qv4 threshold and its owner-review receipt."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        validate_quality_v4_thresholds,
+    )
+
+    threshold_file_sha256 = _expected_sha256(
+        expected_threshold_file_sha256,
+        "expected Qv4 threshold file SHA-256",
+    )
+    threshold_payload_sha256 = _expected_sha256(
+        expected_threshold_payload_sha256,
+        "expected Qv4 threshold payload SHA-256",
+    )
+    receipt_file_sha256 = _expected_sha256(
+        expected_receipt_file_sha256,
+        "expected Qv4 owner-review receipt file SHA-256",
+    )
+    receipt_payload_sha256 = _expected_sha256(
+        expected_receipt_payload_sha256,
+        "expected Qv4 owner-review receipt payload SHA-256",
+    )
+    threshold_path = root / QUALITY_V4_THRESHOLDS_FILENAME
+    if threshold_path.is_symlink() or not threshold_path.is_file():
+        raise ValueError("dataset-local Qv4 threshold file is missing")
+    if _sha256(threshold_path) != threshold_file_sha256:
+        raise ValueError("Qv4 threshold file identity mismatch")
+    thresholds = json.loads(threshold_path.read_text(encoding="utf-8"))
+    if not isinstance(thresholds, Mapping):
+        raise ValueError("Qv4 threshold contract must be a mapping")
+    validation = validate_quality_v4_thresholds(
+        thresholds,
+        expected_thresholds_sha256=threshold_payload_sha256,
+        require_formal_freeze=True,
+    )
+    if validation.get("formal_freeze_eligible") is not True:
+        raise ValueError("Qv4 threshold contract is not formally frozen")
+
+    receipt_path = _safe_dataset_path(
+        root,
+        QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH,
+    )
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError("Qv4 owner-review receipt is missing")
+    if _sha256(receipt_path) != receipt_file_sha256:
+        raise ValueError("Qv4 owner-review receipt file identity mismatch")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "schema_version",
+        "threshold_schema_version",
+        "threshold_file_sha256",
+        "threshold_payload_sha256",
+        "owner_review",
+        "payload_sha256",
+    }:
+        raise ValueError("Qv4 owner-review receipt inventory mismatch")
+    if (
+        receipt.get("schema_version") != QUALITY_V4_OWNER_REVIEW_RECEIPT_SCHEMA
+        or receipt.get("threshold_schema_version") != validation.get("schema_version")
+        or receipt.get("threshold_file_sha256") != threshold_file_sha256
+        or receipt.get("threshold_payload_sha256") != threshold_payload_sha256
+        or receipt.get("owner_review") != thresholds.get("owner_review")
+        or receipt.get("payload_sha256") != receipt_payload_sha256
+        or _payload_sha256(receipt) != receipt_payload_sha256
+    ):
+        raise ValueError("Qv4 owner-review receipt binding mismatch")
+    identity = {
+        "schema_version": validation["schema_version"],
+        "file_sha256": threshold_file_sha256,
+        "payload_sha256": threshold_payload_sha256,
+        "owner_review_receipt": {
+            "relative_path": QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH,
+            "file_sha256": receipt_file_sha256,
+            "payload_sha256": receipt_payload_sha256,
+        },
+    }
+    return dict(thresholds), identity
 
 
 def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -3070,6 +3187,7 @@ def _audit_winner_episode(
     reset: Mapping[str, Any],
     card: Mapping[str, Any],
     planner_dominance: Mapping[str, Any] | None,
+    quality_v4_validation: Mapping[str, Any],
 ) -> None:
     from se3_wam.benchmark.dataset import audit_episode
 
@@ -3085,6 +3203,15 @@ def _audit_winner_episode(
     metadata = json.loads((episode_dir / "episode.json").read_text(encoding="utf-8"))
     if metadata != {key: winner[key] for key in metadata}:
         raise ValueError("winner manifest does not reproduce the episode record")
+    metrics = metadata.get("metrics")
+    if (
+        not isinstance(metrics, Mapping)
+        or metrics.get("eligible_for_behavior_cloning") is not True
+        or metadata.get("quality_v4_validation") != quality_v4_validation
+    ):
+        raise ValueError(
+            "winner episode is not bound to a passing independently recomputed Qv4 gate"
+        )
     request = metadata.get("request")
     if not isinstance(request, dict):
         raise ValueError("winner episode reset request is missing")
@@ -3126,6 +3253,8 @@ def _audit_winner_episode(
         or teacher.get("source_identity") != card["source_identity"]
         or teacher.get("quality_v2_threshold_identity")
         != card.get("quality_v2_threshold_identity")
+        or teacher.get("quality_v4_threshold_identity")
+        != card.get("quality_v4_threshold_identity")
         or teacher.get("planner_dominance") != planner_dominance
         or teacher.get("evaluator_identity") != card.get("evaluator_identity")
         or teacher.get("compatibility_evidence") != card.get("compatibility_evidence")
@@ -3224,6 +3353,7 @@ def _audit_export_state_and_progress(
         "reset_manifest_sha256": card["reset_manifest_sha256"],
         "source_identity": card["source_identity"],
         "quality_v2_threshold_identity": card["quality_v2_threshold_identity"],
+        "quality_v4_threshold_identity": card["quality_v4_threshold_identity"],
     }
     if any(state.get(key) != value for key, value in expected_state_values.items()):
         raise ValueError("export-state identity does not match the dataset card")
@@ -3298,10 +3428,93 @@ def _audit_export_state_and_progress(
             raise ValueError(f"progress boundary does not match final {name}")
 
 
-def _audit_quality_v4_full_exports(
-    root: Path, winner_rows: Sequence[Mapping[str, Any]]
-) -> dict[str, Any]:
-    """Independently re-gate every Qv4 winner HDF5 when the new path exists."""
+def _quality_v4_expected_files(
+    reset_episode_ids: Sequence[str],
+    winner_episode_ids: Sequence[str],
+) -> set[str]:
+    return {
+        *(f"attempts/{episode_id}.json" for episode_id in reset_episode_ids),
+        *(f"lightweight_sources/{episode_id}.h5" for episode_id in reset_episode_ids),
+        *(f"full_exports/{episode_id}.h5" for episode_id in winner_episode_ids),
+        *(f"full_exports/{episode_id}.gate.json" for episode_id in winner_episode_ids),
+    }
+
+
+def _audit_quality_v4_source_inventory(
+    root: Path,
+    *,
+    task: str,
+    reset_episode_ids: Sequence[str],
+    winner_episode_ids: Sequence[str],
+    threshold_identity: Mapping[str, Any],
+) -> None:
+    """Audit the required Qv4 attempt/lightweight/full-export file inventory."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        QUALITY_V4_ARTIFACT_SUBDIRECTORY,
+        audit_quality_v4_lightweight_source,
+    )
+
+    directory = root / QUALITY_V4_ARTIFACT_SUBDIRECTORY
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("required Qv4 artifact directory is missing")
+    if any(path.is_symlink() for path in directory.rglob("*")):
+        raise ValueError("Qv4 artifact directory cannot contain symlinks")
+    expected_files = _quality_v4_expected_files(
+        reset_episode_ids,
+        winner_episode_ids,
+    )
+    actual_files = {
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    if actual_files != expected_files:
+        raise ValueError(
+            "Qv4 artifact file inventory mismatch: "
+            f"missing={sorted(expected_files - actual_files)}, "
+            f"extra={sorted(actual_files - expected_files)}"
+        )
+    for episode_id in reset_episode_ids:
+        attempt = json.loads(
+            (directory / "attempts" / f"{episode_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if not isinstance(attempt, Mapping):
+            raise ValueError("Qv4 attempt is not a mapping")
+        attempt_sha256 = _expected_sha256(
+            attempt.get("attempt_sha256"),
+            f"Qv4 attempt {episode_id} SHA-256",
+        )
+        if (
+            attempt.get("schema_version") != QUALITY_V4_ATTEMPT_SCHEMA
+            or attempt.get("episode_id") != episode_id
+            or attempt.get("task_id") != task
+            or attempt.get("thresholds_sha256")
+            != threshold_identity.get("payload_sha256")
+            or _identity_sha256(attempt, "attempt_sha256") != attempt_sha256
+        ):
+            raise ValueError(f"Qv4 attempt {episode_id} identity drift")
+        lightweight = audit_quality_v4_lightweight_source(
+            directory / "lightweight_sources" / f"{episode_id}.h5"
+        )
+        if (
+            lightweight.get("episode_id") != episode_id
+            or lightweight.get("task_id") != task
+            or lightweight.get("attempt_sha256") != attempt_sha256
+            or lightweight.get("source_sha256") != attempt.get("source_sha256")
+        ):
+            raise ValueError(f"Qv4 lightweight source {episode_id} identity drift")
+
+
+def _audit_quality_v4_full_exports_with_validations(
+    root: Path,
+    winner_rows: Sequence[Mapping[str, Any]],
+    *,
+    threshold_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Independently re-gate every required Qv4 winner HDF5."""
 
     from examples.embodiment.dynamic_benchmark_quality_v4 import (
         QUALITY_V4_FULL_EXPORT_SUBDIRECTORY,
@@ -3310,14 +3523,8 @@ def _audit_quality_v4_full_exports(
     )
 
     directory = root / QUALITY_V4_FULL_EXPORT_SUBDIRECTORY
-    if not directory.exists():
-        return {
-            "enabled": False,
-            "audited_count": 0,
-            "thresholds_sha256": None,
-            "orientation_contract_sha256": None,
-            "gate_sha256": [],
-        }
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("required Qv4 full-export directory is missing")
     episode_ids = []
     for winner in winner_rows:
         request = winner.get("request")
@@ -3335,6 +3542,7 @@ def _audit_quality_v4_full_exports(
     gate_hashes = []
     threshold_hashes = set()
     orientation_hashes = set()
+    validations: dict[str, dict[str, Any]] = {}
     for episode_id, winner in zip(episode_ids, winner_rows, strict=True):
         export_path = directory / f"{episode_id}.h5"
         recorded_gate = json.loads(
@@ -3343,6 +3551,15 @@ def _audit_quality_v4_full_exports(
         recomputed_gate = audit_quality_v4_full_export(export_path)
         if recorded_gate != recomputed_gate:
             raise ValueError("Qv4 recorded full-export gate does not recompute")
+        if (
+            recomputed_gate.get("episode_id") != episode_id
+            or recomputed_gate.get("thresholds_sha256")
+            != threshold_identity.get("payload_sha256")
+            or recomputed_gate.get("formal_thresholds_frozen") is not True
+            or recomputed_gate.get("owner_review_complete") is not True
+            or recomputed_gate.get("eligible_for_behavior_cloning") is not True
+        ):
+            raise ValueError("Qv4 full-export gate identity or eligibility mismatch")
         dataset_gate = dataset_quality_v4_validation(recomputed_gate)
         if not dataset_gate["passed"]:
             raise ValueError("Qv4 winner is not behavior-cloning eligible")
@@ -3378,18 +3595,41 @@ def _audit_quality_v4_full_exports(
                 raise ValueError(
                     "Qv4 winner episode is not bound to its full-export gate"
                 )
+        validations[episode_id] = dataset_gate
         gate_hashes.append(recomputed_gate["gate_sha256"])
         threshold_hashes.add(recomputed_gate["thresholds_sha256"])
         orientation_hashes.add(recomputed_gate["orientation_contract_sha256"])
-    if len(threshold_hashes) != 1 or len(orientation_hashes) != 1:
+    if (
+        threshold_hashes != {threshold_identity.get("payload_sha256")}
+        or len(orientation_hashes) != 1
+    ):
         raise ValueError("Qv4 winners mix threshold or orientation contracts")
-    return {
-        "enabled": True,
-        "audited_count": len(episode_ids),
-        "thresholds_sha256": next(iter(threshold_hashes)),
-        "orientation_contract_sha256": next(iter(orientation_hashes)),
-        "gate_sha256": gate_hashes,
-    }
+    return (
+        {
+            "enabled": True,
+            "audited_count": len(episode_ids),
+            "thresholds_sha256": next(iter(threshold_hashes)),
+            "orientation_contract_sha256": next(iter(orientation_hashes)),
+            "gate_sha256": gate_hashes,
+        },
+        validations,
+    )
+
+
+def _audit_quality_v4_full_exports(
+    root: Path,
+    winner_rows: Sequence[Mapping[str, Any]],
+    *,
+    threshold_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Public test seam for the strict Qv4 full-export audit."""
+
+    summary, _ = _audit_quality_v4_full_exports_with_validations(
+        root,
+        winner_rows,
+        threshold_identity=threshold_identity,
+    )
+    return summary
 
 
 def _audit_dataset(
@@ -3399,6 +3639,10 @@ def _audit_dataset(
     expected_checksums_sha256: str,
     expected_candidate_sha256: str,
     expected_quality_v2_thresholds_sha256: str,
+    expected_quality_v4_threshold_file_sha256: str,
+    expected_quality_v4_threshold_payload_sha256: str,
+    expected_quality_v4_receipt_file_sha256: str,
+    expected_quality_v4_receipt_payload_sha256: str,
 ) -> dict[str, Any]:
     if not root.is_dir():
         raise FileNotFoundError(root)
@@ -3434,6 +3678,15 @@ def _audit_dataset(
     }
     if card.get("quality_v2_threshold_identity") != expected_threshold_identity:
         raise ValueError("dataset card quality-v2 threshold identity mismatch")
+    _, quality_v4_threshold_identity = _audit_quality_v4_contract(
+        root,
+        expected_threshold_file_sha256=expected_quality_v4_threshold_file_sha256,
+        expected_threshold_payload_sha256=expected_quality_v4_threshold_payload_sha256,
+        expected_receipt_file_sha256=expected_quality_v4_receipt_file_sha256,
+        expected_receipt_payload_sha256=expected_quality_v4_receipt_payload_sha256,
+    )
+    if card.get("quality_v4_threshold_identity") != quality_v4_threshold_identity:
+        raise ValueError("dataset card Qv4 threshold identity mismatch")
     candidate_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
     candidates = _candidate_rows(candidate_payload, card=card)
     candidate_search_mode = _candidate_search_mode(card)
@@ -3614,14 +3867,27 @@ def _audit_dataset(
         if not isinstance(episode_id, str) or episode_id in winner_by_episode:
             raise ValueError("winner episode IDs must be non-empty and unique")
         winner_by_episode[episode_id] = winner
-    quality_v4_full_exports = _audit_quality_v4_full_exports(root, winner_rows)
-    if isinstance(card.get("quality_v4_threshold_identity"), Mapping):
-        if not quality_v4_full_exports["enabled"]:
-            raise ValueError("Qv4 production export is missing full-export artifacts")
-        if quality_v4_full_exports["thresholds_sha256"] != card[
-            "quality_v4_threshold_identity"
-        ].get("thresholds_sha256"):
-            raise ValueError("Qv4 full exports use a different threshold contract")
+    quality_v4_reset_episode_ids = []
+    for result in reset_results:
+        episode_id = result.get("episode_id")
+        if not isinstance(episode_id, str) or not episode_id:
+            raise ValueError("Qv4 reset result has no episode identity")
+        quality_v4_reset_episode_ids.append(episode_id)
+    _audit_quality_v4_source_inventory(
+        root,
+        task=str(card["task"]),
+        reset_episode_ids=quality_v4_reset_episode_ids,
+        winner_episode_ids=list(winner_by_episode),
+        threshold_identity=quality_v4_threshold_identity,
+    )
+    (
+        quality_v4_full_exports,
+        quality_v4_validations,
+    ) = _audit_quality_v4_full_exports_with_validations(
+        root,
+        winner_rows,
+        threshold_identity=quality_v4_threshold_identity,
+    )
 
     accepted = 0
     render_parity_skips: Counter[str] = Counter()
@@ -3784,6 +4050,7 @@ def _audit_dataset(
             "compatibility_evidence",
             "calibration_evidence",
             "candidate_release_manifest_sha256",
+            "quality_v4_threshold_identity",
         ):
             if winner.get(key) != card.get(key):
                 raise ValueError(f"published winner {key} mismatch")
@@ -3815,6 +4082,7 @@ def _audit_dataset(
             reset,
             card,
             planner_dominance,
+            quality_v4_validations[episode_id],
         )
         accepted += 1
     if consumed_skip_events != set(skip_events):
@@ -3846,6 +4114,7 @@ def _audit_dataset(
         "source_identity": card["source_identity"],
         "quality_v2_threshold_identity": expected_threshold_identity,
         "quality_v2_calibration_wave_receipt_identity": (calibration_receipt_identity),
+        "quality_v4_threshold_identity": quality_v4_threshold_identity,
         "quality_v4_full_exports": quality_v4_full_exports,
         "accepted_count": accepted,
         "attempted_reset_count": len(reset_results),
@@ -3892,6 +4161,22 @@ def main() -> None:
         args.expected_quality_v2_thresholds_sha256,
         "expected quality-v2 threshold SHA-256",
     )
+    expected_quality_v4_threshold_file = _expected_sha256(
+        args.expected_quality_v4_thresholds_file_sha256,
+        "expected Qv4 threshold file SHA-256",
+    )
+    expected_quality_v4_threshold_payload = _expected_sha256(
+        args.expected_quality_v4_thresholds_payload_sha256,
+        "expected Qv4 threshold payload SHA-256",
+    )
+    expected_quality_v4_receipt_file = _expected_sha256(
+        args.expected_quality_v4_owner_review_receipt_file_sha256,
+        "expected Qv4 owner-review receipt file SHA-256",
+    )
+    expected_quality_v4_receipt_payload = _expected_sha256(
+        args.expected_quality_v4_owner_review_receipt_payload_sha256,
+        "expected Qv4 owner-review receipt payload SHA-256",
+    )
     started = time.time()
     report: dict[str, Any] = {
         "schema_version": AUDIT_SCHEMA,
@@ -3900,6 +4185,14 @@ def main() -> None:
         "checksums_sha256": expected_checksums,
         "candidate_manifest_sha256": expected_candidate,
         "quality_v2_thresholds_sha256": expected_quality_v2_thresholds,
+        "quality_v4_thresholds_file_sha256": expected_quality_v4_threshold_file,
+        "quality_v4_thresholds_payload_sha256": expected_quality_v4_threshold_payload,
+        "quality_v4_owner_review_receipt_file_sha256": (
+            expected_quality_v4_receipt_file
+        ),
+        "quality_v4_owner_review_receipt_payload_sha256": (
+            expected_quality_v4_receipt_payload
+        ),
         "auditor_commit": auditor_commit,
         "started_unix_s": started,
     }
@@ -3910,6 +4203,18 @@ def main() -> None:
             expected_checksums_sha256=expected_checksums,
             expected_candidate_sha256=expected_candidate,
             expected_quality_v2_thresholds_sha256=expected_quality_v2_thresholds,
+            expected_quality_v4_threshold_file_sha256=(
+                expected_quality_v4_threshold_file
+            ),
+            expected_quality_v4_threshold_payload_sha256=(
+                expected_quality_v4_threshold_payload
+            ),
+            expected_quality_v4_receipt_file_sha256=(
+                expected_quality_v4_receipt_file
+            ),
+            expected_quality_v4_receipt_payload_sha256=(
+                expected_quality_v4_receipt_payload
+            ),
         )
         report.update(
             status="passed",

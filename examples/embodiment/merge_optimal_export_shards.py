@@ -42,12 +42,6 @@ from typing import Any
 from examples.embodiment.dynamic_benchmark_calibration_projection import (
     CALIBRATION_BINDING_PROJECTION_SCHEMA,
 )
-from examples.embodiment.dynamic_benchmark_quality_v4 import (
-    QUALITY_V4_FULL_EXPORT_SUBDIRECTORY,
-    audit_quality_v4_full_export,
-    dataset_quality_v4_validation,
-    load_quality_v4_thresholds,
-)
 from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     EXPORT_SCHEMA,
     FIRST_ELIGIBLE_SEARCH_MODE,
@@ -64,6 +58,18 @@ from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     _root_checksums,
     _selection_contract,
     _validate_quality_v2_calibration_receipt_artifact,
+)
+
+QUALITY_V4_THRESHOLDS_FILENAME = "quality_v4_thresholds.json"
+QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH = (
+    "provenance/quality_v4/owner_review_receipt.json"
+)
+QUALITY_V4_OWNER_REVIEW_RECEIPT_SCHEMA = (
+    "se3wam-quality-v4-owner-review-receipt-v0.1"
+)
+QUALITY_V4_ATTEMPT_SCHEMA = "rlinf-dynamic-benchmark-quality-v4-attempt-v0.1"
+QUALITY_V4_FULL_EXPORT_GATE_SCHEMA = (
+    "rlinf-dynamic-benchmark-quality-v4-full-export-gate-v0.1"
 )
 
 
@@ -294,6 +300,19 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _identity_sha256(payload: Mapping[str, Any], field: str) -> str:
+    unsigned = dict(payload)
+    unsigned.pop(field, None)
+    canonical = json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _episode_number(episode_id: str) -> int:
     match = re.search(r"-(\d{5,})-s\d+$", episode_id)
     if match is None:
@@ -382,6 +401,258 @@ def _tree_inventory(root: Path) -> dict[str, str]:
     }
 
 
+def _validate_quality_v4_shard_contract(
+    shard: Path,
+    export_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reopen one shard's frozen Qv4 threshold and owner-review receipt."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        validate_quality_v4_thresholds,
+    )
+
+    raw_identity = export_state.get("quality_v4_threshold_identity")
+    if not isinstance(raw_identity, Mapping) or set(raw_identity) != {
+        "schema_version",
+        "file_sha256",
+        "payload_sha256",
+        "owner_review_receipt",
+    }:
+        raise ValueError(f"{shard} has no exact Qv4 threshold identity")
+    threshold_file_sha256 = _expected_sha256(
+        raw_identity.get("file_sha256"),
+        f"{shard} Qv4 threshold file SHA-256",
+    )
+    threshold_payload_sha256 = _expected_sha256(
+        raw_identity.get("payload_sha256"),
+        f"{shard} Qv4 threshold payload SHA-256",
+    )
+    threshold_path = shard / QUALITY_V4_THRESHOLDS_FILENAME
+    if threshold_path.is_symlink() or not threshold_path.is_file():
+        raise ValueError(f"{shard} has no dataset-local Qv4 threshold file")
+    threshold_bytes = threshold_path.read_bytes()
+    if hashlib.sha256(threshold_bytes).hexdigest() != threshold_file_sha256:
+        raise ValueError(f"{shard} Qv4 threshold file SHA-256 mismatch")
+    try:
+        thresholds = json.loads(threshold_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{shard} Qv4 threshold is not UTF-8 JSON") from error
+    if not isinstance(thresholds, Mapping):
+        raise ValueError(f"{shard} Qv4 threshold must be a mapping")
+    validation = validate_quality_v4_thresholds(
+        thresholds,
+        expected_thresholds_sha256=threshold_payload_sha256,
+        require_formal_freeze=True,
+    )
+    if (
+        validation.get("schema_version") != raw_identity.get("schema_version")
+        or validation.get("thresholds_sha256") != threshold_payload_sha256
+        or validation.get("formal_freeze_eligible") is not True
+    ):
+        raise ValueError(f"{shard} Qv4 frozen threshold identity mismatch")
+
+    raw_receipt_identity = raw_identity.get("owner_review_receipt")
+    if not isinstance(raw_receipt_identity, Mapping) or set(
+        raw_receipt_identity
+    ) != {"relative_path", "file_sha256", "payload_sha256"}:
+        raise ValueError(f"{shard} has no exact Qv4 owner-review receipt identity")
+    if (
+        raw_receipt_identity.get("relative_path")
+        != QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH
+    ):
+        raise ValueError(f"{shard} Qv4 owner-review receipt path mismatch")
+    receipt_file_sha256 = _expected_sha256(
+        raw_receipt_identity.get("file_sha256"),
+        f"{shard} Qv4 owner-review receipt file SHA-256",
+    )
+    receipt_payload_sha256 = _expected_sha256(
+        raw_receipt_identity.get("payload_sha256"),
+        f"{shard} Qv4 owner-review receipt payload SHA-256",
+    )
+    receipt_path = shard / QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError(f"{shard} has no Qv4 owner-review receipt")
+    receipt_bytes = receipt_path.read_bytes()
+    if hashlib.sha256(receipt_bytes).hexdigest() != receipt_file_sha256:
+        raise ValueError(f"{shard} Qv4 owner-review receipt file SHA-256 mismatch")
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{shard} Qv4 owner-review receipt is not UTF-8 JSON") from error
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "schema_version",
+        "threshold_schema_version",
+        "threshold_file_sha256",
+        "threshold_payload_sha256",
+        "owner_review",
+        "payload_sha256",
+    }:
+        raise ValueError(f"{shard} Qv4 owner-review receipt inventory mismatch")
+    if (
+        receipt.get("schema_version") != QUALITY_V4_OWNER_REVIEW_RECEIPT_SCHEMA
+        or receipt.get("threshold_schema_version") != raw_identity.get("schema_version")
+        or receipt.get("threshold_file_sha256") != threshold_file_sha256
+        or receipt.get("threshold_payload_sha256") != threshold_payload_sha256
+        or receipt.get("owner_review") != thresholds.get("owner_review")
+        or receipt.get("payload_sha256") != receipt_payload_sha256
+        or _payload_sha256(receipt) != receipt_payload_sha256
+    ):
+        raise ValueError(f"{shard} Qv4 owner-review receipt binding mismatch")
+    return {
+        "schema_version": str(raw_identity["schema_version"]),
+        "file_sha256": threshold_file_sha256,
+        "payload_sha256": threshold_payload_sha256,
+        "owner_review_receipt": {
+            "relative_path": QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH,
+            "file_sha256": receipt_file_sha256,
+            "payload_sha256": receipt_payload_sha256,
+        },
+    }
+
+
+def _quality_v4_expected_files(
+    reset_episode_ids: list[str],
+    winner_episode_ids: list[str],
+) -> set[str]:
+    return {
+        *(f"attempts/{episode_id}.json" for episode_id in reset_episode_ids),
+        *(f"lightweight_sources/{episode_id}.h5" for episode_id in reset_episode_ids),
+        *(f"full_exports/{episode_id}.h5" for episode_id in winner_episode_ids),
+        *(f"full_exports/{episode_id}.gate.json" for episode_id in winner_episode_ids),
+    }
+
+
+def _validate_quality_v4_artifacts(
+    root: Path,
+    *,
+    task: str,
+    threshold_identity: Mapping[str, Any],
+    reset_episode_ids: list[str],
+    winner_episode_ids: list[str],
+) -> None:
+    """Validate the exact Qv4 source/full-export/gate inventory for one root."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        QUALITY_V4_ARTIFACT_SUBDIRECTORY,
+        audit_quality_v4_lightweight_source,
+    )
+
+    directory = root / QUALITY_V4_ARTIFACT_SUBDIRECTORY
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError(f"{root} is missing the required Qv4 directory")
+    if any(path.is_symlink() for path in directory.rglob("*")):
+        raise ValueError(f"{root} Qv4 artifacts cannot contain symlinks")
+    expected_files = _quality_v4_expected_files(
+        reset_episode_ids,
+        winner_episode_ids,
+    )
+    actual_files = {
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    if actual_files != expected_files:
+        raise ValueError(
+            f"{root} Qv4 artifact inventory mismatch: "
+            f"missing={sorted(expected_files - actual_files)}, "
+            f"extra={sorted(actual_files - expected_files)}"
+        )
+
+    attempts: dict[str, Mapping[str, Any]] = {}
+    for episode_id in reset_episode_ids:
+        attempt_path = directory / "attempts" / f"{episode_id}.json"
+        attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+        if not isinstance(attempt, Mapping):
+            raise ValueError(f"{root} Qv4 attempt {episode_id} is not a mapping")
+        attempt_sha256 = _expected_sha256(
+            attempt.get("attempt_sha256"),
+            f"{root} Qv4 attempt {episode_id} SHA-256",
+        )
+        if (
+            attempt.get("schema_version") != QUALITY_V4_ATTEMPT_SCHEMA
+            or attempt.get("episode_id") != episode_id
+            or attempt.get("task_id") != task
+            or attempt.get("thresholds_sha256")
+            != threshold_identity.get("payload_sha256")
+            or _identity_sha256(attempt, "attempt_sha256") != attempt_sha256
+        ):
+            raise ValueError(f"{root} Qv4 attempt {episode_id} identity drift")
+        lightweight = audit_quality_v4_lightweight_source(
+            directory / "lightweight_sources" / f"{episode_id}.h5"
+        )
+        if (
+            lightweight.get("episode_id") != episode_id
+            or lightweight.get("task_id") != task
+            or lightweight.get("attempt_sha256") != attempt_sha256
+            or lightweight.get("source_sha256") != attempt.get("source_sha256")
+        ):
+            raise ValueError(f"{root} Qv4 lightweight source {episode_id} identity drift")
+        attempts[episode_id] = attempt
+
+    for episode_id in winner_episode_ids:
+        attempt = attempts.get(episode_id)
+        if attempt is None:
+            raise ValueError(f"{root} Qv4 winner {episode_id} has no source attempt")
+        export_path = directory / "full_exports" / f"{episode_id}.h5"
+        gate_path = directory / "full_exports" / f"{episode_id}.gate.json"
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        if not isinstance(gate, Mapping):
+            raise ValueError(f"{root} Qv4 winner gate {episode_id} is not a mapping")
+        gate_sha256 = _expected_sha256(
+            gate.get("gate_sha256"),
+            f"{root} Qv4 winner gate {episode_id} SHA-256",
+        )
+        if (
+            gate.get("schema_version") != QUALITY_V4_FULL_EXPORT_GATE_SCHEMA
+            or gate.get("episode_id") != episode_id
+            or gate.get("task_id") != task
+            or gate.get("attempt_sha256") != attempt.get("attempt_sha256")
+            or gate.get("thresholds_sha256")
+            != threshold_identity.get("payload_sha256")
+            or gate.get("export_file_sha256")
+            != hashlib.sha256(export_path.read_bytes()).hexdigest()
+            or gate.get("formal_thresholds_frozen") is not True
+            or gate.get("owner_review_complete") is not True
+            or gate.get("passed") is not True
+            or gate.get("eligible_for_behavior_cloning") is not True
+            or _identity_sha256(gate, "gate_sha256") != gate_sha256
+        ):
+            raise ValueError(f"{root} Qv4 winner gate {episode_id} identity drift")
+
+
+def _copy_quality_v4_artifacts(
+    *,
+    shard_dirs: list[Path],
+    output: Path,
+    reset_episode_ids: list[str],
+    winner_episode_ids: list[str],
+) -> None:
+    """Copy the kept Qv4 prefix while rejecting every cross-shard collision."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        QUALITY_V4_ARTIFACT_SUBDIRECTORY,
+    )
+
+    for relative in sorted(
+        _quality_v4_expected_files(reset_episode_ids, winner_episode_ids)
+    ):
+        sources = [
+            shard / QUALITY_V4_ARTIFACT_SUBDIRECTORY / relative
+            for shard in shard_dirs
+            if (shard / QUALITY_V4_ARTIFACT_SUBDIRECTORY / relative).is_file()
+        ]
+        if len(sources) != 1:
+            raise ValueError(
+                f"Qv4 artifact {relative!r} has "
+                f"{len(sources)} sources; expected exactly one"
+            )
+        destination = output / QUALITY_V4_ARTIFACT_SUBDIRECTORY / relative
+        if destination.exists():
+            raise FileExistsError(f"Qv4 artifact collision at {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(sources[0], destination)
+
+
 def _validate_quality_v2_shard_contract(
     shard: Path,
     export_state: Mapping[str, Any],
@@ -441,7 +712,9 @@ def _validate_quality_v2_shard_contract(
     )
     receipt_path = shard / receipt_binding["relative_path"]
     if receipt_path.is_symlink() or not receipt_path.is_file():
-        raise ValueError(f"{shard} calibration receipt is missing or symlinked")
+        raise ValueError(
+            f"{shard} quality-v2 calibration receipt is missing or symlinked"
+        )
     raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     expected_receipt_sha256 = (
         hashlib.sha256(receipt_path.read_bytes()).hexdigest()
@@ -467,27 +740,110 @@ def _validate_quality_v2_shard_contract(
 def _validate_quality_v4_shard_contract(
     shard: Path,
     export_state: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Reopen one shard's frozen Qv4 threshold contract."""
+) -> dict[str, Any]:
+    """Reopen one shard's frozen Qv4 threshold and owner-review receipt."""
+
+    from examples.embodiment.dynamic_benchmark_quality_v4 import (
+        validate_quality_v4_thresholds,
+    )
 
     raw_identity = export_state.get("quality_v4_threshold_identity")
-    threshold_path = shard / "quality_v4_thresholds.json"
-    if raw_identity is None and not threshold_path.exists():
-        return None
-    if not isinstance(raw_identity, Mapping):
-        raise ValueError(f"{shard} export state has no Qv4 threshold identity")
-    expected_file_sha256 = _expected_sha256(
+    if not isinstance(raw_identity, Mapping) or set(raw_identity) != {
+        "schema_version",
+        "file_sha256",
+        "payload_sha256",
+        "owner_review_receipt",
+    }:
+        raise ValueError(f"{shard} has no exact Qv4 threshold identity")
+    threshold_file_sha256 = _expected_sha256(
         raw_identity.get("file_sha256"),
-        f"{shard} quality-v4 threshold file SHA-256",
+        f"{shard} Qv4 threshold file SHA-256",
     )
-    _, validation = load_quality_v4_thresholds(
-        threshold_path,
-        expected_file_sha256=expected_file_sha256,
+    threshold_payload_sha256 = _expected_sha256(
+        raw_identity.get("payload_sha256"),
+        f"{shard} Qv4 threshold payload SHA-256",
+    )
+    threshold_path = shard / QUALITY_V4_THRESHOLDS_FILENAME
+    if threshold_path.is_symlink() or not threshold_path.is_file():
+        raise ValueError(f"{shard} has no dataset-local Qv4 threshold file")
+    threshold_bytes = threshold_path.read_bytes()
+    if hashlib.sha256(threshold_bytes).hexdigest() != threshold_file_sha256:
+        raise ValueError(f"{shard} Qv4 threshold file SHA-256 mismatch")
+    try:
+        thresholds = json.loads(threshold_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{shard} Qv4 threshold is not UTF-8 JSON") from error
+    if not isinstance(thresholds, Mapping):
+        raise ValueError(f"{shard} Qv4 threshold must be a mapping")
+    validation = validate_quality_v4_thresholds(
+        thresholds,
+        expected_thresholds_sha256=threshold_payload_sha256,
         require_formal_freeze=True,
     )
-    if dict(raw_identity) != validation:
-        raise ValueError(f"{shard} quality-v4 threshold identity mismatch")
-    return validation
+    if (
+        validation.get("schema_version") != raw_identity.get("schema_version")
+        or validation.get("thresholds_sha256") != threshold_payload_sha256
+        or validation.get("formal_freeze_eligible") is not True
+    ):
+        raise ValueError(f"{shard} Qv4 frozen threshold identity mismatch")
+
+    raw_receipt_identity = raw_identity.get("owner_review_receipt")
+    if not isinstance(raw_receipt_identity, Mapping) or set(
+        raw_receipt_identity
+    ) != {"relative_path", "file_sha256", "payload_sha256"}:
+        raise ValueError(f"{shard} has no exact Qv4 owner-review receipt identity")
+    if (
+        raw_receipt_identity.get("relative_path")
+        != QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH
+    ):
+        raise ValueError(f"{shard} Qv4 owner-review receipt path mismatch")
+    receipt_file_sha256 = _expected_sha256(
+        raw_receipt_identity.get("file_sha256"),
+        f"{shard} Qv4 owner-review receipt file SHA-256",
+    )
+    receipt_payload_sha256 = _expected_sha256(
+        raw_receipt_identity.get("payload_sha256"),
+        f"{shard} Qv4 owner-review receipt payload SHA-256",
+    )
+    receipt_path = shard / QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError(f"{shard} has no Qv4 owner-review receipt")
+    receipt_bytes = receipt_path.read_bytes()
+    if hashlib.sha256(receipt_bytes).hexdigest() != receipt_file_sha256:
+        raise ValueError(f"{shard} Qv4 owner-review receipt file SHA-256 mismatch")
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{shard} Qv4 owner-review receipt is not UTF-8 JSON") from error
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "schema_version",
+        "threshold_schema_version",
+        "threshold_file_sha256",
+        "threshold_payload_sha256",
+        "owner_review",
+        "payload_sha256",
+    }:
+        raise ValueError(f"{shard} Qv4 owner-review receipt inventory mismatch")
+    if (
+        receipt.get("schema_version") != QUALITY_V4_OWNER_REVIEW_RECEIPT_SCHEMA
+        or receipt.get("threshold_schema_version") != raw_identity.get("schema_version")
+        or receipt.get("threshold_file_sha256") != threshold_file_sha256
+        or receipt.get("threshold_payload_sha256") != threshold_payload_sha256
+        or receipt.get("owner_review") != thresholds.get("owner_review")
+        or receipt.get("payload_sha256") != receipt_payload_sha256
+        or _payload_sha256(receipt) != receipt_payload_sha256
+    ):
+        raise ValueError(f"{shard} Qv4 owner-review receipt binding mismatch")
+    return {
+        "schema_version": str(raw_identity["schema_version"]),
+        "file_sha256": threshold_file_sha256,
+        "payload_sha256": threshold_payload_sha256,
+        "owner_review_receipt": {
+            "relative_path": QUALITY_V4_OWNER_REVIEW_RECEIPT_RELATIVE_PATH,
+            "file_sha256": receipt_file_sha256,
+            "payload_sha256": receipt_payload_sha256,
+        },
+    }
 
 
 def main() -> None:
@@ -534,7 +890,8 @@ def main() -> None:
             shard_quality_v2_receipt_binding,
         ) = _validate_quality_v2_shard_contract(shard, shard_export_state)
         shard_quality_v4_threshold_identity = _validate_quality_v4_shard_contract(
-            shard, shard_export_state
+            shard,
+            shard_export_state,
         )
         shard_candidate_sha256 = hashlib.sha256(
             (shard / "candidate_manifest.json").read_bytes()
@@ -569,7 +926,7 @@ def main() -> None:
             shard_quality_v4_threshold_identity
             != reference_quality_v4_threshold_identity
         ):
-            raise ValueError(f"{shard} has a different quality-v4 threshold identity")
+            raise ValueError(f"{shard} has a different Qv4 threshold or receipt identity")
         elif (
             shard_export_state != reference_export_state
             or shard_candidate_sha256 != reference_candidate_sha256
@@ -587,6 +944,13 @@ def main() -> None:
             attempts=shard_attempts,
             winners=shard_winners,
         )
+        _validate_quality_v4_artifacts(
+            shard,
+            task=str(shard_export_state["task"]),
+            threshold_identity=shard_quality_v4_threshold_identity,
+            reset_episode_ids=[str(row["episode_id"]) for row in shard_results],
+            winner_episode_ids=[_winner_episode_id(row) for row in shard_winners],
+        )
         all_results.extend(shard_results)
         all_attempts.extend(shard_attempts)
         all_winners.extend(shard_winners)
@@ -595,6 +959,7 @@ def main() -> None:
     assert reference_export_state is not None
     assert reference_quality_v2_threshold_identity is not None
     assert reference_quality_v2_receipt_binding is not None
+    assert reference_quality_v4_threshold_identity is not None
     expected_global_indices = list(range(int(reference_export_state["max_resets"])))
     if [row["reset_index"] for row in all_results] != expected_global_indices:
         raise ValueError("merged reset coverage is not exact, ordered, and gap-free")
@@ -644,11 +1009,10 @@ def main() -> None:
         reference / "quality_v2_thresholds.json",
         output / "quality_v2_thresholds.json",
     )
-    if reference_quality_v4_threshold_identity is not None:
-        shutil.copyfile(
-            reference / "quality_v4_thresholds.json",
-            output / "quality_v4_thresholds.json",
-        )
+    shutil.copyfile(
+        reference / QUALITY_V4_THRESHOLDS_FILENAME,
+        output / QUALITY_V4_THRESHOLDS_FILENAME,
+    )
     shutil.copyfile(reference / "export_state.json", output / "export_state.json")
     shutil.copyfile(reference / "reset_manifest.jsonl", output / "reset_manifest.jsonl")
     if (reference / "provenance").is_dir():
@@ -665,15 +1029,12 @@ def main() -> None:
         or merged_quality_v2_receipt_binding != reference_quality_v2_receipt_binding
     ):
         raise RuntimeError("merged quality-v2 threshold or receipt identity changed")
-    if reference_quality_v4_threshold_identity is not None:
-        merged_quality_v4_threshold_identity = _validate_quality_v4_shard_contract(
-            output, export_state
-        )
-        if (
-            merged_quality_v4_threshold_identity
-            != reference_quality_v4_threshold_identity
-        ):
-            raise RuntimeError("merged quality-v4 threshold identity changed")
+    merged_quality_v4_threshold_identity = _validate_quality_v4_shard_contract(
+        output,
+        export_state,
+    )
+    if merged_quality_v4_threshold_identity != reference_quality_v4_threshold_identity:
+        raise RuntimeError("merged Qv4 threshold or receipt identity changed")
 
     _write_jsonl(output / "attempts.jsonl", kept_attempts)
     _write_jsonl(output / "reset_results.jsonl", kept_results)
@@ -687,7 +1048,6 @@ def main() -> None:
             if isinstance(relative, str)
             else (f"episodes/{task}/{split}/{episode_id}")
         )
-        winner_shard: Path | None = None
         for shard in shard_dirs:
             source = (
                 shard / target_rel
@@ -696,61 +1056,10 @@ def main() -> None:
             )
             if source.exists():
                 shutil.copytree(source, output / target_rel)
-                winner_shard = shard
                 break
         else:
             raise FileNotFoundError(
                 f"winner episode {episode_id} not found in any shard"
-            )
-        assert winner_shard is not None
-        if reference_quality_v4_threshold_identity is None:
-            continue
-        full_export_relative = (
-            QUALITY_V4_FULL_EXPORT_SUBDIRECTORY / f"{episode_id}.h5"
-        ).as_posix()
-        full_gate_relative = (
-            QUALITY_V4_FULL_EXPORT_SUBDIRECTORY / f"{episode_id}.gate.json"
-        ).as_posix()
-        if (
-            winner.get("quality_v4_full_export_path") != full_export_relative
-            or winner.get("quality_v4_full_export_gate_path") != full_gate_relative
-        ):
-            raise ValueError(
-                f"winner {episode_id} has non-canonical Qv4 artifact paths"
-            )
-        source_export = winner_shard / full_export_relative
-        source_gate = winner_shard / full_gate_relative
-        if (
-            source_export.is_symlink()
-            or source_gate.is_symlink()
-            or not source_export.is_file()
-            or not source_gate.is_file()
-        ):
-            raise FileNotFoundError(f"winner {episode_id} has incomplete Qv4 artifacts")
-        target_export = output / full_export_relative
-        target_gate = output / full_gate_relative
-        target_export.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_export, target_export)
-        shutil.copy2(source_gate, target_gate)
-        recorded_gate = json.loads(target_gate.read_text(encoding="utf-8"))
-        recomputed_gate = audit_quality_v4_full_export(target_export)
-        if recorded_gate != recomputed_gate:
-            raise ValueError(f"winner {episode_id} Qv4 gate does not recompute")
-        if winner.get("quality_v4_full_export_gate_sha256") != recomputed_gate.get(
-            "gate_sha256"
-        ):
-            raise ValueError(f"winner {episode_id} Qv4 gate identity mismatch")
-        validation = dataset_quality_v4_validation(recomputed_gate)
-        episode = json.loads(
-            (output / target_rel / "episode.json").read_text(encoding="utf-8")
-        )
-        if (
-            episode.get("quality_v4_validation") != validation
-            or episode.get("metrics", {}).get("eligible_for_behavior_cloning")
-            is not True
-        ):
-            raise ValueError(
-                f"winner {episode_id} episode is not bound to its Qv4 gate"
             )
     for episode_id in kept_episodes:
         for shard in shard_dirs:
@@ -762,6 +1071,21 @@ def main() -> None:
             raise FileNotFoundError(
                 f"lightweight tape {episode_id} not found in any shard"
             )
+    kept_reset_episode_ids = [str(row["episode_id"]) for row in kept_results]
+    kept_winner_episode_ids = [_winner_episode_id(row) for row in kept_winners]
+    _copy_quality_v4_artifacts(
+        shard_dirs=shard_dirs,
+        output=output,
+        reset_episode_ids=kept_reset_episode_ids,
+        winner_episode_ids=kept_winner_episode_ids,
+    )
+    _validate_quality_v4_artifacts(
+        output,
+        task=str(task),
+        threshold_identity=reference_quality_v4_threshold_identity,
+        reset_episode_ids=kept_reset_episode_ids,
+        winner_episode_ids=kept_winner_episode_ids,
+    )
 
     attempts_path = output / "attempts.jsonl"
     results_path = output / "reset_results.jsonl"
@@ -839,11 +1163,7 @@ def main() -> None:
         "recovery_events": recovery_events,
         "source_identity": source_identity,
         "quality_v2_threshold_identity": reference_quality_v2_threshold_identity,
-        **(
-            {"quality_v4_threshold_identity": (reference_quality_v4_threshold_identity)}
-            if reference_quality_v4_threshold_identity is not None
-            else {}
-        ),
+        "quality_v4_threshold_identity": reference_quality_v4_threshold_identity,
         "image_size": image_size,
         "device": device,
         "started_unix_s": started_unix_s,
