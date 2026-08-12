@@ -1513,21 +1513,32 @@ class GpuNativeTensorBackendEnv:
         overflow = numpy.asarray(audit["overflow"])
         controller = numpy.asarray(audit["controller_valid"])
         driver = numpy.asarray(audit["driver_valid"])
-        terminal = (numpy.asarray(audit["terminated"]) != 0) | (
-            numpy.asarray(audit["truncated"]) != 0
-        )
-        invalid_terminal = (numpy.asarray(audit["terminated"]) != 0) & (
-            numpy.asarray(audit["terminal_reason"]) == 2
-        )
+        terminated = numpy.asarray(audit["terminated"])
+        truncated = numpy.asarray(audit["truncated"])
+        terminal_reason = numpy.asarray(audit["terminal_reason"])
+        # A lane that terminated before its cohort peers stays inactive while the
+        # remaining lanes finish.  The hot path may clear that lane's one-step
+        # terminated flag, but the task terminal reason remains latched.  Treat
+        # that latched reason as terminal so an inactive tail is not mistaken for
+        # a live controller failure.  INVALID_STATE (reason 2) remains fail-closed
+        # even after its one-step flag has been cleared.
+        terminal = (terminated != 0) | (truncated != 0) | (terminal_reason != 0)
+        invalid_terminal = terminal_reason == 2
         if numpy.any(overflow != 0):
             raise GpuNativeTensorBackendUnavailableError(
                 "MJWarp contact/constraint overflow is a hard stop"
             )
-        if numpy.any(invalid_terminal) or numpy.any(
-            ((controller == 0) | (driver == 0)) & ~terminal
-        ):
+        invalid_guard = ((controller == 0) | (driver == 0)) & ~terminal
+        if numpy.any(invalid_terminal) or numpy.any(invalid_guard):
+            lanes = numpy.flatnonzero(invalid_terminal | invalid_guard).tolist()
             raise GpuNativeTensorBackendUnavailableError(
-                "active pre-physics controller/driver guard failed or emitted invalid_state"
+                "active pre-physics controller/driver guard failed or emitted "
+                f"invalid_state: lanes={lanes}, "
+                f"controller={controller[lanes].tolist()}, "
+                f"driver={driver[lanes].tolist()}, "
+                f"terminal_reason={terminal_reason[lanes].tolist()}, "
+                f"terminated={terminated[lanes].tolist()}, "
+                f"truncated={truncated[lanes].tolist()}"
             )
         return MappingProxyType(
             {

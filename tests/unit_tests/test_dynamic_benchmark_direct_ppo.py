@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -22,6 +23,8 @@ from rlinf.envs.dynamic_benchmark.direct_ppo_reward import (
     REWARD_COMPONENT_NAMES,
 )
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import (
+    GpuNativeTensorBackendEnv,
+    GpuNativeTensorBackendUnavailableError,
     GpuNativePrivilegedRewardState,
     GpuNativeVisualPolicyObservation,
 )
@@ -102,6 +105,31 @@ def _signals(*, terminal: bool = False, success: bool = False, reason: int = 0):
         "terminal_reason": torch.tensor([reason], dtype=torch.int32),
         "valid": torch.tensor([True]),
     }
+
+
+def test_health_audit_accepts_latched_terminal_tail_but_rejects_invalid_state() -> None:
+    class FakeEnv:
+        audit: dict[str, np.ndarray]
+
+        def materialize_e2_audit(self) -> dict[str, np.ndarray]:
+            return self.audit
+
+    fake = FakeEnv()
+    backend = object.__new__(GpuNativeTensorBackendEnv)
+    backend._env = fake
+    fake.audit = {
+        "overflow": np.zeros(2, dtype=np.int32),
+        "controller_valid": np.array([0, 1], dtype=np.int32),
+        "driver_valid": np.array([0, 1], dtype=np.int32),
+        "physics_step": np.array([10, 20], dtype=np.int64),
+        "terminated": np.zeros(2, dtype=np.int32),
+        "truncated": np.array([0, 1], dtype=np.int32),
+        "terminal_reason": np.array([3, 0], dtype=np.int32),
+    }
+    backend.materialize_health_audit()
+    fake.audit["terminal_reason"][0] = 2
+    with pytest.raises(GpuNativeTensorBackendUnavailableError, match="lanes=\\[0\\]"):
+        backend.materialize_health_audit()
 
 
 def test_reward_potential_is_symmetric_and_terminal_summary_is_exact_once() -> None:
@@ -225,4 +253,3 @@ def test_rollout_buffer_copies_public_observation_before_render_reuse() -> None:
         truncated=torch.zeros(1, dtype=torch.bool),
     )
     assert torch.equal(buffer.view().observations.rgb["agentview"][0], original)
-
