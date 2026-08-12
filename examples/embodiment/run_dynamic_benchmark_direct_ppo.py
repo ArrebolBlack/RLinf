@@ -56,6 +56,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--science-release", type=Path, required=True)
     parser.add_argument("--heartbeat", type=Path, required=True)
     parser.add_argument("--hold-timeout-s", type=float, default=3600.0)
+    parser.add_argument("--explore-profile")
+    parser.add_argument("--explore-num-envs", type=int)
+    parser.add_argument("--explore-rollout-horizon", type=int)
+    parser.add_argument("--explore-minibatch-size", type=int)
+    parser.add_argument("--explore-ppo-epochs", type=int)
+    parser.add_argument("--explore-encoder-batch-size", type=int)
+    parser.add_argument("--explore-cohorts", type=int, default=3)
     return parser
 
 
@@ -570,6 +577,79 @@ def main() -> int:
     )
     monitor.start()
     try:
+        if args.explore_profile is not None:
+            overrides = (
+                args.explore_num_envs,
+                args.explore_rollout_horizon,
+                args.explore_minibatch_size,
+                args.explore_ppo_epochs,
+                args.explore_encoder_batch_size,
+                args.explore_cohorts,
+            )
+            if any(value is None or value < 1 for value in overrides):
+                raise ValueError("exploratory profile requires positive PPO shape arguments")
+            config = DirectPPORunConfig(
+                name=args.explore_profile,
+                seed=20261600 + int(args.explore_num_envs),
+                num_envs=args.explore_num_envs,
+                cohorts=args.explore_cohorts,
+                rollout_horizon=args.explore_rollout_horizon,
+                minibatch_size=args.explore_minibatch_size,
+                ppo_epochs=args.explore_ppo_epochs,
+                encoder_batch_size=args.explore_encoder_batch_size,
+                manifest_name="train",
+                checkpoint_every_cohorts=args.explore_cohorts,
+            )
+            _seed_all(config.seed)
+            started = time.time()
+            runner = DirectPPORunner(
+                contract=contract,
+                contract_path=contract_path,
+                source=source,
+                config=config,
+                output=args.output / "profile",
+                verify_ledger_double_consume=True,
+            )
+            try:
+                report = runner.run()
+            finally:
+                runner.close()
+            report["resources"] = monitor.summary(start_epoch_s=started)
+            _atomic_json(args.output / "profile" / "report.json", report)
+            measured = report["train"]["cohorts"][1:]
+            if not measured:
+                raise RuntimeError("exploratory profile produced no post-warmup cohort")
+            rates = [row["end_to_end_valid_env_steps_per_s"] for row in measured]
+            summary = {
+                "schema_version": "gpuenv0-direct-ppo-exploratory-profile-v1",
+                "status": "passed",
+                "job_id": contract["job_id"],
+                "profile": asdict(config),
+                "contract_sha256": args.contract_sha256,
+                "sources": source_payload,
+                "control_pid": os.getpid(),
+                "nvml_pid": nvml_pid,
+                "physical_gpu_uuid": observed_uuid,
+                "warmup_cohorts": 1,
+                "measurement_cohorts": len(measured),
+                "end_to_end_valid_env_steps_per_s": {
+                    "median": statistics.median(rates),
+                    "min": min(rates),
+                },
+                "render_enabled_frames_per_s": {
+                    "median": statistics.median(
+                        row["render_enabled_frames_per_s"] for row in measured
+                    ),
+                    "min": min(row["render_enabled_frames_per_s"] for row in measured),
+                },
+                "timing": report["timing"],
+                "resources": report["resources"],
+                "terminal_ledger": report["terminal_ledger"],
+                "checkpoint": report["checkpoint"],
+                "report": str(args.output / "profile" / "report.json"),
+            }
+            _atomic_json(args.output / "summary.json", summary)
+            return 0
         summary: dict[str, Any] = {
             "schema_version": "gpuenv0-direct-ppo-throughput-full-report-v1",
             "status": "running",
