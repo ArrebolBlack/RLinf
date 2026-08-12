@@ -80,6 +80,21 @@ _P0_STATE_ENV_CAPABILITIES = MappingProxyType(
         "device_terminal_mask": True,
     }
 )
+
+
+def _p0_expected_capabilities(
+    *, visual: bool, device_tensor_step: bool
+) -> Mapping[str, bool]:
+    return MappingProxyType(
+        {
+            **_P0_STATE_CONTRACT_CAPABILITIES,
+            "rgb": visual,
+            "depth": visual,
+            "segmentation": visual,
+            "device_tensor_step": device_tensor_step,
+            "device_terminal_mask": device_tensor_step,
+        }
+    )
 _EXPORT_DIGEST_ATTRIBUTES = MappingProxyType(
     {
         "request_sha256": "request_identity_sha256",
@@ -232,6 +247,7 @@ def _validate_public_contract(
     *,
     task_id: str,
     num_envs: int,
+    observation_track: str,
 ) -> tuple[Mapping[str, bool], Mapping[str, bool]]:
     contract = getattr(env, "contract", None)
     if contract is None:
@@ -244,7 +260,7 @@ def _validate_public_contract(
         "batch_size": num_envs,
         "task_id": task_id,
         "consumer": "rl",
-        "observation_track": "state",
+        "observation_track": observation_track,
         "action_mode": "E7",
         "physics_hz": 500,
         "control_hz": 20,
@@ -271,13 +287,22 @@ def _validate_public_contract(
         getattr(env, "capabilities", None),
         context="SE3-WAM environment",
     )
-    if contract_capabilities != _P0_STATE_CONTRACT_CAPABILITIES:
+    visual = observation_track == "hybrid"
+    expected_contract_capabilities = _p0_expected_capabilities(
+        visual=visual,
+        device_tensor_step=False,
+    )
+    expected_env_capabilities = _p0_expected_capabilities(
+        visual=visual,
+        device_tensor_step=True,
+    )
+    if contract_capabilities != expected_contract_capabilities:
         raise GpuNativeTensorBackendUnavailableError(
-            "SE3-WAM P0 STATE contract capability values differ from clean v0.2"
+            "SE3-WAM P0 tensor contract capability values differ from clean v0.2"
         )
-    if env_capabilities != _P0_STATE_ENV_CAPABILITIES:
+    if env_capabilities != expected_env_capabilities:
         raise GpuNativeTensorBackendUnavailableError(
-            "SE3-WAM P0 STATE engine capability values differ from clean v0.2"
+            "SE3-WAM P0 tensor engine capability values differ from clean v0.2"
         )
     return contract_capabilities, env_capabilities
 
@@ -687,6 +712,41 @@ class GpuNativeTensorStep:
 
 
 @dataclass(frozen=True)
+class GpuNativeVisualPolicyObservation:
+    """GPU policy inputs with privileged state structurally excluded."""
+
+    proprio: Any
+    rgb: Mapping[str, Any]
+    depth_m: Mapping[str, Any]
+    segmentation: Mapping[str, Any]
+    information_boundary: str = "proprio_plus_public_rgb_depth_segmentation"
+
+    def __post_init__(self) -> None:
+        if self.proprio is None:
+            raise ValueError("visual policy observation requires proprioception")
+        for name in ("rgb", "depth_m", "segmentation"):
+            values = getattr(self, name)
+            if tuple(values) != ("agentview", "robot0_eye_in_hand") or any(
+                value is None for value in values.values()
+            ):
+                raise ValueError(f"visual policy {name} has the wrong camera set")
+            object.__setattr__(self, name, MappingProxyType(dict(values)))
+
+
+@dataclass(frozen=True)
+class GpuNativePrivilegedRewardState:
+    """Minimal simulator-state view reserved for reward computation."""
+
+    eef_position_m: Any
+    object_position_m: Any
+    object_linear_velocity_m_s: Any
+    fingerpad_contact_flags: Any
+    post_hold_contact_valid: Any
+    layout_sha256: str
+    information_boundary: str = "reward_only_not_policy_visible"
+
+
+@dataclass(frozen=True)
 class GpuNativeTensorTerminalRow:
     """One explicitly materialized terminal lane from the control plane."""
 
@@ -733,6 +793,7 @@ class GpuNativeTensorBackendEnv:
         manifest_sha256: str | None = None,
         task_quality_schema_version: str | None = None,
         task_quality_evaluator_backend_id: str | None = None,
+        observation_track: str = "state",
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
             raise ValueError("GPU tensor backend requires a positive num_envs")
@@ -801,6 +862,17 @@ class GpuNativeTensorBackendEnv:
             raise GpuNativeTensorBackendUnavailableError(
                 "GPU tensor backend requires PyTorch, Warp, and the SE3-WAM GPU package"
             ) from exc
+        try:
+            requested_observation_track = ObservationTrack(observation_track)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "GPU tensor observation_track must be 'state' or 'hybrid'"
+            ) from exc
+        if requested_observation_track not in {
+            ObservationTrack.STATE,
+            ObservationTrack.HYBRID,
+        }:
+            raise ValueError("GPU tensor observation_track must be 'state' or 'hybrid'")
         if not torch.cuda.is_available():
             raise GpuNativeTensorBackendUnavailableError(
                 "PyTorch CUDA is unavailable; CPU fallback is forbidden"
@@ -821,12 +893,14 @@ class GpuNativeTensorBackendEnv:
         self._expected_se3_source_commit = expected_se3_source_commit
         self._expected_se3_source_tree = expected_se3_source_tree
         self._device_ordinal = device_ordinal
+        self._image_size = image_size
         self._device = device
         self._torch = torch
         self._warp = warp
         self._stream_from_torch = stream_from_torch
         self._scoped_stream = scoped_stream
         self._consumer = GpuNativeConsumer.RL
+        self._observation_track = requested_observation_track
         try:
             self._split = Split(split)
         except (TypeError, ValueError) as exc:
@@ -850,7 +924,7 @@ class GpuNativeTensorBackendEnv:
             requests = tuple(
                 replace(
                     row.request,
-                    observation_track=ObservationTrack.STATE,
+                    observation_track=self._observation_track,
                 )
                 for row in manifest_rows
             )
@@ -880,10 +954,11 @@ class GpuNativeTensorBackendEnv:
                 getattr(request, "task_id", None) != task_id
                 or _enum_value(getattr(request, "split", None)) != self._split.value
                 or _enum_value(getattr(request, "action_mode", None)) != "E7"
-                or _enum_value(getattr(request, "observation_track", None)) != "state"
+                or _enum_value(getattr(request, "observation_track", None))
+                != self._observation_track.value
             ):
                 raise GpuNativeTensorBackendUnavailableError(
-                    f"manifest request {ordinal} differs from the P0 STATE/E7 contract"
+                    f"manifest request {ordinal} differs from the P0 tensor/E7 contract"
                 )
         manifest_payloads = tuple(
             _manifest_request_payload(request) for request in requests
@@ -946,7 +1021,7 @@ class GpuNativeTensorBackendEnv:
             task_id,
             consumer=self._consumer,
             batch_size=num_envs,
-            observation_track=ObservationTrack.STATE,
+            observation_track=self._observation_track,
             export_dir=export_dir,
             device_ordinal=device_ordinal,
             image_size=image_size,
@@ -962,6 +1037,7 @@ class GpuNativeTensorBackendEnv:
                 env,
                 task_id=task_id,
                 num_envs=num_envs,
+                observation_track=self._observation_track.value,
             )
             provenance = env.provenance
             if (
@@ -1070,7 +1146,6 @@ class GpuNativeTensorBackendEnv:
         self._device_identity_start = device_identity_start
         self._device_identity_end = device_identity_end
         self._final_device_identity: GpuDeviceIdentityReceipt | None = None
-        self._observation_track = ObservationTrack.STATE
         self._view_cache: dict[str, tuple[int, Any]] = {}
         self._stream_cache: dict[int, Any] = {}
         self._observation_shape: tuple[int, ...] | None = None
@@ -1094,6 +1169,7 @@ class GpuNativeTensorBackendEnv:
             {
                 "task_id": task_id,
                 "consumer": "rl",
+                "observation_track": self._observation_track.value,
                 "batch_size": num_envs,
                 "backend_id": _GPU_NATIVE_BACKEND_ID,
                 "api_version": _GPU_NATIVE_API_VERSION,
@@ -1303,6 +1379,148 @@ class GpuNativeTensorBackendEnv:
         )
         self._view_cache[name] = (tensor.data_ptr(), tensor)
         return tensor
+
+    def visual_policy_observation(
+        self, observation: Any
+    ) -> GpuNativeVisualPolicyObservation:
+        """Split public visual policy inputs from the privileged hot vector.
+
+        The returned object has no field that contains the 184 privileged
+        values.  Reward code receives a separate, named minimal view through
+        :meth:`privileged_reward_state`.
+        """
+
+        if self._observation_track.value != "hybrid":
+            raise GpuNativeTensorBackendUnavailableError(
+                "visual policy observation requires the hybrid observation track"
+            )
+        if (
+            observation.device != self._device
+            or observation.dtype != self._torch.float32
+            or tuple(observation.shape) != (self._num_envs, 216)
+        ):
+            raise GpuNativeTensorBackendUnavailableError(
+                "GPU policy source observation differs from the frozen P0 layout"
+            )
+        visual = self._env.device_visual_observation()
+        rgb = {}
+        depth_m = {}
+        segmentation = {}
+        for camera in ("agentview", "robot0_eye_in_hand"):
+            rgb[camera] = self._view(
+                visual.rgb[camera],
+                f"policy_rgb_{camera}",
+                expected_shape=(
+                    self._num_envs,
+                    self._image_size,
+                    self._image_size,
+                    3,
+                ),
+                expected_dtype=self._torch.float32,
+            )
+            depth_m[camera] = self._view(
+                visual.depth_m[camera],
+                f"policy_depth_{camera}",
+                expected_shape=(
+                    self._num_envs,
+                    self._image_size,
+                    self._image_size,
+                ),
+                expected_dtype=self._torch.float32,
+            )
+            segmentation[camera] = self._view(
+                visual.segmentation[camera],
+                f"policy_segmentation_{camera}",
+                expected_shape=(
+                    self._num_envs,
+                    self._image_size,
+                    self._image_size,
+                ),
+                expected_dtype=self._torch.int32,
+            )
+        proprio = observation[:, :32]
+        if tuple(proprio.shape) != (self._num_envs, 32):
+            raise GpuNativeTensorBackendUnavailableError(
+                "public P0 proprioception does not have 32 elements"
+            )
+        return GpuNativeVisualPolicyObservation(
+            proprio=proprio,
+            rgb=rgb,
+            depth_m=depth_m,
+            segmentation=segmentation,
+        )
+
+    def privileged_reward_state(
+        self, observation: Any
+    ) -> GpuNativePrivilegedRewardState:
+        """Return only named simulator fields required by the frozen reward."""
+
+        try:
+            from se3_wam.benchmark.gpu_native.p0_grasp_observation import (
+                OBSERVATION_LAYOUT_SHA256,
+                PRIVILEGED_HOT_OFFSET,
+                PRIVILEGED_OFFSETS,
+            )
+        except ImportError as exc:
+            raise GpuNativeTensorBackendUnavailableError(
+                "SE3-WAM privileged reward schema is unavailable"
+            ) from exc
+        if (
+            observation.device != self._device
+            or observation.dtype != self._torch.float32
+            or tuple(observation.shape) != (self._num_envs, 216)
+        ):
+            raise GpuNativeTensorBackendUnavailableError(
+                "GPU reward source observation differs from the frozen P0 layout"
+            )
+
+        def field(name: str) -> Any:
+            spec = PRIVILEGED_OFFSETS[name]
+            start = PRIVILEGED_HOT_OFFSET + spec.offset
+            value = observation[:, start : start + spec.size]
+            return value.reshape((self._num_envs, *spec.shape))
+
+        eef_pose = field("eef_pose_xyzw")
+        object_pose = field("object_pose_wxyz")
+        object_twist = field("object_twist_world")
+        return GpuNativePrivilegedRewardState(
+            eef_position_m=eef_pose[:, :3],
+            object_position_m=object_pose[:, :3],
+            object_linear_velocity_m_s=object_twist[:, :3],
+            fingerpad_contact_flags=field("fingerpad_contact_flags"),
+            post_hold_contact_valid=field("capture_post_hold_contact_valid").squeeze(-1),
+            layout_sha256=OBSERVATION_LAYOUT_SHA256,
+        )
+
+    def materialize_health_audit(self) -> Mapping[str, Any]:
+        """Fail closed on overflow or controller/driver guards at a cohort boundary."""
+
+        numpy = importlib.import_module("numpy")
+        audit = self._env.materialize_e2_audit()
+        required = ("overflow", "controller_valid", "driver_valid", "physics_step")
+        if not isinstance(audit, Mapping) or any(name not in audit for name in required):
+            raise GpuNativeTensorBackendUnavailableError(
+                "SE3-WAM health audit lacks required guard fields"
+            )
+        overflow = numpy.asarray(audit["overflow"])
+        controller = numpy.asarray(audit["controller_valid"])
+        driver = numpy.asarray(audit["driver_valid"])
+        if numpy.any(overflow != 0):
+            raise GpuNativeTensorBackendUnavailableError(
+                "MJWarp contact/constraint overflow is a hard stop"
+            )
+        if numpy.any(controller == 0) or numpy.any(driver == 0):
+            raise GpuNativeTensorBackendUnavailableError(
+                "pre-physics controller/driver guard failed"
+            )
+        return MappingProxyType(
+            {
+                "overflow": numpy.array(overflow, copy=True),
+                "controller_valid": numpy.array(controller, copy=True),
+                "driver_valid": numpy.array(driver, copy=True),
+                "physics_step": numpy.array(audit["physics_step"], copy=True),
+            }
+        )
 
     def next_requests(self) -> tuple[Any, ...]:
         """Preview the next deterministic cohort without consuming its cursor."""
@@ -1949,9 +2167,11 @@ class GpuNativeTensorBackendEnv:
 
 __all__ = [
     "GpuDeviceIdentityReceipt",
+    "GpuNativePrivilegedRewardState",
     "GpuNativeTensorBackendEnv",
     "GpuNativeTensorBackendUnavailableError",
     "GpuNativeTensorReset",
     "GpuNativeTensorStep",
     "GpuNativeTensorTerminalRow",
+    "GpuNativeVisualPolicyObservation",
 ]
