@@ -1,0 +1,94 @@
+{
+  "evidence_type": "engineering_validation",
+  "task_id": "GPUPLAN0/t4_sphere",
+  "date": "2026-08-12",
+  "owner_review": "pending_owner_review",
+  "formal_result_job_started": false,
+  "queue_state": "blocked",
+  "runtime_ledger": {
+    "local_path": "local_private/runtime/runtime.db",
+    "present_in_research_worktree": false,
+    "formal_capacity_authorized": false
+  },
+  "planned_resource": {
+    "lane": "RES-A800X8-TEMP/L7",
+    "gpu_uuid": "GPU-880ae61b-ce48-d155-31b4-018356b25bf2"
+  },
+  "base_source_identity": {
+    "se3_commit": "31b07c52660c5fe0451d9d97f0494fe3d849ec10",
+    "se3_tree": "b38a7fff7ef00c847dabef9daee8b67e5bc99169",
+    "mujoco_warp_commit": "632aa7a908e6533631cd311204d416a5a4026925",
+    "mujoco_warp_tree": "69ab0bd2c9470d7fec27a153dd6b3d0faa04f7fc",
+    "rlinf_commit": "cdbb29eb708a4b463920562f84f39aa9bc8ba06d",
+    "rlinf_tree": "631dd582196c8f73d3a5e32c3bb641d26a27b1d5",
+    "dynamic_commit": "53aa580dcfab69dea66e19e2d60e4397bfa89f27",
+    "dynamic_tree": "16f9ca0ef444a73dbc4028c91ddfc415cb8038ed"
+  },
+  "checks": [
+    {
+      "name": "rlinf_targeted_unit_tests",
+      "status": "passed",
+      "result": "76 passed",
+      "scope": [
+        "tests/unit_tests/test_gpu_native_tensor_backend.py",
+        "tests/unit_tests/test_dynamic_benchmark_tensor_offpolicy_smoke.py"
+      ]
+    },
+    {
+      "name": "se3_teacher_and_gpu_native_tests",
+      "status": "passed_with_skips",
+      "result": "37 passed, 6 skipped",
+      "scope": [
+        "tests/test_dynamic_benchmark_teacher_factory.py",
+        "tests/test_gpu_native_ramp_engine.py",
+        "tests/test_gpu_native_ramp_e2e.py"
+      ]
+    },
+    {
+      "name": "se3_ramp_task_and_fixture_tests",
+      "status": "passed_with_skips",
+      "result": "50 passed, 5 skipped",
+      "scope": [
+        "tests/test_gpu_native_ramp_task.py",
+        "tests/test_dynamic_benchmark_ramp.py",
+        "tests/test_supported_ramp_geometry.py"
+      ]
+    },
+    {
+      "name": "syntax_and_diff_checks",
+      "status": "passed",
+      "result": "py_compile and git diff --check"
+    }
+  ],
+  "failures_and_blockers": [
+    {
+      "name": "uv_dependency_resolution_on_windows",
+      "status": "preserved",
+      "command": "uv run pytest tests/unit_tests/test_gpu_native_tensor_backend.py tests/unit_tests/test_dynamic_benchmark_tensor_offpolicy_smoke.py -q",
+      "error": "ray==2.57.0 has no compatible Windows wheel/source distribution; uv created no usable project environment"
+    },
+    {
+      "name": "local_cuda_runtime_probe",
+      "status": "preserved",
+      "observed": {
+        "torch_importable": false,
+        "warp_importable": false,
+        "mujoco_importable": false,
+        "nvidia_smi_gpu_uuid": "GPU-13e04d2a-af9c-1087-d37e-5a3ad3b7afd8"
+      },
+      "impact": "No local CUDA Ramp execution or render/physics attestation was attempted; the observed GPU is not the planned Owner lane UUID"
+    },
+    {
+      "name": "clean_source_attestation_after_candidate_edits",
+      "status": "expected_until_owner_review",
+      "impact": "Formal jobs remain prohibited until the modified SE3/RLinf worktrees receive a reviewed clean commit/tree and matching manifest/provenance pins"
+    }
+  ],
+  "not_started": [
+    "E0 B=1",
+    "D32 baseline",
+    "MC64 candidate sweep",
+    "H1024 held-out evaluation",
+    "training or promotion"
+  ]
+}

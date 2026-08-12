@@ -753,10 +753,13 @@ def test_privileged_teacher_rollout_keeps_device_observations_in_replay(
     contracts = types.ModuleType("se3_wam.benchmark.contracts")
     contracts.ActionMode = action_mode
     teacher_factory = types.ModuleType("se3_wam.benchmark.teacher_factory")
-    teacher_factory.make_privileged_teacher = lambda _task: (
-        Teacher(),
-        {"teacher_type": "fixture"},
-    )
+    teacher_requests: list[Any] = []
+
+    def make_teacher(_task: str, *, request: Any) -> tuple[Teacher, dict[str, str]]:
+        teacher_requests.append(request)
+        return Teacher(), {"teacher_type": "fixture"}
+
+    teacher_factory.make_privileged_teacher = make_teacher
     for name, stub in (
         ("se3_wam", types.ModuleType("se3_wam")),
         ("se3_wam.benchmark", types.ModuleType("se3_wam.benchmark")),
@@ -836,6 +839,10 @@ def test_privileged_teacher_rollout_keeps_device_observations_in_replay(
     reset = SimpleNamespace(
         observation=device_observations[0],
         episode_ids=("episode-0", "episode-1"),
+        requests=tuple(
+            SimpleNamespace(episode_id=episode_id)
+            for episode_id in ("episode-0", "episode-1")
+        ),
     )
     rollout, elapsed, evidence = module._rollout_privileged_teacher_cohort(
         env=env,
@@ -850,6 +857,10 @@ def test_privileged_teacher_rollout_keeps_device_observations_in_replay(
     assert evidence["observation_audit_lanes"] == 3
     assert evidence["terminal_mask_host_materializations"] == 2
     assert evidence["host_to_device_action_transfers"] == 2
+    assert [request.episode_id for request in teacher_requests] == [
+        "episode-0",
+        "episode-1",
+    ]
 
 
 def test_dagger_rollout_executes_actor_but_records_teacher_corrections(
@@ -896,10 +907,13 @@ def test_dagger_rollout_executes_actor_but_records_teacher_corrections(
     contracts = types.ModuleType("se3_wam.benchmark.contracts")
     contracts.ActionMode = action_mode
     teacher_factory = types.ModuleType("se3_wam.benchmark.teacher_factory")
-    teacher_factory.make_privileged_teacher = lambda _task: (
-        Teacher(),
-        {"teacher_type": "fixture"},
-    )
+    teacher_requests: list[Any] = []
+
+    def make_teacher(_task: str, *, request: Any) -> tuple[Teacher, dict[str, str]]:
+        teacher_requests.append(request)
+        return Teacher(), {"teacher_type": "fixture"}
+
+    teacher_factory.make_privileged_teacher = make_teacher
     for name, stub in (
         ("se3_wam", types.ModuleType("se3_wam")),
         ("se3_wam.benchmark", types.ModuleType("se3_wam.benchmark")),
@@ -990,6 +1004,7 @@ def test_dagger_rollout_executes_actor_but_records_teacher_corrections(
     reset = SimpleNamespace(
         observation=observations[0],
         episode_ids=("episode-0",),
+        requests=(SimpleNamespace(episode_id="episode-0"),),
     )
     online_view, correction_view, elapsed, evidence = (
         module._rollout_dagger_correction_cohort(
@@ -1013,3 +1028,4 @@ def test_dagger_rollout_executes_actor_but_records_teacher_corrections(
     assert evidence["executed_action_source"] == "deterministic_gpu_actor"
     assert evidence["labels_are_successful_demonstrations"] is False
     assert evidence["host_to_device_label_transfers"] == 2
+    assert [request.episode_id for request in teacher_requests] == ["episode-0"]

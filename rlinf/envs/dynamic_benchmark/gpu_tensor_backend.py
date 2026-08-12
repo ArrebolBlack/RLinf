@@ -80,6 +80,15 @@ _P0_STATE_ENV_CAPABILITIES = MappingProxyType(
         "device_terminal_mask": True,
     }
 )
+_T4_TASK_IDS = frozenset({"t4_sphere"})
+_T4_STATE_CONTRACT_CAPABILITIES = _P0_STATE_CONTRACT_CAPABILITIES
+_T4_STATE_ENV_CAPABILITIES = MappingProxyType(
+    {
+        **_T4_STATE_CONTRACT_CAPABILITIES,
+        "device_tensor_step": True,
+        "device_terminal_mask": False,
+    }
+)
 _EXPORT_DIGEST_ATTRIBUTES = MappingProxyType(
     {
         "request_sha256": "request_identity_sha256",
@@ -174,6 +183,12 @@ def _manifest_sha256(requests: tuple[Any, ...]) -> str:
     return _manifest_payload_sha256(
         [_manifest_request_payload(request) for request in requests]
     )
+
+
+def _request_identity_without_episode(request: Any) -> Mapping[str, Any]:
+    payload = _manifest_request_payload(request)
+    payload["episode_id"] = None
+    return MappingProxyType(payload)
 
 
 def _freeze_manifest_request(request: Any, payload: Mapping[str, Any]) -> Any:
@@ -271,13 +286,23 @@ def _validate_public_contract(
         getattr(env, "capabilities", None),
         context="SE3-WAM environment",
     )
-    if contract_capabilities != _P0_STATE_CONTRACT_CAPABILITIES:
+    expected_contract_capabilities = (
+        _P0_STATE_CONTRACT_CAPABILITIES
+        if task_id == "p0_grasp"
+        else _T4_STATE_CONTRACT_CAPABILITIES
+    )
+    expected_env_capabilities = (
+        _P0_STATE_ENV_CAPABILITIES
+        if task_id == "p0_grasp"
+        else _T4_STATE_ENV_CAPABILITIES
+    )
+    if contract_capabilities != expected_contract_capabilities:
         raise GpuNativeTensorBackendUnavailableError(
-            "SE3-WAM P0 STATE contract capability values differ from clean v0.2"
+            f"SE3-WAM {task_id} STATE contract capability values differ from clean v0.2"
         )
-    if env_capabilities != _P0_STATE_ENV_CAPABILITIES:
+    if env_capabilities != expected_env_capabilities:
         raise GpuNativeTensorBackendUnavailableError(
-            "SE3-WAM P0 STATE engine capability values differ from clean v0.2"
+            f"SE3-WAM {task_id} STATE engine capability values differ from clean v0.2"
         )
     return contract_capabilities, env_capabilities
 
@@ -664,6 +689,7 @@ class GpuNativeTensorReset:
     seeds: tuple[int, ...]
     manifest_ordinals: tuple[int, ...]
     manifest_sha256: str
+    requests: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -754,8 +780,15 @@ class GpuNativeTensorBackendEnv:
             name="expected_se3_source_tree",
         )
         _require_single_uuid_visibility(expected_gpu_uuid, device_ordinal)
-        if task_id != "p0_grasp":
-            raise ValueError("GPU tensor R0 admission is currently limited to p0_grasp")
+        if task_id != "p0_grasp" and task_id not in _T4_TASK_IDS:
+            raise ValueError(
+                "GPU tensor R0 admission is limited to p0_grasp or the gated T4 sphere adapter"
+            )
+        if task_id in _T4_TASK_IDS and manifest_requests is None:
+            raise GpuNativeTensorBackendUnavailableError(
+                "T4 tensor admission requires an Owner-frozen caller manifest; "
+                "automatic manifest generation is not permitted"
+            )
         if (
             isinstance(image_size, bool)
             or not isinstance(image_size, int)
@@ -830,7 +863,7 @@ class GpuNativeTensorBackendEnv:
         try:
             self._split = Split(split)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"unsupported P0-Grasp manifest split: {split!r}") from exc
+            raise ValueError(f"unsupported GPU-native manifest split: {split!r}") from exc
         self._manifest_seed = manifest_seed
         if manifest_requests is None:
             effective_manifest_size = 4096 if manifest_size is None else manifest_size
@@ -883,7 +916,7 @@ class GpuNativeTensorBackendEnv:
                 or _enum_value(getattr(request, "observation_track", None)) != "state"
             ):
                 raise GpuNativeTensorBackendUnavailableError(
-                    f"manifest request {ordinal} differs from the P0 STATE/E7 contract"
+                    f"manifest request {ordinal} differs from the {task_id} STATE/E7 contract"
                 )
         manifest_payloads = tuple(
             _manifest_request_payload(request) for request in requests
@@ -940,8 +973,18 @@ class GpuNativeTensorBackendEnv:
             != "state"
         ):
             raise GpuNativeTensorBackendUnavailableError(
-                "frozen export request differs from the exact P0 STATE/E7 contract"
+                f"frozen export request differs from the exact {task_id} STATE/E7 contract"
             )
+        if task_id in _T4_TASK_IDS:
+            frozen_identity = _request_identity_without_episode(frozen_request)
+            if any(
+                _request_identity_without_episode(request) != frozen_identity
+                for request in frozen_manifest_requests
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 tensor adapter refuses manifest factors/seeds that the current "
+                    "RampEngine export cannot apply per reset"
+                )
         env = make_gpu_native_env(
             task_id,
             consumer=self._consumer,
@@ -1077,6 +1120,7 @@ class GpuNativeTensorBackendEnv:
         self._active_episode_ids: tuple[str, ...] | None = None
         self._active_manifest_ordinals: tuple[int, ...] | None = None
         self._active_generation: int | None = None
+        self._terminal_consumed_episode_ids: set[str] = set()
         self._last_transport_receipt: Mapping[str, Any] | None = None
         self._transport_checks = 0
         self._teacher_audit_materializations = 0
@@ -1399,6 +1443,7 @@ class GpuNativeTensorBackendEnv:
         self._active_episode_ids = episode_ids
         self._active_manifest_ordinals = ordinals
         self._active_generation = state.generation
+        self._terminal_consumed_episode_ids.clear()
         return GpuNativeTensorReset(
             observation=observation,
             generation=state.generation,
@@ -1406,6 +1451,7 @@ class GpuNativeTensorBackendEnv:
             seeds=tuple(request.seed for request in request_values),
             manifest_ordinals=ordinals,
             manifest_sha256=self._manifest_sha256,
+            requests=tuple(_defensive_manifest_request(request) for request in request_values),
         )
 
     def step_device(self, action: Any) -> GpuNativeTensorStep:
@@ -1647,6 +1693,149 @@ class GpuNativeTensorBackendEnv:
         self._teacher_audit_materializations += 1
         return tuple(observations)
 
+    def _materialize_terminal_audit_once(
+        self,
+        indices: tuple[int, ...],
+        episode_ids: tuple[str, ...],
+    ) -> tuple[GpuNativeTensorTerminalRow, ...]:
+        """Build T4 terminal rows from one explicit host audit control-plane call."""
+
+        if any(episode_id in self._terminal_consumed_episode_ids for episode_id in episode_ids):
+            raise GpuNativeTensorBackendUnavailableError(
+                "T4 terminal audit attempted to consume an episode more than once"
+            )
+        try:
+            from se3_wam.benchmark.api import ObservationBundle, StepResult
+            from se3_wam.benchmark.contracts import EventRecord
+            from se3_wam.benchmark.gpu_native.audit import AuditBatch, AuditLane, AuditRequest
+            from se3_wam.benchmark.task_quality import EpisodeQualitySummary
+        except ImportError as exc:
+            raise GpuNativeTensorBackendUnavailableError(
+                "SE3-WAM T4 terminal audit API is unavailable"
+            ) from exc
+        audit = self._env.materialize_audit(
+            AuditRequest(lanes=indices, include_step_result=True)
+        )
+        if (
+            type(audit) is not AuditBatch
+            or audit.backend_id != _GPU_NATIVE_BACKEND_ID
+            or audit.provenance != self._env.provenance
+        ):
+            raise GpuNativeTensorBackendUnavailableError(
+                "T4 terminal audit backend/provenance identity mismatch"
+            )
+        rows = audit.lanes
+        if (
+            not isinstance(rows, tuple)
+            or tuple(getattr(row, "lane", None) for row in rows) != indices
+        ):
+            raise GpuNativeTensorBackendUnavailableError(
+                "T4 terminal audit changed the requested lane order"
+            )
+        materialized: list[GpuNativeTensorTerminalRow] = []
+        for lane, episode_id, row in zip(indices, episode_ids, rows, strict=True):
+            if type(row) is not AuditLane or type(row.step_result) is not StepResult:
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit row differs from the public AuditLane/StepResult ABI"
+                )
+            observation = row.observation
+            step = row.step_result
+            if (
+                row.episode_id != episode_id
+                or type(observation) is not ObservationBundle
+                or observation.episode_id != episode_id
+                or observation.task_id != self._task_id
+                or step.observation is not observation
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit changed lane, episode, task, or observation identity"
+                )
+            if any(
+                type(value) is not bool
+                for value in (step.terminated, step.truncated, step.success)
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit masks are not exact booleans"
+                )
+            if not (step.terminated or step.truncated) or (
+                step.terminated and step.truncated
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit row is not exactly one terminal outcome"
+                )
+            if step.success and not step.terminated:
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit success does not imply termination"
+                )
+            reason = step.termination_reason
+            if not isinstance(reason, str) or not reason or reason.strip() != reason:
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit row lacks a canonical termination reason"
+                )
+            quality = step.task_quality
+            if step.success:
+                if (
+                    type(quality) is not EpisodeQualitySummary
+                    or quality.episode_id != episode_id
+                    or quality.task_id != self._task_id
+                    or quality.terminal is not True
+                ):
+                    raise GpuNativeTensorBackendUnavailableError(
+                        "successful T4 terminal audit lacks typed task quality"
+                    )
+            elif quality is not None:
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 failure/timeout terminal audit must not carry task quality"
+                )
+            events = observation.events_since_last_observation
+            if not isinstance(events, tuple) or any(
+                type(event) is not EventRecord for event in events
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit events do not use the exact EventRecord ABI"
+                )
+            if not any(event.name == reason for event in events):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit lacks its canonical terminal event"
+                )
+            clocks = (
+                observation.physics_step,
+                observation.control_step,
+                observation.policy_step,
+            )
+            if any(type(value) is not int or value < 0 for value in clocks):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit clock is not a non-negative integer"
+                )
+            if (
+                clocks[1] < 1
+                or clocks[2] != clocks[1]
+                or not 25 * (clocks[1] - 1) < clocks[0] <= 25 * clocks[1]
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T4 terminal audit clocks do not identify a control interval"
+                )
+            materialized.append(
+                GpuNativeTensorTerminalRow(
+                    lane=lane,
+                    episode_id=episode_id,
+                    task_id=self._task_id,
+                    terminated=step.terminated,
+                    truncated=step.truncated,
+                    success=step.success,
+                    termination_reason=reason,
+                    completion=1.0 if step.success else 0.0,
+                    task_quality=quality,
+                    observation=observation,
+                    events=events,
+                    physics_step=clocks[0],
+                    control_step=clocks[1],
+                    policy_step=clocks[2],
+                )
+            )
+        self._terminal_consumed_episode_ids.update(episode_ids)
+        return tuple(materialized)
+
     def materialize_terminal_ledger_once(
         self,
         indices: tuple[int, ...],
@@ -1686,6 +1875,11 @@ class GpuNativeTensorBackendEnv:
                 raise GpuNativeTensorBackendUnavailableError(
                     "terminal episode identity differs from the active cohort"
                 )
+        env_capabilities = getattr(
+            self, "_env_capabilities", _P0_STATE_ENV_CAPABILITIES
+        )
+        if not env_capabilities["device_terminal_mask"]:
+            return self._materialize_terminal_audit_once(indices, episode_ids)
         try:
             from se3_wam.benchmark.contracts import EventRecord
             from se3_wam.benchmark.gpu_native.audit import (

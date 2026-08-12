@@ -727,6 +727,7 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert reset.seeds == (20261050, 20261051, 20261052)
     assert reset.manifest_ordinals == (0, 1, 2)
     assert reset.manifest_sha256 == backend.manifest_sha256
+    assert tuple(request.episode_id for request in reset.requests) == reset.episode_ids
     assert len({request.seed for request in fake_env.reset_calls[0]}) == 3
     assert (
         len({tuple(request.factors.values()) for request in fake_env.reset_calls[0]})
@@ -748,6 +749,24 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert sys.modules["warp"].to_torch_calls == first_conversion_count
     backend.close()
     assert fake_env.closed
+
+
+def test_t4_admission_requires_owner_frozen_manifest_before_runtime_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    with pytest.raises(
+        GpuNativeTensorBackendUnavailableError,
+        match="Owner-frozen caller manifest",
+    ):
+        GpuNativeTensorBackendEnv(
+            task_id="t4_sphere",
+            num_envs=1,
+            export_dir="/tmp/export",
+            expected_gpu_uuid=_GPU_UUID,
+            expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+            expected_se3_source_tree=_SE3_SOURCE_TREE,
+        )
 
 
 def test_generated_manifest_projects_only_observation_track_to_state(
