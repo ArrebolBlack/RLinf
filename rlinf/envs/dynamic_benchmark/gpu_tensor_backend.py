@@ -1497,7 +1497,15 @@ class GpuNativeTensorBackendEnv:
 
         numpy = importlib.import_module("numpy")
         audit = self._env.materialize_e2_audit()
-        required = ("overflow", "controller_valid", "driver_valid", "physics_step")
+        required = (
+            "overflow",
+            "controller_valid",
+            "driver_valid",
+            "physics_step",
+            "terminated",
+            "truncated",
+            "terminal_reason",
+        )
         if not isinstance(audit, Mapping) or any(name not in audit for name in required):
             raise GpuNativeTensorBackendUnavailableError(
                 "SE3-WAM health audit lacks required guard fields"
@@ -1505,13 +1513,21 @@ class GpuNativeTensorBackendEnv:
         overflow = numpy.asarray(audit["overflow"])
         controller = numpy.asarray(audit["controller_valid"])
         driver = numpy.asarray(audit["driver_valid"])
+        terminal = (numpy.asarray(audit["terminated"]) != 0) | (
+            numpy.asarray(audit["truncated"]) != 0
+        )
+        invalid_terminal = (numpy.asarray(audit["terminated"]) != 0) & (
+            numpy.asarray(audit["terminal_reason"]) == 2
+        )
         if numpy.any(overflow != 0):
             raise GpuNativeTensorBackendUnavailableError(
                 "MJWarp contact/constraint overflow is a hard stop"
             )
-        if numpy.any(controller == 0) or numpy.any(driver == 0):
+        if numpy.any(invalid_terminal) or numpy.any(
+            ((controller == 0) | (driver == 0)) & ~terminal
+        ):
             raise GpuNativeTensorBackendUnavailableError(
-                "pre-physics controller/driver guard failed"
+                "active pre-physics controller/driver guard failed or emitted invalid_state"
             )
         return MappingProxyType(
             {
