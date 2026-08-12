@@ -586,6 +586,17 @@ class DynamicBenchmarkEnv(gym.Env):
                 export_dir=str(export_dir),
                 device_ordinal=int(_cfg_get(cfg, "gpu_native_device_ordinal", 0)),
                 image_size=self.image_size,
+                expected_gpu_uuid=_cfg_get(cfg, "gpu_native_expected_gpu_uuid", None),
+                expected_se3_source_commit=_cfg_get(
+                    cfg, "gpu_native_expected_se3_source_commit", None
+                ),
+                expected_se3_source_tree=_cfg_get(
+                    cfg, "gpu_native_expected_se3_source_tree", None
+                ),
+                observation_track=str(
+                    _cfg_get(cfg, "gpu_native_observation_track", "state")
+                ),
+                **task_quality_kwargs,
             )
             self.envs = []
             self._executor = None
