@@ -44,6 +44,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Mapping
 
+import numpy as np
+
 
 class GpuNativeBackendUnavailableError(RuntimeError):
     """Raised when the SE3-WAM GPU-native backend seam cannot be built."""
@@ -203,18 +205,22 @@ class GpuNativeBackendEnv:
             raise GpuNativeBackendUnavailableError(
                 "frozen export task_id does not match the requested task"
             )
+        frozen_track = getattr(self._frozen_request.observation_track, "value", None)
+        if frozen_track != self._observation_track.value:
+            raise GpuNativeBackendUnavailableError(
+                "frozen export observation track does not match the GPU adapter track"
+            )
         self._planner_mode = planner_mode
         self._planner = None
+        self._task_quality_enabled = False
         if task_quality_schema_version is not None:
-            self._env.enable_task_quality(
+            self.enable_task_quality(
                 evaluator_backend_id=task_quality_evaluator_backend_id,
                 schema_version=task_quality_schema_version,
             )
         elif planner_enabled:
             self._env.enable_task_quality(evaluator_backend_id=evaluator_backend_id)
-        self._task_quality_enabled = bool(
-            task_quality_schema_version is not None or planner_enabled
-        )
+            self._task_quality_enabled = True
         if planner_enabled:
             try:
                 from se3_wam.benchmark.gpu_native.surface_planner import (
@@ -236,6 +242,10 @@ class GpuNativeBackendEnv:
         self._last_terminal_ledger: Any | None = None
         self._action_tapes: list[list[Any]] = [[] for _ in range(num_envs)]
         self._observation_tapes: list[list[Any]] = [[] for _ in range(num_envs)]
+        self._active_mask = np.ones(num_envs, dtype=np.bool_)
+        self._episode_ids: tuple[str | None, ...] = (None,) * num_envs
+        self._last_observations: tuple[Any | None, ...] = (None,) * num_envs
+        self._last_terminal_rows: tuple[Any, ...] = ()
 
     @property
     def task_id(self) -> str:
@@ -278,10 +288,43 @@ class GpuNativeBackendEnv:
         return self._task_quality_enabled
 
     @property
+    def current_observations(self) -> tuple[Any | None, ...]:
+        """Return the latest materialized observation for each lane."""
+
+        return self._last_observations
+
+    @property
+    def last_terminal_rows(self) -> tuple[Any, ...]:
+        """Return terminal rows materialized by the most recent step."""
+
+        return self._last_terminal_rows
+
+    @property
     def last_terminal_ledger(self) -> Any | None:
         """Return the one-shot terminal receipt produced by the latest step."""
 
         return self._last_terminal_ledger
+
+    def enable_task_quality(
+        self,
+        *,
+        evaluator_backend_id: str,
+        schema_version: str,
+    ) -> None:
+        """Enable the backend's released success-quality schema before reset."""
+
+        if self._task_quality_enabled:
+            raise RuntimeError("GPU task quality is already enabled")
+        method = getattr(self._env, "enable_task_quality", None)
+        if method is None:
+            raise GpuNativeBackendUnavailableError(
+                "the GPU-native engine does not expose task-quality admission"
+            )
+        method(
+            evaluator_backend_id=evaluator_backend_id,
+            schema_version=schema_version,
+        )
+        self._task_quality_enabled = True
 
     def action_tape(self, lane: int = 0) -> tuple[Any, ...]:
         """Return the complete live action tape for one lane."""
@@ -340,8 +383,6 @@ class GpuNativeBackendEnv:
 
     def policy_steps(self) -> Any:
         """Return the host clock policy steps expected for the next commands."""
-        import numpy as np
-
         return np.asarray(
             self._env.bookkeeping.clock.policy_steps,
             dtype=np.int64,
@@ -364,8 +405,14 @@ class GpuNativeBackendEnv:
         if len(observations) != self._num_envs:
             raise RuntimeError("GPU-native reset lost lane observations")
         self._last_terminal_ledger = None
+        self._last_terminal_rows = ()
         self._action_tapes = [[] for _ in range(self._num_envs)]
         self._observation_tapes = [[observation] for observation in observations]
+        self._active_mask = np.ones(self._num_envs, dtype=np.bool_)
+        self._episode_ids = tuple(
+            getattr(request, "episode_id", None) for request in requests_tuple
+        )
+        self._last_observations = observations
         return observations
 
     def step(self, commands: Any) -> tuple[Any, ...]:
@@ -379,17 +426,40 @@ class GpuNativeBackendEnv:
             raise ValueError("GPU-native step requires one command per lane")
         from se3_wam.benchmark.gpu_native.audit import AuditRequest
 
-        self._env.step(commands_tuple)
+        # The all-None case is retained for the legacy adapter contract tests;
+        # real MjWarp batches must provide E7 commands for every selected lane.
+        if all(value is None for value in commands_tuple) and np.all(self._active_mask):
+            selected_mask = np.array(self._active_mask, copy=True)
+        else:
+            selected_mask = self._active_mask & np.asarray(
+                [value is not None for value in commands_tuple], dtype=np.bool_
+            )
+        selected_lanes = tuple(int(value) for value in np.flatnonzero(selected_mask))
+        if not selected_lanes:
+            self._last_terminal_ledger = None
+            self._last_terminal_rows = ()
+            return (None,) * self._num_envs
+        if hasattr(self._env, "mark_done"):
+            self._env.step(commands_tuple, active_mask=selected_mask)
+        else:
+            self._env.step(commands_tuple)
         audit = self._env.materialize_audit(
-            AuditRequest(lanes=tuple(range(self._num_envs)), include_step_result=True)
+            AuditRequest(lanes=selected_lanes, include_step_result=True)
         )
-        results = tuple(lane.step_result for lane in audit.lanes)
-        if len(results) != self._num_envs or any(value is None for value in results):
-            raise RuntimeError("GPU-native step lost lane step results")
+        result_by_lane: dict[int, Any] = {}
+        for lane in audit.lanes:
+            if lane.step_result is None:
+                raise RuntimeError("GPU-native step lost a lane step result")
+            result_by_lane[lane.lane] = lane.step_result
+            self._last_observations = self._replace_observation(
+                self._last_observations,
+                lane.lane,
+                lane.step_result.observation,
+            )
         self._last_terminal_ledger = None
         terminal_lanes = tuple(
             lane
-            for lane, result in enumerate(results)
+            for lane, result in result_by_lane.items()
             if bool(getattr(result, "terminated", False))
             or bool(getattr(result, "truncated", False))
         )
@@ -410,13 +480,36 @@ class GpuNativeBackendEnv:
             if tuple(row.lane for row in ledger.rows) != terminal_lanes:
                 raise RuntimeError("GPU-native terminal ledger changed lane order")
             self._last_terminal_ledger = ledger
-        for lane, (command, result) in enumerate(zip(commands_tuple, results, strict=True)):
+            self._last_terminal_rows = tuple(ledger.rows)
+        else:
+            self._last_terminal_rows = ()
+        done_mask = np.zeros(self._num_envs, dtype=np.bool_)
+        results: list[Any | None] = [None] * self._num_envs
+        for lane in selected_lanes:
+            command = commands_tuple[lane]
+            result = result_by_lane[lane]
+            results[lane] = result
             values = getattr(command, "values", None)
             self._action_tapes[lane].append(
                 values.copy() if hasattr(values, "copy") else values
             )
             self._observation_tapes[lane].append(result.observation)
-        return results
+            done_mask[lane] = bool(getattr(result, "terminated", False)) or bool(
+                getattr(result, "truncated", False)
+            )
+        if np.any(done_mask):
+            if hasattr(self._env, "mark_done"):
+                self._env.mark_done(done_mask)
+            self._active_mask &= ~done_mask
+        return tuple(results)
+
+    @staticmethod
+    def _replace_observation(
+        observations: tuple[Any | None, ...], lane: int, observation: Any
+    ) -> tuple[Any | None, ...]:
+        updated = list(observations)
+        updated[lane] = observation
+        return tuple(updated)
 
     def step_planner(self) -> tuple[Any, ...]:
         """Advance one online CPU-Plan/GPU-physics control interval."""
