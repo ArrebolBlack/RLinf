@@ -27,8 +27,10 @@ import numpy as np
 
 TASK_ID = "t1_xyz"
 BACKEND_ID = "mjwarp_gpu_v1"
-SE3_SOURCE_COMMIT = "31b07c52660c5fe0451d9d97f0494fe3d849ec10"
-SE3_SOURCE_TREE = "b38a7fff7ef00c847dabef9daee8b67e5bc99169"
+BASE_SE3_SOURCE_COMMIT = "31b07c52660c5fe0451d9d97f0494fe3d849ec10"
+BASE_SE3_SOURCE_TREE = "b38a7fff7ef00c847dabef9daee8b67e5bc99169"
+SE3_SOURCE_COMMIT = "c1af4de449b05043bd01dcf1c323399bfd22e7ef"
+SE3_SOURCE_TREE = "f0effcd10b5bfa1b48b052255a9067cb7c1b7b7b"
 QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v2"
 QUALITY_EVALUATOR_ID = "gpu-planner-t1-xyz-e0-v2"
 
@@ -327,7 +329,7 @@ def main() -> None:
         args.expected_se3_source_commit != SE3_SOURCE_COMMIT
         or args.expected_se3_source_tree != SE3_SOURCE_TREE
     ):
-        raise ValueError("E0 is pinned to the released SE3-WAM source commit/tree")
+        raise ValueError("E0 is pinned to the committed SE3-WAM candidate source commit/tree")
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite {args.output}")
     tape_output = args.tape_output or args.output.with_name(f"{args.output.stem}.tape.npz")
@@ -431,6 +433,8 @@ def main() -> None:
             "source_pin": {
                 "se3_commit": args.expected_se3_source_commit,
                 "se3_tree": args.expected_se3_source_tree,
+                "base_se3_commit": BASE_SE3_SOURCE_COMMIT,
+                "base_se3_tree": BASE_SE3_SOURCE_TREE,
             },
             "export_dir": str(args.export_dir),
             "episode_id": request.episode_id,
