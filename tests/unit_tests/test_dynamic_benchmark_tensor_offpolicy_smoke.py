@@ -17,7 +17,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import math
 import sys
 import types
 from contextlib import nullcontext
@@ -569,7 +568,6 @@ def test_teacher_overrides_are_strict_planner_only_identity(
     module = _load_module(monkeypatch)
     path = tmp_path / "teacher-overrides.json"
     payload = {
-        "close_axis_alignment_tolerance_rad": 0.1,
         "close_retry_steps": 20,
         "lift_action_z_max": 0.4,
         "post_hold_settle_steps": 2,
@@ -593,8 +591,12 @@ def test_teacher_overrides_are_strict_planner_only_identity(
     )
 
     unknown = tmp_path / "unknown.json"
-    unknown.write_text('{"scientific_resolution": 1.0}', encoding="utf-8")
-    with pytest.raises(ValueError, match="unsupported demo teacher override"):
+    unknown.write_text(
+        '{"close_axis_alignment_tolerance_rad": 0.1}', encoding="utf-8"
+    )
+    with pytest.raises(
+        ValueError, match="unsupported demo teacher override.*close_axis_alignment"
+    ):
         module._config(
             _arguments(
                 module,
@@ -621,25 +623,6 @@ def test_teacher_overrides_are_strict_planner_only_identity(
                 str(duplicate),
             )
         )
-
-    out_of_range = tmp_path / "out-of-range.json"
-    out_of_range.write_text(
-        json.dumps({"close_axis_alignment_tolerance_rad": math.pi}),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="close_axis_alignment_tolerance_rad"):
-        module._config(
-            _arguments(
-                module,
-                "--demo-policy",
-                "privileged_teacher",
-                "--minimum-demo-success-rate",
-                "0.75",
-                "--demo-teacher-overrides",
-                str(out_of_range),
-            )
-        )
-
 
 def test_empty_teacher_override_file_still_requires_privileged_teacher(
     monkeypatch: pytest.MonkeyPatch,
