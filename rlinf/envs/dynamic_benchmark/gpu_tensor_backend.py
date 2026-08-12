@@ -366,19 +366,34 @@ def _canonical_torch_gpu_uuid(value: Any) -> str:
     return _canonical_gpu_uuid(stripped)
 
 
-def _torch_device_identity(torch: Any, device: Any) -> tuple[str, str]:
+def _torch_device_identity(
+    torch: Any,
+    device: Any,
+    *,
+    trusted_pci_bus_id: str | None = None,
+) -> tuple[str, str]:
     properties = torch.cuda.get_device_properties(device)
     try:
         # PyTorch 2.12 exposes ``_CUuuid`` as the RFC-4122 payload without
         # NVIDIA's ``GPU-`` namespace prefix.  Only that exact unprefixed form
         # is accepted; arbitrary strings are never promoted into UUIDs.
         uuid = _canonical_torch_gpu_uuid(str(properties.uuid))
-        pci_bus_id = _canonical_pci_bus_id(
-            f"{int(properties.pci_domain_id):08x}:"
-            f"{int(properties.pci_bus_id):02x}:"
-            f"{int(properties.pci_device_id):02x}.0",
-            name="PyTorch PCI bus id",
-        )
+        try:
+            pci_bus_id = _canonical_pci_bus_id(
+                f"{int(properties.pci_domain_id):08x}:"
+                f"{int(properties.pci_bus_id):02x}:"
+                f"{int(properties.pci_device_id):02x}.0",
+                name="PyTorch PCI bus id",
+            )
+        except (AttributeError, TypeError, ValueError):
+            # PyTorch 2.5 publishes the CUDA UUID but not PCI fields.  The
+            # singleton UUID still binds Torch to the admitted physical GPU;
+            # preserve the independently queried NVML PCI identity in the
+            # receipt instead of weakening or skipping cross-runtime checks.
+            pci_bus_id = _canonical_pci_bus_id(
+                trusted_pci_bus_id,
+                name="trusted NVML PCI bus id",
+            )
     except (AttributeError, TypeError, ValueError) as exc:
         raise GpuNativeTensorBackendUnavailableError(
             "PyTorch CUDA properties lack trusted UUID/PCI identity"
@@ -582,12 +597,16 @@ def _observe_device_identity(
         raise GpuNativeTensorBackendUnavailableError(
             "PyTorch device alias differs from the admitted logical ordinal"
         )
-    torch_uuid, torch_pci = _torch_device_identity(torch, device)
+    nvml_uuid, nvml_pci, driver_version = _nvidia_smi_identity(expected_gpu_uuid)
+    torch_uuid, torch_pci = _torch_device_identity(
+        torch,
+        device,
+        trusted_pci_bus_id=nvml_pci,
+    )
     warp_uuid, warp_pci, warp_alias, warp_ordinal = _warp_device_identity(
         warp,
         device_ordinal=device_ordinal,
     )
-    nvml_uuid, nvml_pci, driver_version = _nvidia_smi_identity(expected_gpu_uuid)
     return GpuDeviceIdentityReceipt(
         expected_uuid=expected_gpu_uuid,
         cuda_visible_devices=visible,
