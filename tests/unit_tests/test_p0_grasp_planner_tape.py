@@ -98,3 +98,16 @@ def test_p0_planner_fails_closed_without_gpu_visual_audit() -> None:
     )
     with pytest.raises(_MODULE.P0GraspPlannerError, match="visual"):
         _MODULE.CurrentStatePlannerAdapter(backend, SimpleNamespace(act=lambda _: None))
+
+
+def test_p0_causal_fingerprint_excludes_rendered_media() -> None:
+    state = {
+        "metadata": "metadata-a",
+        "proprio/robot0": "proprio-a",
+        "privileged/object": "state-a",
+        "rgb/agentview": "rgb-a",
+        "depth_m/agentview": "depth-a",
+        "segmentation/agentview": "seg-a",
+    }
+    changed_media = {**state, "rgb/agentview": "rgb-b"}
+    assert _MODULE.causal_observation_fingerprint(SimpleNamespace(component_sha256=state)) == _MODULE.causal_observation_fingerprint(SimpleNamespace(component_sha256=changed_media))

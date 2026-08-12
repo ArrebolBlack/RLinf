@@ -125,6 +125,20 @@ def observation_fingerprint(observation: Any) -> str:
     )
 
 
+def causal_observation_fingerprint(observation: Any) -> str:
+    """Fingerprint the STATE track while keeping rendered media separately auditable."""
+
+    components = getattr(observation, "component_sha256", None)
+    if isinstance(components, Mapping):
+        state_components = {
+            name: digest
+            for name, digest in components.items()
+            if not name.startswith(("rgb/", "depth_m/", "segmentation/"))
+        }
+        return _digest(state_components)
+    return observation_fingerprint(observation)
+
+
 def planner_step_diagnostics(observation: Any, planner: Any) -> Mapping[str, Any]:
     """Record bounded causal metadata without replacing the observation packet."""
 
@@ -521,7 +535,7 @@ class CurrentStatePlannerAdapter:
                 episode_id=observation.episode_id,
                 task_id=observation.task_id,
                 policy_step=observation.policy_step,
-                observation_fingerprint_sha256=observation_fingerprint(observation),
+                observation_fingerprint_sha256=causal_observation_fingerprint(observation),
                 action=tuple(float(value) for value in values),
                 diagnostics=planner_step_diagnostics(observation, self._planner),
             )
@@ -581,7 +595,7 @@ def replay_action_trajectory(backend: Any, tape: ActionTrajectoryTape) -> Replay
         if (
             observation.episode_id != entry.episode_id
             or observation.policy_step != policy_step
-            or observation_fingerprint(observation) != entry.observation_fingerprint_sha256
+            or causal_observation_fingerprint(observation) != entry.observation_fingerprint_sha256
         ):
             raise P0GraspPlannerError(f"replay observation fingerprint differs at policy_step {policy_step}")
         action = torch.as_tensor(
@@ -609,6 +623,7 @@ __all__ = [
     "PlannerTapeEntry",
     "PlannerTapeIdentity",
     "ReplayReceipt",
+    "causal_observation_fingerprint",
     "observation_fingerprint",
     "planner_step_diagnostics",
     "replay_action_trajectory",
