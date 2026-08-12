@@ -978,6 +978,26 @@ def test_constructor_normalizes_only_exact_unprefixed_torch_uuid(
         backend.attest_end()
 
 
+def test_constructor_accepts_torch_uuid_when_old_torch_omits_pci_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    captured, _fake_env, _device = _install_fakes(monkeypatch)
+    for name in ("pci_domain_id", "pci_bus_id", "pci_device_id"):
+        delattr(captured["torch_properties"], name)
+
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+    )
+    assert backend.device_identity.torch_uuid == _GPU_UUID
+    assert backend.device_identity.torch_pci_bus_id == _PCI_BUS_ID
+
+
 def test_attest_end_reobserves_after_success_and_close_checks_independently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

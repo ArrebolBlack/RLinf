@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Data package public entrypoints."""
+"""Data package public entrypoints.
 
-from rlinf.data import schema, storage
+The public names stay lazy so a standalone on-policy learner can import its
+rollout buffer without initializing the Ray-backed storage stack.
+"""
 
-from .device_replay_buffer import (
-    DeviceReplayBatch,
-    DeviceReplayBuffer,
-    DeviceReplayContractError,
-)
+from __future__ import annotations
+
+import importlib
 
 __all__ = [
     "schema",
@@ -29,3 +29,15 @@ __all__ = [
     "DeviceReplayBuffer",
     "DeviceReplayContractError",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"schema", "storage"}:
+        value = importlib.import_module(f"rlinf.data.{name}")
+    elif name in {"DeviceReplayBatch", "DeviceReplayBuffer", "DeviceReplayContractError"}:
+        module = importlib.import_module("rlinf.data.device_replay_buffer")
+        value = getattr(module, name)
+    else:
+        raise AttributeError(name)
+    globals()[name] = value
+    return value

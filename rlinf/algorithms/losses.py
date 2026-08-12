@@ -21,7 +21,7 @@ from rlinf.algorithms.utils import huber_loss
 from rlinf.utils.metric_utils import (
     compute_critic_explained_variance_stats,
 )
-from rlinf.utils.utils import masked_mean, masked_mean_ratio
+from rlinf.algorithms.masked_ops import masked_mean, masked_mean_ratio
 
 
 def compute_decoupled_ppo_actor_loss(
