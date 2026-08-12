@@ -1464,6 +1464,30 @@ def _apply_demo_teacher_overrides(teacher: Any, overrides: Mapping[str, Any]) ->
         setattr(teacher, name, value)
 
 
+def _reset_requests_for_teachers(reset: Any, env: GpuNativeTensorBackendEnv) -> tuple[Any, ...]:
+    """Return the exact per-lane reset requests that define planner geometry."""
+
+    requests = getattr(reset, "requests", None)
+    if not isinstance(requests, tuple) or len(requests) != env.num_envs:
+        raise RuntimeError(
+            "GPU planner rollout requires one immutable ResetRequest for every cohort lane"
+        )
+    if any(request is None for request in requests):
+        raise RuntimeError("GPU planner rollout received an incomplete ResetRequest cohort")
+    episode_ids = getattr(reset, "episode_ids", None)
+    if tuple(request.episode_id for request in requests) != tuple(episode_ids or ()):
+        raise RuntimeError("GPU planner ResetRequest identities differ from the reset cohort")
+    return requests
+
+
+def _teacher_metadata_payload(metadata: list[dict[str, Any]]) -> Any:
+    if not metadata:
+        raise RuntimeError("planner teacher cohort is empty")
+    if all(item == metadata[0] for item in metadata[1:]):
+        return metadata[0]
+    return tuple(metadata)
+
+
 def _rollout_privileged_teacher_cohort(
     *,
     env: GpuNativeTensorBackendEnv,
@@ -1479,16 +1503,15 @@ def _rollout_privileged_teacher_cohort(
     effective_overrides = dict(teacher_overrides or {})
     teachers = []
     teacher_metadata = []
-    for _lane in range(env.num_envs):
-        teacher, metadata = make_privileged_teacher(env.task_id)
+    requests = _reset_requests_for_teachers(reset, env)
+    for request in requests:
+        teacher, metadata = make_privileged_teacher(env.task_id, request=request)
         _apply_demo_teacher_overrides(teacher, effective_overrides)
         teacher.reset()
         teachers.append(teacher)
         teacher_metadata.append(
             {**dict(metadata), "runtime_planner_overrides": effective_overrides}
         )
-    if any(metadata != teacher_metadata[0] for metadata in teacher_metadata[1:]):
-        raise RuntimeError("privileged teacher metadata differs across cohort lanes")
     observation_audit_calls_before = env.teacher_audit_materializations
     observation_audit_lanes = 0
     terminal_mask_host_materializations = 0
@@ -1569,7 +1592,7 @@ def _rollout_privileged_teacher_cohort(
     evidence = {
         "producer": DEMO_PRODUCERS["privileged_teacher"],
         "teacher_count": len(teachers),
-        "teacher_metadata": teacher_metadata[0],
+        "teacher_metadata": _teacher_metadata_payload(teacher_metadata),
         "observation_audit_calls": observation_audit_calls,
         "observation_audit_lanes": observation_audit_lanes,
         "terminal_mask_host_materializations": terminal_mask_host_materializations,
@@ -1596,17 +1619,15 @@ def _rollout_dagger_correction_cohort(
     effective_overrides = dict(teacher_overrides or {})
     teachers = []
     teacher_metadata = []
-    for _lane in range(env.num_envs):
-        teacher, metadata = make_privileged_teacher(env.task_id)
+    requests = _reset_requests_for_teachers(reset, env)
+    for request in requests:
+        teacher, metadata = make_privileged_teacher(env.task_id, request=request)
         _apply_demo_teacher_overrides(teacher, effective_overrides)
         teacher.reset()
         teachers.append(teacher)
         teacher_metadata.append(
             {**dict(metadata), "runtime_planner_overrides": effective_overrides}
         )
-    if any(metadata != teacher_metadata[0] for metadata in teacher_metadata[1:]):
-        raise RuntimeError("DAgger teacher metadata differs across cohort lanes")
-
     observation_audit_calls_before = env.teacher_audit_materializations
     observation_audit_lanes = 0
     terminal_mask_host_materializations = 0
@@ -1705,7 +1726,7 @@ def _rollout_dagger_correction_cohort(
         "label_action_source": DEMO_PRODUCERS["privileged_teacher"],
         "labels_are_successful_demonstrations": False,
         "teacher_count": len(teachers),
-        "teacher_metadata": teacher_metadata[0],
+        "teacher_metadata": _teacher_metadata_payload(teacher_metadata),
         "observation_audit_calls": observation_audit_calls,
         "observation_audit_lanes": observation_audit_lanes,
         "terminal_mask_host_materializations": terminal_mask_host_materializations,
