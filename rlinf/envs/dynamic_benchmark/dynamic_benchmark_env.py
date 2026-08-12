@@ -541,7 +541,31 @@ class DynamicBenchmarkEnv(gym.Env):
         self.task_quality_evaluator_backend_id = task_quality_kwargs.get(
             "task_quality_evaluator_backend_id"
         )
+        self.gpu_native = bool(_cfg_get(cfg, "gpu_native", False))
         self.auto_reset = bool(_cfg_get(cfg, "auto_reset", True))
+        self.gpu_native_planner_mode = _cfg_get(cfg, "gpu_native_planner_mode", None)
+        if self.gpu_native_planner_mode not in {None, "online_privileged_teacher_v1"}:
+            raise ValueError("unsupported gpu_native_planner_mode")
+        self.gpu_native_runtime_manifest_path = _cfg_get(
+            cfg, "gpu_native_runtime_manifest_path", None
+        )
+        self.gpu_native_runtime_manifest_sha256 = _cfg_get(
+            cfg, "gpu_native_runtime_manifest_sha256", None
+        )
+        if self.gpu_native_planner_mode is not None:
+            if not self.gpu_native:
+                raise ValueError("gpu_native_planner_mode requires gpu_native=True")
+            if self.auto_reset:
+                raise ValueError("online GPU Planner mode requires auto_reset=False")
+            if self.task_quality_schema_version is None:
+                raise ValueError("online GPU Planner mode requires task-quality schema identity")
+            if (
+                not isinstance(self.gpu_native_runtime_manifest_path, str)
+                or not self.gpu_native_runtime_manifest_path.strip()
+                or not isinstance(self.gpu_native_runtime_manifest_sha256, str)
+                or not self.gpu_native_runtime_manifest_sha256.strip()
+            ):
+                raise ValueError("online GPU Planner mode requires a hash-pinned runtime manifest")
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
         self.worker_threads = int(_cfg_get(cfg, "worker_threads", 1))
         if self.worker_threads < 1:
@@ -562,7 +586,6 @@ class DynamicBenchmarkEnv(gym.Env):
         )
         if self.process_residual_planner and not self.worker_processes:
             raise ValueError("process residual planner requires process workers")
-        self.gpu_native = bool(_cfg_get(cfg, "gpu_native", False))
         self._gpu_backend = None
         if self.gpu_native:
             if self.worker_processes:
@@ -586,6 +609,12 @@ class DynamicBenchmarkEnv(gym.Env):
                 export_dir=str(export_dir),
                 device_ordinal=int(_cfg_get(cfg, "gpu_native_device_ordinal", 0)),
                 image_size=self.image_size,
+                camera_observations=self.camera_observations,
+                planner_mode=self.gpu_native_planner_mode,
+                runtime_manifest_path=self.gpu_native_runtime_manifest_path,
+                runtime_manifest_sha256=self.gpu_native_runtime_manifest_sha256,
+                task_quality_schema_version=self.task_quality_schema_version,
+                evaluator_backend_id=self.task_quality_evaluator_backend_id,
             )
             self.envs = []
             self._executor = None
@@ -1222,6 +1251,10 @@ class DynamicBenchmarkEnv(gym.Env):
         )
         if np.any(indices < 0) or np.any(indices >= self.num_envs):
             raise IndexError("reset env_idx is out of range")
+        if self.gpu_native_planner_mode is not None and tuple(indices) != tuple(
+            range(self.num_envs)
+        ):
+            raise ValueError("online GPU Planner mode requires a full-cohort reset")
         row_count = max(1, int(indices.size))
         metrics_start = self._phase_start()
         self._reset_metrics(indices)
@@ -1428,29 +1461,46 @@ class DynamicBenchmarkEnv(gym.Env):
                 )
         elif self._gpu_backend is not None:
             policy_steps = self._gpu_backend.policy_steps()
-            commands = []
-            command_sources: list[tuple[int, np.ndarray]] = []
-            for index in range(self.num_envs):
-                observation = self._raw_observations[index]
-                request = self._requests[index]
-                if observation is None or request is None:
-                    raise RuntimeError(
-                        "Dynamic Benchmark vector member is not initialized"
-                    )
-                commands.append(
-                    self._ActionCommand(
-                        mode=request.action_mode,
-                        values=action_array[index],
-                        policy_step=int(policy_steps[index]),
-                    )
+            if bool(getattr(self._gpu_backend, "planner_enabled", False)):
+                planner_results = self._gpu_backend.step_planner()
+                planner_actions = np.asarray(
+                    self._gpu_backend.last_planner_actions,
+                    dtype=np.float64,
                 )
-                command_sources.append((index, action_array[index]))
+                if planner_actions.shape != (self.num_envs, 7):
+                    raise RuntimeError("GPU Planner returned an invalid action cohort")
+                action_sources = [
+                    (index, planner_actions[index]) for index in range(self.num_envs)
+                ]
+                backend_results = planner_results
+                planner_seconds = self._gpu_backend.last_planner_seconds
+                environment_seconds = self._gpu_backend.last_environment_seconds
+                process_planner_action_s[:] = planner_seconds
+                process_environment_step_s[:] = environment_seconds
+            else:
+                commands = []
+                action_sources = []
+                for index in range(self.num_envs):
+                    observation = self._raw_observations[index]
+                    request = self._requests[index]
+                    if observation is None or request is None:
+                        raise RuntimeError(
+                            "Dynamic Benchmark vector member is not initialized"
+                        )
+                    commands.append(
+                        self._ActionCommand(
+                            mode=request.action_mode,
+                            values=action_array[index],
+                            policy_step=int(policy_steps[index]),
+                        )
+                    )
+                    action_sources.append((index, action_array[index]))
+                backend_results = self._gpu_backend.step(commands)
             step_results = []
-            for (index, values), result in zip(
-                command_sources, self._gpu_backend.step(commands), strict=True
-            ):
+            for (index, values), result in zip(action_sources, backend_results, strict=True):
                 request = self._requests[index]
                 assert request is not None
+                applied_action_array[index] = np.asarray(values, dtype=np.float64)
                 action = self._ActionCommand(
                     mode=request.action_mode,
                     values=values,
@@ -1848,11 +1898,17 @@ class DynamicBenchmarkEnv(gym.Env):
             "state_schema": self.state_schema,
         }
         if getattr(self, "_gpu_backend", None) is not None:
+            planner_mode = getattr(self, "gpu_native_planner_mode", None)
             identity["gpu_native"] = True
             identity["gpu_native_export_dir"] = self._gpu_backend.export_dir
             identity["gpu_native_device_ordinal"] = int(
                 _cfg_get(self.cfg, "gpu_native_device_ordinal", 0)
             )
+            identity["gpu_native_planner_mode"] = planner_mode
+            if planner_mode is not None:
+                identity["gpu_native_runtime_manifest_sha256"] = (
+                    getattr(self, "gpu_native_runtime_manifest_sha256", None)
+                )
         lift_weight = float(_cfg_get(cfg, "reward_lift_shaping_weight", 0.0))
         orientation_weight = float(
             _cfg_get(cfg, "reward_orientation_shaping_weight", 0.0)
