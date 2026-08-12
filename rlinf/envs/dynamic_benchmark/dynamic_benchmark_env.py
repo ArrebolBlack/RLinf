@@ -586,6 +586,8 @@ class DynamicBenchmarkEnv(gym.Env):
                 export_dir=str(export_dir),
                 device_ordinal=int(_cfg_get(cfg, "gpu_native_device_ordinal", 0)),
                 image_size=self.image_size,
+                task_quality_schema_version=self.task_quality_schema_version,
+                task_quality_evaluator_backend_id=self.task_quality_evaluator_backend_id,
             )
             self.envs = []
             self._executor = None

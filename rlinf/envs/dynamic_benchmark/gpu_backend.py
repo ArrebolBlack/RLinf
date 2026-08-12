@@ -38,6 +38,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Mapping
 
+import numpy as np
+
 
 class GpuNativeBackendUnavailableError(RuntimeError):
     """Raised when the SE3-WAM GPU-native backend seam cannot be built."""
@@ -60,6 +62,9 @@ class GpuNativeBackendEnv:
         export_dir: str,
         device_ordinal: int = 0,
         image_size: int = 64,
+        observation_track: Any | None = None,
+        task_quality_schema_version: str | None = None,
+        task_quality_evaluator_backend_id: str | None = None,
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
             raise ValueError("GPU-native backend requires a positive num_envs")
@@ -93,11 +98,16 @@ class GpuNativeBackendEnv:
         self._num_envs = num_envs
         self._export_dir = export_dir
         self._consumer = GpuNativeConsumer.RL
+        track = (
+            ObservationTrack.STATE if observation_track is None else observation_track
+        )
+        if not isinstance(track, ObservationTrack):
+            raise ValueError("observation_track must be a SE(3)-WAM ObservationTrack")
         self._env = make_gpu_native_env(
             task_id,
             consumer=self._consumer,
             batch_size=num_envs,
-            observation_track=ObservationTrack.STATE,
+            observation_track=track,
             export_dir=export_dir,
             device_ordinal=device_ordinal,
             image_size=image_size,
@@ -108,8 +118,30 @@ class GpuNativeBackendEnv:
             raise GpuNativeBackendUnavailableError(
                 "frozen export task_id does not match the requested task"
             )
-        self._observation_track = ObservationTrack.STATE
+        frozen_track = getattr(self._frozen_request.observation_track, "value", None)
+        if frozen_track != track.value:
+            raise GpuNativeBackendUnavailableError(
+                "frozen export observation track does not match the GPU adapter track"
+            )
+        self._observation_track = track
         self._episode_counter = 0
+        self._active_mask = np.ones(num_envs, dtype=np.bool_)
+        self._episode_ids: tuple[str | None, ...] = (None,) * num_envs
+        self._last_observations: tuple[Any | None, ...] = (None,) * num_envs
+        self._last_terminal_rows: tuple[Any, ...] = ()
+        self._task_quality_enabled = False
+        if (task_quality_schema_version is None) != (
+            task_quality_evaluator_backend_id is None
+        ):
+            raise ValueError(
+                "GPU task quality requires both schema version and evaluator backend ID"
+            )
+        if task_quality_schema_version is not None:
+            assert task_quality_evaluator_backend_id is not None
+            self.enable_task_quality(
+                evaluator_backend_id=task_quality_evaluator_backend_id,
+                schema_version=task_quality_schema_version,
+            )
 
     @property
     def task_id(self) -> str:
@@ -139,6 +171,47 @@ class GpuNativeBackendEnv:
     def frozen_request(self) -> Any:
         return self._frozen_request
 
+    @property
+    def observation_track(self) -> Any:
+        return self._observation_track
+
+    @property
+    def current_observations(self) -> tuple[Any | None, ...]:
+        """Return the latest materialized observation for each lane."""
+
+        return self._last_observations
+
+    @property
+    def last_terminal_rows(self) -> tuple[Any, ...]:
+        """Return terminal rows materialized by the most recent step."""
+
+        return self._last_terminal_rows
+
+    @property
+    def task_quality_enabled(self) -> bool:
+        return self._task_quality_enabled
+
+    def enable_task_quality(
+        self,
+        *,
+        evaluator_backend_id: str,
+        schema_version: str,
+    ) -> None:
+        """Enable the backend's released success-quality schema before reset."""
+
+        if self._task_quality_enabled:
+            raise RuntimeError("GPU task quality is already enabled")
+        method = getattr(self._env, "enable_task_quality", None)
+        if method is None:
+            raise GpuNativeBackendUnavailableError(
+                "the GPU-native engine does not expose task-quality admission"
+            )
+        method(
+            evaluator_backend_id=evaluator_backend_id,
+            schema_version=schema_version,
+        )
+        self._task_quality_enabled = True
+
     def next_request(self) -> Any:
         """Return the frozen export request with a fresh per-lane episode id.
 
@@ -166,33 +239,104 @@ class GpuNativeBackendEnv:
 
     def reset(self, requests: Any) -> tuple[Any, ...]:
         """Reset the whole batch and materialize every active lane."""
-        if len(tuple(requests)) != self._num_envs:
+        request_tuple = tuple(requests)
+        if len(request_tuple) != self._num_envs:
             raise ValueError("GPU-native reset requires one request per lane")
         from se3_wam.benchmark.gpu_native.audit import AuditRequest
 
-        self._env.reset(requests)
+        self._env.reset(request_tuple)
         audit = self._env.materialize_audit(
             AuditRequest(lanes=tuple(range(self._num_envs)), include_step_result=False)
         )
         observations = tuple(lane.observation for lane in audit.lanes)
         if len(observations) != self._num_envs:
             raise RuntimeError("GPU-native reset lost lane observations")
+        self._active_mask = np.ones(self._num_envs, dtype=np.bool_)
+        self._episode_ids = tuple(
+            getattr(request, "episode_id", None) for request in request_tuple
+        )
+        self._last_observations = observations
+        self._last_terminal_rows = ()
         return observations
 
     def step(self, commands: Any) -> tuple[Any, ...]:
-        """Step the whole batch and materialize every active lane."""
-        if len(tuple(commands)) != self._num_envs:
+        """Step selected active lanes from current E7 commands."""
+        command_tuple = tuple(commands)
+        if len(command_tuple) != self._num_envs:
             raise ValueError("GPU-native step requires one command per lane")
         from se3_wam.benchmark.gpu_native.audit import AuditRequest
 
-        self._env.step(commands)
+        # The all-None case is retained for the legacy adapter contract tests;
+        # real MjWarp batches must provide E7 commands for every selected lane.
+        if all(value is None for value in command_tuple) and np.all(self._active_mask):
+            selected_mask = np.array(self._active_mask, copy=True)
+        else:
+            selected_mask = self._active_mask & np.asarray(
+                [value is not None for value in command_tuple], dtype=np.bool_
+            )
+        selected_lanes = tuple(int(value) for value in np.flatnonzero(selected_mask))
+        if not selected_lanes:
+            self._last_terminal_rows = ()
+            return (None,) * self._num_envs
+        if hasattr(self._env, "mark_done"):
+            self._env.step(command_tuple, active_mask=selected_mask)
+        else:
+            self._env.step(command_tuple)
         audit = self._env.materialize_audit(
-            AuditRequest(lanes=tuple(range(self._num_envs)), include_step_result=True)
+            AuditRequest(lanes=selected_lanes, include_step_result=True)
         )
-        results = tuple(lane.step_result for lane in audit.lanes)
-        if len(results) != self._num_envs or any(value is None for value in results):
-            raise RuntimeError("GPU-native step lost lane step results")
-        return results
+        result_by_lane = {}
+        for lane in audit.lanes:
+            if lane.step_result is None:
+                raise RuntimeError("GPU-native step lost a lane step result")
+            result_by_lane[lane.lane] = lane.step_result
+            self._last_observations = self._replace_observation(
+                self._last_observations, lane.lane, lane.step_result.observation
+            )
+
+        terminal_rows: list[Any] = []
+        terminal_method = getattr(self._env, "materialize_terminal_ledger", None)
+        if terminal_method is not None:
+            from se3_wam.benchmark.gpu_native.audit import TerminalLedgerRequest
+
+            for lane in selected_lanes:
+                result = result_by_lane[lane]
+                if not bool(getattr(result, "terminated", False)) and not bool(
+                    getattr(result, "truncated", False)
+                ):
+                    continue
+                episode_id = self._episode_ids[lane]
+                if episode_id is None:
+                    raise RuntimeError("terminal lane has no reset episode identity")
+                terminal_batch = terminal_method(
+                    TerminalLedgerRequest(lanes=(lane,), episode_ids=(episode_id,))
+                )
+                terminal_rows.extend(terminal_batch.rows)
+        self._last_terminal_rows = tuple(terminal_rows)
+
+        done_mask = np.zeros(self._num_envs, dtype=np.bool_)
+        for lane in selected_lanes:
+            result = result_by_lane[lane]
+            done_mask[lane] = bool(getattr(result, "terminated", False)) or bool(
+                getattr(result, "truncated", False)
+            )
+        if np.any(done_mask):
+            if hasattr(self._env, "mark_done"):
+                self._env.mark_done(done_mask)
+            self._active_mask &= ~done_mask
+
+        results: list[Any | None] = [None] * self._num_envs
+        for lane, result in result_by_lane.items():
+            results[lane] = result
+        return tuple(results)
+
+    @staticmethod
+    def _replace_observation(
+        observations: tuple[Any | None, ...], lane: int, observation: Any
+    ) -> tuple[Any | None, ...]:
+        updated = list(observations)
+        updated[lane] = observation
+        return tuple(updated)
 
     def close(self) -> None:
         self._env.close()
