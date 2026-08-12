@@ -50,6 +50,7 @@ from examples.embodiment.train_dynamic_benchmark_expert import (
     _rng_state,
     _save_demo_replay_cache,
     _score,
+    _successful_task_quality_diagnostics,
 )
 
 
@@ -299,6 +300,107 @@ def test_policy_score_is_success_then_safety_lexicographic() -> None:
 
     assert _score(safer_but_less_complete) > _score(unsafe)
     assert _score(more_success) > _score(baseline)
+
+
+def test_evaluation_vector_width_cannot_expand_declared_episode_count(
+    tmp_path,
+) -> None:
+    common = [
+        "--task",
+        "t4_sphere",
+        "--algorithm",
+        "residual_rlpd",
+        "--rlinf-commit",
+        "a" * 40,
+        "--benchmark-commit",
+        "b" * 40,
+        "--output",
+        str(tmp_path / "run"),
+        "--eval-num-envs",
+        "32",
+        "--eval-episodes",
+        "8",
+    ]
+
+    with pytest.raises(ValueError, match="cannot exceed eval_episodes"):
+        _config(_parse_args(common))
+
+
+def _task_quality_summary(value: float) -> dict[str, object]:
+    return {
+        "schema_version": "db0-episode-task-quality-v2",
+        "episode_id": "fixture",
+        "task_id": "t2_se3",
+        "evaluator_backend_id": "fixture-backend",
+        "schema_sha256": "a" * 64,
+        "physics_sample_count": 25,
+        "terminal": True,
+        "components": {
+            "terminal_goal_orientation_error_rad": {
+                "value": value,
+                "direction": "minimize",
+                "unit": "rad",
+                "scientific_resolution": 1e-6,
+                "reducer": "terminal",
+            }
+        },
+        "summary_sha256": "b" * 64,
+    }
+
+
+def test_successful_task_quality_is_diagnostic_and_success_conditioned() -> None:
+    diagnostics = _successful_task_quality_diagnostics(
+        [
+            {"success": True, "task_quality": _task_quality_summary(0.2)},
+            {"success": False, "task_quality": _task_quality_summary(99.0)},
+            {"success": True, "task_quality": _task_quality_summary(0.4)},
+        ]
+    )
+
+    assert diagnostics["status"] == "complete"
+    assert diagnostics["successful_episode_count"] == 2
+    assert diagnostics["summarized_episode_count"] == 2
+    assert diagnostics["components"]["terminal_goal_orientation_error_rad"] == {
+        "direction": "minimize",
+        "unit": "rad",
+        "scientific_resolution": 1e-6,
+        "reducer": "terminal",
+        "mean": pytest.approx(0.3),
+    }
+
+
+def test_task_quality_unavailable_does_not_change_selector() -> None:
+    diagnostics = _successful_task_quality_diagnostics([{"success": True}])
+
+    assert diagnostics == {
+        "status": "unavailable",
+        "successful_episode_count": 1,
+        "summarized_episode_count": 0,
+        "components": {},
+    }
+    core_metrics = _selection_metrics(success=1.0, safety=0.0)
+    with_diagnostics = dict(core_metrics, successful_task_quality=diagnostics)
+    assert _score(with_diagnostics) == _score(core_metrics)
+
+
+def test_task_quality_diagnostics_fail_closed_on_partial_or_identity_drift() -> None:
+    with pytest.raises(RuntimeError, match="missing for some successful"):
+        _successful_task_quality_diagnostics(
+            [
+                {"success": True, "task_quality": _task_quality_summary(0.2)},
+                {"success": True},
+            ]
+        )
+
+    drifted = _task_quality_summary(0.4)
+    drifted["schema_sha256"] = "c" * 64
+    with pytest.raises(RuntimeError, match="identity changed"):
+        _successful_task_quality_diagnostics(
+            [
+                {"success": True, "task_quality": _task_quality_summary(0.2)},
+                {"success": True, "task_quality": drifted},
+            ]
+        )
 
 
 def _selection_metrics(
@@ -668,6 +770,7 @@ def test_exact_cpu_process_recipe_is_enabled_by_default(tmp_path) -> None:
 
     assert config.num_envs == 32
     assert config.eval_num_envs == 32
+    assert config.eval_episodes == 32
     assert config.env_worker_processes == 32
     assert config.eval_worker_processes == 32
     assert config.process_start_method == expert_trainer._default_process_start_method()

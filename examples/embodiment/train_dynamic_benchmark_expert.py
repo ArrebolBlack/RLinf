@@ -567,7 +567,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-alpha", type=float, default=0.01)
     parser.add_argument("--target-entropy", type=float, default=-7.0)
     parser.add_argument("--eval-interval", type=int, default=10_000)
-    parser.add_argument("--eval-episodes", type=int, default=16)
+    parser.add_argument("--eval-episodes", type=int, default=_DEFAULT_CPU_VECTOR_WIDTH)
     parser.add_argument("--checkpoint-interval", type=int, default=10_000)
     parser.add_argument("--log-interval", type=int, default=1_000)
     parser.add_argument("--train-manifest-seed", type=int, default=20261050)
@@ -712,6 +712,11 @@ def _config(args: argparse.Namespace) -> TrainConfig:
     RewardRegistry.from_config(config.reward_components)
     if min(config.num_envs, config.eval_num_envs, config.demo_num_envs) < 1:
         raise ValueError("environment counts must be positive")
+    if config.eval_num_envs > config.eval_episodes:
+        raise ValueError(
+            "eval_num_envs cannot exceed eval_episodes; validation must not "
+            "execute undeclared episodes"
+        )
     if config.env_worker_threads < 1 or config.eval_worker_threads < 1:
         raise ValueError("environment worker thread counts must be positive")
     if config.env_worker_processes < 0 or config.eval_worker_processes < 0:
@@ -1878,20 +1883,24 @@ def _evaluate(
                 if episode_id is None:
                     continue
                 reason = infos["termination_reason"][index]
-                records.append(
-                    {
-                        "manifest_episode_index": episode_id,
-                        "success": bool(infos["success"][index]),
-                        "safety_failure": reason in safety_failures,
-                        "termination_reason": reason,
-                        "trajectory_completion": float(
-                            infos["trajectory_completion"][index]
-                        ),
-                        "return": float(episode_returns[index]),
-                        "duration_steps": int(episode_steps[index]),
-                        "action_l2_sum": float(episode_effort[index]),
-                    }
-                )
+                record = {
+                    "manifest_episode_index": episode_id,
+                    "success": bool(infos["success"][index]),
+                    "safety_failure": reason in safety_failures,
+                    "termination_reason": reason,
+                    "trajectory_completion": float(
+                        infos["trajectory_completion"][index]
+                    ),
+                    "return": float(episode_returns[index]),
+                    "duration_steps": int(episode_steps[index]),
+                    "action_l2_sum": float(episode_effort[index]),
+                }
+                task_quality_rows = infos.get("task_quality")
+                if task_quality_rows is not None:
+                    task_quality = task_quality_rows[index]
+                    if task_quality is not None:
+                        record["task_quality"] = copy.deepcopy(task_quality)
+                records.append(record)
                 episode_returns[index] = 0.0
                 episode_effort[index] = 0.0
                 episode_steps[index] = 0
@@ -1940,6 +1949,7 @@ def _evaluate(
         "mean_action_l2_sum": float(
             np.mean([record["action_l2_sum"] for record in records])
         ),
+        "successful_task_quality": _successful_task_quality_diagnostics(records),
         "wall_time_s": wall_time_s,
         "env_steps_per_second": stepped_env_rows / max(wall_time_s, 1e-6),
         "environment_step_mean_ms": 1000.0 * environment_step_s / max(1, vector_steps),
@@ -1977,6 +1987,90 @@ def _evaluate(
     if environment_phase_timings is not None:
         result["environment_phase_timings"] = environment_phase_timings
     return result
+
+
+def _successful_task_quality_diagnostics(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize already-recorded task quality without changing selection gates."""
+
+    successful = [record for record in records if bool(record.get("success"))]
+    if not successful:
+        return {
+            "status": "no_successful_episodes",
+            "successful_episode_count": 0,
+            "summarized_episode_count": 0,
+            "components": {},
+        }
+    summaries = [record.get("task_quality") for record in successful]
+    available = [summary for summary in summaries if summary is not None]
+    if not available:
+        return {
+            "status": "unavailable",
+            "successful_episode_count": len(successful),
+            "summarized_episode_count": 0,
+            "components": {},
+        }
+    if len(available) != len(summaries):
+        raise RuntimeError(
+            "task-quality diagnostics are missing for some successful validation episodes"
+        )
+    first = available[0]
+    if not isinstance(first, Mapping):
+        raise RuntimeError("task-quality diagnostics must be mappings")
+    component_payload = first.get("components")
+    if not isinstance(component_payload, Mapping) or not component_payload:
+        raise RuntimeError("task-quality diagnostics are missing components")
+    component_names = tuple(component_payload)
+    identity_fields = (
+        "schema_version",
+        "task_id",
+        "evaluator_backend_id",
+        "schema_sha256",
+    )
+    identity = {name: first.get(name) for name in identity_fields}
+    component_metadata: dict[str, dict[str, Any]] = {}
+    component_values: dict[str, list[float]] = {name: [] for name in component_names}
+    for summary in available:
+        if not isinstance(summary, Mapping):
+            raise RuntimeError("task-quality diagnostics must be mappings")
+        if {name: summary.get(name) for name in identity_fields} != identity:
+            raise RuntimeError(
+                "task-quality diagnostic identity changed across validation"
+            )
+        components = summary.get("components")
+        if not isinstance(components, Mapping) or tuple(components) != component_names:
+            raise RuntimeError("task-quality components changed across validation")
+        for name in component_names:
+            component = components[name]
+            if not isinstance(component, Mapping):
+                raise RuntimeError("task-quality component must be a mapping")
+            metadata = {
+                key: component.get(key)
+                for key in ("direction", "unit", "scientific_resolution", "reducer")
+            }
+            if name in component_metadata and component_metadata[name] != metadata:
+                raise RuntimeError(
+                    "task-quality component metadata changed across validation"
+                )
+            component_metadata[name] = metadata
+            value = float(component.get("value"))
+            if not math.isfinite(value):
+                raise RuntimeError("task-quality component value must be finite")
+            component_values[name].append(value)
+    return {
+        "status": "complete",
+        "successful_episode_count": len(successful),
+        "summarized_episode_count": len(available),
+        **identity,
+        "components": {
+            name: {
+                **component_metadata[name],
+                "mean": float(np.mean(component_values[name])),
+            }
+            for name in component_names
+        },
+    }
 
 
 def _score(metrics: dict[str, Any]) -> tuple[float, ...]:
