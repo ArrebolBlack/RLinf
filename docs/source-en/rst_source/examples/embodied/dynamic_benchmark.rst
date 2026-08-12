@@ -155,7 +155,11 @@ active, and residual-RLPD evaluates its privileged planner in the owning subproc
 Use the generated ``--no-persistent-eval-workers`` and
 ``--no-eval-planner-in-processes`` switches, or set both process counts to ``0``, for
 an explicit serial compatibility run. Sampler/learner overlap remains disabled because
-it changes replay order.
+it changes replay order. Active final-source configs use W32 training while preserving
+their frozen eight-episode validation budget. Materialize each task's planner demo cache
+once with ``prepare_dynamic_benchmark_demo_replay.py`` from the current source identity,
+then reuse it across learner seeds with explicit ``--demo-seed``,
+``--demo-rlinf-commit`` and ``--demo-replay-in``. Identity drift fails closed.
 
 The parent process still assigns manifest rows and restores replies by environment
 index, so seed and episode order do not depend on worker completion order. Each
@@ -349,6 +353,18 @@ Test-ID/OOD remain available only for the single post-freeze comparison.
 
 Export best-known trajectories
 ------------------------------
+
+CPU production uses ``run_dynamic_benchmark_cpu_production.py``. Each job is a
+NUMA-local W16 fresh-process shard set; a campaign runs one W16 job per NUMA node
+(W16+W16 on the measured two-socket hosts). Exact resume, phase/execution sidecars,
+CPU-only OSMesa, full-pool selection, and accepted-prefix merge are built in. Add
+``--fixed-reset-workload`` only for a scientifically fixed reset workload. GPU count is
+not a generator argument; use another qualified CPU/NUMA host for more throughput.
+
+.. code-block:: bash
+
+   python examples/embodiment/run_dynamic_benchmark_cpu_production.py \
+      --campaign-manifest /path/to/current-approved-campaign.json --resume
 
 First generate the paired Owner-review subset from an
 ``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` review candidate manifest whose

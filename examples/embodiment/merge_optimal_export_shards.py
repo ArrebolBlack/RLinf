@@ -38,6 +38,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from examples.embodiment.dynamic_benchmark_calibration_projection import (
+    CALIBRATION_BINDING_PROJECTION_SCHEMA,
+)
 from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     EXPORT_SCHEMA,
     FIRST_ELIGIBLE_SEARCH_MODE,
@@ -429,13 +432,27 @@ def _validate_quality_v2_shard_contract(
         f"{shard} authenticated benchmark commit",
         source_identity.get(benchmark_key),
     )
-    _validate_quality_v2_calibration_receipt_artifact(
+    receipt_path = shard / receipt_binding["relative_path"]
+    raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected_receipt_sha256 = (
+        hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        if isinstance(raw_receipt, Mapping)
+        and raw_receipt.get("schema_version")
+        == CALIBRATION_BINDING_PROJECTION_SCHEMA
+        else receipt_binding["file_sha256"]
+    )
+    receipt = _validate_quality_v2_calibration_receipt_artifact(
         threshold_payload,
-        shard / receipt_binding["relative_path"],
-        expected_sha256=receipt_binding["file_sha256"],
+        receipt_path,
+        expected_sha256=expected_receipt_sha256,
         expected_benchmark_commit=expected_benchmark_commit,
     )
-    return identity, receipt_binding
+    receipt_identity = {
+        "relative_path": receipt.relative_path,
+        "file_sha256": receipt.sha256,
+        "payload_sha256": receipt.sha256,
+    }
+    return identity, receipt_identity
 
 
 def main() -> None:

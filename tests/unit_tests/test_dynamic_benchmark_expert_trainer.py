@@ -798,6 +798,24 @@ def test_exact_cpu_process_recipe_is_enabled_by_default(tmp_path) -> None:
     assert serial.persistent_eval_workers is False
 
 
+def test_residual_rlpd_is_the_default_algorithm(tmp_path) -> None:
+    config = _config(
+        _parse_args(
+            [
+                "--task",
+                "t4_slider",
+                "--rlinf-commit",
+                "a" * 40,
+                "--benchmark-commit",
+                "b" * 40,
+                "--output",
+                str(tmp_path / "run"),
+            ]
+        )
+    )
+    assert config.algorithm == "residual_rlpd"
+
+
 def test_process_worker_configuration_is_overridable_and_thread_exclusive(
     tmp_path,
 ) -> None:

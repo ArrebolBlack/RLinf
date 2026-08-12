@@ -1,4 +1,4 @@
-# RLD2-QA Cycle-1 common recipe.  The metric bundle is evaluated at export time;
+# ARCHIVED RLD2-QA Cycle-1 common recipe. The metric bundle is evaluated at export time;
 # this optional training term only discourages high-frequency arm-action changes
 # using the previous applied action, never future state.
 reward_components:

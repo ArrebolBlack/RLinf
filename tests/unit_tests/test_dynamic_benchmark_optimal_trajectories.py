@@ -53,23 +53,37 @@ from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
 from examples.embodiment.audit_dynamic_benchmark_optimal_trajectories import (
     _selected as _audit_selected,
 )
+from examples.embodiment.dynamic_benchmark_calibration_projection import (
+    EXACT_TASKS as _PROJECTION_TASKS,
+)
+from examples.embodiment.dynamic_benchmark_calibration_projection import (
+    REVIEW_SCHEMA as _PROJECTION_REVIEW_SCHEMA,
+)
+from examples.embodiment.dynamic_benchmark_calibration_projection import (
+    canonical_json_bytes as _projection_json_bytes,
+)
+from examples.embodiment.dynamic_benchmark_calibration_projection import (
+    projection_payload,
+)
 from examples.embodiment.export_dynamic_benchmark_optimal_trajectories import (
     CANDIDATE_SCHEMA,
+    FULL_POOL_SEARCH_MODE,
     PLANNER_PARETO_SELECTION_MODE,
     _ArmedResetReplayEnv,
     _budget_sequence,
+    _candidate_budgets,
     _candidate_identity,
     _copy_provenance_file,
     _eligible,
     _file_boundary,
     _progress_payload,
-    _scientific_recovery_events,
     _quality_score,
     _quality_v2_dominance_contract,
     _quality_v2_metric_thresholds,
     _recover_partial_output,
     _render_parity_skip,
     _restore_candidate_start,
+    _scientific_recovery_events,
     _select_winner,
     _t5_replan_causal_evidence,
     _task_quality_from_infos,
@@ -299,6 +313,44 @@ def _calibration_receipt_fixture(tmp_path: Path) -> tuple[dict, Path, str]:
     return thresholds, receipt_path, receipt_sha256
 
 
+def _approved_projection_review(commit: str) -> dict:
+    review = {
+        "schema_version": _PROJECTION_REVIEW_SCHEMA,
+        "counts": {
+            "approved": 14,
+            "pending_owner_review": 0,
+            "rejected": 0,
+            "revise": 0,
+            "tasks": 14,
+        },
+        "owner_review_complete": True,
+        "training_data_authorized": True,
+        "full_trajectory_generation": True,
+        "promotion_authorized": True,
+        "source_identity": {
+            "production_authorization": {
+                "approved_planner_master_commit": commit,
+                "authorized_on": "2026-08-12",
+                "authorized_tasks": list(_PROJECTION_TASKS),
+                "decision": "approved",
+                "scope": "cpu_planner_full_trajectory_generation_and_training_data",
+            }
+        },
+        "units": [
+            {
+                "task": task,
+                "review_status": "approved",
+                "owner_review": {"decision": "approved"},
+            }
+            for task in _PROJECTION_TASKS
+        ],
+    }
+    review["payload_sha256"] = hashlib.sha256(
+        _projection_json_bytes(review)
+    ).hexdigest()
+    return review
+
+
 def _planner_dominance_contract() -> dict:
     def metric(direction: str, resolution: float, *, steps: bool = False) -> dict:
         return {
@@ -501,6 +553,34 @@ def test_candidate_manifest_is_commit_bound_and_resolves_relative_paths(
             benchmark_commit="b" * 40,
             max_k=8,
         )
+
+
+def test_v01_planner_only_manifest_supports_explicit_k1_full_pool(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "schema_version": CANDIDATE_SCHEMA,
+        "task": "t2_trans",
+        "rlinf_commit": "a" * 40,
+        "benchmark_commit": "b" * 40,
+        "candidates": [{"candidate_id": "planner", "kind": "planner"}],
+    }
+    task, specs = _validate_candidate_manifest(
+        payload,
+        manifest_path=tmp_path / "candidates.json",
+        rlinf_commit="a" * 40,
+        benchmark_commit="b" * 40,
+        max_k=1,
+    )
+    assert task == "t2_trans"
+    assert len(specs) == 1
+    assert specs[0].kind == "planner"
+    assert _candidate_budgets(
+        FULL_POOL_SEARCH_MODE,
+        initial_k=1,
+        max_k=1,
+        candidate_pool_size=len(specs),
+    ) == (1,)
 
 
 def test_winner_selection_is_quality_first_then_stable_candidate_index() -> None:
@@ -984,6 +1064,38 @@ def test_quality_v2_calibration_receipt_artifact_round_trip(tmp_path: Path) -> N
         "file_sha256": receipt_sha256,
         "payload_sha256": receipt_sha256,
     }
+
+
+def test_quality_v2_calibration_binding_projection_round_trip(tmp_path: Path) -> None:
+    thresholds, _, _ = _calibration_receipt_fixture(tmp_path)
+    projection_path = tmp_path / "binding_projection.json"
+    projection_path.write_bytes(
+        _projection_json_bytes(
+            projection_payload(
+                thresholds["calibration_wave_receipt"],
+                "f" * 40,
+                _approved_projection_review("f" * 40),
+                "d" * 64,
+            )
+        )
+    )
+    projection_sha256 = hashlib.sha256(projection_path.read_bytes()).hexdigest()
+    provenance = _validate_quality_v2_calibration_receipt_artifact(
+        thresholds,
+        projection_path,
+        expected_sha256=projection_sha256,
+        expected_benchmark_commit="f" * 40,
+    )
+    assert provenance.sha256 == projection_sha256
+    dataset_root = tmp_path / "projection-dataset"
+    dataset_path = dataset_root / provenance.relative_path
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_bytes(projection_path.read_bytes())
+    assert _audit_quality_v2_calibration_receipt_artifact(
+        dataset_root,
+        thresholds,
+        expected_benchmark_commit="f" * 40,
+    )["file_sha256"] == projection_sha256
 
 
 def test_quality_v2_calibration_receipt_binds_evaluator_benchmark_commit(
@@ -1537,6 +1649,52 @@ def test_shard_merge_preserves_qv3_receipt_for_independent_auditor(
     checksum_inventory = (output / "SHA256SUMS").read_text(encoding="utf-8")
     assert "quality_v2_thresholds.json" in checksum_inventory
     assert "provenance/calibration_wave/wave_receipt.json" in checksum_inventory
+
+
+def test_projection_shards_merge_and_reaudit_with_actual_projection_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, thresholds, _, _ = _write_sharded_quality_merge_fixture(tmp_path)
+    projection_bytes = _projection_json_bytes(
+        projection_payload(
+            thresholds["calibration_wave_receipt"],
+            _CALIBRATION_BENCHMARK_COMMIT,
+            _approved_projection_review(_CALIBRATION_BENCHMARK_COMMIT),
+            "d" * 64,
+        )
+    )
+    projection_sha256 = hashlib.sha256(projection_bytes).hexdigest()
+    relative = thresholds["calibration_wave_receipt"]["relative_path"]
+    for shard in root.glob("shard-*"):
+        (shard / relative).write_bytes(projection_bytes)
+    output = tmp_path / "projection-merged"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "merge_optimal_export_shards.py",
+            "--root",
+            str(root),
+            "--output",
+            str(output),
+            "--accepted-episodes",
+            "2",
+        ],
+    )
+    _merge_shards_main()
+    merged_thresholds = json.loads(
+        (output / "quality_v2_thresholds.json").read_text(encoding="utf-8")
+    )
+    assert _audit_quality_v2_calibration_receipt_artifact(
+        output,
+        merged_thresholds,
+        expected_benchmark_commit=_CALIBRATION_BENCHMARK_COMMIT,
+    ) == {
+        "relative_path": relative,
+        "file_sha256": projection_sha256,
+        "payload_sha256": projection_sha256,
+    }
 
 
 @pytest.mark.parametrize(

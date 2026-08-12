@@ -406,7 +406,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--algorithm",
         choices=("bc", "sac", "rlpd", "residual_rlpd"),
-        default="rlpd",
+        default="residual_rlpd",
     )
     parser.add_argument("--rlinf-commit", required=True)
     parser.add_argument(

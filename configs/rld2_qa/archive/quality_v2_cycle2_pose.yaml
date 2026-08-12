@@ -1,4 +1,4 @@
-# RLD2-QA Cycle-2 arm A for T2-SE3 placement instability.
+# ARCHIVED RLD2-QA Cycle-2 arm A for T2-SE3 placement instability.
 #
 # This arm was predeclared after the Cycle-1 seed-1 failure cluster (7/8 at an
 # intermediate checkpoint, 0/8 at 20K) and before the N0 recovery seeds are

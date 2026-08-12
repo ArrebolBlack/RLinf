@@ -1,4 +1,4 @@
-# RLD2-QA Cycle-2 arm B for T3 phase/progress regressions that remain after
+# ARCHIVED RLD2-QA Cycle-2 arm B for T3 phase/progress regressions that remain after
 # quality_v2_cycle2_stage.yaml.  It changes only two predeclared controls:
 # a smaller planner-residual envelope and a stronger past-action-rate penalty.
 # Run this arm only if the first stage arm fails frozen validation; never choose

@@ -150,6 +150,10 @@ return 可比较。
 residual-RLPD 还默认在环境所属子进程内计算 privileged planner。需要显式串行兼容模式时，
 使用自动生成的 ``--no-persistent-eval-workers``、``--no-eval-planner-in-processes``，或将
 两类 process 数都设为 ``0``。sampler/learner overlap 仍默认关闭，因为它会改变 replay 顺序。
+active final-source 配置使用 W32 训练但保留冻结的 8-episode validation 预算。每个 task 先用
+``prepare_dynamic_benchmark_demo_replay.py`` 和当前源码 identity 物化一次 Planner demo cache，
+再通过显式 ``--demo-seed``、``--demo-rlinf-commit`` 与 ``--demo-replay-in`` 跨 learner seed
+复用；任一 identity 漂移都会 fail closed。
 
 manifest row 仍由主进程分配，返回值按 env index 恢复，因此 seed 与 episode 顺序不依赖
 worker 完成顺序。每个子进程内部保持串行，对应的 ``--*-worker-threads`` 必须为 ``1``。
@@ -320,6 +324,17 @@ test-ID/OOD 只用于冻结后的单次比较。
 
 导出 best-known 轨迹
 -------------------
+
+CPU 生产使用 ``run_dynamic_benchmark_cpu_production.py``。每个 job 是单 NUMA W16
+fresh-process shard set；campaign 在每个 NUMA 同时只运行一个 W16 job，双路主机因此自动成为
+W16+W16。exact resume、phase/execution sidecar、CPU-only OSMesa、full-pool 与
+accepted-prefix merge 均内置。只有科学合同固定完整 reset workload 时才增加
+``--fixed-reset-workload``。generator 不接收 GPU 数量；增加吞吐应增加合格 CPU/NUMA 主机。
+
+.. code-block:: bash
+
+   python examples/embodiment/run_dynamic_benchmark_cpu_production.py \
+      --campaign-manifest /path/to/current-approved-campaign.json --resume
 
 首先从 ``rlinf-dynamic-benchmark-optimal-candidates-v0.1`` review candidate manifest
 生成配对 Owner-review 子集；其 ``review_contract`` 必须为

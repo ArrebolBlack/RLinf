@@ -27,8 +27,8 @@ BENCHMARK_COMMIT = "b" * 40
 
 FROZEN_CORE = {
     "algorithm": "residual_rlpd",
-    "num_envs": 2,
-    "eval_num_envs": 2,
+    "num_envs": 32,
+    "eval_num_envs": 8,
     "demo_num_envs": 2,
     "total_env_steps": 20_000,
     "random_env_steps": 2_000,
@@ -38,7 +38,7 @@ FROZEN_CORE = {
     "bc_steps": 2_000,
     "batch_size": 512,
     "replay_capacity": 250_000,
-    "updates_per_vector_step": 1,
+    "updates_per_vector_step": 16,
     "q_heads": 10,
     "q_target_subset": 2,
     "actor_bc_weight": 100.0,

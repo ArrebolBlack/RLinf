@@ -293,8 +293,24 @@ def _audit_quality_v2_calibration_receipt_artifact(
 ) -> dict[str, str]:
     """Reopen the dataset-local receipt instead of trusting threshold metadata."""
 
+    from examples.embodiment.dynamic_benchmark_calibration_projection import (
+        validate_projection_artifact,
+    )
+
     binding = _quality_v2_calibration_receipt_binding(thresholds)
     receipt_path = _safe_dataset_path(root, binding["relative_path"])
+    projection = validate_projection_artifact(
+        thresholds,
+        receipt_path,
+        expected_sha256=None,
+        expected_benchmark_commit=expected_benchmark_commit,
+    )
+    if projection is not None:
+        return {
+            "relative_path": str(binding["relative_path"]),
+            "file_sha256": str(projection["file_sha256"]),
+            "payload_sha256": str(projection["payload_sha256"]),
+        }
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise ValueError(
             "quality-v2 calibration receipt artifact is missing or symlinked"

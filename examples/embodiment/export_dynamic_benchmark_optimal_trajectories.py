@@ -424,7 +424,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--accepted-episodes", type=int, default=100)
     parser.add_argument("--max-resets", type=int, default=200)
     parser.add_argument("--initial-k", type=int, default=8)
-    parser.add_argument("--max-k", type=int, choices=(8, 16, 32), default=32)
+    parser.add_argument("--max-k", type=int, choices=(1, 8, 16, 32), default=32)
     parser.add_argument(
         "--candidate-search-mode",
         choices=CANDIDATE_SEARCH_MODES,
@@ -578,7 +578,23 @@ def _validate_quality_v2_calibration_receipt_artifact(
 ) -> ProvenanceFile:
     """Reopen and cross-check the distributable exact-14 calibration receipt."""
 
+    from examples.embodiment.dynamic_benchmark_calibration_projection import (
+        validate_projection_artifact,
+    )
+
     binding = _quality_v2_calibration_receipt_binding(thresholds)
+    projection = validate_projection_artifact(
+        thresholds,
+        receipt_path,
+        expected_sha256=expected_sha256,
+        expected_benchmark_commit=expected_benchmark_commit,
+    )
+    if projection is not None:
+        return ProvenanceFile(
+            source_path=receipt_path.resolve(),
+            relative_path=str(binding["relative_path"]),
+            sha256=str(projection["file_sha256"]),
+        )
     if expected_sha256 is not None:
         expected = _expected_sha256(
             expected_sha256,

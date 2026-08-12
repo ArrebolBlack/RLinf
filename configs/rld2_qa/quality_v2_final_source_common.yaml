@@ -1,9 +1,9 @@
-# RLD2-QA clean final-source recipe for the eleven non-special exact-14 tasks.
+# CPU production residual-RLPD recipe for the eleven non-special exact-14 tasks.
 # Run identity, source commits, output paths, task, and seed stay explicit on the
 # launcher CLI and are deliberately forbidden from this frozen recipe.
 algorithm: residual_rlpd
-num_envs: 2
-eval_num_envs: 2
+num_envs: 32
+eval_num_envs: 8
 demo_num_envs: 2
 total_env_steps: 20000
 random_env_steps: 2000
@@ -13,7 +13,7 @@ demo_ratio: 0.5
 bc_steps: 2000
 batch_size: 512
 replay_capacity: 250000
-updates_per_vector_step: 1
+updates_per_vector_step: 16
 q_heads: 10
 q_target_subset: 2
 actor_bc_weight: 100.0
