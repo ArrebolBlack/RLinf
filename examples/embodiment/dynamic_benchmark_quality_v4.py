@@ -628,7 +628,12 @@ def build_quality_v4_rollout_source(
         raise ValueError("Qv4 rollout requires at least two observations")
     issued = np.asarray(issued_actions, dtype=np.float64)
     action_count = len(observations) - 1
-    if issued.ndim != 2 or issued.shape[0] != action_count:
+    if (
+        issued.ndim != 2
+        or issued.shape[0] != action_count
+        or issued.shape[1] < 1
+        or not np.all(np.isfinite(issued))
+    ):
         raise ValueError("Qv4 rollout issued action tape does not align")
     issue_time = np.asarray(
         [float(observation.time_s) for observation in observations[:-1]],
@@ -645,7 +650,14 @@ def build_quality_v4_rollout_source(
     normalized_physics: list[Any] = []
     previous_time = -math.inf
     for sample in physics_samples:
-        time_s = float(_sample_value(sample, "time_s"))
+        time_value = _sample_value(sample, "time_s")
+        qpos_value = _sample_value(sample, "simulator_qpos")
+        qvel_value = _sample_value(sample, "simulator_qvel")
+        if time_value is None or qpos_value is None or qvel_value is None:
+            raise ValueError("Qv4 physics source sample is missing time/qpos/qvel")
+        time_s = float(time_value)
+        if not math.isfinite(time_s):
+            raise ValueError("Qv4 physics source tape contains a non-finite time")
         if math.isclose(time_s, previous_time, abs_tol=1.0e-12, rel_tol=0.0):
             continue
         if time_s < previous_time:
@@ -1143,6 +1155,15 @@ def build_quality_v4_attempt(source: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "Qv4 field tape lacks action/observation/result/clock mappings"
         )
+    if not {"issued", "applied"}.issubset(action_fields):
+        raise ValueError("Qv4 action field tape lacks issued/applied actions")
+    required_action_clocks = {
+        "action_issue_time_s",
+        "action_applied_time_s",
+        "action_applied_source_policy_step",
+    }
+    if not required_action_clocks.issubset(clock_fields):
+        raise ValueError("Qv4 action field tape lacks issued/applied clocks")
     field_issued = np.asarray(action_fields.get("issued"), dtype=np.float64)
     field_applied = np.asarray(action_fields.get("applied"), dtype=np.float64)
     field_issue_time = np.asarray(
@@ -1214,6 +1235,13 @@ def build_quality_v4_attempt(source: Mapping[str, Any]) -> dict[str, Any]:
     clock = field_tape.get("clock")
     if not isinstance(physics, Mapping) or not isinstance(clock, Mapping):
         raise ValueError("Qv4 field tape has no physics/clock source mappings")
+    required_physics = {
+        "eef_pose_xyzw",
+        "contact_impulse_n_s",
+        "contact_names",
+    }
+    if not required_physics.issubset(physics) or "physics_time_s" not in clock:
+        raise ValueError("Qv4 field tape lacks physics/contact source fields")
     physics_reducer = quality.PhysicsRateEEFReducer()
     physics_reducer.update_many(
         clock.get("physics_time_s"),

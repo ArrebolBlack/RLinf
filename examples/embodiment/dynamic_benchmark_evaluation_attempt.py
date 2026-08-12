@@ -303,9 +303,8 @@ def load_quality_v4_rollout_reference(
     return dict(payload)
 
 
-def materialize_quality_v4_fresh_replay_attempt(
+def build_quality_v4_fresh_replay_attempt(
     *,
-    output: Path,
     record: Mapping[str, Any],
     raw_env: Any,
     observations: list[Any],
@@ -319,7 +318,7 @@ def materialize_quality_v4_fresh_replay_attempt(
     base_replay_validation: Mapping[str, Any],
     replay_capture: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Rebuild original/replay Qv4 tapes and publish the lightweight candidate."""
+    """Rebuild original/replay Qv4 tapes without publishing an artifact."""
 
     from se3_wam.benchmark.trajectory_quality_v4 import (
         compare_replayed_observations_v4,
@@ -396,6 +395,48 @@ def materialize_quality_v4_fresh_replay_attempt(
         base_replay_validation=base_replay_validation,
         observation_comparison=observation_comparison,
     )
+    return {
+        "source": finalized_source,
+        "attempt": attempt,
+        "fresh_replay_observation_comparison": observation_comparison,
+    }
+
+
+def materialize_quality_v4_fresh_replay_attempt(
+    *,
+    output: Path,
+    record: Mapping[str, Any],
+    raw_env: Any,
+    observations: list[Any],
+    actions: np.ndarray,
+    rewards: list[float],
+    outcomes: list[tuple[Any, ...]],
+    physics_samples: list[Any],
+    events: tuple[Any, ...],
+    thresholds: Mapping[str, Any],
+    reference_contract: Mapping[str, Any],
+    base_replay_validation: Mapping[str, Any],
+    replay_capture: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebuild Qv4 tapes and publish one lightweight evaluation candidate."""
+
+    built = build_quality_v4_fresh_replay_attempt(
+        record=record,
+        raw_env=raw_env,
+        observations=observations,
+        actions=actions,
+        rewards=rewards,
+        outcomes=outcomes,
+        physics_samples=physics_samples,
+        events=events,
+        thresholds=thresholds,
+        reference_contract=reference_contract,
+        base_replay_validation=base_replay_validation,
+        replay_capture=replay_capture,
+    )
+    finalized_source = built["source"]
+    attempt = built["attempt"]
+    observation_comparison = built["fresh_replay_observation_comparison"]
     materialized = materialize_quality_v4_evaluation_attempt(output, finalized_source)
     if materialized["attempt"] != attempt:
         raise RuntimeError("Qv4 materialized attempt differs from fresh-replay gate")

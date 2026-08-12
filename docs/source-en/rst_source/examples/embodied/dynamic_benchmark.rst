@@ -392,6 +392,9 @@ the promotion receipt. The review exporter requires and revalidates the same pai
       --expected-quality-v2-thresholds-sha256 "$QUALITY_V2_SHA" \
       --quality-v2-calibration-wave-receipt "$CALIBRATION_RECEIPT" \
       --expected-quality-v2-calibration-wave-receipt-sha256 "$CALIBRATION_RECEIPT_SHA" \
+      --quality-v4-thresholds "$QUALITY_V4_THRESHOLDS" \
+      --expected-quality-v4-thresholds-sha256 "$QUALITY_V4_SHA" \
+      --quality-v4-reference-root "$QUALITY_V4_REFERENCE_ROOT" \
       --evaluator-commit "$EVALUATOR_COMMIT" \
       --evaluator-benchmark-commit "$BENCHMARK_COMMIT" \
       --partition review --manifest-seed 20261250 --review-resets 20 \
@@ -457,8 +460,13 @@ An interrupted export can repeat the same command with ``--resume``. It verifies
 immutable source and candidate identities, preserves any uncommitted tail in a
 sibling recovery directory, truncates JSONL files to the last atomically committed
 reset boundary, and reruns that reset. Every attempt keeps a lightweight
-state/action/reward tape and exact replay evidence; each winner additionally keeps
-RGB-D/HDF5 evidence.
+state/action/reward tape and exact replay evidence. Each winner additionally keeps
+the monotonic physics-rate EEF tape, named contact impulses, and issued/applied
+actions in ``quality_v4/full_exports/<episode>.h5``. The exporter independently
+recomputes its adjacent ``<episode>.gate.json`` and writes the resulting Qv4
+validation into ``EpisodeTrace`` before atomically publishing the dataset episode.
+Missing physics, contact, or action sources fail closed. Non-T5 applied actions are
+explicitly identical to issued actions; T5 uses the canonical queue history.
 
 For an exact uninterrupted-versus-resumed artifact comparison, pass
 ``--execution-receipt-json`` with a path outside the dataset root on every run. The

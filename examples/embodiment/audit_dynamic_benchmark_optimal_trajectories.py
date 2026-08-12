@@ -3335,7 +3335,7 @@ def _audit_quality_v4_full_exports(
     gate_hashes = []
     threshold_hashes = set()
     orientation_hashes = set()
-    for episode_id in episode_ids:
+    for episode_id, winner in zip(episode_ids, winner_rows, strict=True):
         export_path = directory / f"{episode_id}.h5"
         recorded_gate = json.loads(
             (directory / f"{episode_id}.gate.json").read_text(encoding="utf-8")
@@ -3346,6 +3346,38 @@ def _audit_quality_v4_full_exports(
         dataset_gate = dataset_quality_v4_validation(recomputed_gate)
         if not dataset_gate["passed"]:
             raise ValueError("Qv4 winner is not behavior-cloning eligible")
+        expected_export_path = (
+            QUALITY_V4_FULL_EXPORT_SUBDIRECTORY / f"{episode_id}.h5"
+        ).as_posix()
+        expected_gate_path = (
+            QUALITY_V4_FULL_EXPORT_SUBDIRECTORY / f"{episode_id}.gate.json"
+        ).as_posix()
+        if (
+            winner.get("quality_v4_full_export_path", expected_export_path)
+            != expected_export_path
+            or winner.get("quality_v4_full_export_gate_path", expected_gate_path)
+            != expected_gate_path
+            or winner.get(
+                "quality_v4_full_export_gate_sha256", recomputed_gate["gate_sha256"]
+            )
+            != recomputed_gate["gate_sha256"]
+        ):
+            raise ValueError("Qv4 winner manifest artifact binding mismatch")
+        relative_episode_dir = winner.get("relative_episode_dir")
+        if isinstance(relative_episode_dir, str):
+            episode = json.loads(
+                (root / relative_episode_dir / "episode.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if (
+                episode.get("quality_v4_validation") != dataset_gate
+                or episode.get("metrics", {}).get("eligible_for_behavior_cloning")
+                is not True
+            ):
+                raise ValueError(
+                    "Qv4 winner episode is not bound to its full-export gate"
+                )
         gate_hashes.append(recomputed_gate["gate_sha256"])
         threshold_hashes.add(recomputed_gate["thresholds_sha256"])
         orientation_hashes.add(recomputed_gate["orientation_contract_sha256"])
@@ -3583,6 +3615,13 @@ def _audit_dataset(
             raise ValueError("winner episode IDs must be non-empty and unique")
         winner_by_episode[episode_id] = winner
     quality_v4_full_exports = _audit_quality_v4_full_exports(root, winner_rows)
+    if isinstance(card.get("quality_v4_threshold_identity"), Mapping):
+        if not quality_v4_full_exports["enabled"]:
+            raise ValueError("Qv4 production export is missing full-export artifacts")
+        if quality_v4_full_exports["thresholds_sha256"] != card[
+            "quality_v4_threshold_identity"
+        ].get("thresholds_sha256"):
+            raise ValueError("Qv4 full exports use a different threshold contract")
 
     accepted = 0
     render_parity_skips: Counter[str] = Counter()

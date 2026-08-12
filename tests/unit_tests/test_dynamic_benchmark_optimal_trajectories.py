@@ -2105,6 +2105,14 @@ def test_resume_preserves_dirty_tail_and_restores_committed_boundary(
     for directory in (lightweight, published, staging):
         directory.mkdir(parents=True)
         (directory / "evidence.bin").write_bytes(b"dirty")
+    quality_v4_directory = output / "quality_v4" / "full_exports"
+    quality_v4_directory.mkdir(parents=True)
+    quality_v4_files = (
+        quality_v4_directory / f"{dirty_episode}.h5",
+        quality_v4_directory / f"{dirty_episode}.gate.json",
+    )
+    for path in quality_v4_files:
+        path.write_bytes(b"dirty")
     rows = [
         SimpleNamespace(request=SimpleNamespace(episode_id="episode-0")),
         SimpleNamespace(request=SimpleNamespace(episode_id=dirty_episode)),
@@ -2128,9 +2136,14 @@ def test_resume_preserves_dirty_tail_and_restores_committed_boundary(
     assert not lightweight.exists()
     assert not published.exists()
     assert not (output / ".staging").exists()
+    assert not any(path.exists() for path in quality_v4_files)
     assert (recovery / "lightweight" / dirty_episode / "evidence.bin").is_file()
     assert (
         recovery / "episodes" / "t2_trans" / "train" / dirty_episode / "evidence.bin"
+    ).is_file()
+    assert (recovery / "quality_v4" / "full_exports" / f"{dirty_episode}.h5").is_file()
+    assert (
+        recovery / "quality_v4" / "full_exports" / f"{dirty_episode}.gate.json"
     ).is_file()
 
 
