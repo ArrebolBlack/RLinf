@@ -67,6 +67,7 @@ EXECUTION_CONTRACT = {
     "control_hz": 20,
     "fresh_replay_blocking": True,
     "horizon_control_steps": 160,
+    "mjwarp_graph_conditional": True,
     "observation_track": "state",
     "physics_hz": 500,
     "physics_steps_per_control": 25,
@@ -76,6 +77,7 @@ EXECUTION_CONTRACT = {
     "review_materialization": "independent_scene_wrist_render_v1",
     "sensor_hz": 20,
     "terminal_ledger_exact_once": True,
+    "warp_deterministic_mode": "RUN_TO_RUN",
 }
 
 

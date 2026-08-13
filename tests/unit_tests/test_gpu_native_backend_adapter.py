@@ -330,6 +330,42 @@ def test_adapter_request_mapping(fake_se3_wam: _FakeSe3Wam) -> None:
     assert backend.backend_id == "mjwarp_gpu_v1"
 
 
+def test_deterministic_solver_configuration_reaches_fresh_replay(
+    fake_se3_wam: _FakeSe3Wam,
+) -> None:
+    backend = GpuNativeBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        solver_deterministic_mode="RUN_TO_RUN",
+        graph_conditional=True,
+    )
+    _, kwargs = fake_se3_wam.artifacts["factory_kwargs"]
+    assert kwargs["engine_kwargs"] == {
+        "solver_deterministic_mode": "RUN_TO_RUN",
+        "graph_conditional": True,
+    }
+
+    replay = backend.new_replay_backend()
+    assert replay is not backend
+    _, replay_kwargs = fake_se3_wam.artifacts["factory_kwargs"]
+    assert replay_kwargs["engine_kwargs"] == {
+        "solver_deterministic_mode": "RUN_TO_RUN",
+        "graph_conditional": True,
+    }
+
+
+@pytest.mark.parametrize("mode", ["SINGLE_RUN", "", 1])
+def test_adapter_rejects_unknown_solver_deterministic_mode(mode: Any) -> None:
+    with pytest.raises(ValueError, match="solver_deterministic_mode"):
+        GpuNativeBackendEnv(
+            task_id="p0_grasp",
+            num_envs=1,
+            export_dir="/tmp/export",
+            solver_deterministic_mode=mode,
+        )
+
+
 def test_planner_is_current_state_closed_loop_and_tape_replay_is_diagnostic(
     fake_se3_wam: _FakeSe3Wam,
 ) -> None:

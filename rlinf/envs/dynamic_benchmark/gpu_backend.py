@@ -196,6 +196,8 @@ class GpuNativeBackendEnv:
         observation_track: str | Any | None = "state",
         require_exact_export_identity: bool = False,
         render_observations: bool = False,
+        solver_deterministic_mode: str | None = None,
+        graph_conditional: bool | None = None,
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
             raise ValueError("GPU-native backend requires a positive num_envs")
@@ -249,6 +251,12 @@ class GpuNativeBackendEnv:
                 raise ValueError("online Planner mode requires evaluator_backend_id")
         if not isinstance(render_observations, bool):
             raise TypeError("render_observations must be a boolean")
+        if solver_deterministic_mode not in {None, "NOT_GUARANTEED", "RUN_TO_RUN"}:
+            raise ValueError(
+                "solver_deterministic_mode must be NOT_GUARANTEED, RUN_TO_RUN, or None"
+            )
+        if graph_conditional is not None and not isinstance(graph_conditional, bool):
+            raise TypeError("graph_conditional must be a boolean or None")
         try:
             from se3_wam.benchmark.contracts import ObservationTrack
             from se3_wam.benchmark.gpu_native.factory import make_gpu_native_env
@@ -300,6 +308,8 @@ class GpuNativeBackendEnv:
         self._task_quality_schema_version = task_quality_schema_version
         self._task_quality_evaluator_backend_id = task_quality_evaluator_backend_id
         self._require_exact_export_identity = require_exact_export_identity
+        self._solver_deterministic_mode = solver_deterministic_mode
+        self._graph_conditional = graph_conditional
         self._consumer = GpuNativeConsumer.RL
         self._render_observations = render_observations
         runtime_evidence = ()
@@ -329,6 +339,8 @@ class GpuNativeBackendEnv:
             ("expected_device_uuid", expected_gpu_uuid),
             ("expected_source_commit", expected_se3_source_commit),
             ("expected_source_tree", expected_se3_source_tree),
+            ("solver_deterministic_mode", solver_deterministic_mode),
+            ("graph_conditional", graph_conditional),
         ):
             if value is not None:
                 engine_kwargs[name] = value
@@ -555,6 +567,8 @@ class GpuNativeBackendEnv:
             observation_track=self._observation_track.value,
             require_exact_export_identity=self._require_exact_export_identity,
             render_observations=self._render_observations,
+            solver_deterministic_mode=self._solver_deterministic_mode,
+            graph_conditional=self._graph_conditional,
         )
 
     @property

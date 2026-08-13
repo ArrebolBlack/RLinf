@@ -434,6 +434,16 @@ def _validate_provenance(
         or provenance.get("git_tree") != expected_tree
     ):
         raise RuntimeError("t1_xyz result SE3 source provenance drifted")
+    runtime_versions = provenance.get("runtime_versions")
+    if not isinstance(runtime_versions, Mapping):
+        raise RuntimeError("t1_xyz result lacks runtime version provenance")
+    if (
+        runtime_versions.get("warp-deterministic-mode")
+        != EXECUTION_CONTRACT["warp_deterministic_mode"]
+        or runtime_versions.get("mjwarp-graph-conditional")
+        != str(EXECUTION_CONTRACT["mjwarp_graph_conditional"]).lower()
+    ):
+        raise RuntimeError("t1_xyz result deterministic solver provenance drifted")
 
 
 def _validate_module_root(module: Any, expected_root: Path, name: str) -> None:
@@ -762,6 +772,8 @@ def main() -> None:
         observation_track=EXECUTION_CONTRACT["observation_track"],
         require_exact_export_identity=True,
         render_observations=True,
+        solver_deterministic_mode=EXECUTION_CONTRACT["warp_deterministic_mode"],
+        graph_conditional=EXECUTION_CONTRACT["mjwarp_graph_conditional"],
     )
     try:
         if (

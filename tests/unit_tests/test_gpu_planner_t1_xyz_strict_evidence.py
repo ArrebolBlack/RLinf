@@ -60,8 +60,40 @@ def test_result_runners_expose_only_frozen_manifest_strict_evidence() -> None:
 def test_frozen_execution_uses_state_e7_and_canonical_evaluator() -> None:
     assert STRICT.EXECUTION_CONTRACT["observation_track"] == "state"
     assert STRICT.EXECUTION_CONTRACT["action_mode"] == "E7"
+    assert STRICT.EXECUTION_CONTRACT["warp_deterministic_mode"] == "RUN_TO_RUN"
+    assert STRICT.EXECUTION_CONTRACT["mjwarp_graph_conditional"] is True
     assert STRICT.QUALITY_SCHEMA_VERSION == "db0-episode-task-quality-v2"
     assert STRICT.QUALITY_EVALUATOR_ID == "mjwarp_gpu_v1"
+
+
+def test_runner_requires_run_to_run_solver_provenance() -> None:
+    provenance = {
+        "backend_id": "mjwarp_gpu_v1",
+        "device_platform": "cuda",
+        "physical_device_uuid": "GPU-test",
+        "git_commit": "a" * 40,
+        "git_tree": "b" * 40,
+        "runtime_versions": {
+            "warp-deterministic-mode": "RUN_TO_RUN",
+            "mjwarp-graph-conditional": "true",
+        },
+    }
+    E0._validate_provenance(
+        provenance,
+        expected_gpu_uuid="GPU-test",
+        expected_commit="a" * 40,
+        expected_tree="b" * 40,
+    )
+
+    wrong_mode = copy.deepcopy(provenance)
+    wrong_mode["runtime_versions"]["warp-deterministic-mode"] = "NOT_GUARANTEED"
+    with pytest.raises(RuntimeError, match="deterministic solver provenance"):
+        E0._validate_provenance(
+            wrong_mode,
+            expected_gpu_uuid="GPU-test",
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
 
 def test_d32_does_not_count_replay_audit_mismatch_as_completed_or_success() -> None:
