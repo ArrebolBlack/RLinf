@@ -238,8 +238,12 @@ class GpuCurrentStatePlanner:
         quality_schema_version: str = DEFAULT_QUALITY_SCHEMA_VERSION,
     ) -> None:
         self._require_gpu_backend(backend, task_id)
-        if getattr(backend, "num_envs", None) != 1:
-            raise ValueError("current-state Planner currently requires one GPU lane")
+        if (
+            isinstance(getattr(backend, "num_envs", None), bool)
+            or not isinstance(getattr(backend, "num_envs", None), int)
+            or getattr(backend, "num_envs", 0) < 1
+        ):
+            raise ValueError("current-state Planner requires at least one GPU lane")
         if (
             isinstance(max_control_steps, bool)
             or not isinstance(max_control_steps, int)
@@ -334,6 +338,8 @@ class GpuCurrentStatePlanner:
     def rollout(self, request: Any | None = None) -> PlannerTape:
         """Execute one live current-observation rollout and return its tape."""
 
+        if self.backend.num_envs != 1:
+            raise ValueError("rollout requires a one-lane GPU backend; use rollout_batch")
         if request is None:
             request = self.backend.next_request()
         if getattr(request, "task_id", None) != self.task_id:
@@ -391,6 +397,112 @@ class GpuCurrentStatePlanner:
             terminal_row=terminal_rows[0],
             source_identity=self.source_identity,
             action_tape_sha256=_action_digest(tuple(actions)),
+        )
+
+    def rollout_batch(self, requests: Any) -> tuple[PlannerTape, ...]:
+        """Execute independent live current-observation rollouts in one GPU batch.
+
+        Each lane owns its own host Planner instance and action/observation tape;
+        the CUDA backend remains the only state transition and terminal/evaluator
+        authority.  Inactive lanes submit ``None`` after natural termination so
+        the batch can finish without padding a terminal episode with actions.
+        """
+
+        request_tuple = tuple(requests)
+        if len(request_tuple) != self.backend.num_envs:
+            raise ValueError("batch rollout requires one request per GPU lane")
+        if not request_tuple:
+            raise ValueError("batch rollout requires at least one request")
+        for request in request_tuple:
+            if getattr(request, "task_id", None) != self.task_id:
+                raise ValueError("Planner request task_id differs from the configured task")
+
+        planners: list[Any] = []
+        for request in request_tuple:
+            planner_result = self._planner_factory(self.task_id, request)
+            planner = (
+                planner_result[0]
+                if isinstance(planner_result, tuple)
+                else planner_result
+            )
+            reset = getattr(planner, "reset", None)
+            if callable(reset):
+                reset()
+            planners.append(planner)
+
+        reset_observations = tuple(self.backend.reset(request_tuple))
+        if len(reset_observations) != len(request_tuple) or any(
+            observation is None for observation in reset_observations
+        ):
+            raise RuntimeError("GPU backend batch reset did not return all current observations")
+
+        observations = [[observation] for observation in reset_observations]
+        actions: list[list[Any]] = [[] for _ in request_tuple]
+        results: list[list[Any]] = [[] for _ in request_tuple]
+        terminal_rows: list[Any] = []
+        active = np.ones(len(request_tuple), dtype=np.bool_)
+
+        for _ in range(self.max_control_steps):
+            commands: list[Any | None] = [None] * len(request_tuple)
+            for lane in np.flatnonzero(active):
+                lane_index = int(lane)
+                act = getattr(planners[lane_index], "act", None)
+                if not callable(act):
+                    raise TypeError("Planner must expose act(current_observation)")
+                commands[lane_index] = self._coerce_action(
+                    act(observations[lane_index][-1]),
+                    request_tuple[lane_index],
+                    observations[lane_index][-1],
+                )
+
+            step_results = tuple(self.backend.step(tuple(commands)))
+            if len(step_results) != len(request_tuple):
+                raise RuntimeError("GPU backend batch step returned the wrong lane count")
+            terminal_rows.extend(tuple(getattr(self.backend, "last_terminal_rows", ())))
+
+            done = np.zeros(len(request_tuple), dtype=np.bool_)
+            for lane in np.flatnonzero(active):
+                lane_index = int(lane)
+                result = step_results[lane_index]
+                if result is None:
+                    raise RuntimeError("GPU backend batch step lost an active lane result")
+                next_observation = getattr(result, "observation", None)
+                if next_observation is None:
+                    raise RuntimeError("GPU batch step result has no next current observation")
+                actions[lane_index].append(commands[lane_index])
+                results[lane_index].append(result)
+                observations[lane_index].append(next_observation)
+                done[lane_index] = bool(getattr(result, "terminated", False)) or bool(
+                    getattr(result, "truncated", False)
+                )
+            active &= ~done
+            if not np.any(active):
+                break
+        else:
+            raise RuntimeError("Planner batch rollout exceeded the frozen GPU environment horizon")
+
+        rows_by_lane: dict[int, Any] = {}
+        for row in terminal_rows:
+            lane = int(getattr(row, "lane"))
+            if lane in rows_by_lane:
+                raise RuntimeError(f"GPU Planner batch produced duplicate terminal row for lane {lane}")
+            rows_by_lane[lane] = row
+        if set(rows_by_lane) != set(range(len(request_tuple))):
+            raise RuntimeError(
+                "GPU Planner batch must produce exactly one terminal ledger row per lane"
+            )
+
+        return tuple(
+            PlannerTape(
+                request=request_tuple[lane],
+                observations=tuple(observations[lane]),
+                actions=tuple(actions[lane]),
+                results=tuple(results[lane]),
+                terminal_row=rows_by_lane[lane],
+                source_identity=self.source_identity,
+                action_tape_sha256=_action_digest(tuple(actions[lane])),
+            )
+            for lane in range(len(request_tuple))
         )
 
     def replay(
