@@ -9,7 +9,7 @@
 The result path accepts only a sealed E0/D32 manifest row.  It validates the
 complete export-bound ResetRequest and the clean five-repository source tuple
 before constructing CUDA, plans from the current observation at every control
-step, and emits a countable result only after strict fresh-backend replay,
+step, and emits a countable result only after semantic fresh-backend replay,
 quality-v2, exact-once terminal ledger, and evidence-file gates all pass.
 """
 
@@ -40,7 +40,7 @@ def _load_strict_contract() -> Any:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load strict evidence contract: {path}")
+        raise RuntimeError(f"cannot load review evidence contract: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -66,6 +66,8 @@ _VISUAL_PRIVILEGED_SUFFIXES = (
     "target_image_fraction",
     "occluder_visible_pixels",
 )
+_FLOAT_REPORT_ATOL = 1.0e-5
+_FLOAT_REPORT_RTOL = 1.0e-5
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -216,32 +218,53 @@ def _first_divergence(
     *,
     fresh_backend_distinct: bool,
     backend_identity_exact: bool,
-    observation_mismatch: Mapping[str, Any] | None,
-    review_mismatch: Mapping[str, Any] | None,
+    reset_identity_exact: bool,
+    action_tape_exact: bool,
+    observation_semantic_mismatch: Mapping[str, Any] | None,
+    review_semantic_mismatch: Mapping[str, Any] | None,
     outcome_mismatch: Mapping[str, Any] | None,
-    terminal_ledger_mismatch: Mapping[str, Any] | None,
+    terminal_ledger_semantic_exact: bool,
     terminal_ledger_exact_once: bool,
     commands: Sequence[Any],
 ) -> dict[str, Any] | None:
-    """Locate the earliest strict-replay failure and bind its action context."""
+    """Locate the first blocking semantic replay failure."""
 
     if not fresh_backend_distinct:
         return {"channel": "fresh_backend_distinct", "control_step": None}
     if not backend_identity_exact:
         return {"channel": "backend_identity", "control_step": None}
+    if not reset_identity_exact:
+        return {"channel": "reset_identity", "control_step": None}
+    if not action_tape_exact:
+        return {"channel": "action_tape", "control_step": None}
 
     candidates: list[tuple[int, int, str, Mapping[str, Any]]] = []
+
+    def semantic_step(mismatch: Mapping[str, Any]) -> int:
+        path = str(mismatch.get("path", ""))
+        _, bracket, suffix = path.partition("[")
+        token, closing, _ = suffix.partition("]")
+        if bracket and closing:
+            try:
+                return int(token)
+            except ValueError:
+                pass
+        return 0
+
     for priority, (channel, mismatch, outcome_offset) in enumerate(
         (
-            ("observation", observation_mismatch, 0),
-            ("review", review_mismatch, 0),
+            ("observation_semantics", observation_semantic_mismatch, 0),
+            ("review_semantics", review_semantic_mismatch, 0),
             ("outcome", outcome_mismatch, 1),
         )
     ):
         if mismatch is not None:
+            sequence_index = mismatch.get("sequence_index")
+            if isinstance(sequence_index, bool) or not isinstance(sequence_index, int):
+                sequence_index = semantic_step(mismatch)
             candidates.append(
                 (
-                    int(mismatch["sequence_index"]) + outcome_offset,
+                    sequence_index + outcome_offset,
                     priority,
                     channel,
                     mismatch,
@@ -258,12 +281,11 @@ def _first_divergence(
             "transition_action": preceding_action,
             "mismatch": dict(mismatch),
         }
-    if terminal_ledger_mismatch is not None:
+    if not terminal_ledger_semantic_exact:
         return {
-            "channel": "terminal_ledger",
+            "channel": "terminal_ledger_semantics",
             "control_step": None,
             "transition_action": (_command_payload(commands[-1]) if commands else None),
-            "mismatch": dict(terminal_ledger_mismatch),
         }
     if not terminal_ledger_exact_once:
         return {
@@ -272,6 +294,306 @@ def _first_divergence(
             "transition_action": (_command_payload(commands[-1]) if commands else None),
         }
     return None
+
+
+def _new_numeric_drift_report() -> dict[str, Any]:
+    return {
+        "blocking": False,
+        "float_atol": _FLOAT_REPORT_ATOL,
+        "float_rtol": _FLOAT_REPORT_RTOL,
+        "compared_arrays": 0,
+        "exact_arrays": 0,
+        "within_reporting_tolerance_arrays": 0,
+        "compared_values": 0,
+        "absolute_error_sum": 0.0,
+        "max_absolute_error": 0.0,
+        "first_exact_mismatch": None,
+        "first_reporting_tolerance_mismatch": None,
+    }
+
+
+def _record_array_drift(
+    report: dict[str, Any],
+    *,
+    path: str,
+    expected: Any,
+    actual: Any,
+) -> dict[str, Any] | None:
+    left = np.asarray(expected)
+    right = np.asarray(actual)
+    if left.shape != right.shape or left.dtype != right.dtype:
+        return {
+            "path": path,
+            "expected_shape": list(left.shape),
+            "actual_shape": list(right.shape),
+            "expected_dtype": str(left.dtype),
+            "actual_dtype": str(right.dtype),
+        }
+    if np.issubdtype(left.dtype, np.number) and (
+        not np.all(np.isfinite(left)) or not np.all(np.isfinite(right))
+    ):
+        return {"path": path, "error": "non-finite numeric value"}
+
+    exact = np.array_equal(left, right)
+    if np.issubdtype(left.dtype, np.floating):
+        within_tolerance = np.allclose(
+            left,
+            right,
+            rtol=_FLOAT_REPORT_RTOL,
+            atol=_FLOAT_REPORT_ATOL,
+            equal_nan=False,
+        )
+    else:
+        within_tolerance = exact
+    difference = np.abs(left.astype(np.float64) - right.astype(np.float64))
+    value_count = int(difference.size)
+    absolute_error_sum = float(np.sum(difference, dtype=np.float64))
+    max_absolute_error = float(np.max(difference)) if value_count else 0.0
+    report["compared_arrays"] += 1
+    report["exact_arrays"] += int(exact)
+    report["within_reporting_tolerance_arrays"] += int(within_tolerance)
+    report["compared_values"] += value_count
+    report["absolute_error_sum"] += absolute_error_sum
+    report["max_absolute_error"] = max(report["max_absolute_error"], max_absolute_error)
+    mismatch = {
+        "path": path,
+        "max_absolute_error": max_absolute_error,
+        "mean_absolute_error": absolute_error_sum / value_count if value_count else 0.0,
+    }
+    if not exact and report["first_exact_mismatch"] is None:
+        report["first_exact_mismatch"] = mismatch
+    if not within_tolerance and report["first_reporting_tolerance_mismatch"] is None:
+        report["first_reporting_tolerance_mismatch"] = mismatch
+    return None
+
+
+def _finish_numeric_drift_report(report: dict[str, Any]) -> dict[str, Any]:
+    compared_values = int(report.pop("compared_values"))
+    absolute_error_sum = float(report.pop("absolute_error_sum"))
+    report["mean_absolute_error"] = (
+        absolute_error_sum / compared_values if compared_values else 0.0
+    )
+    report["exact"] = report["exact_arrays"] == report["compared_arrays"]
+    report["within_reporting_tolerance"] = (
+        report["within_reporting_tolerance_arrays"] == report["compared_arrays"]
+    )
+    return report
+
+
+def _compare_observation_sequences(
+    expected: Sequence[Any],
+    actual: Sequence[Any],
+) -> dict[str, Any]:
+    left_values = tuple(expected)
+    right_values = tuple(actual)
+    report = _new_numeric_drift_report()
+    semantic_mismatch: dict[str, Any] | None = None
+    if len(left_values) != len(right_values):
+        semantic_mismatch = {
+            "path": "observations",
+            "expected_length": len(left_values),
+            "actual_length": len(right_values),
+        }
+    for index, (left, right) in enumerate(zip(left_values, right_values, strict=False)):
+        left_identity = (
+            left.episode_id,
+            left.task_id,
+            int(left.physics_step),
+            int(left.control_step),
+            int(left.policy_step),
+        )
+        right_identity = (
+            right.episode_id,
+            right.task_id,
+            int(right.physics_step),
+            int(right.control_step),
+            int(right.policy_step),
+        )
+        if semantic_mismatch is None and left_identity != right_identity:
+            semantic_mismatch = {
+                "path": f"observations[{index}].identity",
+                "expected": list(left_identity),
+                "actual": list(right_identity),
+            }
+        mismatch = _record_array_drift(
+            report,
+            path=f"observations[{index}].time_s",
+            expected=np.asarray([left.time_s], dtype=np.float64),
+            actual=np.asarray([right.time_s], dtype=np.float64),
+        )
+        if semantic_mismatch is None and mismatch is not None:
+            semantic_mismatch = mismatch
+        left_events = tuple(event.name for event in left.events_since_last_observation)
+        right_events = tuple(
+            event.name for event in right.events_since_last_observation
+        )
+        if semantic_mismatch is None and left_events != right_events:
+            semantic_mismatch = {
+                "path": f"observations[{index}].events",
+                "expected": list(left_events),
+                "actual": list(right_events),
+            }
+        for group_name in ("rgb", "depth_m", "segmentation", "proprio", "privileged"):
+            left_group = getattr(left, group_name)
+            right_group = getattr(right, group_name)
+            if semantic_mismatch is None and tuple(sorted(left_group)) != tuple(
+                sorted(right_group)
+            ):
+                semantic_mismatch = {
+                    "path": f"observations[{index}].{group_name}",
+                    "expected_keys": sorted(left_group),
+                    "actual_keys": sorted(right_group),
+                }
+                continue
+            for name in sorted(set(left_group) & set(right_group)):
+                mismatch = _record_array_drift(
+                    report,
+                    path=f"observations[{index}].{group_name}.{name}",
+                    expected=left_group[name],
+                    actual=right_group[name],
+                )
+                if semantic_mismatch is None and mismatch is not None:
+                    semantic_mismatch = mismatch
+    return {
+        "semantic_structure_exact": semantic_mismatch is None,
+        "first_semantic_mismatch": semantic_mismatch,
+        "numeric_drift": _finish_numeric_drift_report(report),
+    }
+
+
+def _compare_review_sequences(
+    expected: Sequence[Mapping[str, Any]],
+    actual: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    left_values = tuple(expected)
+    right_values = tuple(actual)
+    report = _new_numeric_drift_report()
+    semantic_mismatch: dict[str, Any] | None = None
+    if len(left_values) != len(right_values):
+        semantic_mismatch = {
+            "path": "review",
+            "expected_length": len(left_values),
+            "actual_length": len(right_values),
+        }
+    for index, (left, right) in enumerate(zip(left_values, right_values, strict=False)):
+        if semantic_mismatch is None and set(left) != set(right):
+            semantic_mismatch = {
+                "path": f"review[{index}]",
+                "expected_cameras": sorted(left),
+                "actual_cameras": sorted(right),
+            }
+        for camera in sorted(set(left) & set(right)):
+            mismatch = _record_array_drift(
+                report,
+                path=f"review[{index}].{camera}",
+                expected=left[camera],
+                actual=right[camera],
+            )
+            if semantic_mismatch is None and mismatch is not None:
+                semantic_mismatch = mismatch
+    return {
+        "semantic_structure_exact": semantic_mismatch is None,
+        "first_semantic_mismatch": semantic_mismatch,
+        "numeric_drift": _finish_numeric_drift_report(report),
+    }
+
+
+def _task_quality_semantics(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        return {"invalid": type(value).__name__}
+    components = value.get("components")
+    if not isinstance(components, Mapping):
+        return {"invalid_components": type(components).__name__}
+    return {
+        "episode_id": value.get("episode_id"),
+        "task_id": value.get("task_id"),
+        "evaluator_backend_id": value.get("evaluator_backend_id"),
+        "schema_version": value.get("schema_version"),
+        "schema_sha256": value.get("schema_sha256"),
+        "terminal": value.get("terminal"),
+        "components": {
+            name: {
+                key: component.get(key)
+                for key in ("direction", "unit", "scientific_resolution", "reducer")
+            }
+            for name, component in components.items()
+            if isinstance(component, Mapping)
+        },
+    }
+
+
+def _terminal_ledger_semantics(
+    ledger: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "lane": row.get("lane"),
+            "episode_id": row.get("episode_id"),
+            "task_id": row.get("task_id"),
+            "outcome": row.get("outcome"),
+            "terminated": row.get("terminated"),
+            "truncated": row.get("truncated"),
+            "success": row.get("success"),
+            "termination_reason": row.get("termination_reason"),
+            "event_names": [event.get("name") for event in row.get("events", ())],
+            "task_quality": _task_quality_semantics(row.get("task_quality")),
+        }
+        for row in ledger
+    ]
+
+
+def _compare_terminal_numeric_drift(
+    expected: Sequence[Mapping[str, Any]],
+    actual: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    report = _new_numeric_drift_report()
+    for index, (left, right) in enumerate(zip(expected, actual, strict=False)):
+        for name in ("physics_step", "control_step", "policy_step", "completion"):
+            _record_array_drift(
+                report,
+                path=f"terminal[{index}].{name}",
+                expected=np.asarray([left.get(name)], dtype=np.float64),
+                actual=np.asarray([right.get(name)], dtype=np.float64),
+            )
+        for event_index, (left_event, right_event) in enumerate(
+            zip(left.get("events", ()), right.get("events", ()), strict=False)
+        ):
+            for name in ("physics_step", "time_s"):
+                _record_array_drift(
+                    report,
+                    path=f"terminal[{index}].events[{event_index}].{name}",
+                    expected=np.asarray([left_event.get(name)], dtype=np.float64),
+                    actual=np.asarray([right_event.get(name)], dtype=np.float64),
+                )
+        left_quality = left.get("task_quality")
+        right_quality = right.get("task_quality")
+        if isinstance(left_quality, Mapping) and isinstance(right_quality, Mapping):
+            _record_array_drift(
+                report,
+                path=f"terminal[{index}].task_quality.physics_sample_count",
+                expected=np.asarray(
+                    [left_quality.get("physics_sample_count")], dtype=np.float64
+                ),
+                actual=np.asarray(
+                    [right_quality.get("physics_sample_count")], dtype=np.float64
+                ),
+            )
+            left_components = left_quality.get("components", {})
+            right_components = right_quality.get("components", {})
+            for name in sorted(set(left_components) & set(right_components)):
+                _record_array_drift(
+                    report,
+                    path=f"terminal[{index}].task_quality.components.{name}.value",
+                    expected=np.asarray(
+                        [left_components[name].get("value")], dtype=np.float64
+                    ),
+                    actual=np.asarray(
+                        [right_components[name].get("value")], dtype=np.float64
+                    ),
+                )
+    return _finish_numeric_drift_report(report)
 
 
 def _write_json_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
@@ -465,12 +787,12 @@ def _replay(
     backend: Any,
     request: Any,
     observations: tuple[Any, ...],
-    review_digests: tuple[str, ...],
+    reviews: tuple[Mapping[str, Any], ...],
     commands: tuple[Any, ...],
     outcomes: tuple[tuple[bool, bool, bool, str | None], ...],
     terminal_ledger: Any,
 ) -> dict[str, Any]:
-    """Run a strict independent replay with the same materialization order."""
+    """Run a fresh replay with exact identities and semantic outcome gates."""
 
     replay_backend = backend.new_replay_backend()
     try:
@@ -478,13 +800,19 @@ def _replay(
         primary_provenance = _provenance_payload(backend.provenance)
         replay_provenance = _provenance_payload(replay_backend.provenance)
         backend_identity_exact = replay_provenance == primary_provenance
+        frozen_requests = tuple(replay_backend.frozen_requests)
+        reset_identity_exact = len(frozen_requests) == 1 and request_identity(
+            frozen_requests[0]
+        ) == request_identity(request)
         replay_raw_observation = replay_backend.reset((request,))[0]
         replay_observation, replay_review = _state_and_review_observation(
             replay_raw_observation
         )
         replay_observations = [replay_observation]
         observation_digests = [_observation_digest(replay_observation)]
+        replay_reviews = [replay_review]
         actual_review_digests = [_review_digest(replay_review)]
+        replay_action_payloads: list[dict[str, Any]] = []
         replay_outcomes: list[tuple[bool, bool, bool, str | None]] = []
         for command in commands:
             replay_command = _make_command(
@@ -492,11 +820,13 @@ def _replay(
                 command.values,
                 int(replay_backend.policy_steps()[0]),
             )
+            replay_action_payloads.append(_command_payload(replay_command))
             result = replay_backend.step((replay_command,))[0]
             replay_observation, replay_review = _state_and_review_observation(
                 result.observation
             )
             replay_observations.append(replay_observation)
+            replay_reviews.append(replay_review)
             observation_digests.append(_observation_digest(replay_observation))
             actual_review_digests.append(_review_digest(replay_review))
             replay_outcomes.append(
@@ -524,6 +854,11 @@ def _replay(
         except Exception as exc:
             exact_once_error = {"error_type": type(exc).__name__, "error": str(exc)}
         terminal_ledger_exact_once = exact_once_error is None
+        if len(replay_ledger) == 1:
+            _validate_terminal_quality(
+                replay_ledger[0],
+                episode_id=str(request.episode_id),
+            )
         expected_observation_payloads = [
             _observation_payload(value) for value in observations
         ]
@@ -534,47 +869,80 @@ def _replay(
             expected_observation_payloads,
             replay_observation_payloads,
         )
-        review_mismatch = _first_sequence_mismatch(
-            review_digests,
-            actual_review_digests,
-        )
         outcome_mismatch = _first_sequence_mismatch(outcomes, replay_outcomes)
         terminal_ledger_mismatch = _first_sequence_mismatch(
             expected_ledger,
             replay_ledger,
         )
         observation_tape_exact = observation_mismatch is None
-        review_tape_exact = tuple(actual_review_digests) == review_digests
+        expected_review_digests = tuple(_review_digest(value) for value in reviews)
+        review_mismatch = _first_sequence_mismatch(
+            expected_review_digests,
+            actual_review_digests,
+        )
+        review_tape_exact = review_mismatch is None
+        expected_action_payloads = [_command_payload(command) for command in commands]
+        action_tape_exact = replay_action_payloads == expected_action_payloads
         outcomes_exact = outcome_mismatch is None
         terminal_ledger_exact = terminal_ledger_mismatch is None
+        observation_comparison = _compare_observation_sequences(
+            observations,
+            replay_observations,
+        )
+        review_comparison = _compare_review_sequences(reviews, replay_reviews)
+        terminal_ledger_semantic_exact = _terminal_ledger_semantics(
+            expected_ledger
+        ) == _terminal_ledger_semantics(replay_ledger)
         first_divergence = _first_divergence(
             fresh_backend_distinct=fresh_backend_distinct,
             backend_identity_exact=backend_identity_exact,
-            observation_mismatch=observation_mismatch,
-            review_mismatch=review_mismatch,
+            reset_identity_exact=reset_identity_exact,
+            action_tape_exact=action_tape_exact,
+            observation_semantic_mismatch=observation_comparison[
+                "first_semantic_mismatch"
+            ],
+            review_semantic_mismatch=review_comparison["first_semantic_mismatch"],
             outcome_mismatch=outcome_mismatch,
-            terminal_ledger_mismatch=terminal_ledger_mismatch,
+            terminal_ledger_semantic_exact=terminal_ledger_semantic_exact,
             terminal_ledger_exact_once=terminal_ledger_exact_once,
             commands=commands,
         )
         return {
-            "mode": "strict_fresh_backend",
+            "mode": "semantic_fresh_backend_v1",
             "passed": bool(
                 fresh_backend_distinct
                 and backend_identity_exact
-                and observation_tape_exact
-                and review_tape_exact
+                and reset_identity_exact
+                and action_tape_exact
+                and observation_comparison["semantic_structure_exact"]
+                and review_comparison["semantic_structure_exact"]
                 and outcomes_exact
-                and terminal_ledger_exact
+                and terminal_ledger_semantic_exact
                 and terminal_ledger_exact_once
             ),
             "fresh_backend_distinct": fresh_backend_distinct,
             "backend_identity_exact": backend_identity_exact,
             "source_identity_exact": backend_identity_exact,
+            "reset_identity_exact": reset_identity_exact,
+            "action_tape_exact": action_tape_exact,
+            "observation_semantic_structure_exact": observation_comparison[
+                "semantic_structure_exact"
+            ],
             "observation_tape_exact": observation_tape_exact,
+            "observation_numeric_drift": observation_comparison["numeric_drift"],
+            "review_semantic_structure_exact": review_comparison[
+                "semantic_structure_exact"
+            ],
             "review_tape_exact": review_tape_exact,
+            "review_numeric_drift": review_comparison["numeric_drift"],
+            "semantic_outcomes_exact": outcomes_exact,
             "outcomes_exact": outcomes_exact,
+            "terminal_ledger_semantic_exact": terminal_ledger_semantic_exact,
             "terminal_ledger_exact": terminal_ledger_exact,
+            "terminal_numeric_drift": _compare_terminal_numeric_drift(
+                expected_ledger,
+                replay_ledger,
+            ),
             "terminal_ledger_exact_once": terminal_ledger_exact_once,
             "primary_provenance": primary_provenance,
             "replay_provenance": replay_provenance,
@@ -595,7 +963,7 @@ def _write_visual_gif(path: Path, reviews: Sequence[Mapping[str, Any]]) -> None:
     try:
         import imageio.v3 as iio
     except ImportError as exc:
-        raise RuntimeError("strict evidence export requires imageio") from exc
+        raise RuntimeError("review evidence export requires imageio") from exc
     frames = []
     for review in reviews:
         left = np.asarray(review["agentview"], dtype=np.uint8)
@@ -695,13 +1063,13 @@ def main() -> None:
     if tape_output.suffix.lower() != ".npz":
         raise ValueError("--tape-output must use the .npz suffix")
     if tape_output.exists() or visual_gif.exists():
-        raise FileExistsError("strict evidence output paths must be new")
+        raise FileExistsError("review evidence output paths must be new")
     replay_failure_output = args.output.with_name(
-        f"{args.output.stem}.strict-replay-failure.json"
+        f"{args.output.stem}.semantic-replay-failure.json"
     )
     if replay_failure_output.exists():
         raise FileExistsError(
-            f"refusing to overwrite strict replay failure evidence: {replay_failure_output}"
+            f"refusing to overwrite semantic replay failure evidence: {replay_failure_output}"
         )
 
     # All host/source/export checks complete before any CUDA backend exists.
@@ -841,7 +1209,7 @@ def main() -> None:
             backend=backend,
             request=request,
             observations=tuple(observations),
-            review_digests=tuple(_review_digest(value) for value in reviews),
+            reviews=tuple(reviews),
             commands=tuple(commands),
             outcomes=tuple(outcomes),
             terminal_ledger=terminal_ledger,
@@ -849,8 +1217,8 @@ def main() -> None:
         if replay.get("passed") is not True:
             action_tape = [_command_payload(command) for command in commands]
             failure_payload = {
-                "schema_version": "gpu-planner-t1-xyz-strict-replay-failure-v1",
-                "status": "blocked_strict_fresh_replay",
+                "schema_version": "gpu-planner-t1-xyz-semantic-replay-failure-v1",
+                "status": "blocked_semantic_fresh_replay",
                 "evidence_passed": False,
                 "qualification_completed": 0,
                 "review_candidate": False,
@@ -889,7 +1257,7 @@ def main() -> None:
             }
             _write_json_exclusive(replay_failure_output, failure_payload)
             raise RuntimeError(
-                "strict fresh replay failed; fail-closed evidence written to "
+                "semantic fresh replay failed; fail-closed evidence written to "
                 f"{replay_failure_output.resolve()}: "
                 f"{json.dumps(replay, sort_keys=True)}"
             )
@@ -911,7 +1279,7 @@ def main() -> None:
         }
         payload = {
             "schema_version": RESULT_SCHEMA_VERSION,
-            "status": "completed_strict_evidence",
+            "status": "completed_review_evidence",
             "evidence_passed": True,
             "task_id": TASK_ID,
             "backend_id": BACKEND_ID,

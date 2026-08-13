@@ -13,7 +13,7 @@ import importlib.util
 import json
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -140,6 +140,32 @@ def _observation(step: int) -> Any:
     )
 
 
+def _numeric_drift_observation(step: int) -> Any:
+    value = _observation(step)
+    rgb = {name: np.array(array, copy=True) for name, array in value.rgb.items()}
+    rgb["agentview"][0, 0, 0] += 1
+    return replace(
+        value,
+        rgb=rgb,
+        proprio={"robot0": np.asarray([step + 1.0e-3], dtype=np.float64)},
+    )
+
+
+def _request() -> Any:
+    return SimpleNamespace(
+        action_mode=_ActionMode.E7,
+        api_version="gpu-native-api-v0.2",
+        episode_id="episode-0",
+        factors={},
+        object_mode="dynamic",
+        observation_track="state",
+        reset_mode="exact",
+        seed=1000,
+        split="test_id",
+        task_id="t1_xyz",
+    )
+
+
 def test_state_planner_and_review_materialization_are_separate() -> None:
     raw = _observation(0)
     state, review = E0._state_and_review_observation(raw)
@@ -155,6 +181,14 @@ def test_state_planner_and_review_materialization_are_separate() -> None:
 
 
 def _terminal_ledger() -> Any:
+    quality_payload = {
+        "episode_id": "episode-0",
+        "task_id": "t1_xyz",
+        "schema_version": STRICT.QUALITY_SCHEMA_VERSION,
+        "evaluator_backend_id": STRICT.QUALITY_EVALUATOR_ID,
+        "terminal": True,
+        "components": {},
+    }
     row = SimpleNamespace(
         lane=0,
         episode_id="episode-0",
@@ -169,7 +203,7 @@ def _terminal_ledger() -> Any:
         policy_step=1,
         completion=1.0,
         events=(),
-        task_quality=None,
+        task_quality=SimpleNamespace(to_dict=lambda: dict(quality_payload)),
     )
     return SimpleNamespace(rows=(row,))
 
@@ -213,6 +247,8 @@ def test_fresh_replay_rejects_backend_source_identity_mismatch(
         gpu_backend,
     )
 
+    request = _request()
+
     class _FreshReplay:
         provenance = SimpleNamespace(
             backend_id="mjwarp_gpu_v1",
@@ -220,6 +256,7 @@ def test_fresh_replay_rejects_backend_source_identity_mismatch(
             git_tree="c" * 40,
         )
         last_terminal_ledger = _terminal_ledger()
+        frozen_requests = (request,)
 
         def reset(self, requests: Any) -> tuple[Any, ...]:
             assert len(tuple(requests)) == 1
@@ -251,18 +288,18 @@ def test_fresh_replay_rejects_backend_source_identity_mismatch(
         ),
         new_replay_backend=lambda: _FreshReplay(),
     )
-    request = SimpleNamespace(action_mode=_ActionMode.E7)
-    command = SimpleNamespace(values=np.zeros(7, dtype=np.float64))
+    command = SimpleNamespace(
+        mode=_ActionMode.E7,
+        policy_step=0,
+        values=np.zeros(7, dtype=np.float64),
+    )
     state_0, review_0 = E0._state_and_review_observation(_observation(0))
     state_1, review_1 = E0._state_and_review_observation(_observation(1))
     replay = E0._replay(
         backend=primary,
         request=request,
         observations=(state_0, state_1),
-        review_digests=(
-            E0._review_digest(review_0),
-            E0._review_digest(review_1),
-        ),
+        reviews=(review_0, review_1),
         commands=(command,),
         outcomes=((True, False, True, "success"),),
         terminal_ledger=_terminal_ledger(),
@@ -285,10 +322,7 @@ def test_fresh_replay_rejects_backend_source_identity_mismatch(
         backend=matching_primary,
         request=request,
         observations=(state_0, state_1),
-        review_digests=(
-            E0._review_digest(review_0),
-            E0._review_digest(review_1),
-        ),
+        reviews=(review_0, review_1),
         commands=(command,),
         outcomes=((True, False, True, "success"),),
         terminal_ledger=_terminal_ledger(),
@@ -340,9 +374,11 @@ def test_fresh_replay_records_first_observation_divergence(
         git_commit="a" * 40,
         git_tree="b" * 40,
     )
+    request = _request()
 
     class _DivergentReplay:
         last_terminal_ledger = _terminal_ledger()
+        frozen_requests = (request,)
 
         def __init__(self) -> None:
             self.provenance = provenance
@@ -373,11 +409,10 @@ def test_fresh_replay_records_first_observation_divergence(
         provenance=provenance,
         new_replay_backend=lambda: _DivergentReplay(),
     )
-    request = SimpleNamespace(action_mode=_ActionMode.E7)
     command = SimpleNamespace(
         mode=_ActionMode.E7,
         policy_step=0,
-        values=np.arange(7, dtype=np.float64),
+        values=np.linspace(-0.6, 0.6, 7, dtype=np.float64),
     )
     state_0, review_0 = E0._state_and_review_observation(_observation(0))
     state_1, review_1 = E0._state_and_review_observation(_observation(1))
@@ -386,10 +421,7 @@ def test_fresh_replay_records_first_observation_divergence(
         backend=primary,
         request=request,
         observations=(state_0, state_1),
-        review_digests=(
-            E0._review_digest(review_0),
-            E0._review_digest(review_1),
-        ),
+        reviews=(review_0, review_1),
         commands=(command,),
         outcomes=((True, False, True, "success"),),
         terminal_ledger=_terminal_ledger(),
@@ -397,20 +429,123 @@ def test_fresh_replay_records_first_observation_divergence(
 
     assert replay["passed"] is False
     assert replay["observation_tape_exact"] is False
-    assert replay["first_divergence"]["channel"] == "observation"
+    assert replay["first_divergence"]["channel"] == "observation_semantics"
     assert replay["first_divergence"]["control_step"] == 1
-    assert replay["first_divergence"]["mismatch"]["sequence_index"] == 1
+    assert replay["first_divergence"]["mismatch"]["path"].startswith("observations[1]")
     assert replay["first_divergence"]["transition_action"] == {
         "mode": "E7",
         "policy_step": 0,
-        "values": [float(value) for value in range(7)],
+        "values": np.linspace(-0.6, 0.6, 7, dtype=np.float64).tolist(),
     }
 
 
-def test_strict_replay_failure_evidence_is_exclusive(tmp_path: Path) -> None:
-    path = tmp_path / "result.strict-replay-failure.json"
+def test_fresh_replay_reports_numeric_drift_without_blocking(monkeypatch: Any) -> None:
+    api = types.ModuleType("se3_wam.benchmark.api")
+
+    class _ActionCommand:
+        def __init__(self, *, mode: Any, values: Any, policy_step: int) -> None:
+            self.mode = mode
+            self.values = values
+            self.policy_step = policy_step
+
+    api.ActionCommand = _ActionCommand
+    monkeypatch.setitem(sys.modules, "se3_wam", types.ModuleType("se3_wam"))
+    monkeypatch.setitem(
+        sys.modules, "se3_wam.benchmark", types.ModuleType("se3_wam.benchmark")
+    )
+    monkeypatch.setitem(sys.modules, "se3_wam.benchmark.api", api)
+
+    gpu_backend = types.ModuleType("rlinf.envs.dynamic_benchmark.gpu_backend")
+    gpu_backend.assert_terminal_ledger_exact_once = lambda backend, rows: (
+        "second_consumption_rejected",
+    )
+    rlinf = types.ModuleType("rlinf")
+    rlinf.__path__ = []
+    envs = types.ModuleType("rlinf.envs")
+    envs.__path__ = []
+    dynamic = types.ModuleType("rlinf.envs.dynamic_benchmark")
+    dynamic.__path__ = []
+    monkeypatch.setitem(sys.modules, "rlinf", rlinf)
+    monkeypatch.setitem(sys.modules, "rlinf.envs", envs)
+    monkeypatch.setitem(sys.modules, "rlinf.envs.dynamic_benchmark", dynamic)
+    monkeypatch.setitem(
+        sys.modules,
+        "rlinf.envs.dynamic_benchmark.gpu_backend",
+        gpu_backend,
+    )
+
+    request = _request()
+    provenance = SimpleNamespace(
+        backend_id="mjwarp_gpu_v1",
+        git_commit="a" * 40,
+        git_tree="b" * 40,
+    )
+
+    class _NumericDriftReplay:
+        frozen_requests = (request,)
+        last_terminal_ledger = _terminal_ledger()
+
+        def __init__(self) -> None:
+            self.provenance = provenance
+
+        def reset(self, requests: Any) -> tuple[Any, ...]:
+            assert tuple(requests) == (request,)
+            return (_observation(0),)
+
+        def policy_steps(self) -> np.ndarray:
+            return np.asarray([0], dtype=np.int64)
+
+        def step(self, commands: Any) -> tuple[Any, ...]:
+            assert len(tuple(commands)) == 1
+            return (
+                SimpleNamespace(
+                    observation=_numeric_drift_observation(1),
+                    terminated=True,
+                    truncated=False,
+                    success=True,
+                    termination_reason="success",
+                ),
+            )
+
+        def close(self) -> None:
+            pass
+
+    primary = SimpleNamespace(
+        provenance=provenance,
+        new_replay_backend=lambda: _NumericDriftReplay(),
+    )
+    command = SimpleNamespace(
+        mode=_ActionMode.E7,
+        policy_step=0,
+        values=np.linspace(-0.6, 0.6, 7, dtype=np.float64),
+    )
+    state_0, review_0 = E0._state_and_review_observation(_observation(0))
+    state_1, review_1 = E0._state_and_review_observation(_observation(1))
+
+    replay = E0._replay(
+        backend=primary,
+        request=request,
+        observations=(state_0, state_1),
+        reviews=(review_0, review_1),
+        commands=(command,),
+        outcomes=((True, False, True, "success"),),
+        terminal_ledger=_terminal_ledger(),
+    )
+
+    assert replay["passed"] is True
+    assert replay["first_divergence"] is None
+    assert replay["observation_semantic_structure_exact"] is True
+    assert replay["review_semantic_structure_exact"] is True
+    assert replay["observation_tape_exact"] is False
+    assert replay["review_tape_exact"] is False
+    assert replay["observation_numeric_drift"]["blocking"] is False
+    assert replay["review_numeric_drift"]["blocking"] is False
+
+
+def test_semantic_replay_failure_evidence_is_exclusive(tmp_path: Path) -> None:
+    path = tmp_path / "result.semantic-replay-failure.json"
     payload = {
-        "status": "blocked_strict_fresh_replay",
+        "status": "blocked_semantic_fresh_replay",
         "evidence_passed": False,
         "qualification_completed": 0,
     }
@@ -606,7 +741,7 @@ def _strict_result(
     ]
     return {
         "schema_version": STRICT.RESULT_SCHEMA_VERSION,
-        "status": "completed_strict_evidence",
+        "status": "completed_review_evidence",
         "evidence_passed": True,
         "task_id": "t1_xyz",
         "backend_id": "mjwarp_gpu_v1",
@@ -648,16 +783,26 @@ def _strict_result(
             "exact_once_second_consumption_rejected": True,
         },
         "replay": {
-            "mode": "strict_fresh_backend",
+            "mode": "semantic_fresh_backend_v1",
             "passed": True,
             "fresh_backend_distinct": True,
             "backend_identity_exact": True,
+            "reset_identity_exact": True,
+            "action_tape_exact": True,
+            "observation_semantic_structure_exact": True,
             "observation_tape_exact": True,
+            "observation_numeric_drift": {"blocking": False},
+            "review_semantic_structure_exact": True,
+            "review_numeric_drift": {"blocking": False},
+            "semantic_outcomes_exact": True,
             "outcomes_exact": True,
             "review_tape_exact": True,
             "source_identity_exact": True,
+            "terminal_ledger_semantic_exact": True,
             "terminal_ledger_exact": True,
+            "terminal_numeric_drift": {"blocking": False},
             "terminal_ledger_exact_once": True,
+            "first_divergence": None,
             "primary_provenance": provenance,
             "replay_provenance": provenance,
             "replay_observation_sha256": STRICT.payload_sha256(trajectory_tape),
@@ -731,16 +876,21 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     for flag in (
         "fresh_backend_distinct",
         "backend_identity_exact",
-        "observation_tape_exact",
-        "outcomes_exact",
-        "review_tape_exact",
         "source_identity_exact",
-        "terminal_ledger_exact",
+        "reset_identity_exact",
+        "action_tape_exact",
+        "observation_semantic_structure_exact",
+        "review_semantic_structure_exact",
+        "semantic_outcomes_exact",
+        "terminal_ledger_semantic_exact",
         "terminal_ledger_exact_once",
     ):
         replay_mismatch = copy.deepcopy(valid)
         replay_mismatch["replay"][flag] = False
         invalid_rows.append(replay_mismatch)
+    blocking_numeric_drift = copy.deepcopy(valid)
+    blocking_numeric_drift["replay"]["observation_numeric_drift"]["blocking"] = True
+    invalid_rows.append(blocking_numeric_drift)
     wrong_quality = copy.deepcopy(valid)
     wrong_quality["quality"]["schema_version"] = "db0-episode-task-quality-v1"
     invalid_rows.append(wrong_quality)
@@ -786,6 +936,16 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     for invalid in invalid_rows:
         with pytest.raises((RuntimeError, ValueError)):
             STRICT.validate_result_for_row(invalid, manifest=manifest, row=row)
+
+    numeric_drift_is_diagnostic = copy.deepcopy(valid)
+    numeric_drift_is_diagnostic["replay"]["observation_tape_exact"] = False
+    numeric_drift_is_diagnostic["replay"]["review_tape_exact"] = False
+    numeric_drift_is_diagnostic["replay"]["terminal_ledger_exact"] = False
+    STRICT.validate_result_for_row(
+        numeric_drift_is_diagnostic,
+        manifest=manifest,
+        row=row,
+    )
 
 
 def test_row_validator_binds_ledger_and_evidence_files(tmp_path: Path) -> None:

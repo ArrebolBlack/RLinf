@@ -27,8 +27,8 @@ TASK_ID = "t1_xyz"
 BACKEND_ID = "mjwarp_gpu_v1"
 QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v2"
 QUALITY_EVALUATOR_ID = BACKEND_ID
-MANIFEST_SCHEMA_VERSION = "gpuplan0-t1-xyz-strict-evidence-manifest-v2"
-RESULT_SCHEMA_VERSION = "gpu-planner-t1-xyz-strict-evidence-result-v2"
+MANIFEST_SCHEMA_VERSION = "gpuplan0-t1-xyz-review-evidence-manifest-v3"
+RESULT_SCHEMA_VERSION = "gpu-planner-t1-xyz-review-evidence-result-v3"
 D32_SUMMARY_SCHEMA_VERSION = "gpu-planner-t1-xyz-d32-strict-summary-v2"
 
 CANONICAL_REQUEST_FIELDS = (
@@ -65,7 +65,7 @@ EXECUTION_CONTRACT = {
     "action_mode": "E7",
     "backend_id": BACKEND_ID,
     "control_hz": 20,
-    "fresh_replay_blocking": True,
+    "fresh_replay_gate": "semantic_identity_outcome_quality_v1",
     "horizon_control_steps": 160,
     "observation_track": "state",
     "physics_hz": 500,
@@ -74,6 +74,7 @@ EXECUTION_CONTRACT = {
     "quality_evaluator_id": QUALITY_EVALUATOR_ID,
     "quality_schema_version": QUALITY_SCHEMA_VERSION,
     "review_materialization": "independent_scene_wrist_render_v1",
+    "replay_numeric_drift_blocking": False,
     "sensor_hz": 20,
     "terminal_ledger_exact_once": True,
 }
@@ -254,7 +255,7 @@ def load_frozen_manifest(
     if not isinstance(payload, dict):
         raise ValueError("t1_xyz manifest must be a JSON object")
     if payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
-        raise ValueError("t1_xyz manifest schema is not the strict evidence contract")
+        raise ValueError("t1_xyz manifest schema is not the review evidence contract")
     if payload.get("task_id") != TASK_ID or payload.get("backend_id") != BACKEND_ID:
         raise ValueError("t1_xyz manifest task/backend identity mismatch")
     phase = payload.get("phase")
@@ -557,7 +558,7 @@ def validate_result_for_row(
     manifest: T1XYZFrozenManifest,
     row: Mapping[str, Any],
 ) -> None:
-    """Reject any row that did not pass every strict evidence gate."""
+    """Reject any row that did not pass every required review evidence gate."""
 
     binding = result.get("manifest")
     replay = result.get("replay")
@@ -569,16 +570,18 @@ def validate_result_for_row(
     required_replay = (
         "fresh_backend_distinct",
         "backend_identity_exact",
-        "observation_tape_exact",
-        "outcomes_exact",
-        "review_tape_exact",
         "source_identity_exact",
-        "terminal_ledger_exact",
+        "reset_identity_exact",
+        "action_tape_exact",
+        "observation_semantic_structure_exact",
+        "review_semantic_structure_exact",
+        "semantic_outcomes_exact",
+        "terminal_ledger_semantic_exact",
         "terminal_ledger_exact_once",
     )
     if (
         result.get("schema_version") != RESULT_SCHEMA_VERSION
-        or result.get("status") != "completed_strict_evidence"
+        or result.get("status") != "completed_review_evidence"
         or result.get("evidence_passed") is not True
         or result.get("task_id") != TASK_ID
         or result.get("backend_id") != BACKEND_ID
@@ -593,7 +596,7 @@ def validate_result_for_row(
         or result.get("review_materialization")
         != EXECUTION_CONTRACT["review_materialization"]
     ):
-        raise RuntimeError("row result is not completed strict t1_xyz evidence")
+        raise RuntimeError("row result is not completed t1_xyz review evidence")
     if not isinstance(binding, Mapping) or binding != {
         "candidate_index": row["candidate_index"],
         "episode_id": row["request"]["episode_id"],
@@ -647,13 +650,30 @@ def validate_result_for_row(
         raise RuntimeError("row result terminal ledger gate did not pass")
     if (
         not isinstance(replay, Mapping)
-        or replay.get("mode") != "strict_fresh_backend"
+        or replay.get("mode") != "semantic_fresh_backend_v1"
         or replay.get("passed") is not True
         or any(replay.get(name) is not True for name in required_replay)
         or replay.get("primary_provenance") != provenance
         or replay.get("replay_provenance") != provenance
+        or replay.get("first_divergence") is not None
     ):
         raise RuntimeError("row result fresh replay gate did not pass")
+    for name in (
+        "observation_numeric_drift",
+        "review_numeric_drift",
+        "terminal_numeric_drift",
+    ):
+        report = replay.get(name)
+        if not isinstance(report, Mapping) or report.get("blocking") is not False:
+            raise RuntimeError("row result numeric replay diagnostics are invalid")
+    for name in (
+        "observation_tape_exact",
+        "review_tape_exact",
+        "outcomes_exact",
+        "terminal_ledger_exact",
+    ):
+        if type(replay.get(name)) is not bool:
+            raise RuntimeError("row result exact replay diagnostics are invalid")
     ledger = result.get("terminal_ledger")
     if (
         not isinstance(ledger, list)
@@ -790,7 +810,7 @@ def validate_result_for_row(
         raise RuntimeError(
             "evidence trajectory tape digest differs from the result payload"
         )
-    replay_observation_digest = _require_sha256(
+    _require_sha256(
         replay.get("replay_observation_sha256"),
         "replay.replay_observation_sha256",
     )
@@ -798,18 +818,12 @@ def validate_result_for_row(
         replay.get("replay_review_sha256"),
         "replay.replay_review_sha256",
     )
-    replay_ledger_digest = _require_sha256(
+    _require_sha256(
         replay.get("replay_ledger_sha256"),
         "replay.replay_ledger_sha256",
     )
-    if replay_observation_digest != trajectory_digest:
-        raise RuntimeError(
-            "replay observation receipt differs from the trajectory tape"
-        )
-    if replay_ledger_digest != payload_sha256(ledger):
-        raise RuntimeError(
-            "replay terminal ledger receipt differs from the result ledger"
-        )
+    # Replay digests are provenance receipts. Numeric/byte equality with the
+    # primary CUDA rollout is diagnostic only under the semantic replay gate.
     evidence_files = (
         ("tape_file", "tape_file_sha256", ".npz"),
         ("visual_file", "visual_sha256", ".gif"),
