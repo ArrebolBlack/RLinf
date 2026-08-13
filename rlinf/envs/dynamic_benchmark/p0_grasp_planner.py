@@ -771,6 +771,10 @@ def replay_action_trajectory(
     reset_health = _health_snapshot(backend)
     if dict(reset_health) != dict(tape._reset_health):
         raise P0GraspPlannerError("replay reset health differs from the online tape")
+    # Match the online adapter's reset boundary exactly.  The review copy is a
+    # CUDA synchronization point even though rendered media are excluded from
+    # the causal STATE fingerprint.
+    _review_frame(backend)
 
     torch = importlib.import_module("torch")
     receipts = []
@@ -806,6 +810,9 @@ def replay_action_trajectory(
             raise P0GraspPlannerError(
                 f"replay step result differs at policy_step {policy_step}"
             )
+        # Preserve the online step -> health -> review ordering before the next
+        # current-state observation is materialized.
+        _review_frame(backend)
         receipts.append(
             ReplayStepReceipt(
                 policy_step=policy_step,

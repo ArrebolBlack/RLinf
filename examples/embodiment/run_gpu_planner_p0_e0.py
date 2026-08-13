@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -30,9 +31,10 @@ import numpy as np
 
 SCHEMA_VERSION = "se3wam-gpu-planner-review-bundle-v1"
 SCHEMA_ID = "https://se3-wam.local/schemas/gpu-planner-review-bundle-v1.json"
-TASK_QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v1"
+TASK_QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v2"
 BACKEND_ID = "mjwarp_gpu_v1"
 JOB_ID = "GPUPLAN0/p0-grasp-e0-v1"
+SOURCE_EVALUATION_PHASE = "engineering_e0"
 _RUN_ARGUMENTS = (
     "source_root",
     "run_root",
@@ -102,6 +104,109 @@ def _canonical(value: Any) -> bytes:
 
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _normalized_actions(tape: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "mode": "E7",
+            "policy_step": int(entry.policy_step),
+            "values": [float(value) for value in entry.action],
+        }
+        for entry in tape.entries
+    ]
+
+
+def _action_tape_sha256(actions: list[dict[str, Any]]) -> str:
+    """Match the review verifier's language-neutral E7 action digest."""
+
+    digest = hashlib.sha256()
+    for index, action in enumerate(actions):
+        mode = action["mode"].encode("utf-8")
+        policy_step = int(action["policy_step"])
+        values = tuple(float(value) for value in action["values"])
+        if policy_step != index or not values or not all(np.isfinite(values)):
+            raise RuntimeError("action tape is not sequential and finite")
+        digest.update(struct.pack("<I", len(mode)))
+        digest.update(mode)
+        digest.update(struct.pack("<qI", policy_step, len(values)))
+        digest.update(struct.pack(f"<{len(values)}d", *values))
+    return digest.hexdigest()
+
+
+def _review_contract_payloads(
+    *,
+    tape: Any,
+    terminal: Mapping[str, Any],
+    replay: Any,
+    terminal_observation_fingerprint: str,
+    online_teacher_audits: int,
+    online_transport_checks: int,
+    replay_teacher_audits: int,
+    replay_transport_checks: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    actions = _normalized_actions(tape)
+    action_digest = _action_tape_sha256(actions)
+    fingerprints = [
+        entry.observation_fingerprint_sha256 for entry in tape.entries
+    ] + [terminal_observation_fingerprint]
+    if len(fingerprints) != len(actions) + 1:
+        raise RuntimeError("current-observation chain does not cover reset to terminal")
+    results = []
+    for index, entry in enumerate(tape.entries):
+        is_terminal = index == len(tape.entries) - 1
+        results.append(
+            {
+                "observation_fingerprint_sha256": fingerprints[index + 1],
+                "terminated": bool(terminal["terminated"]) if is_terminal else False,
+                "truncated": bool(terminal["truncated"]) if is_terminal else False,
+                "success": bool(terminal["success"]) if is_terminal else False,
+                "termination_reason": (
+                    terminal["termination_reason"] if is_terminal else None
+                ),
+                "physics_step": int(entry.health_after["physics_step"]),
+                "control_step": index + 1,
+                "policy_step": index + 1,
+            }
+        )
+    quality = terminal.get("task_quality")
+    quality_summary = quality.get("summary_sha256") if isinstance(quality, Mapping) else None
+    action_payload = {
+        "schema_version": "se3wam-gpu-planner-action-tape-v1",
+        "action_tape_sha256": action_digest,
+        "actions": actions,
+    }
+    trajectory_payload = {
+        "schema_version": "se3wam-gpu-planner-trajectory-tape-v1",
+        "action_tape_sha256": action_digest,
+        "actions": actions,
+        "episode_id": terminal["episode_id"],
+        "task_id": terminal["task_id"],
+        "observation_fingerprints": fingerprints,
+        "results": results,
+        "terminal": dict(terminal),
+        "raw_tape": tape.as_dict(),
+    }
+    replay_payload = {
+        "schema_version": "se3wam-gpu-planner-replay-v2",
+        "passed": bool(replay.passed),
+        "fresh_backend": True,
+        "planner_called": False,
+        "action_count": len(actions),
+        "action_tape_sha256": action_digest,
+        "observation_fingerprints": fingerprints,
+        "trajectory_payload_sha256": tape.sha256,
+        "backend_identity_sha256": replay.backend_identity_sha256,
+        "online_teacher_audit_count": online_teacher_audits,
+        "online_action_transport_count": online_transport_checks,
+        "replay_teacher_audit_count": replay_teacher_audits,
+        "replay_action_transport_count": replay_transport_checks,
+        "terminal_ledger_materializations": {"online": 1, "replay": 1},
+        "terminal_quality_summary_sha256": quality_summary,
+        "terminal": dict(terminal),
+        "steps": [_jsonable(step) for step in replay.steps],
+    }
+    return action_payload, trajectory_payload, replay_payload
 
 
 def _file_sha256(path: Path) -> str:
@@ -510,6 +615,7 @@ def _run(args: argparse.Namespace) -> int:
     )
     from rlinf.envs.dynamic_benchmark.p0_grasp_planner import (
         CurrentStatePlannerAdapter,
+        causal_observation_fingerprint,
         replay_action_trajectory,
     )
 
@@ -555,6 +661,12 @@ def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("reset manifest identity differs from the backend")
         _last_result, terminal_rows = adapter.run_natural_termination()
         online_row = terminal_rows[0]
+        online_terminal_observations = online_env.materialize_teacher_observations((0,))
+        if len(online_terminal_observations) != 1:
+            raise RuntimeError("online terminal observation audit did not return B=1")
+        terminal_observation_fingerprint = causal_observation_fingerprint(
+            online_terminal_observations[0]
+        )
         online_device = online_env.attest_end()
         tape = adapter.tape
         scene_frames = adapter.scene_frames
@@ -562,7 +674,7 @@ def _run(args: argparse.Namespace) -> int:
         online_teacher_audits = online_env.teacher_audit_materializations
         online_transport_checks = online_env.transport_checks
         if (
-            online_teacher_audits != tape.identity.horizon_steps
+            online_teacher_audits != tape.identity.horizon_steps + 1
             or online_transport_checks != tape.identity.horizon_steps
         ):
             raise RuntimeError(
@@ -573,11 +685,19 @@ def _run(args: argparse.Namespace) -> int:
 
         replay_env = GpuNativeTensorBackendEnv(**common)
         replay = replay_action_trajectory(replay_env, tape)
+        replay_terminal_observations = replay_env.materialize_teacher_observations((0,))
+        if len(replay_terminal_observations) != 1:
+            raise RuntimeError("replay terminal observation audit did not return B=1")
+        replay_terminal_fingerprint = causal_observation_fingerprint(
+            replay_terminal_observations[0]
+        )
+        if replay_terminal_fingerprint != terminal_observation_fingerprint:
+            raise RuntimeError("fresh replay terminal observation fingerprint differs")
         replay_device = replay_env.attest_end()
         replay_teacher_audits = replay_env.teacher_audit_materializations
         replay_transport_checks = replay_env.transport_checks
         if (
-            replay_teacher_audits != tape.identity.horizon_steps
+            replay_teacher_audits != tape.identity.horizon_steps + 1
             or replay_transport_checks != tape.identity.horizon_steps
         ):
             raise RuntimeError(
@@ -606,25 +726,19 @@ def _run(args: argparse.Namespace) -> int:
         action_path = episode_dir / "action_tape.json"
         trajectory_path = episode_dir / "trajectory_tape.json"
         replay_path = episode_dir / "replay.json"
-        _write_json(action_path, tape.action_dict())
-        _write_json(trajectory_path, tape.as_dict())
-        replay_payload = {
-            "schema_version": "se3wam-gpu-planner-replay-v2",
-            "passed": replay.passed,
-            "fresh_backend": True,
-            "planner_called": False,
-            "action_tape_sha256": _file_sha256(action_path),
-            "trajectory_tape_sha256": _file_sha256(trajectory_path),
-            "trajectory_payload_sha256": tape.sha256,
-            "backend_identity_sha256": replay.backend_identity_sha256,
-            "online_teacher_audit_count": online_teacher_audits,
-            "online_action_transport_count": online_transport_checks,
-            "replay_teacher_audit_count": replay_teacher_audits,
-            "replay_action_transport_count": replay_transport_checks,
-            "terminal_ledger_materializations": {"online": 1, "replay": 1},
-            "terminal": replay_terminal,
-            "steps": [_jsonable(step) for step in replay.steps],
-        }
+        action_payload, trajectory_payload, replay_payload = _review_contract_payloads(
+            tape=tape,
+            terminal=terminal,
+            replay=replay,
+            terminal_observation_fingerprint=terminal_observation_fingerprint,
+            online_teacher_audits=online_teacher_audits,
+            online_transport_checks=online_transport_checks,
+            replay_teacher_audits=replay_teacher_audits,
+            replay_transport_checks=replay_transport_checks,
+        )
+        _write_json(action_path, action_payload)
+        _write_json(trajectory_path, trajectory_payload)
+        replay_payload["trajectory_tape_sha256"] = _file_sha256(trajectory_path)
         _write_json(replay_path, replay_payload)
         scene_media = _encode_gif(scene_frames, media_dir / "scene.gif")
         wrist_media = _encode_gif(wrist_frames, media_dir / "wrist.gif")
@@ -744,6 +858,7 @@ def _run(args: argparse.Namespace) -> int:
             "result_sha256": _sha256(terminal),
             "terminal_reason": terminal["termination_reason"],
             "success": terminal["success"],
+            "terminal": terminal,
             "action_tape": {
                 "path": str(action_path.relative_to(bundle_dir)),
                 "sha256": _file_sha256(action_path),
@@ -815,7 +930,7 @@ def _run(args: argparse.Namespace) -> int:
                 "freeze_payload_sha256": _sha256(freeze_payload),
             },
             "evaluation": {
-                "phase": "development",
+                "phase": SOURCE_EVALUATION_PHASE,
                 "split": "train",
                 "test_ids": [int(reset.manifest_ordinals[0])],
                 "manifest_seeds": [int(args.manifest_seed)],
@@ -855,8 +970,8 @@ def _run(args: argparse.Namespace) -> int:
         }
         (bundle_dir / "import_instructions.md").write_text(
             "# GPUPLAN0 p0_grasp E0 import\n\n"
-            "Validate `bundle.json` against `schema/review_bundle_schema.json`, "
-            "verify `SHA256SUMS`, source/gitlink identities, singleton CUDA UUID, "
+            "This is the immutable engineering-E0 source bundle; do not import it "
+            "directly. Verify `SHA256SUMS`, source/gitlink identities, singleton CUDA UUID, "
             "released runtime lease, exact-once terminal ledger, full tape, and "
             "fresh replay before the unique serial gallery import. Scene and wrist "
             "contain the reset frame plus every post-control frame at nominal 50 ms "
@@ -867,8 +982,10 @@ def _run(args: argparse.Namespace) -> int:
             "training data, nor policy replacement.\n\n"
             "After the runtime-ledger lease is actually released, finalize only "
             "the lease receipt with `python candidate/run_gpu_planner_p0_e0.py "
-            "--finalize-bundle <bundle-directory>`, then validate the finalized "
-            "`bundle.json` against the copied schema.\n",
+            "--finalize-bundle <bundle-directory>`. Then use the exact Dynamic "
+            "Benchmark source to export an append-only development candidate and "
+            "validate that exported `bundle.json` against the copied schema plus "
+            "the five recorded source repositories.\n",
             encoding="utf-8",
         )
         checksum_path = _write_checksums(bundle_dir)
