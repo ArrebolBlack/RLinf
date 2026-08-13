@@ -77,7 +77,9 @@ class GpuNativePlannerStep:
         if not self.observations or not (
             len(self.observations) == len(self.actions) == len(self.results)
         ):
-            raise ValueError("planner step observations, actions, and results must align")
+            raise ValueError(
+                "planner step observations, actions, and results must align"
+            )
 
 
 @dataclass(frozen=True)
@@ -96,7 +98,9 @@ class GpuNativePlannerTape:
 
     def __post_init__(self) -> None:
         if not self.requests or len(self.requests) != len(self.initial_observations):
-            raise ValueError("planner tape requests and initial observations must align")
+            raise ValueError(
+                "planner tape requests and initial observations must align"
+            )
         if len(self.teacher_metadata) != len(self.requests):
             raise ValueError("planner tape teacher metadata must align with requests")
         expected_index = 0
@@ -197,6 +201,7 @@ class GpuNativeBackendEnv:
         require_exact_export_identity: bool = False,
         render_observations: bool = False,
         solver_deterministic_mode: str | None = None,
+        solver_deterministic_max_records: int | None = None,
         graph_conditional: bool | None = None,
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
@@ -255,6 +260,14 @@ class GpuNativeBackendEnv:
             raise ValueError(
                 "solver_deterministic_mode must be NOT_GUARANTEED, RUN_TO_RUN, or None"
             )
+        if solver_deterministic_max_records is not None and (
+            isinstance(solver_deterministic_max_records, bool)
+            or not isinstance(solver_deterministic_max_records, int)
+            or solver_deterministic_max_records <= 0
+        ):
+            raise ValueError(
+                "solver_deterministic_max_records must be a positive integer or None"
+            )
         if graph_conditional is not None and not isinstance(graph_conditional, bool):
             raise TypeError("graph_conditional must be a boolean or None")
         try:
@@ -309,6 +322,7 @@ class GpuNativeBackendEnv:
         self._task_quality_evaluator_backend_id = task_quality_evaluator_backend_id
         self._require_exact_export_identity = require_exact_export_identity
         self._solver_deterministic_mode = solver_deterministic_mode
+        self._solver_deterministic_max_records = solver_deterministic_max_records
         self._graph_conditional = graph_conditional
         self._consumer = GpuNativeConsumer.RL
         self._render_observations = render_observations
@@ -340,6 +354,7 @@ class GpuNativeBackendEnv:
             ("expected_source_commit", expected_se3_source_commit),
             ("expected_source_tree", expected_se3_source_tree),
             ("solver_deterministic_mode", solver_deterministic_mode),
+            ("solver_deterministic_max_records", solver_deterministic_max_records),
             ("graph_conditional", graph_conditional),
         ):
             if value is not None:
@@ -568,6 +583,7 @@ class GpuNativeBackendEnv:
             require_exact_export_identity=self._require_exact_export_identity,
             render_observations=self._render_observations,
             solver_deterministic_mode=self._solver_deterministic_mode,
+            solver_deterministic_max_records=self._solver_deterministic_max_records,
             graph_conditional=self._graph_conditional,
         )
 
@@ -827,7 +843,9 @@ class GpuNativeBackendEnv:
             raise ValueError("GPU-native reset requires a ResetRequest for every lane")
         for request in selected:
             if getattr(request, "task_id", None) != self._task_id:
-                raise ValueError("GPU-native reset request task_id does not match the backend")
+                raise ValueError(
+                    "GPU-native reset request task_id does not match the backend"
+                )
         return selected
 
     def _materialize_current_observations(self) -> tuple[Any, ...]:
@@ -838,7 +856,9 @@ class GpuNativeBackendEnv:
             from se3_wam.benchmark.gpu_native.audit import AuditRequest
 
             audit = self._env.materialize_audit(
-                AuditRequest(lanes=tuple(range(self._num_envs)), include_step_result=False)
+                AuditRequest(
+                    lanes=tuple(range(self._num_envs)), include_step_result=False
+                )
             )
             observations = tuple(lane.observation for lane in audit.lanes)
             if any(lane.step_result is not None for lane in audit.lanes):
@@ -991,7 +1011,10 @@ class GpuNativeBackendEnv:
                 "SE3-WAM GPU backend lacks the T3 replay-probe audit seam"
             )
         payload = materializer()
-        if not isinstance(payload, Mapping) or payload.get("diagnostic_only") is not True:
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("diagnostic_only") is not True
+        ):
             raise GpuNativeBackendUnavailableError(
                 "T3 replay-probe audit returned an invalid diagnostic receipt"
             )
@@ -1176,7 +1199,9 @@ class GpuNativeBackendEnv:
             actual_results = self._step_commands(expected.actions)
             result_matches = tuple(
                 self._result_signature(actual) == self._result_signature(recorded)
-                for actual, recorded in zip(actual_results, expected.results, strict=True)
+                for actual, recorded in zip(
+                    actual_results, expected.results, strict=True
+                )
             )
             step_reports.append(
                 MappingProxyType(
@@ -1188,8 +1213,7 @@ class GpuNativeBackendEnv:
                 )
             )
         passed = all(initial_matches) and all(
-            all(report["pre_observation_matches"])
-            and all(report["result_matches"])
+            all(report["pre_observation_matches"]) and all(report["result_matches"])
             for report in step_reports
         )
         return MappingProxyType(
@@ -1214,7 +1238,9 @@ class GpuNativeBackendEnv:
         if not selected or len(set(selected)) != len(selected):
             raise ValueError("terminal ledger lanes must be non-empty and unique")
         if any(
-            isinstance(lane, bool) or not isinstance(lane, int) or not 0 <= lane < self._num_envs
+            isinstance(lane, bool)
+            or not isinstance(lane, int)
+            or not 0 <= lane < self._num_envs
             for lane in selected
         ):
             raise ValueError("terminal ledger lane is outside the GPU batch")
@@ -1225,7 +1251,9 @@ class GpuNativeBackendEnv:
             )
             for lane in selected
         ):
-            raise RuntimeError("terminal ledger requires a terminal result for every lane")
+            raise RuntimeError(
+                "terminal ledger requires a terminal result for every lane"
+            )
         episode_ids = tuple(self._active_requests[lane].episode_id for lane in selected)
         if self._terminal_ledger_consumed.intersection(episode_ids):
             raise RuntimeError("terminal ledger row was requested more than once")

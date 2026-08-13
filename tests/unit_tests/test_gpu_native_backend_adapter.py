@@ -151,8 +151,12 @@ class _FakeEnv:
         if len(tuple(requests)) != self.batch_size:
             raise AssertionError("reset requests must cover the whole batch")
 
-    def materialize_current_observations(self, lanes: tuple[int, ...]) -> tuple[Any, ...]:
-        return tuple(_FakeObservation(lane=lane, step=self.step_calls) for lane in lanes)
+    def materialize_current_observations(
+        self, lanes: tuple[int, ...]
+    ) -> tuple[Any, ...]:
+        return tuple(
+            _FakeObservation(lane=lane, step=self.step_calls) for lane in lanes
+        )
 
     def step(self, commands: Any) -> None:
         self.step_calls += 1
@@ -242,9 +246,9 @@ def fake_se3_wam(monkeypatch: pytest.MonkeyPatch) -> _FakeSe3Wam:
         factory.planner_teachers.append(teacher)
         return teacher, {"request_episode_id": request.episode_id}
 
-    modules["se3_wam.benchmark.teacher_factory"].make_privileged_teacher = (
-        make_privileged_teacher
-    )
+    modules[
+        "se3_wam.benchmark.teacher_factory"
+    ].make_privileged_teacher = make_privileged_teacher
     return _FakeSe3Wam(
         factory=factory,
         artifacts=captured,
@@ -338,11 +342,13 @@ def test_deterministic_solver_configuration_reaches_fresh_replay(
         num_envs=3,
         export_dir="/tmp/export",
         solver_deterministic_mode="RUN_TO_RUN",
+        solver_deterministic_max_records=4,
         graph_conditional=True,
     )
     _, kwargs = fake_se3_wam.artifacts["factory_kwargs"]
     assert kwargs["engine_kwargs"] == {
         "solver_deterministic_mode": "RUN_TO_RUN",
+        "solver_deterministic_max_records": 4,
         "graph_conditional": True,
     }
 
@@ -351,6 +357,7 @@ def test_deterministic_solver_configuration_reaches_fresh_replay(
     _, replay_kwargs = fake_se3_wam.artifacts["factory_kwargs"]
     assert replay_kwargs["engine_kwargs"] == {
         "solver_deterministic_mode": "RUN_TO_RUN",
+        "solver_deterministic_max_records": 4,
         "graph_conditional": True,
     }
 
@@ -366,6 +373,17 @@ def test_adapter_rejects_unknown_solver_deterministic_mode(mode: Any) -> None:
         )
 
 
+@pytest.mark.parametrize("maximum", [0, -1, True, 1.5])
+def test_adapter_rejects_invalid_solver_deterministic_max_records(maximum: Any) -> None:
+    with pytest.raises(ValueError, match="solver_deterministic_max_records"):
+        GpuNativeBackendEnv(
+            task_id="p0_grasp",
+            num_envs=1,
+            export_dir="/tmp/export",
+            solver_deterministic_max_records=maximum,
+        )
+
+
 def test_planner_is_current_state_closed_loop_and_tape_replay_is_diagnostic(
     fake_se3_wam: _FakeSe3Wam,
 ) -> None:
@@ -378,11 +396,15 @@ def test_planner_is_current_state_closed_loop_and_tape_replay_is_diagnostic(
     observations = backend.reset_planner(requests)
     assert len(observations) == 3
     assert fake_se3_wam.planner_requests == list(requests)
-    assert all(teacher.reset_calls == 1 for teacher in fake_se3_wam.factory.planner_teachers)
+    assert all(
+        teacher.reset_calls == 1 for teacher in fake_se3_wam.factory.planner_teachers
+    )
 
     step = backend.planner_step()
     assert step.step_index == 0
-    assert all(teacher.act_calls == 1 for teacher in fake_se3_wam.factory.planner_teachers)
+    assert all(
+        teacher.act_calls == 1 for teacher in fake_se3_wam.factory.planner_teachers
+    )
     tape = backend.planner_tape()
     assert tape.steps == (step,)
 

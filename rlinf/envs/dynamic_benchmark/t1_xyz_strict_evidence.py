@@ -77,6 +77,7 @@ EXECUTION_CONTRACT = {
     "review_materialization": "independent_scene_wrist_render_v1",
     "sensor_hz": 20,
     "terminal_ledger_exact_once": True,
+    "warp_deterministic_max_records": 4,
     "warp_deterministic_mode": "RUN_TO_RUN",
 }
 

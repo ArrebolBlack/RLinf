@@ -440,6 +440,8 @@ def _validate_provenance(
     if (
         runtime_versions.get("warp-deterministic-mode")
         != EXECUTION_CONTRACT["warp_deterministic_mode"]
+        or runtime_versions.get("warp-deterministic-max-records")
+        != str(EXECUTION_CONTRACT["warp_deterministic_max_records"])
         or runtime_versions.get("mjwarp-graph-conditional")
         != str(EXECUTION_CONTRACT["mjwarp_graph_conditional"]).lower()
     ):
@@ -773,6 +775,9 @@ def main() -> None:
         require_exact_export_identity=True,
         render_observations=True,
         solver_deterministic_mode=EXECUTION_CONTRACT["warp_deterministic_mode"],
+        solver_deterministic_max_records=EXECUTION_CONTRACT[
+            "warp_deterministic_max_records"
+        ],
         graph_conditional=EXECUTION_CONTRACT["mjwarp_graph_conditional"],
     )
     try:
