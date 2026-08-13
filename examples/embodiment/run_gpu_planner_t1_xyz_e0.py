@@ -37,7 +37,12 @@ QUALITY_EVALUATOR_ID = "gpu-planner-t1-xyz-e0-v2"
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--export-dir", type=Path, required=True)
+    parser.add_argument("--export-dir", type=Path)
+    parser.add_argument(
+        "--manifest-row",
+        type=Path,
+        help="Common-runner manifest row; its export_dir is used when --export-dir is omitted.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--tape-output",
@@ -65,6 +70,37 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="E0 is intentionally limited to one natural-termination episode.",
+    )
+    parser.add_argument(
+        "--replay-policy",
+        choices=("audit", "strict"),
+        default="audit",
+        help="Record fresh replay divergence as audit evidence by default; strict is diagnostic-only.",
+    )
+    parser.add_argument(
+        "--planner-lookahead-s",
+        type=float,
+        help="Optional single-variable Planner override for the exploratory run.",
+    )
+    parser.add_argument(
+        "--planner-contact-lookahead-s",
+        type=float,
+        help="Optional contact-phase Planner lookahead override for the exploratory run.",
+    )
+    parser.add_argument(
+        "--planner-adaptive-lookahead-speed-gain-s-per-mps",
+        type=float,
+        help="Optional speed-adaptive Planner lookahead gain for the exploratory run.",
+    )
+    parser.add_argument(
+        "--planner-lift-ramp-steps",
+        type=int,
+        help="Optional number of Planner lift-ramp control steps for the exploratory run.",
+    )
+    parser.add_argument(
+        "--planner-lift-contact-loss-retry-steps",
+        type=int,
+        help="Optional Planner lift-contact-loss retry window for the exploratory run.",
     )
     return parser
 
@@ -325,6 +361,37 @@ def main() -> None:
         raise ValueError("GPU Planner E0 requires hybrid GPU scene/wrist observations")
     if args.image_size < 64:
         raise ValueError("--image-size must be at least 64")
+    if args.export_dir is None:
+        if args.manifest_row is None:
+            raise ValueError("one of --export-dir or --manifest-row is required")
+        row = json.loads(args.manifest_row.read_text(encoding="utf-8"))
+        export_dir = row.get("export_dir")
+        if not isinstance(export_dir, str) or not export_dir:
+            raise ValueError("manifest row must contain a non-empty export_dir")
+        args.export_dir = Path(export_dir)
+    if args.planner_lookahead_s is not None and (
+        not np.isfinite(args.planner_lookahead_s) or args.planner_lookahead_s <= 0
+    ):
+        raise ValueError("--planner-lookahead-s must be finite and positive")
+    if args.planner_contact_lookahead_s is not None and (
+        not np.isfinite(args.planner_contact_lookahead_s)
+        or args.planner_contact_lookahead_s < 0
+    ):
+        raise ValueError("--planner-contact-lookahead-s must be finite and nonnegative")
+    if args.planner_adaptive_lookahead_speed_gain_s_per_mps is not None and (
+        not np.isfinite(args.planner_adaptive_lookahead_speed_gain_s_per_mps)
+        or args.planner_adaptive_lookahead_speed_gain_s_per_mps < 0
+    ):
+        raise ValueError(
+            "--planner-adaptive-lookahead-speed-gain-s-per-mps must be finite and nonnegative"
+        )
+    if args.planner_lift_ramp_steps is not None and args.planner_lift_ramp_steps < 0:
+        raise ValueError("--planner-lift-ramp-steps must be nonnegative")
+    if (
+        args.planner_lift_contact_loss_retry_steps is not None
+        and args.planner_lift_contact_loss_retry_steps < 1
+    ):
+        raise ValueError("--planner-lift-contact-loss-retry-steps must be positive")
     if (
         args.expected_se3_source_commit != SE3_SOURCE_COMMIT
         or args.expected_se3_source_tree != SE3_SOURCE_TREE
@@ -366,6 +433,70 @@ def main() -> None:
         request = backend.next_request()
         observations = list(backend.reset((request,)))
         teacher, preparation = make_privileged_teacher(TASK_ID, request=request)
+        planner_overrides: list[dict[str, Any]] = []
+        if args.planner_lookahead_s is not None:
+            if not hasattr(teacher, "lookahead_s"):
+                raise RuntimeError("t1_xyz teacher does not expose lookahead_s")
+            teacher.lookahead_s = float(args.planner_lookahead_s)
+            planner_overrides.append(
+                {
+                    "variable": "lookahead_s",
+                    "value": float(args.planner_lookahead_s),
+                }
+            )
+        if args.planner_contact_lookahead_s is not None:
+            if not hasattr(teacher, "contact_lookahead_s"):
+                raise RuntimeError("t1_xyz teacher does not expose contact_lookahead_s")
+            teacher.contact_lookahead_s = float(args.planner_contact_lookahead_s)
+            planner_overrides.append(
+                {
+                    "variable": "contact_lookahead_s",
+                    "value": float(args.planner_contact_lookahead_s),
+                }
+            )
+        if args.planner_adaptive_lookahead_speed_gain_s_per_mps is not None:
+            if not hasattr(teacher, "adaptive_lookahead_speed_gain_s_per_mps"):
+                raise RuntimeError(
+                    "t1_xyz teacher does not expose adaptive_lookahead_speed_gain_s_per_mps"
+                )
+            teacher.adaptive_lookahead_speed_gain_s_per_mps = float(
+                args.planner_adaptive_lookahead_speed_gain_s_per_mps
+            )
+            planner_overrides.append(
+                {
+                    "variable": "adaptive_lookahead_speed_gain_s_per_mps",
+                    "value": float(args.planner_adaptive_lookahead_speed_gain_s_per_mps),
+                }
+            )
+        if args.planner_lift_ramp_steps is not None:
+            if not hasattr(teacher, "lift_ramp_steps"):
+                raise RuntimeError("t1_xyz teacher does not expose lift_ramp_steps")
+            teacher.lift_ramp_steps = int(args.planner_lift_ramp_steps)
+            planner_overrides.append(
+                {
+                    "variable": "lift_ramp_steps",
+                    "value": int(args.planner_lift_ramp_steps),
+                }
+            )
+        if args.planner_lift_contact_loss_retry_steps is not None:
+            if not hasattr(teacher, "lift_contact_loss_retry_steps"):
+                raise RuntimeError(
+                    "t1_xyz teacher does not expose lift_contact_loss_retry_steps"
+                )
+            teacher.lift_contact_loss_retry_steps = int(
+                args.planner_lift_contact_loss_retry_steps
+            )
+            planner_overrides.append(
+                {
+                    "variable": "lift_contact_loss_retry_steps",
+                    "value": int(args.planner_lift_contact_loss_retry_steps),
+                }
+            )
+        if planner_overrides:
+            preparation = dict(preparation)
+            preparation["planner_overrides"] = planner_overrides
+            if len(planner_overrides) == 1:
+                preparation["planner_override"] = planner_overrides[0]
         if hasattr(teacher, "reset"):
             teacher.reset()
         commands: list[Any] = []
@@ -398,30 +529,64 @@ def main() -> None:
         terminal_ledger = backend.last_terminal_ledger
         if terminal_ledger is None:
             raise RuntimeError("E0 Planner did not produce an exact-once terminal ledger")
-        replay = _replay(
-            backend=backend,
-            request=request,
-            observations=tuple(observations),
-            commands=tuple(commands),
-            outcomes=tuple(outcomes),
-            terminal_ledger=terminal_ledger,
-        )
-        if not replay["passed"]:
+        try:
+            replay = _replay(
+                backend=backend,
+                request=request,
+                observations=tuple(observations),
+                commands=tuple(commands),
+                outcomes=tuple(outcomes),
+                terminal_ledger=terminal_ledger,
+            )
+        except Exception as exc:
+            replay = {
+                "passed": False,
+                "observation_tape_exact": False,
+                "outcomes_exact": False,
+                "terminal_ledger_exact": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            if args.replay_policy == "strict":
+                raise
+        if not replay["passed"] and args.replay_policy == "strict":
             raise RuntimeError(f"GPU Planner E0 replay failed: {json.dumps(replay, sort_keys=True)}")
         _write_tape_npz(tape_output, observations, commands)
-        _write_visual_gif(visual_gif, observations)
+        visual_error = None
+        try:
+            _write_visual_gif(visual_gif, observations)
+        except RuntimeError as exc:
+            # GIF encoding is an optional presentation artifact.  Keep the
+            # GPU-rendered observation tape and online terminal result even
+            # when the shared runtime does not provide an imageio encoder.
+            visual_error = {"error_type": type(exc).__name__, "error": str(exc)}
 
         ledger_payload = _ledger_payload(terminal_ledger)
         action_tape = [np.asarray(command.values, dtype=np.float64).tolist() for command in commands]
         trajectory_tape = [_observation_digest(value) for value in observations]
+        online_success = bool(result.success)
+        if online_success and replay["passed"]:
+            status = "passed"
+        elif online_success:
+            status = "completed_replay_audit_mismatch"
+        else:
+            status = "completed_online_failure"
         payload = {
             "schema_version": "gpu-planner-t1-xyz-e0-v2",
-            "status": "passed",
+            "status": status,
             "task_id": TASK_ID,
             "job_phase": "e0",
             "online_planner": True,
             "planner_observation_source": "current_observation_each_control_step",
             "planner_compute": "cpu_allowed",
+            "planner_override": (
+                None
+                if not planner_overrides
+                else planner_overrides[0]
+                if len(planner_overrides) == 1
+                else {"variables": planner_overrides}
+            ),
+            "planner_overrides": planner_overrides or None,
             "frozen_action_replay": False,
             "cpu_physics_or_env_fallback": False,
             "quality": {
@@ -440,7 +605,8 @@ def main() -> None:
             "episode_id": request.episode_id,
             "control_steps": len(commands),
             "physics_steps": int(observations[-1].physics_step),
-            "success": bool(result.success),
+            "success": online_success,
+            "online_success": online_success,
             "termination_reason": result.termination_reason,
             "action_tape": action_tape,
             "action_sha256": _json_sha256(action_tape),
@@ -450,7 +616,7 @@ def main() -> None:
             "tape_sha256": _file_sha256(tape_output),
             "terminal_ledger": ledger_payload,
             "terminal_ledger_sha256": _json_sha256(ledger_payload),
-            "replay": replay,
+            "replay": {"policy": args.replay_policy, **replay},
             "teacher_preparation": preparation,
             "planner_latency_s": {
                 "count": len(latencies_s),
@@ -462,8 +628,9 @@ def main() -> None:
                 "scene_camera": "agentview",
                 "wrist_camera": "robot0_eye_in_hand",
                 "gpu_rendered": True,
-                "gif": str(visual_gif),
-                "gif_sha256": _file_sha256(visual_gif),
+                "gif": str(visual_gif) if visual_error is None else None,
+                "gif_sha256": _file_sha256(visual_gif) if visual_error is None else None,
+                "gif_error": visual_error,
             },
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
