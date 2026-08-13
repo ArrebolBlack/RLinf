@@ -27,6 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 
 _MODULE_PATH = (
@@ -215,6 +216,40 @@ class _ObservationBundle:
     physics_step: int
     control_step: int
     policy_step: int
+    rgb: dict[str, np.ndarray] = field(
+        default_factory=lambda: {
+            "agentview": np.full((64, 64, 3), 17, dtype=np.uint8),
+            "robot0_eye_in_hand": np.full((64, 64, 3), 23, dtype=np.uint8),
+        }
+    )
+    depth_m: dict[str, np.ndarray] = field(
+        default_factory=lambda: {
+            "agentview": np.full((64, 64, 1), 2.0, dtype=np.float32),
+            "robot0_eye_in_hand": np.full((64, 64, 1), 3.0, dtype=np.float32),
+        }
+    )
+    segmentation: dict[str, np.ndarray] = field(
+        default_factory=lambda: {
+            "agentview": np.full((64, 64, 1), 4, dtype=np.int32),
+            "robot0_eye_in_hand": np.full((64, 64, 1), 5, dtype=np.int32),
+        }
+    )
+    privileged: dict[str, np.ndarray] = field(
+        default_factory=lambda: {
+            f"{camera}_{suffix}": np.asarray([index + 1.0], dtype=np.float64)
+            for index, (camera, suffix) in enumerate(
+                (
+                    (camera, suffix)
+                    for camera in ("agentview", "robot0_eye_in_hand")
+                    for suffix in (
+                        "target_visible_pixels",
+                        "target_image_fraction",
+                        "occluder_visible_pixels",
+                    )
+                )
+            )
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -749,6 +784,94 @@ def test_tensor_backend_preserves_actions_and_outputs_as_device_views(
     assert sys.modules["warp"].to_torch_calls == first_conversion_count
     backend.close()
     assert fake_env.closed
+
+
+def test_state_contract_can_enable_independent_gpu_review_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", _GPU_UUID)
+    captured, fake_env, _device = _install_fakes(monkeypatch)
+
+    def enable_review_capabilities() -> None:
+        fake_env.capabilities.rgb = True
+        fake_env.capabilities.depth = True
+        fake_env.capabilities.segmentation = True
+
+    captured["factory_hook"] = enable_review_capabilities
+    backend = GpuNativeTensorBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        expected_gpu_uuid=_GPU_UUID,
+        expected_se3_source_commit=_SE3_SOURCE_COMMIT,
+        expected_se3_source_tree=_SE3_SOURCE_TREE,
+        observation_track="state",
+        render_observations=True,
+    )
+
+    assert backend.observation_track == "state"
+    assert backend.render_observations is True
+    assert captured["factory"][1]["observation_track"].value == "state"
+    assert captured["factory"][1]["render_observations"] is True
+    assert fake_env.contract.capabilities.rgb is False
+    assert fake_env.capabilities.rgb is True
+    backend.reset()
+    observation = backend.materialize_teacher_observations((0,))[0]
+    assert all(not np.any(value) for value in observation.rgb.values())
+    assert all(np.all(value == 1.0) for value in observation.depth_m.values())
+    assert all(not np.any(value) for value in observation.segmentation.values())
+    assert all(not np.any(value) for value in observation.privileged.values())
+
+
+def test_review_rgb_materializes_selected_gpu_frames_as_uint8() -> None:
+    class _HostTensor:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def detach(self) -> _HostTensor:
+            return self
+
+        def cpu(self) -> _HostTensor:
+            return self
+
+        def numpy(self) -> Any:
+            return self.value
+
+    rgb = {
+        "agentview": object(),
+        "robot0_eye_in_hand": object(),
+    }
+    values = {
+        rgb["agentview"]: _HostTensor(
+            __import__("numpy").full((2, 2, 2, 3), 0.5, dtype="float32")
+        ),
+        rgb["robot0_eye_in_hand"]: _HostTensor(
+            __import__("numpy").full((2, 2, 2, 3), 0.25, dtype="float32")
+        ),
+    }
+    backend = object.__new__(GpuNativeTensorBackendEnv)
+    backend._closed = False  # noqa: SLF001
+    backend._render_observations = True  # noqa: SLF001
+    backend._steps_since_reset = 0  # noqa: SLF001
+    backend._num_envs = 2  # noqa: SLF001
+    backend._image_size = 2  # noqa: SLF001
+    backend._torch = SimpleNamespace(float32=object())  # noqa: SLF001
+    backend._env = SimpleNamespace(  # noqa: SLF001
+        device_visual_observation=lambda: SimpleNamespace(rgb=rgb)
+    )
+    backend._view = lambda value, name, **kwargs: values[value]  # noqa: SLF001
+
+    rows = backend.materialize_review_rgb((1,))
+    assert len(rows) == 1
+    assert rows[0]["agentview"].dtype.name == "uint8"
+    assert rows[0]["agentview"].tolist() == [
+        [[128, 128, 128], [128, 128, 128]],
+        [[128, 128, 128], [128, 128, 128]],
+    ]
+    assert rows[0]["robot0_eye_in_hand"].tolist() == [
+        [[64, 64, 64], [64, 64, 64]],
+        [[64, 64, 64], [64, 64, 64]],
+    ]
 
 
 def test_t4_admission_requires_owner_frozen_manifest_before_runtime_start(

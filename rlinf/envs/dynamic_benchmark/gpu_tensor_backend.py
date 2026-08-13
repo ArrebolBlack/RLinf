@@ -103,6 +103,8 @@ def _p0_expected_capabilities(
             and (task_id == "p0_grasp" or task_id in _T1_CAPTURE_TASK_IDS),
         }
     )
+
+
 _EXPORT_DIGEST_ATTRIBUTES = MappingProxyType(
     {
         "request_sha256": "request_identity_sha256",
@@ -262,6 +264,7 @@ def _validate_public_contract(
     task_id: str,
     num_envs: int,
     observation_track: str,
+    render_observations: bool,
 ) -> tuple[Mapping[str, bool], Mapping[str, bool]]:
     contract = getattr(env, "contract", None)
     if contract is None:
@@ -301,15 +304,15 @@ def _validate_public_contract(
         getattr(env, "capabilities", None),
         context="SE3-WAM environment",
     )
-    visual = observation_track == "hybrid"
+    contract_visual = observation_track == "hybrid"
     expected_contract_capabilities = _p0_expected_capabilities(
         task_id=task_id,
-        visual=visual,
+        visual=contract_visual,
         device_tensor_step=False,
     )
     expected_env_capabilities = _p0_expected_capabilities(
         task_id=task_id,
-        visual=visual,
+        visual=render_observations,
         device_tensor_step=True,
     )
     if contract_capabilities != expected_contract_capabilities:
@@ -822,6 +825,7 @@ class GpuNativeTensorBackendEnv:
         expected_se3_source_tree: str,
         device_ordinal: int = 0,
         image_size: int = 64,
+        render_observations: bool | None = None,
         split: str = "train",
         manifest_seed: int = 20261050,
         manifest_size: int | None = None,
@@ -884,6 +888,10 @@ class GpuNativeTensorBackendEnv:
             or image_size < 1
         ):
             raise ValueError("image_size must be a positive integer")
+        if render_observations is not None and not isinstance(
+            render_observations, bool
+        ):
+            raise ValueError("render_observations must be a bool or None")
         if (
             isinstance(manifest_seed, bool)
             or not isinstance(manifest_seed, int)
@@ -934,6 +942,11 @@ class GpuNativeTensorBackendEnv:
             ObservationTrack.HYBRID,
         }:
             raise ValueError("GPU tensor observation_track must be 'state' or 'hybrid'")
+        effective_render_observations = (
+            requested_observation_track is ObservationTrack.HYBRID
+            if render_observations is None
+            else render_observations
+        )
         if not torch.cuda.is_available():
             raise GpuNativeTensorBackendUnavailableError(
                 "PyTorch CUDA is unavailable; CPU fallback is forbidden"
@@ -970,6 +983,7 @@ class GpuNativeTensorBackendEnv:
         self._expected_se3_source_tree = expected_se3_source_tree
         self._device_ordinal = device_ordinal
         self._image_size = image_size
+        self._render_observations = effective_render_observations
         self._device = device
         self._torch = torch
         self._warp = warp
@@ -980,7 +994,9 @@ class GpuNativeTensorBackendEnv:
         try:
             self._split = Split(split)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"unsupported GPU-native manifest split: {split!r}") from exc
+            raise ValueError(
+                f"unsupported GPU-native manifest split: {split!r}"
+            ) from exc
         self._manifest_seed = manifest_seed
         if manifest_requests is None:
             if task_id != "p0_grasp":
@@ -1128,6 +1144,7 @@ class GpuNativeTensorBackendEnv:
             device_ordinal=device_ordinal,
             image_size=image_size,
             runtime_evidence=runtime_evidence,
+            render_observations=effective_render_observations,
             engine_kwargs={
                 "expected_device_uuid": expected_gpu_uuid,
                 "expected_model_sha256": export_identity_start["model_sha256"],
@@ -1141,6 +1158,7 @@ class GpuNativeTensorBackendEnv:
                 task_id=task_id,
                 num_envs=num_envs,
                 observation_track=self._observation_track.value,
+                render_observations=effective_render_observations,
             )
             provenance = env.provenance
             if (
@@ -1274,6 +1292,7 @@ class GpuNativeTensorBackendEnv:
                 "task_id": task_id,
                 "consumer": "rl",
                 "observation_track": self._observation_track.value,
+                "render_observations": effective_render_observations,
                 "batch_size": num_envs,
                 "backend_id": _GPU_NATIVE_BACKEND_ID,
                 "api_version": _GPU_NATIVE_API_VERSION,
@@ -1308,12 +1327,24 @@ class GpuNativeTensorBackendEnv:
         return self._task_id
 
     @property
+    def backend_id(self) -> str:
+        return _GPU_NATIVE_BACKEND_ID
+
+    @property
     def num_envs(self) -> int:
         return self._num_envs
 
     @property
     def device(self) -> Any:
         return self._device
+
+    @property
+    def observation_track(self) -> str:
+        return self._observation_track.value
+
+    @property
+    def render_observations(self) -> bool:
+        return self._render_observations
 
     @property
     def cohort_horizon_steps(self) -> int:
@@ -1592,9 +1623,80 @@ class GpuNativeTensorBackendEnv:
             object_position_m=object_pose[:, :3],
             object_linear_velocity_m_s=object_twist[:, :3],
             fingerpad_contact_flags=field("fingerpad_contact_flags"),
-            post_hold_contact_valid=field("capture_post_hold_contact_valid").squeeze(-1),
+            post_hold_contact_valid=field("capture_post_hold_contact_valid").squeeze(
+                -1
+            ),
             layout_sha256=OBSERVATION_LAYOUT_SHA256,
         )
+
+    def materialize_review_rgb(
+        self,
+        lanes: tuple[int, ...] | None = None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Materialize current GPU-rendered scene/wrist frames for review audit.
+
+        Rendering remains part of the CUDA reset/step path. This explicit host
+        copy is only an artifact-control-plane operation and does not alter the
+        frozen policy observation track.
+        """
+
+        if self._closed:
+            raise GpuNativeTensorBackendUnavailableError("GPU tensor backend is closed")
+        if not self._render_observations:
+            raise GpuNativeTensorBackendUnavailableError(
+                "review RGB requires render_observations=True"
+            )
+        if self._steps_since_reset is None:
+            raise GpuNativeTensorBackendUnavailableError(
+                "review RGB materialization requires a reset cohort"
+            )
+        selected = tuple(range(self._num_envs)) if lanes is None else lanes
+        if not isinstance(selected, tuple):
+            raise TypeError("review RGB lanes must be an immutable tuple")
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("review RGB lanes must be non-empty and unique")
+        if any(
+            isinstance(lane, bool)
+            or not isinstance(lane, int)
+            or not 0 <= lane < self._num_envs
+            for lane in selected
+        ):
+            raise ValueError("review RGB lane is outside the active cohort")
+
+        numpy = importlib.import_module("numpy")
+        visual = self._env.device_visual_observation()
+        tensors = {}
+        for camera in ("agentview", "robot0_eye_in_hand"):
+            tensors[camera] = self._view(
+                visual.rgb[camera],
+                f"review_rgb_{camera}",
+                expected_shape=(
+                    self._num_envs,
+                    self._image_size,
+                    self._image_size,
+                    3,
+                ),
+                expected_dtype=self._torch.float32,
+            )
+        host = {
+            camera: tensor.detach().cpu().numpy() for camera, tensor in tensors.items()
+        }
+        frames = []
+        for lane in selected:
+            row = {}
+            for camera, values in host.items():
+                frame = numpy.asarray(values[lane], dtype=numpy.float32)
+                if not numpy.all(numpy.isfinite(frame)):
+                    raise GpuNativeTensorBackendUnavailableError(
+                        f"GPU review RGB is non-finite for {camera} lane {lane}"
+                    )
+                encoded = numpy.rint(numpy.clip(frame, 0.0, 1.0) * 255.0).astype(
+                    numpy.uint8
+                )
+                encoded.setflags(write=False)
+                row[camera] = encoded
+            frames.append(MappingProxyType(row))
+        return tuple(frames)
 
     def materialize_health_audit(self) -> Mapping[str, Any]:
         """Fail closed on overflow or controller/driver guards at a cohort boundary."""
@@ -1610,7 +1712,9 @@ class GpuNativeTensorBackendEnv:
             "truncated",
             "terminal_reason",
         )
-        if not isinstance(audit, Mapping) or any(name not in audit for name in required):
+        if not isinstance(audit, Mapping) or any(
+            name not in audit for name in required
+        ):
             raise GpuNativeTensorBackendUnavailableError(
                 "SE3-WAM health audit lacks required guard fields"
             )
@@ -1650,6 +1754,7 @@ class GpuNativeTensorBackendEnv:
                 "controller_valid": numpy.array(controller, copy=True),
                 "driver_valid": numpy.array(driver, copy=True),
                 "physics_step": numpy.array(audit["physics_step"], copy=True),
+                "terminal": numpy.asarray(terminal, dtype=numpy.int32).copy(),
             }
         )
 
@@ -1756,7 +1861,9 @@ class GpuNativeTensorBackendEnv:
             seeds=tuple(request.seed for request in request_values),
             manifest_ordinals=ordinals,
             manifest_sha256=self._manifest_sha256,
-            requests=tuple(_defensive_manifest_request(request) for request in request_values),
+            requests=tuple(
+                _defensive_manifest_request(request) for request in request_values
+            ),
         )
 
     def step_device(self, action: Any) -> GpuNativeTensorStep:
@@ -1994,6 +2101,49 @@ class GpuNativeTensorBackendEnv:
                 raise GpuNativeTensorBackendUnavailableError(
                     "teacher audit clock differs from the active control boundary"
                 )
+            if self._observation_track.value == "state" and self._render_observations:
+                # Independent review rendering must not silently widen the frozen
+                # STATE policy boundary.  The engine audit validates the current
+                # CUDA state and render, then this control-plane adapter restores
+                # the canonical state-only camera sentinels before the Planner can
+                # observe the packet.  Real scene/wrist pixels remain available
+                # only through materialize_review_rgb().
+                numpy = importlib.import_module("numpy")
+                rgb = {}
+                depth_m = {}
+                segmentation = {}
+                privileged = dict(observation.privileged)
+                for camera in ("agentview", "robot0_eye_in_hand"):
+                    rgb[camera] = numpy.zeros(
+                        (self._image_size, self._image_size, 3),
+                        dtype=numpy.uint8,
+                    )
+                    depth_m[camera] = numpy.ones(
+                        (self._image_size, self._image_size, 1),
+                        dtype=numpy.float32,
+                    )
+                    segmentation[camera] = numpy.zeros(
+                        (self._image_size, self._image_size, 1),
+                        dtype=numpy.int32,
+                    )
+                    for suffix in (
+                        "target_visible_pixels",
+                        "target_image_fraction",
+                        "occluder_visible_pixels",
+                    ):
+                        name = f"{camera}_{suffix}"
+                        if name not in privileged:
+                            raise GpuNativeTensorBackendUnavailableError(
+                                f"STATE teacher audit lacks privileged sentinel {name}"
+                            )
+                        privileged[name] = numpy.zeros_like(privileged[name])
+                observation = replace(
+                    observation,
+                    rgb=rgb,
+                    depth_m=depth_m,
+                    segmentation=segmentation,
+                    privileged=privileged,
+                )
             observations.append(observation)
         self._teacher_audit_materializations += 1
         return tuple(observations)
@@ -2005,7 +2155,10 @@ class GpuNativeTensorBackendEnv:
     ) -> tuple[GpuNativeTensorTerminalRow, ...]:
         """Build T4 terminal rows from one explicit host audit control-plane call."""
 
-        if any(episode_id in self._terminal_consumed_episode_ids for episode_id in episode_ids):
+        if any(
+            episode_id in self._terminal_consumed_episode_ids
+            for episode_id in episode_ids
+        ):
             raise GpuNativeTensorBackendUnavailableError(
                 "T4 terminal audit attempted to consume an episode more than once"
             )
