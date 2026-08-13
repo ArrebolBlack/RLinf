@@ -3,126 +3,115 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Run the bounded t1_xyz GPU Planner E0 smoke.
+"""Run one fail-closed ``t1_xyz`` GPU Planner evidence row.
 
-The online path is deliberately small and explicit:
-
-    current host STATE observation -> ConveyorScriptedTeacher -> E7
-    -> the same ``mjwarp_gpu_v1`` CUDA environment
-
-The replay path constructs a second CUDA backend and replays the complete
-action tape.  This file is an E0 engineering smoke, not a D32/MC64/H1024
-result runner; it refuses more than one episode until Queue and Owner freeze a
-manifest and matched reference.
+The result path accepts only a sealed E0/D32 manifest row.  It validates the
+complete export-bound ResetRequest and the clean five-repository source tuple
+before constructing CUDA, plans from the current observation at every control
+step, and emits a countable result only after strict fresh-backend replay,
+quality-v2, exact-once terminal ledger, and evidence-file gates all pass.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 
-TASK_ID = "t1_xyz"
-BACKEND_ID = "mjwarp_gpu_v1"
-BASE_SE3_SOURCE_COMMIT = "31b07c52660c5fe0451d9d97f0494fe3d849ec10"
-BASE_SE3_SOURCE_TREE = "b38a7fff7ef00c847dabef9daee8b67e5bc99169"
-SE3_SOURCE_COMMIT = "c1af4de449b05043bd01dcf1c323399bfd22e7ef"
-SE3_SOURCE_TREE = "f0effcd10b5bfa1b48b052255a9067cb7c1b7b7b"
-QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v2"
-QUALITY_EVALUATOR_ID = "gpu-planner-t1-xyz-e0-v2"
+
+def _load_strict_contract() -> Any:
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "rlinf/envs/dynamic_benchmark/t1_xyz_strict_evidence.py"
+    )
+    name = "_t1_xyz_strict_evidence_contract"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load strict evidence contract: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_STRICT = _load_strict_contract()
+BACKEND_ID = _STRICT.BACKEND_ID
+EXECUTION_CONTRACT = _STRICT.EXECUTION_CONTRACT
+QUALITY_EVALUATOR_ID = _STRICT.QUALITY_EVALUATOR_ID
+QUALITY_SCHEMA_VERSION = _STRICT.QUALITY_SCHEMA_VERSION
+RESULT_SCHEMA_VERSION = _STRICT.RESULT_SCHEMA_VERSION
+TASK_ID = _STRICT.TASK_ID
+load_frozen_manifest = _STRICT.load_frozen_manifest
+preflight_export_request = _STRICT.preflight_export_request
+request_identity = _STRICT.request_identity
+validate_repository_tuple = _STRICT.validate_repository_tuple
+validate_result_for_row = _STRICT.validate_result_for_row
+
+_REVIEW_CAMERAS = ("agentview", "robot0_eye_in_hand")
+_VISUAL_PRIVILEGED_SUFFIXES = (
+    "target_visible_pixels",
+    "target_image_fraction",
+    "occluder_visible_pixels",
+)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--export-dir", type=Path)
-    parser.add_argument(
-        "--manifest-row",
-        type=Path,
-        help="Common-runner manifest row; its export_dir is used when --export-dir is omitted.",
-    )
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--row-index", type=int, required=True)
+    parser.add_argument("--phase", choices=("e0", "d32"), default="e0")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--tape-output",
         type=Path,
-        help="Optional full observation/action tape path; defaults beside --output.",
-    )
-    parser.add_argument("--expected-gpu-uuid", required=True)
-    parser.add_argument("--expected-se3-source-commit", default=SE3_SOURCE_COMMIT)
-    parser.add_argument("--expected-se3-source-tree", default=SE3_SOURCE_TREE)
-    parser.add_argument("--device-ordinal", type=int, default=0)
-    parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument(
-        "--observation-track",
-        choices=("hybrid",),
-        default="hybrid",
-        help="Capture the GPU scene and wrist cameras alongside the Planner state.",
+        help="Complete observation/action tape; defaults beside --output.",
     )
     parser.add_argument(
         "--visual-gif",
         type=Path,
-        help="Optional GPU-rendered side-by-side scene/wrist GIF; valid only with --observation-track hybrid.",
+        help="GPU-rendered scene/wrist GIF; defaults beside --output.",
     )
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=1,
-        help="E0 is intentionally limited to one natural-termination episode.",
-    )
-    parser.add_argument(
-        "--replay-policy",
-        choices=("audit", "strict"),
-        default="audit",
-        help="Record fresh replay divergence as audit evidence by default; strict is diagnostic-only.",
-    )
-    parser.add_argument(
-        "--planner-lookahead-s",
-        type=float,
-        help="Optional single-variable Planner override for the exploratory run.",
-    )
-    parser.add_argument(
-        "--planner-contact-lookahead-s",
-        type=float,
-        help="Optional contact-phase Planner lookahead override for the exploratory run.",
-    )
-    parser.add_argument(
-        "--planner-adaptive-lookahead-speed-gain-s-per-mps",
-        type=float,
-        help="Optional speed-adaptive Planner lookahead gain for the exploratory run.",
-    )
-    parser.add_argument(
-        "--planner-lift-ramp-steps",
-        type=int,
-        help="Optional number of Planner lift-ramp control steps for the exploratory run.",
-    )
-    parser.add_argument(
-        "--planner-lift-contact-loss-retry-steps",
-        type=int,
-        help="Optional Planner lift-contact-loss retry window for the exploratory run.",
-    )
+    parser.add_argument("--expected-gpu-uuid", required=True)
+    parser.add_argument("--research-source-root", type=Path, required=True)
+    parser.add_argument("--se3-source-root", type=Path, required=True)
+    parser.add_argument("--mjwarp-source-root", type=Path, required=True)
+    parser.add_argument("--rlinf-source-root", type=Path, required=True)
+    parser.add_argument("--dynamic-source-root", type=Path, required=True)
+    parser.add_argument("--device-ordinal", type=int, default=0)
+    parser.add_argument("--image-size", type=int, default=64)
     return parser
 
 
 def _json_sha256(payload: Any) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _array_digest(value: Any) -> str:
@@ -135,8 +124,6 @@ def _array_digest(value: Any) -> str:
 
 
 def _observation_digest(observation: Any) -> str:
-    """Hash the complete public observation, including both rendered cameras."""
-
     payload: dict[str, Any] = {
         "identity": {
             "episode_id": observation.episode_id,
@@ -147,11 +134,16 @@ def _observation_digest(observation: Any) -> str:
             "time_s": float(observation.time_s),
         },
         "rgb": {name: _array_digest(value) for name, value in observation.rgb.items()},
-        "depth_m": {name: _array_digest(value) for name, value in observation.depth_m.items()},
-        "segmentation": {
-            name: _array_digest(value) for name, value in observation.segmentation.items()
+        "depth_m": {
+            name: _array_digest(value) for name, value in observation.depth_m.items()
         },
-        "proprio": {name: _array_digest(value) for name, value in observation.proprio.items()},
+        "segmentation": {
+            name: _array_digest(value)
+            for name, value in observation.segmentation.items()
+        },
+        "proprio": {
+            name: _array_digest(value) for name, value in observation.proprio.items()
+        },
         "privileged": {
             name: _array_digest(value) for name, value in observation.privileged.items()
         },
@@ -167,39 +159,118 @@ def _observation_digest(observation: Any) -> str:
     return _json_sha256(payload)
 
 
+def _readonly_copy(value: Any) -> np.ndarray:
+    array = np.array(value, copy=True)
+    array.setflags(write=False)
+    return array
+
+
+def _state_and_review_observation(
+    observation: Any,
+) -> tuple[Any, dict[str, np.ndarray]]:
+    """Split one rendered audit packet into STATE Planner and review material."""
+
+    groups = {
+        "rgb": observation.rgb,
+        "depth_m": observation.depth_m,
+        "segmentation": observation.segmentation,
+    }
+    for group_name, group in groups.items():
+        if not isinstance(group, Mapping) or set(group) != set(_REVIEW_CAMERAS):
+            raise RuntimeError(
+                f"t1_xyz {group_name} must contain the exact scene/wrist cameras"
+            )
+
+    review: dict[str, np.ndarray] = {}
+    state_rgb: dict[str, np.ndarray] = {}
+    state_depth: dict[str, np.ndarray] = {}
+    state_segmentation: dict[str, np.ndarray] = {}
+    for camera in _REVIEW_CAMERAS:
+        rgb = np.asarray(observation.rgb[camera])
+        depth = np.asarray(observation.depth_m[camera])
+        segmentation = np.asarray(observation.segmentation[camera])
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[-1] != 3:
+            raise RuntimeError(f"t1_xyz review RGB for {camera} is not uint8 HxWx3")
+        scalar_image_shape = (*rgb.shape[:2], 1)
+        if (
+            depth.shape != scalar_image_shape
+            or segmentation.shape != scalar_image_shape
+        ):
+            raise RuntimeError(f"t1_xyz review material shapes differ for {camera}")
+        if not np.all(np.isfinite(depth)):
+            raise RuntimeError(f"t1_xyz review depth for {camera} is non-finite")
+        review[camera] = _readonly_copy(rgb)
+        state_rgb[camera] = _readonly_copy(np.zeros_like(rgb))
+        state_depth[camera] = _readonly_copy(np.ones_like(depth))
+        state_segmentation[camera] = _readonly_copy(np.zeros_like(segmentation))
+
+    if not isinstance(observation.privileged, Mapping):
+        raise RuntimeError("t1_xyz observation privileged payload must be a mapping")
+    privileged = {
+        name: _readonly_copy(value) for name, value in observation.privileged.items()
+    }
+    required_visual_keys = {
+        f"{camera}_{suffix}"
+        for camera in _REVIEW_CAMERAS
+        for suffix in _VISUAL_PRIVILEGED_SUFFIXES
+    }
+    missing = sorted(required_visual_keys - set(privileged))
+    if missing:
+        raise RuntimeError(
+            f"t1_xyz rendered audit lacks visual privileged fields: {missing}"
+        )
+    for name in required_visual_keys:
+        privileged[name] = _readonly_copy(np.zeros_like(privileged[name]))
+
+    state_observation = replace(
+        observation,
+        rgb=MappingProxyType(state_rgb),
+        depth_m=MappingProxyType(state_depth),
+        segmentation=MappingProxyType(state_segmentation),
+        privileged=MappingProxyType(privileged),
+    )
+    return state_observation, review
+
+
+def _review_digest(review: Mapping[str, Any]) -> str:
+    if set(review) != set(_REVIEW_CAMERAS):
+        raise RuntimeError("t1_xyz review packet changed the scene/wrist camera set")
+    return _json_sha256(
+        {camera: _array_digest(review[camera]) for camera in _REVIEW_CAMERAS}
+    )
+
+
 def _ledger_payload(ledger: Any) -> list[dict[str, Any]]:
     if ledger is None:
         return []
-    rows = []
-    for row in ledger.rows:
-        rows.append(
-            {
-                "lane": int(row.lane),
-                "episode_id": row.episode_id,
-                "task_id": row.task_id,
-                "outcome": row.outcome.value,
-                "terminated": bool(row.terminated),
-                "truncated": bool(row.truncated),
-                "success": bool(row.success),
-                "termination_reason": row.termination_reason,
-                "physics_step": int(row.physics_step),
-                "control_step": int(row.control_step),
-                "policy_step": int(row.policy_step),
-                "completion": float(row.completion),
-                "events": [
-                    {
-                        "name": event.name,
-                        "physics_step": int(event.physics_step),
-                        "time_s": float(event.time_s),
-                    }
-                    for event in row.events
-                ],
-                "task_quality": (
-                    None if row.task_quality is None else row.task_quality.to_dict()
-                ),
-            }
-        )
-    return rows
+    return [
+        {
+            "lane": int(row.lane),
+            "episode_id": row.episode_id,
+            "task_id": row.task_id,
+            "outcome": row.outcome.value,
+            "terminated": bool(row.terminated),
+            "truncated": bool(row.truncated),
+            "success": bool(row.success),
+            "termination_reason": row.termination_reason,
+            "physics_step": int(row.physics_step),
+            "control_step": int(row.control_step),
+            "policy_step": int(row.policy_step),
+            "completion": float(row.completion),
+            "events": [
+                {
+                    "name": event.name,
+                    "physics_step": int(event.physics_step),
+                    "time_s": float(event.time_s),
+                }
+                for event in row.events
+            ],
+            "task_quality": None
+            if row.task_quality is None
+            else row.task_quality.to_dict(),
+        }
+        for row in ledger.rows
+    ]
 
 
 def _provenance_payload(provenance: Any) -> dict[str, Any]:
@@ -223,12 +294,35 @@ def _provenance_payload(provenance: Any) -> dict[str, Any]:
     } | {"runtime_versions": dict(getattr(provenance, "runtime_versions", {}))}
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _validate_provenance(
+    provenance: Mapping[str, Any],
+    *,
+    expected_gpu_uuid: str,
+    expected_commit: str,
+    expected_tree: str,
+) -> None:
+    if provenance.get("backend_id") != BACKEND_ID:
+        raise RuntimeError("t1_xyz result backend is not mjwarp_gpu_v1")
+    if provenance.get("device_platform") not in {"cuda", "gpu"}:
+        raise RuntimeError("t1_xyz result did not use CUDA/GPU physics")
+    if provenance.get("physical_device_uuid") != expected_gpu_uuid:
+        raise RuntimeError("t1_xyz result used a different physical GPU")
+    if (
+        provenance.get("git_commit") != expected_commit
+        or provenance.get("git_tree") != expected_tree
+    ):
+        raise RuntimeError("t1_xyz result SE3 source provenance drifted")
+
+
+def _validate_module_root(module: Any, expected_root: Path, name: str) -> None:
+    module_file = getattr(module, "__file__", None)
+    if not isinstance(module_file, str):
+        raise RuntimeError(f"{name} import has no filesystem identity")
+    resolved = Path(module_file).resolve(strict=True)
+    try:
+        resolved.relative_to(expected_root.resolve(strict=True))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} imported outside the sealed source root") from exc
 
 
 def _make_command(request: Any, values: Sequence[float], policy_step: int) -> Any:
@@ -249,15 +343,28 @@ def _replay(
     backend: Any,
     request: Any,
     observations: tuple[Any, ...],
+    review_digests: tuple[str, ...],
     commands: tuple[Any, ...],
     outcomes: tuple[tuple[bool, bool, bool, str | None], ...],
     terminal_ledger: Any,
 ) -> dict[str, Any]:
+    """Run a strict independent replay with the same materialization order."""
+
     replay_backend = backend.new_replay_backend()
     try:
-        replay_observation = replay_backend.reset((request,))[0]
+        fresh_backend_distinct = replay_backend is not backend
+        primary_provenance = _provenance_payload(backend.provenance)
+        replay_provenance = _provenance_payload(replay_backend.provenance)
+        backend_identity_exact = replay_provenance == primary_provenance
+        replay_raw_observation = replay_backend.reset((request,))[0]
+        replay_observation, replay_review = _state_and_review_observation(
+            replay_raw_observation
+        )
         observation_digests = [_observation_digest(replay_observation)]
-        expected_observation_digests = [_observation_digest(value) for value in observations]
+        actual_review_digests = [_review_digest(replay_review)]
+        expected_observation_digests = [
+            _observation_digest(value) for value in observations
+        ]
         replay_outcomes: list[tuple[bool, bool, bool, str | None]] = []
         for command in commands:
             replay_command = _make_command(
@@ -266,7 +373,11 @@ def _replay(
                 int(replay_backend.policy_steps()[0]),
             )
             result = replay_backend.step((replay_command,))[0]
-            observation_digests.append(_observation_digest(result.observation))
+            replay_observation, replay_review = _state_and_review_observation(
+                result.observation
+            )
+            observation_digests.append(_observation_digest(replay_observation))
+            actual_review_digests.append(_review_digest(replay_review))
             replay_outcomes.append(
                 (
                     bool(result.terminated),
@@ -275,35 +386,72 @@ def _replay(
                     result.termination_reason,
                 )
             )
-        replay_ledger = _ledger_payload(replay_backend.last_terminal_ledger)
+        replay_ledger_object = replay_backend.last_terminal_ledger
+        replay_ledger = _ledger_payload(replay_ledger_object)
         expected_ledger = _ledger_payload(terminal_ledger)
+        exact_once_error = None
+        exact_once_witnesses: tuple[str, ...] = ()
+        try:
+            from rlinf.envs.dynamic_benchmark.gpu_backend import (
+                assert_terminal_ledger_exact_once,
+            )
+
+            exact_once_witnesses = assert_terminal_ledger_exact_once(
+                replay_backend,
+                () if replay_ledger_object is None else replay_ledger_object.rows,
+            )
+        except Exception as exc:
+            exact_once_error = {"error_type": type(exc).__name__, "error": str(exc)}
+        terminal_ledger_exact_once = exact_once_error is None
+        observation_tape_exact = observation_digests == expected_observation_digests
+        review_tape_exact = tuple(actual_review_digests) == review_digests
+        outcomes_exact = tuple(replay_outcomes) == outcomes
+        terminal_ledger_exact = replay_ledger == expected_ledger
         return {
+            "mode": "strict_fresh_backend",
             "passed": bool(
-                observation_digests == expected_observation_digests
-                and tuple(replay_outcomes) == outcomes
-                and replay_ledger == expected_ledger
+                fresh_backend_distinct
+                and backend_identity_exact
+                and observation_tape_exact
+                and review_tape_exact
+                and outcomes_exact
+                and terminal_ledger_exact
+                and terminal_ledger_exact_once
             ),
-            "observation_tape_exact": observation_digests == expected_observation_digests,
-            "outcomes_exact": tuple(replay_outcomes) == outcomes,
-            "terminal_ledger_exact": replay_ledger == expected_ledger,
+            "fresh_backend_distinct": fresh_backend_distinct,
+            "backend_identity_exact": backend_identity_exact,
+            "source_identity_exact": backend_identity_exact,
+            "observation_tape_exact": observation_tape_exact,
+            "review_tape_exact": review_tape_exact,
+            "outcomes_exact": outcomes_exact,
+            "terminal_ledger_exact": terminal_ledger_exact,
+            "terminal_ledger_exact_once": terminal_ledger_exact_once,
+            "primary_provenance": primary_provenance,
+            "replay_provenance": replay_provenance,
+            "exact_once_negative_witnesses": list(exact_once_witnesses),
+            "exact_once_error": exact_once_error,
             "replay_observation_sha256": _json_sha256(observation_digests),
+            "replay_review_sha256": _json_sha256(actual_review_digests),
             "replay_ledger_sha256": _json_sha256(replay_ledger),
         }
     finally:
         replay_backend.close()
 
 
-def _write_visual_gif(path: Path, observations: Sequence[Any]) -> None:
+def _write_visual_gif(path: Path, reviews: Sequence[Mapping[str, Any]]) -> None:
     if path.exists():
         raise FileExistsError(f"refusing to overwrite {path}")
     try:
         import imageio.v3 as iio
     except ImportError as exc:
-        raise RuntimeError("--visual-gif requires imageio in the GPU runtime") from exc
+        raise RuntimeError("strict evidence export requires imageio") from exc
     frames = []
-    for observation in observations:
-        left = np.asarray(observation.rgb["agentview"], dtype=np.uint8)
-        right = np.asarray(observation.rgb["robot0_eye_in_hand"], dtype=np.uint8)
+    for review in reviews:
+        left = np.asarray(review["agentview"], dtype=np.uint8)
+        right = np.asarray(
+            review["robot0_eye_in_hand"],
+            dtype=np.uint8,
+        )
         if left.shape[0] != right.shape[0]:
             raise RuntimeError("GPU scene and wrist frames have different heights")
         frames.append(np.concatenate((left, right), axis=1))
@@ -316,20 +464,28 @@ def _write_tape_npz(
     observations: Sequence[Any],
     commands: Sequence[Any],
 ) -> None:
-    """Persist the complete host audit tape without replacing online planning."""
-
     if path.exists():
         raise FileExistsError(f"refusing to overwrite {path}")
     if not observations or len(observations) != len(commands) + 1:
-        raise ValueError("trajectory tape must contain one more observation than actions")
+        raise ValueError(
+            "trajectory tape must contain one more observation than actions"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "episode_id": np.asarray([value.episode_id for value in observations]),
         "task_id": np.asarray([value.task_id for value in observations]),
-        "physics_step": np.asarray([value.physics_step for value in observations], dtype=np.int64),
-        "control_step": np.asarray([value.control_step for value in observations], dtype=np.int64),
-        "policy_step": np.asarray([value.policy_step for value in observations], dtype=np.int64),
-        "time_s": np.asarray([value.time_s for value in observations], dtype=np.float64),
+        "physics_step": np.asarray(
+            [value.physics_step for value in observations], dtype=np.int64
+        ),
+        "control_step": np.asarray(
+            [value.control_step for value in observations], dtype=np.int64
+        ),
+        "policy_step": np.asarray(
+            [value.policy_step for value in observations], dtype=np.int64
+        ),
+        "time_s": np.asarray(
+            [value.time_s for value in observations], dtype=np.float64
+        ),
         "action_values": np.stack(
             [np.asarray(value.values, dtype=np.float64) for value in commands]
         ),
@@ -338,23 +494,6 @@ def _write_tape_npz(
         ),
         "observation_digest": np.asarray(
             [_observation_digest(value) for value in observations]
-        ),
-        "event_names_json": np.asarray(
-            [
-                json.dumps(
-                    [
-                        {
-                            "name": event.name,
-                            "physics_step": int(event.physics_step),
-                            "time_s": float(event.time_s),
-                        }
-                        for event in value.events_since_last_observation
-                    ],
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                for value in observations
-            ]
         ),
     }
     for group_name in ("rgb", "depth_m", "segmentation", "proprio", "privileged"):
@@ -366,166 +505,156 @@ def _write_tape_npz(
     np.savez_compressed(path, **payload)
 
 
+def _validate_terminal_quality(
+    terminal: Mapping[str, Any],
+    *,
+    episode_id: str,
+) -> None:
+    quality = terminal.get("task_quality")
+    if terminal.get("success") is True and not isinstance(quality, Mapping):
+        raise RuntimeError("successful t1_xyz result lacks task quality")
+    if quality is None:
+        return
+    if (
+        quality.get("episode_id") != episode_id
+        or quality.get("task_id") != TASK_ID
+        or quality.get("schema_version") != QUALITY_SCHEMA_VERSION
+        or quality.get("evaluator_backend_id") != QUALITY_EVALUATOR_ID
+        or quality.get("terminal") is not True
+    ):
+        raise RuntimeError("t1_xyz terminal quality-v2 identity drifted")
+
+
 def main() -> None:
     args = _parser().parse_args()
-    if args.episodes != 1:
-        raise ValueError("GPU Planner E0 is limited to exactly one episode")
-    if args.observation_track != "hybrid":
-        raise ValueError("GPU Planner E0 requires hybrid GPU scene/wrist observations")
     if args.image_size < 64:
         raise ValueError("--image-size must be at least 64")
-    if args.export_dir is None:
-        if args.manifest_row is None:
-            raise ValueError("one of --export-dir or --manifest-row is required")
-        row = json.loads(args.manifest_row.read_text(encoding="utf-8"))
-        export_dir = row.get("export_dir")
-        if not isinstance(export_dir, str) or not export_dir:
-            raise ValueError("manifest row must contain a non-empty export_dir")
-        args.export_dir = Path(export_dir)
-    if args.planner_lookahead_s is not None and (
-        not np.isfinite(args.planner_lookahead_s) or args.planner_lookahead_s <= 0
-    ):
-        raise ValueError("--planner-lookahead-s must be finite and positive")
-    if args.planner_contact_lookahead_s is not None and (
-        not np.isfinite(args.planner_contact_lookahead_s)
-        or args.planner_contact_lookahead_s < 0
-    ):
-        raise ValueError("--planner-contact-lookahead-s must be finite and nonnegative")
-    if args.planner_adaptive_lookahead_speed_gain_s_per_mps is not None and (
-        not np.isfinite(args.planner_adaptive_lookahead_speed_gain_s_per_mps)
-        or args.planner_adaptive_lookahead_speed_gain_s_per_mps < 0
-    ):
-        raise ValueError(
-            "--planner-adaptive-lookahead-speed-gain-s-per-mps must be finite and nonnegative"
-        )
-    if args.planner_lift_ramp_steps is not None and args.planner_lift_ramp_steps < 0:
-        raise ValueError("--planner-lift-ramp-steps must be nonnegative")
-    if (
-        args.planner_lift_contact_loss_retry_steps is not None
-        and args.planner_lift_contact_loss_retry_steps < 1
-    ):
-        raise ValueError("--planner-lift-contact-loss-retry-steps must be positive")
-    if (
-        args.expected_se3_source_commit != SE3_SOURCE_COMMIT
-        or args.expected_se3_source_tree != SE3_SOURCE_TREE
-    ):
-        raise ValueError("E0 is pinned to the committed SE3-WAM candidate source commit/tree")
+    if args.device_ordinal < 0:
+        raise ValueError("--device-ordinal must be nonnegative")
+    if not args.expected_gpu_uuid.strip():
+        raise ValueError("--expected-gpu-uuid must be non-empty")
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite {args.output}")
-    tape_output = args.tape_output or args.output.with_name(f"{args.output.stem}.tape.npz")
-    if tape_output.exists():
-        raise FileExistsError(f"refusing to overwrite {tape_output}")
-    if tape_output.suffix.lower() != ".npz":
-        raise ValueError("--tape-output must use the .npz suffix")
+    tape_output = args.tape_output or args.output.with_name(
+        f"{args.output.stem}.tape.npz"
+    )
     visual_gif = args.visual_gif or args.output.with_name(
         f"{args.output.stem}.scene-wrist.gif"
     )
+    if tape_output.suffix.lower() != ".npz":
+        raise ValueError("--tape-output must use the .npz suffix")
+    if tape_output.exists() or visual_gif.exists():
+        raise FileExistsError("strict evidence output paths must be new")
 
+    # All host/source/export checks complete before any CUDA backend exists.
+    manifest = load_frozen_manifest(
+        args.manifest,
+        expected_phase=args.phase,
+        verify_exports=True,
+    )
+    row = manifest.row(args.row_index)
+    repositories = validate_repository_tuple(
+        manifest,
+        research_root=args.research_source_root,
+        se3_root=args.se3_source_root,
+        mjwarp_root=args.mjwarp_source_root,
+        rlinf_root=args.rlinf_source_root,
+        dynamic_root=args.dynamic_source_root,
+    )
+    request, export_identity = preflight_export_request(manifest, row)
+    expected_request = dict(row["request"])
+    if request_identity(request) != expected_request:
+        raise RuntimeError("preflight ResetRequest identity drifted")
+    if Path(__file__).resolve().parents[2] != args.rlinf_source_root.resolve(
+        strict=True
+    ):
+        raise RuntimeError(
+            "strict row runner is not executing from the sealed RLinf root"
+        )
+
+    import se3_wam
     from se3_wam.benchmark.config import load_task_config
     from se3_wam.benchmark.teacher_factory import make_privileged_teacher
 
-    from rlinf.envs.dynamic_benchmark.gpu_backend import GpuNativeBackendEnv
+    _validate_module_root(se3_wam, args.se3_source_root, "SE3-WAM")
+
+    from rlinf.envs.dynamic_benchmark.gpu_backend import (
+        GpuNativeBackendEnv,
+        assert_terminal_ledger_exact_once,
+    )
 
     task_config = load_task_config(TASK_ID)
     horizon = int(task_config["clock"]["horizon_steps"])
+    if horizon != EXECUTION_CONTRACT["horizon_control_steps"]:
+        raise RuntimeError("t1_xyz task horizon differs from the sealed contract")
+    teacher, preparation = make_privileged_teacher(TASK_ID, request=request)
+    teacher.reset()
+    se3_identity = manifest.payload["repositories"]["se3_wam"]
     backend = GpuNativeBackendEnv(
         task_id=TASK_ID,
         num_envs=1,
-        export_dir=str(args.export_dir),
+        export_dir=str(manifest.export_dir(row)),
         device_ordinal=args.device_ordinal,
         image_size=args.image_size,
         expected_gpu_uuid=args.expected_gpu_uuid,
-        expected_se3_source_commit=args.expected_se3_source_commit,
-        expected_se3_source_tree=args.expected_se3_source_tree,
+        expected_se3_source_commit=se3_identity["commit"],
+        expected_se3_source_tree=se3_identity["tree"],
         task_quality_schema_version=QUALITY_SCHEMA_VERSION,
         task_quality_evaluator_backend_id=QUALITY_EVALUATOR_ID,
-        observation_track=args.observation_track,
+        observation_track=EXECUTION_CONTRACT["observation_track"],
+        require_exact_export_identity=True,
+        render_observations=True,
     )
     try:
-        if backend.backend_id != BACKEND_ID:
-            raise RuntimeError(f"unexpected backend id: {backend.backend_id!r}")
-        request = backend.next_request()
-        observations = list(backend.reset((request,)))
-        teacher, preparation = make_privileged_teacher(TASK_ID, request=request)
-        planner_overrides: list[dict[str, Any]] = []
-        if args.planner_lookahead_s is not None:
-            if not hasattr(teacher, "lookahead_s"):
-                raise RuntimeError("t1_xyz teacher does not expose lookahead_s")
-            teacher.lookahead_s = float(args.planner_lookahead_s)
-            planner_overrides.append(
-                {
-                    "variable": "lookahead_s",
-                    "value": float(args.planner_lookahead_s),
-                }
+        if (
+            getattr(backend.observation_track, "value", None) != "state"
+            or backend.require_exact_export_identity is not True
+            or backend.render_observations is not True
+        ):
+            raise RuntimeError("CUDA backend did not establish STATE plus review mode")
+        provenance = _provenance_payload(backend.provenance)
+        _validate_provenance(
+            provenance,
+            expected_gpu_uuid=args.expected_gpu_uuid,
+            expected_commit=se3_identity["commit"],
+            expected_tree=se3_identity["tree"],
+        )
+        frozen_requests = backend.frozen_requests
+        if (
+            len(frozen_requests) != 1
+            or request_identity(frozen_requests[0]) != expected_request
+        ):
+            raise RuntimeError(
+                "CUDA backend request differs from the sealed manifest row"
             )
-        if args.planner_contact_lookahead_s is not None:
-            if not hasattr(teacher, "contact_lookahead_s"):
-                raise RuntimeError("t1_xyz teacher does not expose contact_lookahead_s")
-            teacher.contact_lookahead_s = float(args.planner_contact_lookahead_s)
-            planner_overrides.append(
-                {
-                    "variable": "contact_lookahead_s",
-                    "value": float(args.planner_contact_lookahead_s),
-                }
-            )
-        if args.planner_adaptive_lookahead_speed_gain_s_per_mps is not None:
-            if not hasattr(teacher, "adaptive_lookahead_speed_gain_s_per_mps"):
-                raise RuntimeError(
-                    "t1_xyz teacher does not expose adaptive_lookahead_speed_gain_s_per_mps"
-                )
-            teacher.adaptive_lookahead_speed_gain_s_per_mps = float(
-                args.planner_adaptive_lookahead_speed_gain_s_per_mps
-            )
-            planner_overrides.append(
-                {
-                    "variable": "adaptive_lookahead_speed_gain_s_per_mps",
-                    "value": float(args.planner_adaptive_lookahead_speed_gain_s_per_mps),
-                }
-            )
-        if args.planner_lift_ramp_steps is not None:
-            if not hasattr(teacher, "lift_ramp_steps"):
-                raise RuntimeError("t1_xyz teacher does not expose lift_ramp_steps")
-            teacher.lift_ramp_steps = int(args.planner_lift_ramp_steps)
-            planner_overrides.append(
-                {
-                    "variable": "lift_ramp_steps",
-                    "value": int(args.planner_lift_ramp_steps),
-                }
-            )
-        if args.planner_lift_contact_loss_retry_steps is not None:
-            if not hasattr(teacher, "lift_contact_loss_retry_steps"):
-                raise RuntimeError(
-                    "t1_xyz teacher does not expose lift_contact_loss_retry_steps"
-                )
-            teacher.lift_contact_loss_retry_steps = int(
-                args.planner_lift_contact_loss_retry_steps
-            )
-            planner_overrides.append(
-                {
-                    "variable": "lift_contact_loss_retry_steps",
-                    "value": int(args.planner_lift_contact_loss_retry_steps),
-                }
-            )
-        if planner_overrides:
-            preparation = dict(preparation)
-            preparation["planner_overrides"] = planner_overrides
-            if len(planner_overrides) == 1:
-                preparation["planner_override"] = planner_overrides[0]
-        if hasattr(teacher, "reset"):
-            teacher.reset()
+        raw_observations = tuple(backend.reset((request,)))
+        if (
+            len(raw_observations) != 1
+            or raw_observations[0].episode_id != request.episode_id
+            or raw_observations[0].task_id != TASK_ID
+        ):
+            raise RuntimeError("CUDA reset changed the sealed row identity")
+        observation, review = _state_and_review_observation(raw_observations[0])
+        observations = [observation]
+        reviews = [review]
         commands: list[Any] = []
         outcomes: list[tuple[bool, bool, bool, str | None]] = []
         latencies_s: list[float] = []
-        observation = observations[0]
         result = None
         for _ in range(horizon):
             started = time.perf_counter()
             planner_action = teacher.act(observation)
             latencies_s.append(time.perf_counter() - started)
-            command = _make_command(request, planner_action.values, observation.policy_step)
+            command = _make_command(
+                request,
+                planner_action.values,
+                observation.policy_step,
+            )
             result = backend.step((command,))[0]
+            observation, review = _state_and_review_observation(result.observation)
             commands.append(command)
-            observations.append(result.observation)
+            observations.append(observation)
+            reviews.append(review)
             outcomes.append(
                 (
                     bool(result.terminated),
@@ -534,122 +663,131 @@ def main() -> None:
                     result.termination_reason,
                 )
             )
-            observation = result.observation
             if result.terminated or result.truncated:
                 break
         if result is None or not (result.terminated or result.truncated):
-            raise RuntimeError("E0 Planner did not reach natural termination within horizon")
-
+            raise RuntimeError("t1_xyz row did not reach natural termination")
         terminal_ledger = backend.last_terminal_ledger
-        if terminal_ledger is None:
-            raise RuntimeError("E0 Planner did not produce an exact-once terminal ledger")
-        try:
-            replay = _replay(
-                backend=backend,
-                request=request,
-                observations=tuple(observations),
-                commands=tuple(commands),
-                outcomes=tuple(outcomes),
-                terminal_ledger=terminal_ledger,
+        if terminal_ledger is None or len(terminal_ledger.rows) != 1:
+            raise RuntimeError("t1_xyz row lacks one exact terminal ledger row")
+        terminal_payload = _ledger_payload(terminal_ledger)
+        _validate_terminal_quality(
+            terminal_payload[0],
+            episode_id=str(request.episode_id),
+        )
+        primary_exact_once = assert_terminal_ledger_exact_once(
+            backend,
+            terminal_ledger.rows,
+        )
+        replay = _replay(
+            backend=backend,
+            request=request,
+            observations=tuple(observations),
+            review_digests=tuple(_review_digest(value) for value in reviews),
+            commands=tuple(commands),
+            outcomes=tuple(outcomes),
+            terminal_ledger=terminal_ledger,
+        )
+        if replay.get("passed") is not True:
+            raise RuntimeError(
+                f"strict fresh replay failed: {json.dumps(replay, sort_keys=True)}"
             )
-        except Exception as exc:
-            replay = {
-                "passed": False,
-                "observation_tape_exact": False,
-                "outcomes_exact": False,
-                "terminal_ledger_exact": False,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-            if args.replay_policy == "strict":
-                raise
-        if not replay["passed"] and args.replay_policy == "strict":
-            raise RuntimeError(f"GPU Planner E0 replay failed: {json.dumps(replay, sort_keys=True)}")
-        _write_tape_npz(tape_output, observations, commands)
-        visual_error = None
-        try:
-            _write_visual_gif(visual_gif, observations)
-        except RuntimeError as exc:
-            # GIF encoding is an optional presentation artifact.  Keep the
-            # GPU-rendered observation tape and online terminal result even
-            # when the shared runtime does not provide an imageio encoder.
-            visual_error = {"error_type": type(exc).__name__, "error": str(exc)}
 
-        ledger_payload = _ledger_payload(terminal_ledger)
-        action_tape = [np.asarray(command.values, dtype=np.float64).tolist() for command in commands]
+        tape_output = tape_output.resolve()
+        visual_gif = visual_gif.resolve()
+        _write_tape_npz(tape_output, observations, commands)
+        _write_visual_gif(visual_gif, reviews)
+        action_tape = [
+            {
+                "mode": getattr(command.mode, "value", command.mode),
+                "policy_step": int(command.policy_step),
+                "values": np.asarray(command.values, dtype=np.float64).tolist(),
+            }
+            for command in commands
+        ]
         trajectory_tape = [_observation_digest(value) for value in observations]
-        online_success = bool(result.success)
-        if online_success and replay["passed"]:
-            status = "passed"
-        elif online_success:
-            status = "completed_replay_audit_mismatch"
-        else:
-            status = "completed_online_failure"
+        evidence_export = {
+            "passed": True,
+            "action_tape_sha256": _json_sha256(action_tape),
+            "trajectory_tape_sha256": _json_sha256(trajectory_tape),
+            "tape_file": str(tape_output),
+            "tape_file_sha256": _file_sha256(tape_output),
+            "visual_file": str(visual_gif),
+            "visual_sha256": _file_sha256(visual_gif),
+        }
         payload = {
-            "schema_version": "gpu-planner-t1-xyz-e0-v2",
-            "status": status,
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "completed_strict_evidence",
+            "evidence_passed": True,
             "task_id": TASK_ID,
-            "job_phase": "e0",
+            "backend_id": BACKEND_ID,
+            "phase": args.phase,
+            "manifest_index": int(row["manifest_index"]),
+            "manifest": {
+                "candidate_index": row["candidate_index"],
+                "episode_id": row["request"]["episode_id"],
+                "manifest_index": row["manifest_index"],
+                "manifest_sha256": manifest.manifest_sha256,
+                "source_identity_sha256": manifest.source_identity_sha256,
+            },
+            "reset_request": expected_request,
             "online_planner": True,
-            "planner_observation_source": "current_observation_each_control_step",
-            "planner_compute": "cpu_allowed",
-            "planner_override": (
-                None
-                if not planner_overrides
-                else planner_overrides[0]
-                if len(planner_overrides) == 1
-                else {"variables": planner_overrides}
-            ),
-            "planner_overrides": planner_overrides or None,
+            "planner_observation_source": EXECUTION_CONTRACT[
+                "planner_observation_source"
+            ],
+            "planner_observation_track": EXECUTION_CONTRACT["observation_track"],
+            "review_materialization": EXECUTION_CONTRACT["review_materialization"],
             "frozen_action_replay": False,
             "cpu_physics_or_env_fallback": False,
             "quality": {
                 "schema_version": QUALITY_SCHEMA_VERSION,
                 "evaluator_backend_id": QUALITY_EVALUATOR_ID,
             },
-            "backend_id": backend.backend_id,
-            "provenance": _provenance_payload(backend.provenance),
-            "source_pin": {
-                "se3_commit": args.expected_se3_source_commit,
-                "se3_tree": args.expected_se3_source_tree,
-                "base_se3_commit": BASE_SE3_SOURCE_COMMIT,
-                "base_se3_tree": BASE_SE3_SOURCE_TREE,
+            "source_gate": {
+                "passed": True,
+                "repositories_exact": True,
+                "source_identity_sha256": manifest.source_identity_sha256,
+                "repositories": repositories,
             },
-            "export_dir": str(args.export_dir),
-            "episode_id": request.episode_id,
+            "export": export_identity,
+            "provenance": provenance,
+            "success": bool(result.success),
+            "termination_reason": result.termination_reason,
             "control_steps": len(commands),
             "physics_steps": int(observations[-1].physics_step),
-            "success": online_success,
-            "online_success": online_success,
-            "termination_reason": result.termination_reason,
+            "terminal_ledger_gate": {
+                "passed": True,
+                "exact_once_second_consumption_rejected": True,
+                "exact_once_negative_witnesses": list(primary_exact_once),
+            },
+            "terminal_ledger": terminal_payload,
+            "replay": replay,
             "action_tape": action_tape,
-            "action_sha256": _json_sha256(action_tape),
             "trajectory_tape": trajectory_tape,
-            "trajectory_sha256": _json_sha256(trajectory_tape),
-            "tape_file": str(tape_output),
-            "tape_sha256": _file_sha256(tape_output),
-            "terminal_ledger": ledger_payload,
-            "terminal_ledger_sha256": _json_sha256(ledger_payload),
-            "replay": {"policy": args.replay_policy, **replay},
+            "evidence_export": evidence_export,
             "teacher_preparation": preparation,
             "planner_latency_s": {
                 "count": len(latencies_s),
                 "max": max(latencies_s),
                 "mean": float(np.mean(latencies_s)),
             },
-            "visual": {
-                "observation_track": args.observation_track,
-                "scene_camera": "agentview",
-                "wrist_camera": "robot0_eye_in_hand",
-                "gpu_rendered": True,
-                "gif": str(visual_gif) if visual_error is None else None,
-                "gif_sha256": _file_sha256(visual_gif) if visual_error is None else None,
-                "gif_error": visual_error,
-            },
         }
+        validate_result_for_row(payload, manifest=manifest, row=row)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(json.dumps({"status": payload["status"], "control_steps": len(commands), "replay": replay}, sort_keys=True))
+        args.output.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            json.dumps(
+                {
+                    "status": payload["status"],
+                    "manifest_index": payload["manifest_index"],
+                    "success": payload["success"],
+                },
+                sort_keys=True,
+            )
+        )
     finally:
         backend.close()
 
