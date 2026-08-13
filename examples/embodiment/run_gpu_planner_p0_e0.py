@@ -147,9 +147,9 @@ def _review_contract_payloads(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     actions = _normalized_actions(tape)
     action_digest = _action_tape_sha256(actions)
-    fingerprints = [
-        entry.observation_fingerprint_sha256 for entry in tape.entries
-    ] + [terminal_observation_fingerprint]
+    fingerprints = [entry.observation_fingerprint_sha256 for entry in tape.entries] + [
+        terminal_observation_fingerprint
+    ]
     if len(fingerprints) != len(actions) + 1:
         raise RuntimeError("current-observation chain does not cover reset to terminal")
     results = []
@@ -170,7 +170,9 @@ def _review_contract_payloads(
             }
         )
     quality = terminal.get("task_quality")
-    quality_summary = quality.get("summary_sha256") if isinstance(quality, Mapping) else None
+    quality_summary = (
+        quality.get("summary_sha256") if isinstance(quality, Mapping) else None
+    )
     action_payload = {
         "schema_version": "se3wam-gpu-planner-action-tape-v1",
         "action_tape_sha256": action_digest,
