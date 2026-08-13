@@ -892,6 +892,18 @@ def test_t4_admission_requires_owner_frozen_manifest_before_runtime_start(
         )
 
 
+def test_t1_so3_capture_admission_does_not_claim_surface_runtime_inputs() -> None:
+    assert "t1_so3" in _MODULE._T1_CAPTURE_TASK_IDS
+    assert "t1_so3" not in _MODULE._T1_RUNTIME_FEATURE_TASK_IDS
+    assert _MODULE._T1_RUNTIME_FEATURE_TASK_IDS == frozenset({"t1_belt", "t1_occ"})
+    capabilities = _MODULE._p0_expected_capabilities(
+        task_id="t1_so3",
+        visual=True,
+        device_tensor_step=True,
+    )
+    assert capabilities["device_terminal_mask"] is True
+
+
 def test_generated_manifest_projects_only_observation_track_to_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
