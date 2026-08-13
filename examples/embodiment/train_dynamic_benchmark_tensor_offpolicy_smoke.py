@@ -1960,6 +1960,8 @@ def main() -> int:
         split=config.split,
         manifest_seed=config.manifest_seed,
         manifest_size=config.manifest_size,
+        runtime_manifest=config.runtime_manifest,
+        runtime_manifest_sha256=config.runtime_manifest_sha256,
     )
     try:
         _validate_runtime_versions(
