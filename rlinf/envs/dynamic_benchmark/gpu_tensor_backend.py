@@ -57,7 +57,7 @@ _CAPABILITY_NAMES = (
     "snapshot",
     "audit_materialization",
 )
-_P0_STATE_CONTRACT_CAPABILITIES = MappingProxyType(
+_CAPTURE_STATE_CONTRACT_CAPABILITIES = MappingProxyType(
     {
         "physics": True,
         "robot_control": True,
@@ -73,13 +73,19 @@ _P0_STATE_CONTRACT_CAPABILITIES = MappingProxyType(
         "audit_materialization": True,
     }
 )
-_P0_STATE_ENV_CAPABILITIES = MappingProxyType(
+_CAPTURE_STATE_ENV_CAPABILITIES = MappingProxyType(
     {
-        **_P0_STATE_CONTRACT_CAPABILITIES,
+        **_CAPTURE_STATE_CONTRACT_CAPABILITIES,
         "device_tensor_step": True,
         "device_terminal_mask": True,
     }
 )
+# Keep the old private names as compatibility aliases for existing contract
+# tests and downstream imports.  The values are shared by the P0/T1 capture
+# family; the task id is validated separately by the public contract.
+_P0_STATE_CONTRACT_CAPABILITIES = _CAPTURE_STATE_CONTRACT_CAPABILITIES
+_P0_STATE_ENV_CAPABILITIES = _CAPTURE_STATE_ENV_CAPABILITIES
+_T1_CAPTURE_TASK_IDS = frozenset({"t1_belt", "t1_occ"})
 _EXPORT_DIGEST_ATTRIBUTES = MappingProxyType(
     {
         "request_sha256": "request_identity_sha256",
@@ -271,13 +277,13 @@ def _validate_public_contract(
         getattr(env, "capabilities", None),
         context="SE3-WAM environment",
     )
-    if contract_capabilities != _P0_STATE_CONTRACT_CAPABILITIES:
+    if contract_capabilities != _CAPTURE_STATE_CONTRACT_CAPABILITIES:
         raise GpuNativeTensorBackendUnavailableError(
-            "SE3-WAM P0 STATE contract capability values differ from clean v0.2"
+            "SE3-WAM capture STATE contract capability values differ from clean v0.2"
         )
-    if env_capabilities != _P0_STATE_ENV_CAPABILITIES:
+    if env_capabilities != _CAPTURE_STATE_ENV_CAPABILITIES:
         raise GpuNativeTensorBackendUnavailableError(
-            "SE3-WAM P0 STATE engine capability values differ from clean v0.2"
+            "SE3-WAM capture STATE engine capability values differ from clean v0.2"
         )
     return contract_capabilities, env_capabilities
 
@@ -731,6 +737,8 @@ class GpuNativeTensorBackendEnv:
         manifest_size: int | None = None,
         manifest_requests: tuple[Any, ...] | None = None,
         manifest_sha256: str | None = None,
+        runtime_manifest: str | None = None,
+        runtime_manifest_sha256: str | None = None,
         task_quality_schema_version: str | None = None,
         task_quality_evaluator_backend_id: str | None = None,
     ) -> None:
@@ -754,8 +762,18 @@ class GpuNativeTensorBackendEnv:
             name="expected_se3_source_tree",
         )
         _require_single_uuid_visibility(expected_gpu_uuid, device_ordinal)
-        if task_id != "p0_grasp":
-            raise ValueError("GPU tensor R0 admission is currently limited to p0_grasp")
+        if (runtime_manifest is None) != (runtime_manifest_sha256 is None):
+            raise ValueError(
+                "runtime_manifest and runtime_manifest_sha256 must be supplied together"
+            )
+        if task_id in _T1_CAPTURE_TASK_IDS and runtime_manifest is None:
+            raise ValueError(
+                "T1 capture tensor admission requires a pinned surface-velocity runtime manifest"
+            )
+        if task_id not in _T1_CAPTURE_TASK_IDS and runtime_manifest is not None:
+            raise ValueError(
+                "runtime feature evidence is only accepted for the T1 capture tensor seam"
+            )
         if (
             isinstance(image_size, bool)
             or not isinstance(image_size, int)
@@ -805,6 +823,21 @@ class GpuNativeTensorBackendEnv:
             raise GpuNativeTensorBackendUnavailableError(
                 "PyTorch CUDA is unavailable; CPU fallback is forbidden"
             )
+        runtime_evidence = ()
+        if task_id in _T1_CAPTURE_TASK_IDS:
+            try:
+                from se3_wam.benchmark.gpu_native.tasks import load_runtime_feature_evidence
+
+                runtime_evidence = (
+                    load_runtime_feature_evidence(
+                        runtime_manifest,
+                        expected_manifest_sha256=runtime_manifest_sha256,
+                    ),
+                )
+            except Exception as exc:
+                raise GpuNativeTensorBackendUnavailableError(
+                    "T1 capture runtime feature evidence could not be admitted"
+                ) from exc
         device = torch.device(f"cuda:{device_ordinal}")
         try:
             stream_from_torch = warp.stream_from_torch
@@ -830,9 +863,13 @@ class GpuNativeTensorBackendEnv:
         try:
             self._split = Split(split)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"unsupported P0-Grasp manifest split: {split!r}") from exc
+            raise ValueError(f"unsupported GPU-native manifest split: {split!r}") from exc
         self._manifest_seed = manifest_seed
         if manifest_requests is None:
+            if task_id != "p0_grasp":
+                raise ValueError(
+                    "non-P0 capture admission requires an explicitly pinned reset manifest"
+                )
             effective_manifest_size = 4096 if manifest_size is None else manifest_size
             if (
                 isinstance(effective_manifest_size, bool)
@@ -883,7 +920,7 @@ class GpuNativeTensorBackendEnv:
                 or _enum_value(getattr(request, "observation_track", None)) != "state"
             ):
                 raise GpuNativeTensorBackendUnavailableError(
-                    f"manifest request {ordinal} differs from the P0 STATE/E7 contract"
+                    f"manifest request {ordinal} differs from the GPU STATE/E7 contract"
                 )
         manifest_payloads = tuple(
             _manifest_request_payload(request) for request in requests
@@ -940,8 +977,19 @@ class GpuNativeTensorBackendEnv:
             != "state"
         ):
             raise GpuNativeTensorBackendUnavailableError(
-                "frozen export request differs from the exact P0 STATE/E7 contract"
+                "frozen export request differs from the exact GPU STATE/E7 contract"
             )
+        if task_id in _T1_CAPTURE_TASK_IDS:
+            frozen_payload = _manifest_request_payload(frozen_request)
+            frozen_payload.pop("episode_id", None)
+            for ordinal, request in enumerate(frozen_manifest_requests):
+                request_payload = _manifest_request_payload(request)
+                request_payload.pop("episode_id", None)
+                if request_payload != frozen_payload:
+                    raise GpuNativeTensorBackendUnavailableError(
+                        "T1 capture reset manifest must match the one exported scene/factor "
+                        f"identity; lane {ordinal} requests a different reset"
+                    )
         env = make_gpu_native_env(
             task_id,
             consumer=self._consumer,
@@ -950,6 +998,7 @@ class GpuNativeTensorBackendEnv:
             export_dir=export_dir,
             device_ordinal=device_ordinal,
             image_size=image_size,
+            runtime_evidence=runtime_evidence,
             engine_kwargs={
                 "expected_device_uuid": expected_gpu_uuid,
                 "expected_model_sha256": export_identity_start["model_sha256"],
