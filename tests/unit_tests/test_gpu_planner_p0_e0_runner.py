@@ -62,3 +62,7 @@ def test_checksum_verifier_rejects_an_unlisted_bundle_artifact(tmp_path: Path) -
 
     with pytest.raises(RuntimeError, match="complete bundle"):
         _MODULE._verify_checksums(tmp_path)
+
+
+def test_runner_uses_current_task_quality_schema() -> None:
+    assert _MODULE.TASK_QUALITY_SCHEMA_VERSION == "db0-episode-task-quality-v2"

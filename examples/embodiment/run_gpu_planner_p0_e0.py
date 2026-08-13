@@ -30,7 +30,7 @@ import numpy as np
 
 SCHEMA_VERSION = "se3wam-gpu-planner-review-bundle-v1"
 SCHEMA_ID = "https://se3-wam.local/schemas/gpu-planner-review-bundle-v1.json"
-TASK_QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v1"
+TASK_QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v2"
 BACKEND_ID = "mjwarp_gpu_v1"
 JOB_ID = "GPUPLAN0/p0-grasp-e0-v1"
 _RUN_ARGUMENTS = (
