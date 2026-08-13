@@ -23,7 +23,10 @@ import pytest
 from examples.embodiment.dynamic_benchmark_calibration_projection import (
     CALIBRATION_BINDING_PROJECTION_SCHEMA,
     EXACT_TASKS,
+    EXCLUDED_REPAIR_TASKS,
+    REPAIRED_PRODUCTION_TASKS,
     REVIEW_SCHEMA,
+    SCOPED_PRODUCTION_AUTHORIZATION_RECEIPT_SCHEMA,
     canonical_json_bytes,
     projection_payload,
     validate_projection_artifact,
@@ -89,19 +92,21 @@ def _fixture(tmp_path: Path) -> tuple[dict, Path, str]:
         ):
             row[name] = f"{ordinal * 20 + offset + 1:064x}"
         tasks.append(row)
-    thresholds = {"calibration_wave_receipt": {
-        "schema_version": "rld2-qa-planner-calibration-wave-receipt-v0.1",
-        "binding_status": "bound",
-        "scientific_partition": "metric_calibration",
-        "transport_split": "validation",
-        "file_sha256": "a" * 64,
-        "source_identity": {"benchmark_commit": "b" * 40},
-        "task_count": 14,
-        "episodes_per_task": 20,
-        "total_reset_count": 280,
-        "task_order": list(EXACT_TASKS),
-        "tasks": tasks,
-    }}
+    thresholds = {
+        "calibration_wave_receipt": {
+            "schema_version": "rld2-qa-planner-calibration-wave-receipt-v0.1",
+            "binding_status": "bound",
+            "scientific_partition": "metric_calibration",
+            "transport_split": "validation",
+            "file_sha256": "a" * 64,
+            "source_identity": {"benchmark_commit": "b" * 40},
+            "task_count": 14,
+            "episodes_per_task": 20,
+            "total_reset_count": 280,
+            "task_order": list(EXACT_TASKS),
+            "tasks": tasks,
+        }
+    }
     path = tmp_path / "projection.json"
     path.write_bytes(
         canonical_json_bytes(
@@ -111,6 +116,29 @@ def _fixture(tmp_path: Path) -> tuple[dict, Path, str]:
         )
     )
     return thresholds, path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _scoped_receipt(commit: str = "c" * 40) -> dict:
+    return {
+        "schema_version": SCOPED_PRODUCTION_AUTHORIZATION_RECEIPT_SCHEMA,
+        "review_schema_version": REVIEW_SCHEMA,
+        "review_file_sha256": "d" * 64,
+        "review_payload_sha256": "e" * 64,
+        "baseline_reviewed_planner_commit": "b" * 40,
+        "repaired_planner_commit": commit,
+        "authorization_basis": "owner_instruction_2026-08-13_run_repaired_12_now",
+        "authorized_tasks": list(REPAIRED_PRODUCTION_TASKS),
+        "excluded_tasks": list(EXCLUDED_REPAIR_TASKS),
+        "quality_v4_policy": "nonblocking_not_exported",
+        "units": [
+            {
+                "task": task,
+                "baseline_review_status": "approved",
+                "baseline_owner_decision": "approved",
+            }
+            for task in REPAIRED_PRODUCTION_TASKS
+        ],
+    }
 
 
 def test_projection_uses_actual_file_identity_and_exact_frozen_binding(
@@ -125,7 +153,54 @@ def test_projection_uses_actual_file_identity_and_exact_frozen_binding(
     )
     assert result is not None
     assert result["file_sha256"] == actual
-    assert result["file_sha256"] != thresholds["calibration_wave_receipt"]["file_sha256"]
+    assert (
+        result["file_sha256"] != thresholds["calibration_wave_receipt"]["file_sha256"]
+    )
+
+
+def test_projection_accepts_repaired_exact12_authorization(tmp_path: Path) -> None:
+    thresholds, path, _ = _fixture(tmp_path)
+    payload = projection_payload(
+        thresholds["calibration_wave_receipt"], "c" * 40, _review(), "d" * 64
+    )
+    payload["production_authorization_receipt"] = _scoped_receipt()
+    path.write_bytes(canonical_json_bytes(payload))
+    result = validate_projection_artifact(
+        thresholds,
+        path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        expected_benchmark_commit="c" * 40,
+    )
+    assert result is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("repaired_planner_commit", "f" * 40, "differs from evaluator"),
+        ("authorized_tasks", list(EXACT_TASKS), "authorization mismatch"),
+        ("excluded_tasks", [], "authorization mismatch"),
+        ("quality_v4_policy", "blocking", "authorization mismatch"),
+    ],
+)
+def test_projection_rejects_scoped_authorization_tamper(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    thresholds, path, _ = _fixture(tmp_path)
+    payload = projection_payload(
+        thresholds["calibration_wave_receipt"], "c" * 40, _review(), "d" * 64
+    )
+    scoped = _scoped_receipt()
+    scoped[field] = value
+    payload["production_authorization_receipt"] = scoped
+    path.write_bytes(canonical_json_bytes(payload))
+    with pytest.raises(ValueError, match=message):
+        validate_projection_artifact(
+            thresholds,
+            path,
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            expected_benchmark_commit="c" * 40,
+        )
 
 
 @pytest.mark.parametrize("mutation", ["field", "delete"])
@@ -207,7 +282,9 @@ def test_projection_rejects_benchmark_or_authorization_tamper(tmp_path: Path) ->
         )
 
 
-def test_projection_rejects_authorization_hash_unit_or_field_tamper(tmp_path: Path) -> None:
+def test_projection_rejects_authorization_hash_unit_or_field_tamper(
+    tmp_path: Path,
+) -> None:
     thresholds, path, _ = _fixture(tmp_path)
     base = projection_payload(
         thresholds["calibration_wave_receipt"], "c" * 40, _review(), "d" * 64
@@ -217,7 +294,9 @@ def test_projection_rejects_authorization_hash_unit_or_field_tamper(tmp_path: Pa
     bad_hash["production_authorization_receipt"]["review_file_sha256"] = "bad"
     mutations.append((bad_hash, "review file SHA-256"))
     bad_unit = deepcopy(base)
-    bad_unit["production_authorization_receipt"]["units"][0]["owner_decision"] = "pending"
+    bad_unit["production_authorization_receipt"]["units"][0]["owner_decision"] = (
+        "pending"
+    )
     mutations.append((bad_unit, "unit is not owner-approved"))
     missing = deepcopy(base)
     missing["production_authorization_receipt"].pop("review_payload_sha256")

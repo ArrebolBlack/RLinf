@@ -29,6 +29,9 @@ REVIEW_SCHEMA = "se3wam-rld2-cpu-planner-trajectory-review-v1"
 PRODUCTION_AUTHORIZATION_RECEIPT_SCHEMA = (
     "se3wam-cpu-planner-production-authorization-receipt-v0.1"
 )
+SCOPED_PRODUCTION_AUTHORIZATION_RECEIPT_SCHEMA = (
+    "se3wam-cpu-planner-production-authorization-receipt-v0.2"
+)
 EXACT_TASKS = (
     "p0_grasp",
     "t1_xyz",
@@ -44,6 +47,10 @@ EXACT_TASKS = (
     "t4_slider",
     "t4_can",
     "t5_replan",
+)
+EXCLUDED_REPAIR_TASKS = ("t4_sphere", "t5_replan")
+REPAIRED_PRODUCTION_TASKS = tuple(
+    task for task in EXACT_TASKS if task not in EXCLUDED_REPAIR_TASKS
 )
 
 
@@ -137,7 +144,9 @@ def production_authorization_receipt(
                 "review_status": unit_by_task.get(task, {}).get("review_status"),
                 "owner_decision": (
                     unit_by_task.get(task, {}).get("owner_review", {}).get("decision")
-                    if isinstance(unit_by_task.get(task, {}).get("owner_review"), Mapping)
+                    if isinstance(
+                        unit_by_task.get(task, {}).get("owner_review"), Mapping
+                    )
                     else None
                 ),
             }
@@ -149,6 +158,13 @@ def production_authorization_receipt(
 def _validate_authorization_receipt(
     receipt: Any, evaluator_benchmark_commit: str
 ) -> None:
+    if (
+        isinstance(receipt, Mapping)
+        and receipt.get("schema_version")
+        == SCOPED_PRODUCTION_AUTHORIZATION_RECEIPT_SCHEMA
+    ):
+        _validate_scoped_authorization_receipt(receipt, evaluator_benchmark_commit)
+        return
     expected_fields = {
         "schema_version",
         "review_schema_version",
@@ -163,7 +179,9 @@ def _validate_authorization_receipt(
         "units",
     }
     if not isinstance(receipt, Mapping) or set(receipt) != expected_fields:
-        raise ValueError("projection production authorization receipt field inventory mismatch")
+        raise ValueError(
+            "projection production authorization receipt field inventory mismatch"
+        )
     if (
         receipt.get("schema_version") != PRODUCTION_AUTHORIZATION_RECEIPT_SCHEMA
         or receipt.get("review_schema_version") != REVIEW_SCHEMA
@@ -189,7 +207,9 @@ def _validate_authorization_receipt(
             raise ValueError(f"projection authorization receipt has no {flag}")
     authorization = receipt.get("production_authorization")
     if not isinstance(authorization, Mapping):
-        raise ValueError("projection authorization receipt has no production authorization")
+        raise ValueError(
+            "projection authorization receipt has no production authorization"
+        )
     if set(authorization) != {
         "approved_planner_master_commit",
         "authorized_on",
@@ -227,6 +247,64 @@ def _validate_authorization_receipt(
         unit_tasks.append(unit.get("task"))
     if unit_tasks != list(EXACT_TASKS):
         raise ValueError("projection authorization unit tasks/order mismatch")
+
+
+def _validate_scoped_authorization_receipt(
+    receipt: Mapping[str, Any], evaluator_benchmark_commit: str
+) -> None:
+    """Validate the owner-authorized repaired exact-12 production scope."""
+
+    expected_fields = {
+        "schema_version",
+        "review_schema_version",
+        "review_file_sha256",
+        "review_payload_sha256",
+        "baseline_reviewed_planner_commit",
+        "repaired_planner_commit",
+        "authorization_basis",
+        "authorized_tasks",
+        "excluded_tasks",
+        "quality_v4_policy",
+        "units",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError(
+            "scoped projection authorization receipt field inventory mismatch"
+        )
+    if receipt.get("review_schema_version") != REVIEW_SCHEMA:
+        raise ValueError("scoped projection review schema mismatch")
+    _sha256(receipt.get("review_file_sha256"), "scoped review file SHA-256")
+    _sha256(receipt.get("review_payload_sha256"), "scoped review payload SHA-256")
+    _commit(
+        receipt.get("baseline_reviewed_planner_commit"),
+        "scoped baseline planner commit",
+    )
+    repaired_commit = _commit(
+        receipt.get("repaired_planner_commit"), "scoped repaired planner commit"
+    )
+    if repaired_commit != evaluator_benchmark_commit:
+        raise ValueError("scoped repaired planner commit differs from evaluator")
+    if (
+        receipt.get("authorization_basis")
+        != "owner_instruction_2026-08-13_run_repaired_12_now"
+        or receipt.get("quality_v4_policy") != "nonblocking_not_exported"
+        or receipt.get("authorized_tasks") != list(REPAIRED_PRODUCTION_TASKS)
+        or receipt.get("excluded_tasks") != list(EXCLUDED_REPAIR_TASKS)
+    ):
+        raise ValueError("scoped production authorization mismatch")
+    units = receipt.get("units")
+    if not isinstance(units, list) or len(units) != len(REPAIRED_PRODUCTION_TASKS):
+        raise ValueError("scoped authorization unit inventory is not exact12")
+    for task, unit in zip(REPAIRED_PRODUCTION_TASKS, units, strict=True):
+        if (
+            not isinstance(unit, Mapping)
+            or set(unit)
+            != {"task", "baseline_review_status", "baseline_owner_decision"}
+            or unit.get("task") != task
+            or unit.get("baseline_review_status") != "approved"
+            or unit.get("baseline_owner_decision") != "approved"
+        ):
+            raise ValueError("scoped authorization unit is not baseline owner-approved")
 
 
 def _validate_frozen_binding(binding: Mapping[str, Any]) -> None:
@@ -283,7 +361,9 @@ def validate_projection_artifact(
     """Validate a projection, returning None when the artifact is canonical receipt data."""
 
     if artifact_path.is_symlink() or not artifact_path.is_file():
-        raise ValueError("quality-v2 calibration receipt artifact is missing or symlinked")
+        raise ValueError(
+            "quality-v2 calibration receipt artifact is missing or symlinked"
+        )
     artifact_bytes = artifact_path.read_bytes()
     try:
         payload = json.loads(artifact_bytes.decode("utf-8"))
@@ -314,7 +394,9 @@ def validate_projection_artifact(
         raise ValueError("quality-v2 thresholds have no bound calibration receipt")
     _validate_frozen_binding(frozen)
     if not isinstance(projected, Mapping) or dict(projected) != dict(frozen):
-        raise ValueError("calibration binding projection differs from frozen thresholds")
+        raise ValueError(
+            "calibration binding projection differs from frozen thresholds"
+        )
     historical_sha256 = _sha256(
         frozen.get("file_sha256"), "historical canonical receipt file SHA-256"
     )
