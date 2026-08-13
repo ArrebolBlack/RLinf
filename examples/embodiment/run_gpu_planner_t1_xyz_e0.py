@@ -225,6 +225,7 @@ def _first_divergence(
     outcome_mismatch: Mapping[str, Any] | None,
     terminal_ledger_semantic_exact: bool,
     terminal_ledger_exact_once: bool,
+    replay_stop: Mapping[str, Any] | None,
     commands: Sequence[Any],
 ) -> dict[str, Any] | None:
     """Locate the first blocking semantic replay failure."""
@@ -237,6 +238,17 @@ def _first_divergence(
         return {"channel": "reset_identity", "control_step": None}
     if not action_tape_exact:
         return {"channel": "action_tape", "control_step": None}
+    if replay_stop is not None:
+        control_step = int(replay_stop["policy_step"])
+        preceding_action = None
+        if control_step > 0 and control_step - 1 < len(commands):
+            preceding_action = _command_payload(commands[control_step - 1])
+        return {
+            "channel": "replay_terminated_before_action_tape_end",
+            "control_step": control_step,
+            "transition_action": preceding_action,
+            "details": dict(replay_stop),
+        }
 
     candidates: list[tuple[int, int, str, Mapping[str, Any]]] = []
 
@@ -820,14 +832,25 @@ def _replay(
         actual_review_digests = [_review_digest(replay_review)]
         replay_action_payloads: list[dict[str, Any]] = []
         replay_outcomes: list[tuple[bool, bool, bool, str | None]] = []
-        for command in commands:
+        replay_stop: dict[str, Any] | None = None
+        for command_index, command in enumerate(commands):
+            replay_policy_step = int(replay_backend.policy_steps()[0])
             replay_command = _make_command(
                 request,
                 command.values,
-                int(replay_backend.policy_steps()[0]),
+                replay_policy_step,
             )
             replay_action_payloads.append(_command_payload(replay_command))
             result = replay_backend.step((replay_command,))[0]
+            if result is None:
+                replay_stop = {
+                    "reason": "backend_returned_none_after_terminal",
+                    "command_index": command_index,
+                    "policy_step": replay_policy_step,
+                    "submitted_action_count": len(replay_action_payloads),
+                    "expected_action_count": len(commands),
+                }
+                break
             replay_observation, replay_review = _state_and_review_observation(
                 result.observation
             )
@@ -912,6 +935,7 @@ def _replay(
             outcome_mismatch=outcome_mismatch,
             terminal_ledger_semantic_exact=terminal_ledger_semantic_exact,
             terminal_ledger_exact_once=terminal_ledger_exact_once,
+            replay_stop=replay_stop,
             commands=commands,
         )
         return {
@@ -959,6 +983,7 @@ def _replay(
             "replay_provenance": replay_provenance,
             "exact_once_negative_witnesses": list(exact_once_witnesses),
             "exact_once_error": exact_once_error,
+            "replay_stop": replay_stop,
             "first_divergence": first_divergence,
             "replay_observation_sha256": _json_sha256(observation_digests),
             "replay_review_sha256": _json_sha256(actual_review_digests),

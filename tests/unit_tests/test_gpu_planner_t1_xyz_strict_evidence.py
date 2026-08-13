@@ -594,6 +594,140 @@ def test_fresh_replay_reports_numeric_drift_without_blocking(monkeypatch: Any) -
     assert replay["review_numeric_drift"]["blocking"] is False
 
 
+def test_fresh_replay_early_terminal_writes_semantic_blocker(monkeypatch: Any) -> None:
+    api = types.ModuleType("se3_wam.benchmark.api")
+
+    class _ActionCommand:
+        def __init__(self, *, mode: Any, values: Any, policy_step: int) -> None:
+            self.mode = mode
+            self.values = values
+            self.policy_step = policy_step
+
+    api.ActionCommand = _ActionCommand
+    monkeypatch.setitem(sys.modules, "se3_wam", types.ModuleType("se3_wam"))
+    monkeypatch.setitem(
+        sys.modules,
+        "se3_wam.benchmark",
+        types.ModuleType("se3_wam.benchmark"),
+    )
+    monkeypatch.setitem(sys.modules, "se3_wam.benchmark.api", api)
+
+    gpu_backend = types.ModuleType("rlinf.envs.dynamic_benchmark.gpu_backend")
+    gpu_backend.assert_terminal_ledger_exact_once = lambda backend, rows: (
+        "second_consumption_rejected",
+    )
+    rlinf = types.ModuleType("rlinf")
+    rlinf.__path__ = []
+    envs = types.ModuleType("rlinf.envs")
+    envs.__path__ = []
+    dynamic = types.ModuleType("rlinf.envs.dynamic_benchmark")
+    dynamic.__path__ = []
+    monkeypatch.setitem(sys.modules, "rlinf", rlinf)
+    monkeypatch.setitem(sys.modules, "rlinf.envs", envs)
+    monkeypatch.setitem(sys.modules, "rlinf.envs.dynamic_benchmark", dynamic)
+    monkeypatch.setitem(
+        sys.modules,
+        "rlinf.envs.dynamic_benchmark.gpu_backend",
+        gpu_backend,
+    )
+
+    request = _request()
+    provenance = SimpleNamespace(
+        backend_id="mjwarp_gpu_v1",
+        device_name="NVIDIA A100-SXM4-80GB",
+        device_ordinal=0,
+        device_platform="cuda",
+        git_commit="1" * 40,
+        git_tree="2" * 40,
+        implementation_version="test",
+        physical_device_identity_source="warp_cuda_driver",
+        physical_device_pci_bus_id="00000000:01:00.0",
+        physical_device_uuid="GPU-test",
+        precision="float32",
+        runtime_versions={},
+    )
+
+    class _EarlyTerminalReplay:
+        frozen_requests = (request,)
+        last_terminal_ledger = _terminal_ledger()
+
+        def __init__(self) -> None:
+            self.provenance = provenance
+            self.step_count = 0
+            self.closed = False
+
+        def reset(self, requests: Any) -> tuple[Any, ...]:
+            assert tuple(requests) == (request,)
+            return (_observation(0),)
+
+        def policy_steps(self) -> np.ndarray:
+            return np.asarray([self.step_count], dtype=np.int64)
+
+        def step(self, commands: Any) -> tuple[Any, ...]:
+            assert len(tuple(commands)) == 1
+            if self.step_count == 0:
+                self.step_count = 1
+                return (
+                    SimpleNamespace(
+                        observation=_observation(1),
+                        terminated=True,
+                        truncated=False,
+                        success=True,
+                        termination_reason="success",
+                    ),
+                )
+            return (None,)
+
+        def close(self) -> None:
+            self.closed = True
+
+    replay_backend = _EarlyTerminalReplay()
+    primary = SimpleNamespace(
+        provenance=provenance,
+        new_replay_backend=lambda: replay_backend,
+    )
+    commands = tuple(
+        SimpleNamespace(
+            mode=_ActionMode.E7,
+            policy_step=index,
+            values=np.zeros(7, dtype=np.float64),
+        )
+        for index in range(2)
+    )
+    observations_and_reviews = [
+        E0._state_and_review_observation(_observation(index)) for index in range(3)
+    ]
+
+    replay = E0._replay(
+        backend=primary,
+        request=request,
+        observations=tuple(value[0] for value in observations_and_reviews),
+        reviews=tuple(value[1] for value in observations_and_reviews),
+        commands=commands,
+        outcomes=(
+            (False, False, False, None),
+            (True, False, True, "success"),
+        ),
+        terminal_ledger=_terminal_ledger(),
+    )
+
+    assert replay_backend.closed is True
+    assert replay["passed"] is False
+    assert replay["action_tape_exact"] is True
+    assert replay["outcomes_exact"] is False
+    assert replay["replay_stop"] == {
+        "reason": "backend_returned_none_after_terminal",
+        "command_index": 1,
+        "policy_step": 1,
+        "submitted_action_count": 2,
+        "expected_action_count": 2,
+    }
+    assert replay["first_divergence"]["channel"] == (
+        "replay_terminated_before_action_tape_end"
+    )
+    assert replay["first_divergence"]["control_step"] == 1
+
+
 def test_semantic_replay_failure_evidence_is_exclusive(tmp_path: Path) -> None:
     path = tmp_path / "result.semantic-replay-failure.json"
     payload = {
