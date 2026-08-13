@@ -92,6 +92,36 @@ class _FakeEnumValue:
         self.value = value
 
 
+@dataclass(frozen=True)
+class _FakeObservation:
+    lane: int
+    step: int
+
+    @property
+    def episode_id(self) -> str:
+        return f"ep-{self.lane}"
+
+    @property
+    def fingerprint_sha256(self) -> str:
+        return f"obs-{self.lane}-{self.step}"
+
+
+class _FakePlannerTeacher:
+    def __init__(self) -> None:
+        self.reset_calls = 0
+        self.act_calls = 0
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def act(self, observation: Any) -> Any:
+        self.act_calls += 1
+        return SimpleNamespace(
+            values=np.zeros(7, dtype=np.float64),
+            policy_step=int(observation.step),
+        )
+
+
 class _FakeEnv:
     backend_id = "mjwarp_gpu_v1"
 
@@ -109,11 +139,16 @@ class _FakeEnv:
         )
         self.reset_calls = 0
         self.step_calls = 0
+        self.planner_teachers: list[_FakePlannerTeacher] = []
 
     def reset(self, requests: Any) -> None:
         self.reset_calls += 1
+        self.step_calls = 0
         if len(tuple(requests)) != self.batch_size:
             raise AssertionError("reset requests must cover the whole batch")
+
+    def materialize_current_observations(self, lanes: tuple[int, ...]) -> tuple[Any, ...]:
+        return tuple(_FakeObservation(lane=lane, step=self.step_calls) for lane in lanes)
 
     def step(self, commands: Any) -> None:
         self.step_calls += 1
@@ -122,12 +157,27 @@ class _FakeEnv:
 
     def materialize_audit(self, request: Any) -> Any:
         if not request.include_step_result:
-            raise AssertionError("expected include_step_result=True")
+            return SimpleNamespace(
+                lanes=tuple(
+                    SimpleNamespace(
+                        lane=lane,
+                        observation=_FakeObservation(lane=lane, step=self.step_calls),
+                        step_result=None,
+                    )
+                    for lane in request.lanes
+                )
+            )
         lanes = tuple(
             SimpleNamespace(
                 lane=lane,
-                observation=SimpleNamespace(episode_id=f"ep-{lane}"),
-                step_result=SimpleNamespace(observation=SimpleNamespace()),
+                observation=_FakeObservation(lane=lane, step=self.step_calls),
+                step_result=SimpleNamespace(
+                    observation=_FakeObservation(lane=lane, step=self.step_calls),
+                    terminated=False,
+                    truncated=False,
+                    success=False,
+                    termination_reason=None,
+                ),
             )
             for lane in request.lanes
         )
@@ -141,6 +191,7 @@ class _FakeEnv:
 class _FakeSe3Wam:
     factory: Any
     artifacts: Any
+    planner_requests: list[Any]
 
 
 @pytest.fixture
@@ -156,6 +207,7 @@ def fake_se3_wam(monkeypatch: pytest.MonkeyPatch) -> _FakeSe3Wam:
         "se3_wam.benchmark.gpu_native.p0_grasp_engine",
         "se3_wam.benchmark.gpu_native.tasks",
         "se3_wam.benchmark.gpu_native.audit",
+        "se3_wam.benchmark.teacher_factory",
     )
     modules: dict[str, types.ModuleType] = {}
     for name in package_names:
@@ -175,7 +227,24 @@ def fake_se3_wam(monkeypatch: pytest.MonkeyPatch) -> _FakeSe3Wam:
     modules["se3_wam.benchmark.gpu_native.p0_grasp_engine"].load_p0_grasp_artifacts = (
         lambda export_dir: SimpleNamespace(reset_request=_FakeRequest())
     )
-    return _FakeSe3Wam(factory=factory, artifacts=captured)
+    planner_requests: list[Any] = []
+
+    def make_privileged_teacher(task_id: str, *, request: Any, image_size: int) -> Any:
+        assert task_id == request.task_id
+        assert image_size == 64
+        planner_requests.append(request)
+        teacher = _FakePlannerTeacher()
+        factory.planner_teachers.append(teacher)
+        return teacher, {"request_episode_id": request.episode_id}
+
+    modules["se3_wam.benchmark.teacher_factory"].make_privileged_teacher = (
+        make_privileged_teacher
+    )
+    return _FakeSe3Wam(
+        factory=factory,
+        artifacts=captured,
+        planner_requests=planner_requests,
+    )
 
 
 def test_backend_module_importable_without_se3_wam() -> None:
@@ -236,6 +305,32 @@ def test_adapter_request_mapping(fake_se3_wam: _FakeSe3Wam) -> None:
     assert backend.backend_id == "mjwarp_gpu_v1"
 
 
+def test_planner_is_current_state_closed_loop_and_tape_replay_is_diagnostic(
+    fake_se3_wam: _FakeSe3Wam,
+) -> None:
+    backend = GpuNativeBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+    )
+    requests = tuple(backend.next_request() for _ in range(3))
+    observations = backend.reset_planner(requests)
+    assert len(observations) == 3
+    assert fake_se3_wam.planner_requests == list(requests)
+    assert all(teacher.reset_calls == 1 for teacher in fake_se3_wam.factory.planner_teachers)
+
+    step = backend.planner_step()
+    assert step.step_index == 0
+    assert all(teacher.act_calls == 1 for teacher in fake_se3_wam.factory.planner_teachers)
+    tape = backend.planner_tape()
+    assert tape.steps == (step,)
+
+    report = backend.replay_planner_tape_diagnostic(tape)
+    assert report["mode"] == "diagnostic_frozen_action_replay"
+    assert report["closed_loop_planner"] is False
+    assert report["passed"] is True
+
+
 def test_adapter_reset_requires_full_batch(fake_se3_wam: _FakeSe3Wam) -> None:
     backend = GpuNativeBackendEnv(
         task_id="p0_grasp",
@@ -294,6 +389,14 @@ def test_env_gating_forbids_process_workers() -> None:
             total_num_processes=1,
             worker_info=None,
         )
+
+
+def test_gpu_native_auto_reset_rejects_partial_terminal_cohort() -> None:
+    env = object.__new__(DynamicBenchmarkEnv)
+    env._gpu_backend = object()
+    env.num_envs = 2
+    with pytest.raises(RuntimeError, match="full terminal cohort"):
+        env._handle_auto_reset(np.asarray([True, False]), {}, {})
 
 
 def test_env_gpu_identity_attributes(fake_se3_wam: _FakeSe3Wam) -> None:
