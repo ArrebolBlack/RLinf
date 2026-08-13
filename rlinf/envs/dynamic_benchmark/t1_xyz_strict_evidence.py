@@ -73,6 +73,7 @@ EXECUTION_CONTRACT = {
     "planner_observation_source": "current_observation_each_control_step",
     "quality_evaluator_id": QUALITY_EVALUATOR_ID,
     "quality_schema_version": QUALITY_SCHEMA_VERSION,
+    "replay_intermediate_event_drift_blocking": False,
     "review_materialization": "independent_scene_wrist_render_v1",
     "replay_numeric_drift_blocking": False,
     "sensor_hz": 20,
@@ -659,14 +660,16 @@ def validate_result_for_row(
     ):
         raise RuntimeError("row result fresh replay gate did not pass")
     for name in (
+        "observation_event_drift",
         "observation_numeric_drift",
         "review_numeric_drift",
         "terminal_numeric_drift",
     ):
         report = replay.get(name)
         if not isinstance(report, Mapping) or report.get("blocking") is not False:
-            raise RuntimeError("row result numeric replay diagnostics are invalid")
+            raise RuntimeError("row result non-blocking replay diagnostics are invalid")
     for name in (
+        "observation_event_sequence_exact",
         "observation_tape_exact",
         "review_tape_exact",
         "outcomes_exact",

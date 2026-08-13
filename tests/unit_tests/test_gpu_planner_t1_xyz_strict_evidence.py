@@ -60,6 +60,9 @@ def test_result_runners_expose_only_frozen_manifest_strict_evidence() -> None:
 def test_frozen_execution_uses_state_e7_and_canonical_evaluator() -> None:
     assert STRICT.EXECUTION_CONTRACT["observation_track"] == "state"
     assert STRICT.EXECUTION_CONTRACT["action_mode"] == "E7"
+    assert (
+        STRICT.EXECUTION_CONTRACT["replay_intermediate_event_drift_blocking"] is False
+    )
     assert STRICT.QUALITY_SCHEMA_VERSION == "db0-episode-task-quality-v2"
     assert STRICT.QUALITY_EVALUATOR_ID == "mjwarp_gpu_v1"
 
@@ -148,6 +151,13 @@ def _numeric_drift_observation(step: int) -> Any:
         value,
         rgb=rgb,
         proprio={"robot0": np.asarray([step + 1.0e-3], dtype=np.float64)},
+        events_since_last_observation=(
+            SimpleNamespace(
+                name="fingerpad_contact",
+                physics_step=25 * step,
+                time_s=0.05 * step,
+            ),
+        ),
     )
 
 
@@ -537,7 +547,9 @@ def test_fresh_replay_reports_numeric_drift_without_blocking(monkeypatch: Any) -
     assert replay["observation_semantic_structure_exact"] is True
     assert replay["review_semantic_structure_exact"] is True
     assert replay["observation_tape_exact"] is False
+    assert replay["observation_event_sequence_exact"] is False
     assert replay["review_tape_exact"] is False
+    assert replay["observation_event_drift"]["blocking"] is False
     assert replay["observation_numeric_drift"]["blocking"] is False
     assert replay["review_numeric_drift"]["blocking"] is False
 
@@ -790,6 +802,8 @@ def _strict_result(
             "reset_identity_exact": True,
             "action_tape_exact": True,
             "observation_semantic_structure_exact": True,
+            "observation_event_sequence_exact": True,
+            "observation_event_drift": {"blocking": False},
             "observation_tape_exact": True,
             "observation_numeric_drift": {"blocking": False},
             "review_semantic_structure_exact": True,
@@ -891,6 +905,9 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     blocking_numeric_drift = copy.deepcopy(valid)
     blocking_numeric_drift["replay"]["observation_numeric_drift"]["blocking"] = True
     invalid_rows.append(blocking_numeric_drift)
+    blocking_event_drift = copy.deepcopy(valid)
+    blocking_event_drift["replay"]["observation_event_drift"]["blocking"] = True
+    invalid_rows.append(blocking_event_drift)
     wrong_quality = copy.deepcopy(valid)
     wrong_quality["quality"]["schema_version"] = "db0-episode-task-quality-v1"
     invalid_rows.append(wrong_quality)
@@ -938,6 +955,7 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
             STRICT.validate_result_for_row(invalid, manifest=manifest, row=row)
 
     numeric_drift_is_diagnostic = copy.deepcopy(valid)
+    numeric_drift_is_diagnostic["replay"]["observation_event_sequence_exact"] = False
     numeric_drift_is_diagnostic["replay"]["observation_tape_exact"] = False
     numeric_drift_is_diagnostic["replay"]["review_tape_exact"] = False
     numeric_drift_is_diagnostic["replay"]["terminal_ledger_exact"] = False

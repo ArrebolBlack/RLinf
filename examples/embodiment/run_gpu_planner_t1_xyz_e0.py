@@ -388,6 +388,7 @@ def _compare_observation_sequences(
     right_values = tuple(actual)
     report = _new_numeric_drift_report()
     semantic_mismatch: dict[str, Any] | None = None
+    first_event_mismatch: dict[str, Any] | None = None
     if len(left_values) != len(right_values):
         semantic_mismatch = {
             "path": "observations",
@@ -427,8 +428,8 @@ def _compare_observation_sequences(
         right_events = tuple(
             event.name for event in right.events_since_last_observation
         )
-        if semantic_mismatch is None and left_events != right_events:
-            semantic_mismatch = {
+        if first_event_mismatch is None and left_events != right_events:
+            first_event_mismatch = {
                 "path": f"observations[{index}].events",
                 "expected": list(left_events),
                 "actual": list(right_events),
@@ -457,6 +458,11 @@ def _compare_observation_sequences(
     return {
         "semantic_structure_exact": semantic_mismatch is None,
         "first_semantic_mismatch": semantic_mismatch,
+        "event_drift": {
+            "blocking": False,
+            "exact": first_event_mismatch is None,
+            "first_mismatch": first_event_mismatch,
+        },
         "numeric_drift": _finish_numeric_drift_report(report),
     }
 
@@ -929,6 +935,10 @@ def _replay(
                 "semantic_structure_exact"
             ],
             "observation_tape_exact": observation_tape_exact,
+            "observation_event_sequence_exact": observation_comparison["event_drift"][
+                "exact"
+            ],
+            "observation_event_drift": observation_comparison["event_drift"],
             "observation_numeric_drift": observation_comparison["numeric_drift"],
             "review_semantic_structure_exact": review_comparison[
                 "semantic_structure_exact"
