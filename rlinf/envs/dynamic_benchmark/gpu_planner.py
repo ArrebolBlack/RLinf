@@ -18,7 +18,7 @@ import hashlib
 import json
 import struct
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from types import MappingProxyType
 from typing import Any
 
@@ -34,6 +34,10 @@ class GpuPlannerUnavailableError(RuntimeError):
 
 class GpuPlannerReplayError(RuntimeError):
     """Raised when an independent CUDA replay diverges from a Planner tape."""
+
+    def __init__(self, message: str, *, evidence: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = MappingProxyType({} if evidence is None else dict(evidence))
 
 
 def _fingerprint(value: Any) -> str:
@@ -51,6 +55,124 @@ def _fingerprint(value: Any) -> str:
             "observation fingerprint is not hexadecimal"
         ) from exc
     return fingerprint
+
+
+def _array_probe(value: Any) -> dict[str, Any]:
+    array = np.asarray(value)
+    contiguous = np.ascontiguousarray(array)
+    little_endian = contiguous.dtype.newbyteorder("<")
+    payload = np.ascontiguousarray(contiguous.astype(little_endian, copy=False)).tobytes()
+    result: dict[str, Any] = {
+        "dtype": array.dtype.str,
+        "shape": list(array.shape),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    if array.dtype.kind in {"f", "c"}:
+        result["finite"] = bool(np.all(np.isfinite(array)))
+    if array.size <= 16:
+        result["values"] = array.tolist()
+    return result
+
+
+def _probe_value(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> Any:
+    """Serialize diagnostic state without unstable object repr/address values."""
+
+    if seen is None:
+        seen = set()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, np.ndarray):
+        return _array_probe(value)
+    enum_value = getattr(value, "value", value)
+    if enum_value is not value and isinstance(enum_value, (bool, int, float, str)):
+        return enum_value
+    if depth >= 8:
+        return {"opaque_type": f"{type(value).__module__}.{type(value).__qualname__}"}
+    identity = id(value)
+    if identity in seen:
+        return {"cycle_type": f"{type(value).__module__}.{type(value).__qualname__}"}
+    next_seen = {*seen, identity}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _probe_value(item, depth=depth + 1, seen=next_seen)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [
+            _probe_value(item, depth=depth + 1, seen=next_seen) for item in value
+        ]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _probe_value(
+                getattr(value, field.name), depth=depth + 1, seen=next_seen
+            )
+            for field in fields(value)
+        }
+    state = getattr(value, "__dict__", None)
+    if isinstance(state, Mapping):
+        return {
+            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "state": {
+                str(key): _probe_value(item, depth=depth + 1, seen=next_seen)
+                for key, item in sorted(state.items(), key=lambda pair: str(pair[0]))
+                if not callable(item)
+            },
+        }
+    return {"opaque_type": f"{type(value).__module__}.{type(value).__qualname__}"}
+
+
+def _canonical_probe(value: Any) -> dict[str, Any]:
+    payload = _probe_value(value)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {"payload": payload, "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _observation_probe(observation: Any) -> dict[str, Any]:
+    components: dict[str, Any] = {}
+    for field_name in (
+        "rgb",
+        "depth_m",
+        "segmentation",
+        "proprio",
+        "privileged",
+        "events_since_last_observation",
+    ):
+        if not hasattr(observation, field_name):
+            continue
+        value = getattr(observation, field_name)
+        if isinstance(value, Mapping):
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+                components[f"{field_name}.{key}"] = _canonical_probe(item)
+        else:
+            components[field_name] = _canonical_probe(value)
+    clock = {
+        name: getattr(observation, name, None)
+        for name in ("physics_step", "control_step", "policy_step", "time_s")
+    }
+    return {
+        "fingerprint_sha256": _fingerprint(observation),
+        "clock": clock,
+        "components": components,
+    }
+
+
+def _mapping_mismatches(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> list[str]:
+    return sorted(
+        key
+        for key in set(expected) | set(actual)
+        if expected.get(key) != actual.get(key)
+    )
 
 
 def _action_digest(actions: tuple[Any, ...]) -> str:
@@ -148,6 +270,10 @@ class PlannerTape:
     terminal_row: Any
     source_identity: Mapping[str, Any]
     action_tape_sha256: str
+    planner_state_probes: tuple[Mapping[str, Any], ...] = ()
+    backend_probe_boundaries: tuple[Mapping[str, Any], ...] = ()
+    backend_call_order: tuple[str, ...] = ()
+    snapshot_roundtrip_receipt: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if len(self.observations) != len(self.actions) + 1:
@@ -160,9 +286,31 @@ class PlannerTape:
             raise ValueError("Planner tape source identity must be a mapping")
         if self.action_tape_sha256 != _action_digest(self.actions):
             raise ValueError("Planner tape action digest does not match its actions")
+        if self.planner_state_probes and len(self.planner_state_probes) != len(self.actions):
+            raise ValueError("Planner state probe/action lengths differ")
+        if self.backend_probe_boundaries and len(self.backend_probe_boundaries) != len(
+            self.observations
+        ):
+            raise ValueError("backend probe/observation boundary lengths differ")
         object.__setattr__(
             self, "source_identity", MappingProxyType(dict(self.source_identity))
         )
+        object.__setattr__(
+            self,
+            "planner_state_probes",
+            tuple(MappingProxyType(dict(value)) for value in self.planner_state_probes),
+        )
+        object.__setattr__(
+            self,
+            "backend_probe_boundaries",
+            tuple(MappingProxyType(dict(value)) for value in self.backend_probe_boundaries),
+        )
+        if self.snapshot_roundtrip_receipt is not None:
+            object.__setattr__(
+                self,
+                "snapshot_roundtrip_receipt",
+                MappingProxyType(dict(self.snapshot_roundtrip_receipt)),
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return compact JSON-compatible identity and replay metadata."""
@@ -209,6 +357,16 @@ class PlannerTape:
             ],
             "actions": actions,
             "results": [_result_signature(value) for value in self.results],
+            "planner_state_probes": [dict(value) for value in self.planner_state_probes],
+            "backend_probe_boundaries": [
+                dict(value) for value in self.backend_probe_boundaries
+            ],
+            "backend_call_order": list(self.backend_call_order),
+            "snapshot_roundtrip_receipt": (
+                None
+                if self.snapshot_roundtrip_receipt is None
+                else dict(self.snapshot_roundtrip_receipt)
+            ),
             "terminal": terminal,
             "source_identity": dict(self.source_identity),
         }
@@ -236,6 +394,7 @@ class GpuCurrentStatePlanner:
         max_control_steps: int = 420,
         evaluator_backend_id: str | None = None,
         quality_schema_version: str = DEFAULT_QUALITY_SCHEMA_VERSION,
+        capture_replay_probe: bool = False,
     ) -> None:
         self._require_gpu_backend(backend, task_id)
         if (
@@ -250,11 +409,24 @@ class GpuCurrentStatePlanner:
             or max_control_steps < 1
         ):
             raise ValueError("max_control_steps must be a positive integer")
+        if not isinstance(capture_replay_probe, bool):
+            raise ValueError("capture_replay_probe must be bool")
         self.backend = backend
         self.task_id = task_id
         self.max_control_steps = max_control_steps
         self._planner_factory = planner_factory or self._default_planner_factory
+        self.capture_replay_probe = capture_replay_probe
         self.source_identity = _source_identity(backend)
+        if capture_replay_probe:
+            for name in (
+                "materialize_replay_probe_audit",
+                "verify_replay_probe_snapshot_roundtrip",
+                "materialize_current_observations",
+            ):
+                if not callable(getattr(backend, name, None)):
+                    raise GpuPlannerUnavailableError(
+                        f"T3 replay probe requires backend.{name}()"
+                    )
         if evaluator_backend_id is not None and not getattr(
             backend, "task_quality_enabled", False
         ):
@@ -296,6 +468,112 @@ class GpuCurrentStatePlanner:
         from se3_wam.benchmark.teacher_factory import make_privileged_teacher
 
         return make_privileged_teacher(task_id, request=request)
+
+    @staticmethod
+    def _backend_probe(backend: Any) -> Mapping[str, Any]:
+        payload = backend.materialize_replay_probe_audit()
+        if not isinstance(payload, Mapping) or payload.get("diagnostic_only") is not True:
+            raise GpuPlannerReplayError(
+                "GPU replay probe did not return a diagnostic-only mapping"
+            )
+        return MappingProxyType(dict(payload))
+
+    @staticmethod
+    def _current_probe_observation(backend: Any, reset_observation: Any) -> Any:
+        observations = tuple(backend.materialize_current_observations())
+        if len(observations) != 1 or observations[0] is None:
+            raise GpuPlannerReplayError(
+                "GPU replay probe lost the current observation after snapshot restore"
+            )
+        if _fingerprint(observations[0]) != _fingerprint(reset_observation):
+            raise GpuPlannerReplayError(
+                "GPU snapshot roundtrip changed the reset observation fingerprint"
+            )
+        return observations[0]
+
+    @staticmethod
+    def _replay_divergence_evidence(
+        *,
+        control_step: int,
+        expected_observation: Any,
+        actual_observation: Any,
+        expected_result: Mapping[str, Any] | None,
+        actual_result: Mapping[str, Any] | None,
+        action: Any | None,
+        planner_state_probe: Mapping[str, Any] | None,
+        expected_backend_probe: Mapping[str, Any] | None,
+        actual_backend_probe: Mapping[str, Any] | None,
+        expected_call_order: tuple[str, ...],
+        actual_call_order: tuple[str, ...],
+        expected_snapshot_roundtrip: Mapping[str, Any] | None,
+        actual_snapshot_roundtrip: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        expected_observation_probe = _observation_probe(expected_observation)
+        actual_observation_probe = _observation_probe(actual_observation)
+        expected_components = expected_observation_probe["components"]
+        actual_components = actual_observation_probe["components"]
+        backend_mismatches: list[str] = []
+        backend_details: dict[str, Any] | None = None
+        if expected_backend_probe is not None or actual_backend_probe is not None:
+            expected_sections = (
+                {} if expected_backend_probe is None else expected_backend_probe.get("section_sha256", {})
+            )
+            actual_sections = (
+                {} if actual_backend_probe is None else actual_backend_probe.get("section_sha256", {})
+            )
+            backend_mismatches = _mapping_mismatches(expected_sections, actual_sections)
+            backend_details = {
+                "expected_section_sha256": expected_sections,
+                "actual_section_sha256": actual_sections,
+                "mismatched_sections": backend_mismatches,
+                "expected_health": (
+                    None
+                    if expected_backend_probe is None
+                    else expected_backend_probe.get("sections", {}).get("health")
+                ),
+                "actual_health": (
+                    None
+                    if actual_backend_probe is None
+                    else actual_backend_probe.get("sections", {}).get("health")
+                ),
+            }
+        action_payload = None
+        if action is not None:
+            action_payload = {
+                "mode": getattr(getattr(action, "mode", None), "value", None),
+                "policy_step": getattr(action, "policy_step", None),
+                "values": np.asarray(getattr(action, "values", None), dtype=np.float64).tolist(),
+            }
+        return {
+            "schema_version": "rlinf-t3-full-fresh-replay-divergence-v2",
+            "control_step": control_step,
+            "physics_step": actual_observation_probe["clock"].get("physics_step"),
+            "expected_result": None if expected_result is None else dict(expected_result),
+            "actual_result": None if actual_result is None else dict(actual_result),
+            "expected_observation": expected_observation_probe,
+            "actual_observation": actual_observation_probe,
+            "observation_component_mismatches": _mapping_mismatches(
+                expected_components, actual_components
+            ),
+            "backend_probe": backend_details,
+            "backend_probe_mismatched_sections": backend_mismatches,
+            "action": action_payload,
+            "source_planner_state_before_action": (
+                None if planner_state_probe is None else dict(planner_state_probe)
+            ),
+            "expected_backend_call_order": list(expected_call_order),
+            "actual_backend_call_order": list(actual_call_order),
+            "backend_call_order_aligned": expected_call_order == actual_call_order,
+            "expected_snapshot_roundtrip": (
+                None
+                if expected_snapshot_roundtrip is None
+                else dict(expected_snapshot_roundtrip)
+            ),
+            "actual_snapshot_roundtrip": (
+                None if actual_snapshot_roundtrip is None else dict(actual_snapshot_roundtrip)
+            ),
+            "replay_gate_relaxed": False,
+        }
 
     @staticmethod
     def _coerce_action(raw_action: Any, request: Any, observation: Any) -> Any:
@@ -356,16 +634,40 @@ class GpuCurrentStatePlanner:
             raise RuntimeError(
                 "GPU backend reset did not return one current observation"
             )
-        observations: list[Any] = [reset_observations[0]]
+        reset_observation = reset_observations[0]
+        backend_call_order = ["reset"]
+        snapshot_roundtrip_receipt: Mapping[str, Any] | None = None
+        backend_probe_boundaries: list[Mapping[str, Any]] = []
+        if self.capture_replay_probe:
+            receipt = self.backend.verify_replay_probe_snapshot_roundtrip()
+            if not isinstance(receipt, Mapping) or receipt.get("exact") is not True:
+                raise GpuPlannerReplayError(
+                    "GPU replay-probe snapshot roundtrip was not exact"
+                )
+            snapshot_roundtrip_receipt = MappingProxyType(dict(receipt))
+            backend_call_order.append("snapshot_roundtrip")
+            reset_observation = self._current_probe_observation(
+                self.backend, reset_observation
+            )
+            backend_call_order.append("materialize_current_observation")
+            backend_probe_boundaries.append(self._backend_probe(self.backend))
+            backend_call_order.append("replay_probe_audit:0")
+        observations: list[Any] = [reset_observation]
         actions: list[Any] = []
         results: list[Any] = []
-        for _ in range(self.max_control_steps):
+        planner_state_probes: list[Mapping[str, Any]] = []
+        for step_index in range(self.max_control_steps):
             observation = observations[-1]
             act = getattr(planner, "act", None)
             if not callable(act):
                 raise TypeError("Planner must expose act(current_observation)")
+            if self.capture_replay_probe:
+                planner_state_probes.append(
+                    MappingProxyType(_canonical_probe(planner))
+                )
             action = self._coerce_action(act(observation), request, observation)
             step_results = tuple(self.backend.step((action,)))
+            backend_call_order.append(f"step:{step_index + 1}")
             if len(step_results) != 1 or step_results[0] is None:
                 raise RuntimeError("GPU backend step did not return one current result")
             result = step_results[0]
@@ -375,6 +677,9 @@ class GpuCurrentStatePlanner:
             actions.append(action)
             results.append(result)
             observations.append(next_observation)
+            if self.capture_replay_probe:
+                backend_probe_boundaries.append(self._backend_probe(self.backend))
+                backend_call_order.append(f"replay_probe_audit:{step_index + 1}")
             if bool(getattr(result, "terminated", False)) or bool(
                 getattr(result, "truncated", False)
             ):
@@ -397,6 +702,10 @@ class GpuCurrentStatePlanner:
             terminal_row=terminal_rows[0],
             source_identity=self.source_identity,
             action_tape_sha256=_action_digest(tuple(actions)),
+            planner_state_probes=tuple(planner_state_probes),
+            backend_probe_boundaries=tuple(backend_probe_boundaries),
+            backend_call_order=tuple(backend_call_order),
+            snapshot_roundtrip_receipt=snapshot_roundtrip_receipt,
         )
 
     def rollout_batch(self, requests: Any) -> tuple[PlannerTape, ...]:
@@ -522,27 +831,130 @@ class GpuCurrentStatePlanner:
             raise GpuPlannerReplayError(
                 "Planner tape action digest changed before replay"
             )
+        probe_enabled = bool(tape.backend_probe_boundaries)
         observations = tuple(replay_backend.reset((tape.request,)))
-        if len(observations) != 1 or _fingerprint(observations[0]) != _fingerprint(
+        actual_call_order = ["reset"]
+        if len(observations) != 1 or observations[0] is None:
+            raise GpuPlannerReplayError("GPU replay reset lost its B=1 observation")
+        replay_observation = observations[0]
+        actual_snapshot_roundtrip: Mapping[str, Any] | None = None
+        actual_reset_probe: Mapping[str, Any] | None = None
+        if probe_enabled:
+            verifier = getattr(
+                replay_backend, "verify_replay_probe_snapshot_roundtrip", None
+            )
+            materialize_current = getattr(
+                replay_backend, "materialize_current_observations", None
+            )
+            materialize_probe = getattr(
+                replay_backend, "materialize_replay_probe_audit", None
+            )
+            if not all(
+                callable(value)
+                for value in (verifier, materialize_current, materialize_probe)
+            ):
+                raise GpuPlannerReplayError(
+                    "fresh GPU replay backend lacks the recorded T3 probe seams"
+                )
+            receipt = verifier()
+            if not isinstance(receipt, Mapping) or receipt.get("exact") is not True:
+                raise GpuPlannerReplayError(
+                    "fresh GPU replay snapshot roundtrip was not exact"
+                )
+            actual_snapshot_roundtrip = MappingProxyType(dict(receipt))
+            actual_call_order.append("snapshot_roundtrip")
+            replay_observation = self._current_probe_observation(
+                replay_backend, replay_observation
+            )
+            actual_call_order.append("materialize_current_observation")
+            actual_reset_probe = self._backend_probe(replay_backend)
+            actual_call_order.append("replay_probe_audit:0")
+
+        reset_fingerprint_matches = _fingerprint(replay_observation) == _fingerprint(
             tape.observations[0]
-        ):
+        )
+        reset_probe_matches = (
+            not probe_enabled
+            or dict(actual_reset_probe or {}) == dict(tape.backend_probe_boundaries[0])
+        )
+        if not reset_fingerprint_matches or not reset_probe_matches:
+            evidence = self._replay_divergence_evidence(
+                control_step=0,
+                expected_observation=tape.observations[0],
+                actual_observation=replay_observation,
+                expected_result=None,
+                actual_result=None,
+                action=None,
+                planner_state_probe=None,
+                expected_backend_probe=(
+                    tape.backend_probe_boundaries[0] if probe_enabled else None
+                ),
+                actual_backend_probe=actual_reset_probe,
+                expected_call_order=tape.backend_call_order[: len(actual_call_order)],
+                actual_call_order=tuple(actual_call_order),
+                expected_snapshot_roundtrip=tape.snapshot_roundtrip_receipt,
+                actual_snapshot_roundtrip=actual_snapshot_roundtrip,
+            )
             raise GpuPlannerReplayError(
-                "GPU replay reset observation fingerprint diverged"
+                "GPU replay reset observation or mutable-state probe diverged",
+                evidence=evidence,
             )
         replay_results: list[Any] = []
         for index, action in enumerate(tape.actions):
             step_results = tuple(replay_backend.step((action,)))
+            actual_call_order.append(f"step:{index + 1}")
             if len(step_results) != 1 or step_results[0] is None:
                 raise GpuPlannerReplayError("GPU replay lost a step result")
             result = step_results[0]
             expected = _result_signature(tape.results[index])
             actual = _result_signature(result)
-            if actual != expected:
+            actual_backend_probe: Mapping[str, Any] | None = None
+            probe_matches = True
+            if probe_enabled:
+                actual_backend_probe = self._backend_probe(replay_backend)
+                actual_call_order.append(f"replay_probe_audit:{index + 1}")
+                probe_matches = dict(actual_backend_probe) == dict(
+                    tape.backend_probe_boundaries[index + 1]
+                )
+            if actual != expected or not probe_matches:
+                evidence = self._replay_divergence_evidence(
+                    control_step=index + 1,
+                    expected_observation=tape.observations[index + 1],
+                    actual_observation=result.observation,
+                    expected_result=expected,
+                    actual_result=actual,
+                    action=action,
+                    planner_state_probe=(
+                        tape.planner_state_probes[index]
+                        if tape.planner_state_probes
+                        else None
+                    ),
+                    expected_backend_probe=(
+                        tape.backend_probe_boundaries[index + 1]
+                        if probe_enabled
+                        else None
+                    ),
+                    actual_backend_probe=actual_backend_probe,
+                    expected_call_order=tape.backend_call_order[: len(actual_call_order)],
+                    actual_call_order=tuple(actual_call_order),
+                    expected_snapshot_roundtrip=tape.snapshot_roundtrip_receipt,
+                    actual_snapshot_roundtrip=actual_snapshot_roundtrip,
+                )
                 raise GpuPlannerReplayError(
                     f"GPU replay result diverged at control step {index + 1}: "
-                    f"expected={expected}, actual={actual}"
+                    f"expected={expected}, actual={actual}",
+                    evidence=evidence,
                 )
             replay_results.append(result)
+        if tape.backend_call_order and tuple(actual_call_order) != tape.backend_call_order:
+            raise GpuPlannerReplayError(
+                "GPU replay backend call order diverged from the aligned live probe",
+                evidence={
+                    "expected_backend_call_order": list(tape.backend_call_order),
+                    "actual_backend_call_order": actual_call_order,
+                    "replay_gate_relaxed": False,
+                },
+            )
         replay_rows = tuple(getattr(replay_backend, "last_terminal_rows", ()))
         if len(replay_rows) != 1:
             raise GpuPlannerReplayError(
@@ -559,6 +971,15 @@ class GpuCurrentStatePlanner:
             "observation_fingerprints": [
                 _fingerprint(observation) for observation in tape.observations
             ],
+            "backend_call_order_aligned": (
+                not tape.backend_call_order
+                or tuple(actual_call_order) == tape.backend_call_order
+            ),
+            "snapshot_roundtrip_exact": (
+                None
+                if actual_snapshot_roundtrip is None
+                else actual_snapshot_roundtrip.get("exact")
+            ),
             "terminal_quality_summary_sha256": (
                 actual_quality.get("summary_sha256")
                 if actual_quality is not None

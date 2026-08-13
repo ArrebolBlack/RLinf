@@ -29,10 +29,11 @@ CPU by design, but every action is computed from the latest GPU audit packet
 and immediately submitted to that same ``mjwarp_gpu_v1`` environment.  The
 runtime feature manifest and evaluator identity are mandatory in this mode.
 
-The GPU backend currently requires every lane to reuse the one frozen export
-identity (task/seed/split/factors/...); only ``episode_id`` is free.  This
-adapter therefore sources reset requests from the frozen export artifact and
-never falls back to the CPU ``make_mujoco_env`` path.
+The GPU backend requires every lane to reuse the frozen export identity.  The
+legacy homogeneous path may allocate a fresh ``episode_id`` while keeping every
+other reset field exact.  Per-row export runners enable the stricter mode, which
+also freezes ``episode_id`` and validates the complete request before reset or
+step.  Neither path falls back to the CPU ``make_mujoco_env`` implementation.
 
 ``se3_wam`` imports are deliberately lazy so this module (and the tests that
 exercise its request mapping) can be imported on machines without the SE3-WAM
@@ -52,6 +53,62 @@ import numpy as np
 
 class GpuNativeBackendUnavailableError(RuntimeError):
     """Raised when the SE3-WAM GPU-native backend seam cannot be built."""
+
+
+def reset_request_identity(request: Any) -> dict[str, Any]:
+    """Return every field in the canonical ``ResetRequest`` identity."""
+
+    factors = getattr(request, "factors", None)
+    if not isinstance(factors, Mapping):
+        raise ValueError("GPU reset request factors must be a mapping")
+
+    def enum_value(name: str) -> Any:
+        value = getattr(request, name, None)
+        return getattr(value, "value", value)
+
+    identity = {
+        "api_version": getattr(request, "api_version", None),
+        "episode_id": getattr(request, "episode_id", None),
+        "task_id": getattr(request, "task_id", None),
+        "split": enum_value("split"),
+        "seed": getattr(request, "seed", None),
+        "action_mode": enum_value("action_mode"),
+        "observation_track": enum_value("observation_track"),
+        "object_mode": getattr(request, "object_mode", None),
+        "reset_mode": getattr(request, "reset_mode", None),
+        "factors": dict(factors),
+    }
+    if any(value is None for name, value in identity.items() if name != "factors"):
+        raise ValueError("GPU reset request is missing canonical identity fields")
+    return identity
+
+
+def require_exact_reset_request(
+    actual: Any,
+    expected: Any,
+    *,
+    allow_episode_id_change: bool = False,
+    context: str = "GPU reset",
+) -> None:
+    """Fail before physics if an export-bound reset field differs."""
+
+    actual_identity = reset_request_identity(actual)
+    expected_identity = reset_request_identity(expected)
+    compared_fields = tuple(
+        name
+        for name in expected_identity
+        if not (allow_episode_id_change and name == "episode_id")
+    )
+    mismatches = {
+        name: {
+            "expected": expected_identity[name],
+            "actual": actual_identity[name],
+        }
+        for name in compared_fields
+        if actual_identity[name] != expected_identity[name]
+    }
+    if mismatches:
+        raise ValueError(f"{context} request identity mismatch: {mismatches}")
 
 
 class GpuNativeBackendEnv:
@@ -82,6 +139,7 @@ class GpuNativeBackendEnv:
         task_quality_schema_version: str | None = None,
         task_quality_evaluator_backend_id: str | None = None,
         observation_track: str = "state",
+        require_exact_export_identity: bool = False,
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
             raise ValueError("GPU-native backend requires a positive num_envs")
@@ -101,6 +159,8 @@ class GpuNativeBackendEnv:
             raise ValueError("image_size must be a positive integer of at least 16")
         if not isinstance(camera_observations, bool):
             raise ValueError("camera_observations must be bool")
+        if not isinstance(require_exact_export_identity, bool):
+            raise ValueError("require_exact_export_identity must be bool")
         if planner_mode not in {None, "online_privileged_teacher_v1"}:
             raise ValueError("planner_mode is not a registered GPU Planner mode")
         planner_enabled = planner_mode is not None
@@ -166,6 +226,7 @@ class GpuNativeBackendEnv:
         self._expected_se3_source_tree = expected_se3_source_tree
         self._task_quality_schema_version = task_quality_schema_version
         self._task_quality_evaluator_backend_id = task_quality_evaluator_backend_id
+        self._require_exact_export_identity = require_exact_export_identity
         self._consumer = GpuNativeConsumer.RL
         runtime_evidence = ()
         if planner_enabled:
@@ -269,6 +330,7 @@ class GpuNativeBackendEnv:
         self._episode_ids: tuple[str | None, ...] = (None,) * num_envs
         self._last_observations: tuple[Any | None, ...] = (None,) * num_envs
         self._last_terminal_rows: tuple[Any, ...] = ()
+        self._reset_identity_validated = False
 
     @property
     def task_id(self) -> str:
@@ -309,6 +371,12 @@ class GpuNativeBackendEnv:
     @property
     def task_quality_enabled(self) -> bool:
         return self._task_quality_enabled
+
+    @property
+    def require_exact_export_identity(self) -> bool:
+        """Whether reset also freezes the artifact's exact episode identity."""
+
+        return self._require_exact_export_identity
 
     @property
     def frozen_requests(self) -> tuple[Any, ...]:
@@ -393,6 +461,7 @@ class GpuNativeBackendEnv:
             task_quality_schema_version=self._task_quality_schema_version,
             task_quality_evaluator_backend_id=self._task_quality_evaluator_backend_id,
             observation_track=self._observation_track.value,
+            require_exact_export_identity=self._require_exact_export_identity,
         )
 
     def next_request(self) -> Any:
@@ -402,12 +471,26 @@ class GpuNativeBackendEnv:
         the wrapper validates requests against the frozen artifact identity.
         """
         request = self._frozen_request
+        if self._require_exact_export_identity:
+            return request
         episode_id = f"{self._task_id}-gpu-{self._episode_counter:08d}"
         self._episode_counter += 1
         return replace(
             request,
             episode_id=episode_id,
             observation_track=self._observation_track,
+        )
+
+    def validate_frozen_request(self, request: Any, *, exact_episode_id: bool) -> None:
+        """Validate one request against the loaded export without side effects."""
+
+        if not isinstance(exact_episode_id, bool):
+            raise ValueError("exact_episode_id must be bool")
+        require_exact_reset_request(
+            request,
+            self._frozen_request,
+            allow_episode_id_change=not exact_episode_id,
+            context=f"GPU export {self._export_dir}",
         )
 
     def policy_steps(self) -> Any:
@@ -462,8 +545,18 @@ class GpuNativeBackendEnv:
         requests_tuple = tuple(requests)
         if len(requests_tuple) != self._num_envs:
             raise ValueError("GPU-native reset requires one request per lane")
+        self._reset_identity_validated = False
+        for lane, request in enumerate(requests_tuple):
+            require_exact_reset_request(
+                request,
+                self._frozen_request,
+                allow_episode_id_change=not self._require_exact_export_identity,
+                context=f"GPU lane {lane} export {self._export_dir}",
+            )
         if self._planner is not None:
-            return self._planner.reset(requests_tuple)
+            observations = self._planner.reset(requests_tuple)
+            self._reset_identity_validated = True
+            return observations
         from se3_wam.benchmark.gpu_native.audit import AuditRequest
 
         self._env.reset(requests_tuple)
@@ -483,6 +576,7 @@ class GpuNativeBackendEnv:
             getattr(request, "episode_id", None) for request in requests_tuple
         )
         self._last_observations = observations
+        self._reset_identity_validated = True
         return observations
 
     def step(
@@ -493,6 +587,10 @@ class GpuNativeBackendEnv:
     ) -> tuple[Any | None, ...]:
         """Step the whole batch and materialize every active lane."""
         commands_tuple = tuple(commands)
+        if self._require_exact_export_identity and not self._reset_identity_validated:
+            raise RuntimeError(
+                "exact-export GPU backend requires a validated reset before step"
+            )
         if self._planner is not None:
             raise GpuNativeBackendUnavailableError(
                 "online Planner mode rejects external action batches; use step_planner()"
@@ -716,6 +814,36 @@ class GpuNativeBackendEnv:
             )
         return observations
 
+    def materialize_replay_probe_audit(self) -> Mapping[str, Any]:
+        """Return the explicit diagnostic-only T3 engine state audit."""
+
+        materializer = getattr(self._env, "materialize_replay_probe_audit", None)
+        if not callable(materializer):
+            raise GpuNativeBackendUnavailableError(
+                "SE3-WAM GPU backend lacks the T3 replay-probe audit seam"
+            )
+        payload = materializer()
+        if not isinstance(payload, Mapping) or payload.get("diagnostic_only") is not True:
+            raise GpuNativeBackendUnavailableError(
+                "T3 replay-probe audit returned an invalid diagnostic receipt"
+            )
+        return payload
+
+    def verify_replay_probe_snapshot_roundtrip(self) -> Mapping[str, Any]:
+        """Require the explicit B=1 snapshot save/load diagnostic to be exact."""
+
+        verifier = getattr(self._env, "verify_replay_probe_snapshot_roundtrip", None)
+        if not callable(verifier):
+            raise GpuNativeBackendUnavailableError(
+                "SE3-WAM GPU backend lacks the T3 snapshot roundtrip seam"
+            )
+        receipt = verifier()
+        if not isinstance(receipt, Mapping) or receipt.get("exact") is not True:
+            raise GpuNativeBackendUnavailableError(
+                "T3 snapshot roundtrip did not produce an exact receipt"
+            )
+        return receipt
+
     def replay_planner_tape_diagnostic(
         self,
         tape: Any | None = None,
@@ -793,6 +921,7 @@ class GpuNativeMultiExportBackendEnv:
                     observation_track=observation_track,
                     task_quality_evaluator_backend_id=task_quality_evaluator_backend_id,
                     task_quality_schema_version=task_quality_schema_version,
+                    require_exact_export_identity=True,
                 )
                 for path in dirs
             ]
@@ -861,6 +990,16 @@ class GpuNativeMultiExportBackendEnv:
         request_tuple = tuple(requests)
         if len(request_tuple) != self.num_envs:
             raise ValueError("GPU-native multi-export reset requires one request per lane")
+        # Validate the complete cohort before resetting even lane zero.  A late
+        # mismatch must not leave a partially advanced multi-export batch.
+        for lane, (backend, request) in enumerate(
+            zip(self._backends, request_tuple, strict=True)
+        ):
+            require_exact_reset_request(
+                request,
+                backend.frozen_request,
+                context=f"GPU multi-export lane {lane}",
+            )
         observations = []
         for backend, request in zip(self._backends, request_tuple, strict=True):
             lane_observations = backend.reset((request,))

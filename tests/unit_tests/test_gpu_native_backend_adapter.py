@@ -25,7 +25,7 @@ import enum
 import pickle
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,7 +36,10 @@ from rlinf.envs.dynamic_benchmark.dynamic_benchmark_env import DynamicBenchmarkE
 from rlinf.envs.dynamic_benchmark.gpu_backend import (
     GpuNativeBackendEnv,
     GpuNativeBackendUnavailableError,
+    GpuNativeMultiExportBackendEnv,
     GpuNativePlannerAdapter,
+    require_exact_reset_request,
+    reset_request_identity,
 )
 
 
@@ -266,6 +269,79 @@ def test_adapter_reset_requires_full_batch(fake_se3_wam: _FakeSe3Wam) -> None:
     )
     with pytest.raises(ValueError, match="one request per lane"):
         backend.reset([backend.next_request()])
+
+
+def test_exact_export_identity_rejects_drift_before_gpu_reset(
+    fake_se3_wam: _FakeSe3Wam,
+) -> None:
+    backend = GpuNativeBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+        require_exact_export_identity=True,
+    )
+    frozen = backend.frozen_request
+    assert backend.next_request() is frozen
+    assert reset_request_identity(frozen)["episode_id"] == "ep-0"
+
+    episode_drift = replace(frozen, episode_id="ep-mutated")
+    with pytest.raises(ValueError, match="episode_id"):
+        backend.reset((episode_drift, frozen, frozen))
+    assert fake_se3_wam.factory.reset_calls == 0
+
+    factor_drift = replace(
+        frozen,
+        factors={**frozen.factors, "object_position_x_m": 0.125},
+    )
+    with pytest.raises(ValueError, match="factors"):
+        backend.reset((frozen, factor_drift, frozen))
+    assert fake_se3_wam.factory.reset_calls == 0
+
+
+def test_exact_request_helper_can_preserve_legacy_episode_namespace() -> None:
+    frozen = _FakeRequest()
+    changed_episode = replace(frozen, episode_id="fresh-episode")
+
+    require_exact_reset_request(
+        changed_episode,
+        frozen,
+        allow_episode_id_change=True,
+    )
+    with pytest.raises(ValueError, match="episode_id"):
+        require_exact_reset_request(changed_episode, frozen)
+
+
+def test_multi_export_validates_all_rows_before_resetting_lane_zero() -> None:
+    first = _FakeRequest(episode_id="row-0", seed=10)
+    second = _FakeRequest(episode_id="row-1", seed=11)
+
+    class LaneBackend:
+        def __init__(self, request: _FakeRequest) -> None:
+            self.frozen_request = request
+            self.reset_calls = 0
+
+        def reset(self, _requests: Any) -> tuple[Any, ...]:
+            self.reset_calls += 1
+            return (SimpleNamespace(),)
+
+    lanes = (LaneBackend(first), LaneBackend(second))
+    backend = object.__new__(GpuNativeMultiExportBackendEnv)
+    backend._backends = list(lanes)
+    backend._task_id = "p0_grasp"
+    backend._export_dirs = ("row-0", "row-1")
+
+    with pytest.raises(ValueError, match="lane 1.*factors"):
+        backend.reset(
+            (
+                first,
+                replace(
+                    second,
+                    factors={**second.factors, "object_position_x_m": 0.5},
+                ),
+            )
+        )
+
+    assert [lane.reset_calls for lane in lanes] == [0, 0]
 
 
 def test_adapter_not_picklable(fake_se3_wam: _FakeSe3Wam) -> None:

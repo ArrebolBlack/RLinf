@@ -14,6 +14,7 @@ import pytest
 
 from rlinf.envs.dynamic_benchmark.gpu_planner import (
     GpuCurrentStatePlanner,
+    GpuPlannerReplayError,
     GpuPlannerUnavailableError,
 )
 
@@ -147,3 +148,156 @@ def test_planner_rejects_cpu_provenance() -> None:
             backend=_Backend(platform="cpu"),
             task_id="t3_phase",
         )
+
+
+class _ProbeRequest:
+    task_id = "t3_full"
+    episode_id = "t3-full-row-0"
+    action_mode = _MODE
+
+
+class _ProbeObservation:
+    def __init__(self, control_step: int, *, drift: bool = False) -> None:
+        self.physics_step = control_step * 25
+        self.control_step = control_step
+        self.policy_step = control_step
+        self.time_s = control_step * 0.05
+        self.privileged = {
+            "object_pose": np.asarray(
+                [float(control_step), 1.0 if drift else 0.0], dtype=np.float64
+            )
+        }
+        self.proprio = {"joint": np.asarray([control_step], dtype=np.float64)}
+        self.events_since_last_observation = ()
+        self.fingerprint_sha256 = (
+            f"{control_step + 1000:064x}" if drift else f"{control_step + 1:064x}"
+        )
+
+
+class _ProbeResult:
+    def __init__(self, control_step: int, *, drift: bool = False) -> None:
+        self.observation = _ProbeObservation(control_step, drift=drift)
+        self.terminated = control_step >= 3
+        self.truncated = False
+        self.success = False
+        self.termination_reason = "probe_failure" if self.terminated else None
+        self.active_stage_progress = 0.0
+
+
+class _ProbeBackend:
+    backend_id = "mjwarp_gpu_v1"
+    task_id = "t3_full"
+    num_envs = 1
+    observation_track = SimpleNamespace(value="state")
+
+    def __init__(self, *, drift_step: int | None = None) -> None:
+        self.provenance = SimpleNamespace(
+            backend_id="mjwarp_gpu_v1",
+            device_platform="cuda",
+            runtime_versions={},
+        )
+        self.drift_step = drift_step
+        self.step_count = 0
+        self.last_terminal_rows = ()
+        self._observation = _ProbeObservation(0)
+
+    def reset(self, _requests: tuple[_ProbeRequest, ...]) -> tuple[_ProbeObservation, ...]:
+        self.step_count = 0
+        self.last_terminal_rows = ()
+        self._observation = _ProbeObservation(0)
+        return (self._observation,)
+
+    @staticmethod
+    def verify_replay_probe_snapshot_roundtrip() -> dict[str, object]:
+        return {
+            "exact": True,
+            "before_payload_sha256": "a" * 64,
+            "after_payload_sha256": "a" * 64,
+        }
+
+    def materialize_current_observations(self) -> tuple[_ProbeObservation, ...]:
+        return (self._observation,)
+
+    def materialize_replay_probe_audit(self) -> dict[str, object]:
+        drift = self.step_count == self.drift_step
+        stage = 1 if drift else 0
+        health = {
+            "stage_index": stage,
+            "grasp_attachment_active": 0,
+            "dock_attachment_active": 0,
+            "overflow": 0,
+        }
+        health_sha = f"{stage + 1:064x}"
+        return {
+            "diagnostic_only": True,
+            "sections": {
+                "health": health,
+                "snapshot_scope": {"digest": "stable"},
+                "live_mutable_data": {"digest": "stable"},
+                "active_contact": {"digest": "stable"},
+                "active_efc": {"digest": "stable"},
+                "bookkeeping": {"control_step": self.step_count},
+            },
+            "section_sha256": {
+                "health": health_sha,
+                "snapshot_scope": "b" * 64,
+                "live_mutable_data": "c" * 64,
+                "active_contact": "d" * 64,
+                "active_efc": "e" * 64,
+                "bookkeeping": f"{self.step_count + 10:064x}",
+            },
+            "payload_sha256": f"{self.step_count + stage + 20:064x}",
+        }
+
+    def step(self, _actions: tuple[_Action, ...]) -> tuple[_ProbeResult, ...]:
+        self.step_count += 1
+        drift = self.step_count == self.drift_step
+        result = _ProbeResult(self.step_count, drift=drift)
+        self._observation = result.observation
+        if result.terminated:
+            self.last_terminal_rows = (
+                SimpleNamespace(
+                    task_quality=None,
+                    lane=0,
+                    episode_id="t3-full-row-0",
+                    task_id="t3_full",
+                    outcome=SimpleNamespace(value="failure"),
+                    terminated=True,
+                    truncated=False,
+                    success=False,
+                    termination_reason="probe_failure",
+                    physics_step=75,
+                    control_step=3,
+                    policy_step=3,
+                    completion=0.0,
+                ),
+            )
+        return (result,)
+
+
+def test_replay_probe_reports_step3_components_state_and_call_order() -> None:
+    source = _ProbeBackend()
+    runner = GpuCurrentStatePlanner(
+        backend=source,
+        task_id="t3_full",
+        planner_factory=lambda _task_id, _request: _Planner(),
+        max_control_steps=4,
+        capture_replay_probe=True,
+    )
+    tape = runner.rollout(_ProbeRequest())
+
+    with pytest.raises(GpuPlannerReplayError) as raised:
+        runner.replay(tape, backend=_ProbeBackend(drift_step=3))
+
+    evidence = dict(raised.value.evidence)
+    assert evidence["control_step"] == 3
+    assert evidence["physics_step"] == 75
+    assert "privileged.object_pose" in evidence["observation_component_mismatches"]
+    assert evidence["backend_probe_mismatched_sections"] == ["health"]
+    assert evidence["backend_probe"]["expected_health"]["stage_index"] == 0
+    assert evidence["backend_probe"]["actual_health"]["stage_index"] == 1
+    assert evidence["backend_call_order_aligned"] is True
+    assert evidence["action"]["policy_step"] == 2
+    assert evidence["source_planner_state_before_action"] is not None
+    assert evidence["expected_snapshot_roundtrip"]["exact"] is True
+    assert evidence["replay_gate_relaxed"] is False
