@@ -843,6 +843,7 @@ def _replay(
                     result.termination_reason,
                 )
             )
+        replay_task_quality_margin = _task_quality_margin_diagnostic(replay_backend)
         replay_ledger_object = replay_backend.last_terminal_ledger
         replay_ledger = _ledger_payload(replay_ledger_object)
         expected_ledger = _ledger_payload(terminal_ledger)
@@ -962,6 +963,7 @@ def _replay(
             "replay_observation_sha256": _json_sha256(observation_digests),
             "replay_review_sha256": _json_sha256(actual_review_digests),
             "replay_ledger_sha256": _json_sha256(replay_ledger),
+            "task_quality_margin_diagnostic": replay_task_quality_margin,
         }
     finally:
         replay_backend.close()
@@ -1052,6 +1054,56 @@ def _validate_terminal_quality(
         or quality.get("terminal") is not True
     ):
         raise RuntimeError("t1_xyz terminal quality-v2 identity drifted")
+
+
+def _task_quality_margin_diagnostic(backend: Any) -> dict[str, Any]:
+    """Materialize bounded lane-zero state without changing replay gates."""
+
+    materializer = getattr(backend, "materialize_task_quality_audit", None)
+    if not callable(materializer):
+        return {"available": False, "reason": "adapter_method_unavailable"}
+    audit = materializer()
+
+    def scalar(name: str, cast: type[int] | type[float]) -> int | float:
+        values = np.asarray(audit[name]).reshape(-1)
+        if values.size < 1:
+            raise RuntimeError(f"task-quality audit field {name} has no lane-zero value")
+        return cast(values[0])
+
+    return {
+        "available": True,
+        "physics_step": scalar("physics_step", int),
+        "stage_index": scalar("stage_index", int),
+        "bilateral_steps": scalar("bilateral_steps", int),
+        "max_bilateral_steps": scalar("max_bilateral_steps", int),
+        "success": bool(scalar("success", int)),
+        "terminated": bool(scalar("terminated", int)),
+        "truncated": bool(scalar("truncated", int)),
+        "event_mask": scalar("event_mask", int),
+        "event_physics_step": np.asarray(audit["event_physics_step"])
+        .reshape(-1)
+        .astype(np.int64)
+        .tolist(),
+        "quality_physics_sample_count": scalar(
+            "quality_physics_sample_count", int
+        ),
+        "quality_has_post_hold_sample": bool(
+            scalar("quality_has_post_hold_sample", int)
+        ),
+        "quality_maximum_lift_clearance_m": scalar(
+            "quality_maximum_lift_clearance_m", float
+        ),
+        "quality_maximum_axis_error_rad": scalar(
+            "quality_maximum_axis_error_rad", float
+        ),
+        "quality_error": scalar("quality_error", int),
+        "quality_has_bilateral_hold_margin": bool(
+            scalar("quality_has_bilateral_hold_margin", int)
+        ),
+        "quality_bilateral_hold_downstream_margin_m": scalar(
+            "quality_bilateral_hold_downstream_margin_m", float
+        ),
+    }
 
 
 def main() -> None:
@@ -1211,6 +1263,7 @@ def main() -> None:
             terminal_payload[0],
             episode_id=str(request.episode_id),
         )
+        primary_task_quality_margin = _task_quality_margin_diagnostic(backend)
         primary_exact_once = assert_terminal_ledger_exact_once(
             backend,
             terminal_ledger.rows,
@@ -1262,6 +1315,15 @@ def main() -> None:
                     ),
                     "outcomes_sha256": _json_sha256(outcomes),
                     "terminal_ledger_sha256": _json_sha256(terminal_payload),
+                    "terminal_ledger": terminal_payload,
+                    "task_quality_margin_diagnostic": primary_task_quality_margin,
+                },
+                "task_quality_thresholds": {
+                    "bilateral_contact_hold_s": float(
+                        task_config["capture"]["bilateral_contact_hold_s"]
+                    ),
+                    "clearance_m": float(task_config["capture"]["clearance_m"]),
+                    "stable_dwell_s": float(task_config["capture"]["stable_dwell_s"]),
                 },
                 "replay": replay,
             }

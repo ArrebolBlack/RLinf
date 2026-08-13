@@ -67,6 +67,46 @@ def test_frozen_execution_uses_state_e7_and_canonical_evaluator() -> None:
     assert STRICT.QUALITY_EVALUATOR_ID == "mjwarp_gpu_v1"
 
 
+def test_task_quality_margin_diagnostic_serializes_lane_zero() -> None:
+    class _Backend:
+        @staticmethod
+        def materialize_task_quality_audit() -> dict[str, np.ndarray]:
+            return {
+                "physics_step": np.asarray([1250], dtype=np.int64),
+                "stage_index": np.asarray([4], dtype=np.int32),
+                "bilateral_steps": np.asarray([30], dtype=np.int32),
+                "max_bilateral_steps": np.asarray([31], dtype=np.int32),
+                "success": np.asarray([0], dtype=np.int32),
+                "terminated": np.asarray([0], dtype=np.int32),
+                "truncated": np.asarray([0], dtype=np.int32),
+                "event_mask": np.asarray([15], dtype=np.int32),
+                "event_physics_step": np.arange(11, dtype=np.int64),
+                "quality_physics_sample_count": np.asarray([900], dtype=np.int64),
+                "quality_has_post_hold_sample": np.asarray([1], dtype=np.int32),
+                "quality_maximum_lift_clearance_m": np.asarray(
+                    [0.049], dtype=np.float32
+                ),
+                "quality_maximum_axis_error_rad": np.asarray(
+                    [0.02], dtype=np.float32
+                ),
+                "quality_error": np.asarray([0], dtype=np.int32),
+                "quality_has_bilateral_hold_margin": np.asarray(
+                    [1], dtype=np.int32
+                ),
+                "quality_bilateral_hold_downstream_margin_m": np.asarray(
+                    [0.3], dtype=np.float32
+                ),
+            }
+
+    diagnostic = E0._task_quality_margin_diagnostic(_Backend())
+
+    assert diagnostic["available"] is True
+    assert diagnostic["physics_step"] == 1250
+    assert diagnostic["quality_maximum_lift_clearance_m"] == pytest.approx(0.049)
+    assert diagnostic["event_physics_step"] == list(range(11))
+    json.dumps(diagnostic)
+
+
 def test_d32_does_not_count_replay_audit_mismatch_as_completed_or_success() -> None:
     summary = D32._summary(
         [

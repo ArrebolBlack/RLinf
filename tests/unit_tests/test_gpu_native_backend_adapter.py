@@ -151,6 +151,9 @@ class _FakeEnv:
         if len(tuple(requests)) != self.batch_size:
             raise AssertionError("reset requests must cover the whole batch")
 
+    def enable_task_quality(self, **kwargs: Any) -> None:
+        self.task_quality_kwargs = dict(kwargs)
+
     def materialize_current_observations(self, lanes: tuple[int, ...]) -> tuple[Any, ...]:
         return tuple(_FakeObservation(lane=lane, step=self.step_calls) for lane in lanes)
 
@@ -186,6 +189,39 @@ class _FakeEnv:
             for lane in request.lanes
         )
         return SimpleNamespace(lanes=lanes)
+
+    def materialize_e2_audit(self) -> dict[str, np.ndarray]:
+        lane_values = np.arange(self.batch_size, dtype=np.int32)
+        return {
+            "physics_step": lane_values + 100,
+            "stage_index": lane_values + 2,
+            "bilateral_steps": lane_values + 3,
+            "max_bilateral_steps": lane_values + 4,
+            "success": np.zeros(self.batch_size, dtype=np.int32),
+            "terminated": np.zeros(self.batch_size, dtype=np.int32),
+            "truncated": np.zeros(self.batch_size, dtype=np.int32),
+            "event_mask": lane_values,
+            "event_physics_step": np.arange(
+                self.batch_size * 11, dtype=np.int64
+            ),
+            "quality_physics_sample_count": lane_values + 5,
+            "quality_has_post_hold_sample": np.ones(
+                self.batch_size, dtype=np.int32
+            ),
+            "quality_maximum_lift_clearance_m": np.linspace(
+                0.05, 0.07, self.batch_size, dtype=np.float32
+            ),
+            "quality_maximum_axis_error_rad": np.linspace(
+                0.01, 0.03, self.batch_size, dtype=np.float32
+            ),
+            "quality_error": np.zeros(self.batch_size, dtype=np.int32),
+            "quality_has_bilateral_hold_margin": np.ones(
+                self.batch_size, dtype=np.int32
+            ),
+            "quality_bilateral_hold_downstream_margin_m": np.linspace(
+                0.4, 0.2, self.batch_size, dtype=np.float32
+            ),
+        }
 
     def close(self) -> None:
         pass
@@ -328,6 +364,45 @@ def test_adapter_request_mapping(fake_se3_wam: _FakeSe3Wam) -> None:
     assert len(results) == 3
     assert fake_se3_wam.factory.step_calls == 1
     assert backend.backend_id == "mjwarp_gpu_v1"
+
+
+def test_task_quality_audit_is_bounded_and_copied(fake_se3_wam: _FakeSe3Wam) -> None:
+    backend = GpuNativeBackendEnv(
+        task_id="p0_grasp",
+        num_envs=3,
+        export_dir="/tmp/export",
+    )
+    backend.enable_task_quality(
+        evaluator_backend_id="mjwarp_gpu_v1",
+        schema_version="db0-episode-task-quality-v2",
+    )
+
+    audit = backend.materialize_task_quality_audit()
+
+    assert set(audit) == {
+        "physics_step",
+        "stage_index",
+        "bilateral_steps",
+        "max_bilateral_steps",
+        "success",
+        "terminated",
+        "truncated",
+        "event_mask",
+        "event_physics_step",
+        "quality_physics_sample_count",
+        "quality_has_post_hold_sample",
+        "quality_maximum_lift_clearance_m",
+        "quality_maximum_axis_error_rad",
+        "quality_error",
+        "quality_has_bilateral_hold_margin",
+        "quality_bilateral_hold_downstream_margin_m",
+    }
+    assert audit["quality_maximum_lift_clearance_m"].tolist() == pytest.approx(
+        [0.05, 0.06, 0.07]
+    )
+    audit["quality_maximum_lift_clearance_m"][0] = 1.0
+    fresh = fake_se3_wam.factory.materialize_e2_audit()
+    assert fresh["quality_maximum_lift_clearance_m"][0] == pytest.approx(0.05)
 
 
 def test_planner_is_current_state_closed_loop_and_tape_replay_is_diagnostic(

@@ -494,6 +494,48 @@ class GpuNativeBackendEnv:
 
         return self._last_terminal_ledger
 
+    def materialize_task_quality_audit(self) -> Mapping[str, np.ndarray]:
+        """Return a bounded host copy of live task-quality and terminal state.
+
+        This is a diagnostic seam for explaining a semantic replay failure. It
+        does not alter the device state, success gate, or terminal ledger.
+        """
+
+        if not self._task_quality_enabled:
+            raise RuntimeError("GPU task quality is not enabled")
+        materializer = getattr(self._env, "materialize_e2_audit", None)
+        if not callable(materializer):
+            raise GpuNativeBackendUnavailableError(
+                "the GPU-native engine does not expose a task-quality audit"
+            )
+        audit = materializer()
+        fields = (
+            "physics_step",
+            "stage_index",
+            "bilateral_steps",
+            "max_bilateral_steps",
+            "success",
+            "terminated",
+            "truncated",
+            "event_mask",
+            "event_physics_step",
+            "quality_physics_sample_count",
+            "quality_has_post_hold_sample",
+            "quality_maximum_lift_clearance_m",
+            "quality_maximum_axis_error_rad",
+            "quality_error",
+            "quality_has_bilateral_hold_margin",
+            "quality_bilateral_hold_downstream_margin_m",
+        )
+        missing = [name for name in fields if name not in audit]
+        if missing:
+            raise GpuNativeBackendUnavailableError(
+                "task-quality audit is missing fields: " + ", ".join(missing)
+            )
+        return MappingProxyType(
+            {name: np.asarray(audit[name]).copy() for name in fields}
+        )
+
     def enable_task_quality(
         self,
         *,
