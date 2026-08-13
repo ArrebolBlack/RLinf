@@ -29,10 +29,11 @@ CPU by design, but every action is computed from the latest GPU audit packet
 and immediately submitted to that same ``mjwarp_gpu_v1`` environment.  The
 runtime feature manifest and evaluator identity are mandatory in this mode.
 
-The GPU backend currently requires every lane to reuse the one frozen export
-identity (task/seed/split/factors/...); only ``episode_id`` is free.  This
-adapter therefore sources reset requests from the frozen export artifact and
-never falls back to the CPU ``make_mujoco_env`` path.
+One canonical GPU engine still owns one frozen export identity.  The
+``GpuNativeMultiExportBackendEnv`` composition uses one batch-size-one engine
+per lane when a phase requires different reset factors.  Every lane therefore
+keeps its own exported task/seed/split/factors identity without falling back to
+the CPU ``make_mujoco_env`` path.
 
 ``se3_wam`` imports are deliberately lazy so this module (and the tests that
 exercise its request mapping) can be imported on machines without the SE3-WAM
@@ -109,9 +110,15 @@ class GpuNativeBackendEnv:
                 "online privileged Planner mode is registered only for surface T1 or t5_replan"
             )
         if planner_enabled:
-            if not isinstance(runtime_manifest_path, str) or not runtime_manifest_path.strip():
+            if (
+                not isinstance(runtime_manifest_path, str)
+                or not runtime_manifest_path.strip()
+            ):
                 raise ValueError("online Planner mode requires runtime_manifest_path")
-            if not isinstance(runtime_manifest_sha256, str) or not runtime_manifest_sha256.strip():
+            if (
+                not isinstance(runtime_manifest_sha256, str)
+                or not runtime_manifest_sha256.strip()
+            ):
                 raise ValueError("online Planner mode requires runtime_manifest_sha256")
             if task_id == "t5_replan" and (
                 not isinstance(task_quality_schema_version, str)
@@ -120,7 +127,10 @@ class GpuNativeBackendEnv:
                 raise ValueError(
                     "online T5 Planner mode requires task_quality_schema_version"
                 )
-            if not isinstance(evaluator_backend_id, str) or not evaluator_backend_id.strip():
+            if (
+                not isinstance(evaluator_backend_id, str)
+                or not evaluator_backend_id.strip()
+            ):
                 raise ValueError("online Planner mode requires evaluator_backend_id")
         try:
             from se3_wam.benchmark.contracts import ObservationTrack
@@ -508,9 +518,7 @@ class GpuNativeBackendEnv:
                 requested_mask.shape != (self._num_envs,)
                 or requested_mask.dtype != np.bool_
             ):
-                raise ValueError(
-                    f"active_mask must be bool shape ({self._num_envs},)"
-                )
+                raise ValueError(f"active_mask must be bool shape ({self._num_envs},)")
             if not np.any(requested_mask):
                 raise ValueError("active_mask must select at least one lane")
             for lane, (command, active) in enumerate(
@@ -771,16 +779,29 @@ class GpuNativeMultiExportBackendEnv:
         observation_track: Any = "hybrid",
         task_quality_evaluator_backend_id: str | None = None,
         task_quality_schema_version: str | None = None,
+        expected_gpu_uuid: str | None = None,
+        expected_se3_source_commit: str | None = None,
+        expected_se3_source_tree: str | None = None,
     ) -> None:
         dirs = tuple(export_dirs)
         if not dirs:
-            raise ValueError("GPU-native multi-export backend requires at least one export")
+            raise ValueError(
+                "GPU-native multi-export backend requires at least one export"
+            )
         if any(not isinstance(path, str) or not path.strip() for path in dirs):
             raise ValueError("GPU-native multi-export paths must be non-empty strings")
         if len(set(dirs)) != len(dirs):
             raise ValueError("GPU-native multi-export paths must be unique")
         self._task_id = task_id
         self._export_dirs = dirs
+        self._device_ordinal = device_ordinal
+        self._image_size = image_size
+        self._observation_track_value = observation_track
+        self._task_quality_evaluator_backend_id = task_quality_evaluator_backend_id
+        self._task_quality_schema_version = task_quality_schema_version
+        self._expected_gpu_uuid = expected_gpu_uuid
+        self._expected_se3_source_commit = expected_se3_source_commit
+        self._expected_se3_source_tree = expected_se3_source_tree
         self._backends: list[GpuNativeBackendEnv] = []
         try:
             self._backends = [
@@ -793,6 +814,9 @@ class GpuNativeMultiExportBackendEnv:
                     observation_track=observation_track,
                     task_quality_evaluator_backend_id=task_quality_evaluator_backend_id,
                     task_quality_schema_version=task_quality_schema_version,
+                    expected_gpu_uuid=expected_gpu_uuid,
+                    expected_se3_source_commit=expected_se3_source_commit,
+                    expected_se3_source_tree=expected_se3_source_tree,
                 )
                 for path in dirs
             ]
@@ -849,6 +873,33 @@ class GpuNativeMultiExportBackendEnv:
     def frozen_requests(self) -> tuple[Any, ...]:
         return self._frozen_requests
 
+    def observation_tape(self, lane: int) -> tuple[Any, ...]:
+        """Return one lane's primary/replay observation sequence."""
+
+        if (
+            isinstance(lane, bool)
+            or not isinstance(lane, int)
+            or not 0 <= lane < self.num_envs
+        ):
+            raise IndexError(f"lane must be an integer in [0, {self.num_envs})")
+        return self._backends[lane].observation_tape(0)
+
+    def new_replay_backend(self) -> GpuNativeMultiExportBackendEnv:
+        """Build independent B=1 engines for blocking fresh replay."""
+
+        return type(self)(
+            task_id=self._task_id,
+            export_dirs=self._export_dirs,
+            device_ordinal=self._device_ordinal,
+            image_size=self._image_size,
+            observation_track=self._observation_track_value,
+            task_quality_evaluator_backend_id=self._task_quality_evaluator_backend_id,
+            task_quality_schema_version=self._task_quality_schema_version,
+            expected_gpu_uuid=self._expected_gpu_uuid,
+            expected_se3_source_commit=self._expected_se3_source_commit,
+            expected_se3_source_tree=self._expected_se3_source_tree,
+        )
+
     def next_request(self) -> Any:
         """Return an exact export-bound request for compatibility callers."""
 
@@ -860,7 +911,9 @@ class GpuNativeMultiExportBackendEnv:
     def reset(self, requests: Sequence[Any]) -> tuple[Any, ...]:
         request_tuple = tuple(requests)
         if len(request_tuple) != self.num_envs:
-            raise ValueError("GPU-native multi-export reset requires one request per lane")
+            raise ValueError(
+                "GPU-native multi-export reset requires one request per lane"
+            )
         observations = []
         for backend, request in zip(self._backends, request_tuple, strict=True):
             lane_observations = backend.reset((request,))
@@ -877,15 +930,15 @@ class GpuNativeMultiExportBackendEnv:
     ) -> tuple[Any | None, ...]:
         command_tuple = tuple(commands)
         if len(command_tuple) != self.num_envs:
-            raise ValueError("GPU-native multi-export step requires one command per lane")
+            raise ValueError(
+                "GPU-native multi-export step requires one command per lane"
+            )
         if active_mask is None:
             mask = np.ones(self.num_envs, dtype=np.bool_)
         else:
             mask = np.asarray(active_mask)
             if mask.shape != (self.num_envs,) or mask.dtype != np.bool_:
-                raise ValueError(
-                    f"active_mask must be bool shape ({self.num_envs},)"
-                )
+                raise ValueError(f"active_mask must be bool shape ({self.num_envs},)")
         results: list[Any | None] = [None] * self.num_envs
         for lane, (backend, command, active) in enumerate(
             zip(self._backends, command_tuple, mask, strict=True)
@@ -919,7 +972,9 @@ class GpuNativeMultiExportBackendEnv:
         rows = []
         for lane, episode_id in zip(lane_tuple, episode_tuple, strict=True):
             if not 0 <= lane < self.num_envs:
-                raise ValueError(f"terminal ledger lane {lane} is outside the multi-export batch")
+                raise ValueError(
+                    f"terminal ledger lane {lane} is outside the multi-export batch"
+                )
             batch = self._backends[lane].materialize_terminal_ledger(
                 (0,), (episode_id,)
             )
@@ -945,7 +1000,9 @@ class GpuNativeMultiExportBackendEnv:
             backend.close()
 
     def __getstate__(self) -> Mapping[str, Any]:
-        raise TypeError("GpuNativeMultiExportBackendEnv is device-resident and not picklable")
+        raise TypeError(
+            "GpuNativeMultiExportBackendEnv is device-resident and not picklable"
+        )
 
 
 @dataclass(frozen=True)
@@ -954,6 +1011,7 @@ class PlannerTapeReplay:
 
     step_results: tuple[tuple[Any | None, ...], ...]
     terminal_rows: tuple[Any, ...]
+    observation_fingerprints: tuple[tuple[str, ...], ...]
     mode: str = "open_loop_diagnostic"
 
 
@@ -978,6 +1036,9 @@ class GpuNativePlannerAdapter:
         observation_track: Any = "hybrid",
         evaluator_backend_id: str,
         schema_version: str | None = None,
+        expected_gpu_uuid: str | None = None,
+        expected_se3_source_commit: str | None = None,
+        expected_se3_source_tree: str | None = None,
     ) -> None:
         self._task_id = task_id
         if (export_dir is None) == (export_dirs is None):
@@ -999,6 +1060,9 @@ class GpuNativePlannerAdapter:
                 observation_track=observation_track,
                 task_quality_evaluator_backend_id=evaluator_backend_id,
                 task_quality_schema_version=quality_schema,
+                expected_gpu_uuid=expected_gpu_uuid,
+                expected_se3_source_commit=expected_se3_source_commit,
+                expected_se3_source_tree=expected_se3_source_tree,
             )
         else:
             assert export_dir is not None
@@ -1011,6 +1075,9 @@ class GpuNativePlannerAdapter:
                 observation_track=observation_track,
                 task_quality_evaluator_backend_id=evaluator_backend_id,
                 task_quality_schema_version=quality_schema,
+                expected_gpu_uuid=expected_gpu_uuid,
+                expected_se3_source_commit=expected_se3_source_commit,
+                expected_se3_source_tree=expected_se3_source_tree,
             )
         self._teachers: tuple[Any, ...] = ()
         self._teacher_metadata: tuple[Mapping[str, Any], ...] = ()
@@ -1060,7 +1127,21 @@ class GpuNativePlannerAdapter:
 
     @property
     def action_tapes(self) -> tuple[tuple[Mapping[str, Any], ...], ...]:
-        return tuple(tuple(dict(entry) for entry in tape) for tape in self._action_tapes)
+        return tuple(
+            tuple(dict(entry) for entry in tape) for tape in self._action_tapes
+        )
+
+    @property
+    def observation_fingerprints(self) -> tuple[tuple[str, ...], ...]:
+        """Return every reset/post-step fingerprint captured by the live engines."""
+
+        return tuple(
+            tuple(
+                str(observation.fingerprint_sha256)
+                for observation in self._backend.observation_tape(lane)
+            )
+            for lane in range(self.num_envs)
+        )
 
     @property
     def terminal_rows(self) -> tuple[Any, ...]:
@@ -1088,6 +1169,20 @@ class GpuNativePlannerAdapter:
         """Return the exact request identity bound by each export artifact."""
 
         return tuple(self._backend.frozen_requests)
+
+    def new_replay_backend(self) -> Any:
+        """Construct an independent backend with the exact primary identity."""
+
+        return self._backend.new_replay_backend()
+
+    def assert_terminal_ledger_exact_once(self) -> tuple[str, ...]:
+        """Require a second consumption of every terminal row to be rejected."""
+
+        if self._active_mask.any() or len(self._terminal_rows) != self.num_envs:
+            raise RuntimeError(
+                "terminal-ledger exact-once audit requires a completed full batch"
+            )
+        return assert_terminal_ledger_exact_once(self._backend, self._terminal_rows)
 
     def next_request(self) -> Any:
         return self._backend.next_request()
@@ -1142,8 +1237,7 @@ class GpuNativePlannerAdapter:
             "mode": action.mode.value,
             "policy_step": int(action.policy_step),
             "values": [
-                float(value)
-                for value in np.asarray(action.values, dtype=np.float64)
+                float(value) for value in np.asarray(action.values, dtype=np.float64)
             ],
         }
 
@@ -1168,7 +1262,9 @@ class GpuNativePlannerAdapter:
                 continue
             action = teacher.act(observation)
             if type(action) is not ActionCommand:
-                raise RuntimeError("Planner teacher must return the exact ActionCommand ABI")
+                raise RuntimeError(
+                    "Planner teacher must return the exact ActionCommand ABI"
+                )
             if action.mode is not ActionMode.E7:
                 raise RuntimeError("GPU Planner requires E7 actions")
             if action.policy_step != observation.policy_step:
@@ -1183,7 +1279,9 @@ class GpuNativePlannerAdapter:
             raise RuntimeError("GPU Planner backend changed the lane cardinality")
         updated = list(self._observations)
         done_mask = np.zeros(self.num_envs, dtype=np.bool_)
-        for lane, (result, active) in enumerate(zip(results, self._active_mask, strict=True)):
+        for lane, (result, active) in enumerate(
+            zip(results, self._active_mask, strict=True)
+        ):
             if not active:
                 continue
             if result is None:
@@ -1198,9 +1296,21 @@ class GpuNativePlannerAdapter:
                     (observation.episode_id,),
                 )
                 if len(ledger.rows) != 1 or ledger.rows[0].lane != lane:
-                    raise RuntimeError("GPU Planner terminal ledger changed lane identity")
+                    raise RuntimeError(
+                        "GPU Planner terminal ledger changed lane identity"
+                    )
                 if ledger.rows[0].episode_id != observation.episode_id:
-                    raise RuntimeError("GPU Planner terminal ledger changed episode identity")
+                    raise RuntimeError(
+                        "GPU Planner terminal ledger changed episode identity"
+                    )
+                if ledger.rows[0].task_id != self._task_id:
+                    raise RuntimeError(
+                        "GPU Planner terminal ledger changed task identity"
+                    )
+                if any(int(existing.lane) == lane for existing in self._terminal_rows):
+                    raise RuntimeError(
+                        "GPU Planner terminal ledger lane was consumed twice"
+                    )
                 self._terminal_rows.extend(ledger.rows)
                 done_mask[lane] = True
         if np.any(done_mask):
@@ -1214,6 +1324,39 @@ class GpuNativePlannerAdapter:
 
     def __getstate__(self) -> Mapping[str, Any]:
         raise TypeError("GpuNativePlannerAdapter is device-resident and not picklable")
+
+
+def assert_terminal_ledger_exact_once(
+    backend: Any,
+    terminal_rows: Sequence[Any],
+) -> tuple[str, ...]:
+    """Return negative witnesses proving every terminal row is one-shot.
+
+    Call this only after the rows have already been materialized.  A backend
+    that returns a row again is rejected, so a lane cannot silently contribute
+    more than once to a scientific cohort.
+    """
+
+    rows = tuple(sorted(terminal_rows, key=lambda value: int(value.lane)))
+    if len(rows) != int(backend.num_envs):
+        raise RuntimeError("terminal-ledger exact-once audit lacks full batch coverage")
+    lanes = tuple(int(row.lane) for row in rows)
+    if lanes != tuple(range(int(backend.num_envs))):
+        raise RuntimeError("terminal-ledger exact-once audit lane identity drifted")
+    witnesses: list[str] = []
+    for row in rows:
+        try:
+            backend.materialize_terminal_ledger(
+                (int(row.lane),),
+                (str(row.episode_id),),
+            )
+        except Exception as exc:  # exact-once negative witness
+            witnesses.append(f"{type(exc).__name__}: {exc}")
+        else:
+            raise RuntimeError(
+                f"GPU terminal ledger lane {int(row.lane)} was consumable twice"
+            )
+    return tuple(witnesses)
 
 
 def replay_recorded_tape(
@@ -1241,10 +1384,13 @@ def replay_recorded_tape(
         ) from exc
 
     observations = list(backend.reset(request_tuple))
+    observation_fingerprints: list[list[str]] = [
+        [str(observation.fingerprint_sha256)] for observation in observations
+    ]
     active_mask = np.ones(backend.num_envs, dtype=np.bool_)
     consumed = [0] * backend.num_envs
     replay_steps: list[tuple[Any | None, ...]] = []
-    terminal_rows: list[Any] = []
+    terminal_rows_by_lane: dict[int, Any] = {}
     max_tape_length = max((len(tape) for tape in tape_tuple), default=0)
     for time_index in range(max_tape_length):
         commands: list[Any | None] = [None] * backend.num_envs
@@ -1278,12 +1424,30 @@ def replay_recorded_tape(
             if result is None:
                 raise RuntimeError(f"open-loop replay lost active lane {lane}")
             observations[lane] = result.observation
+            observation_fingerprints[lane].append(
+                str(result.observation.fingerprint_sha256)
+            )
             if result.terminated or result.truncated:
                 ledger = backend.materialize_terminal_ledger(
                     (lane,),
                     (observations[lane].episode_id,),
                 )
-                terminal_rows.extend(ledger.rows)
+                if len(ledger.rows) != 1:
+                    raise RuntimeError(
+                        "open-loop replay terminal ledger changed cardinality"
+                    )
+                row = ledger.rows[0]
+                if (
+                    int(row.lane) != lane
+                    or row.episode_id != request_tuple[lane].episode_id
+                    or row.task_id != backend.task_id
+                ):
+                    raise RuntimeError(
+                        "open-loop replay terminal ledger identity drifted"
+                    )
+                if lane in terminal_rows_by_lane:
+                    raise RuntimeError("open-loop replay terminal ledger lane repeated")
+                terminal_rows_by_lane[lane] = row
                 done_mask[lane] = True
         if np.any(done_mask):
             backend.mark_done(done_mask)
@@ -1291,10 +1455,25 @@ def replay_recorded_tape(
         if not np.any(active_mask):
             break
     if np.any(active_mask):
-        raise RuntimeError("open-loop replay tape did not reach terminal state for every lane")
-    if any(count != len(tape) for count, tape in zip(consumed, tape_tuple, strict=True)):
-        raise RuntimeError("open-loop replay tape contains actions after terminal state")
+        raise RuntimeError(
+            "open-loop replay tape did not reach terminal state for every lane"
+        )
+    if any(
+        count != len(tape) for count, tape in zip(consumed, tape_tuple, strict=True)
+    ):
+        raise RuntimeError(
+            "open-loop replay tape contains actions after terminal state"
+        )
+    if set(terminal_rows_by_lane) != set(range(backend.num_envs)):
+        raise RuntimeError(
+            "open-loop replay did not materialize every terminal ledger row"
+        )
     return PlannerTapeReplay(
         step_results=tuple(replay_steps),
-        terminal_rows=tuple(terminal_rows),
+        terminal_rows=tuple(
+            terminal_rows_by_lane[lane] for lane in range(backend.num_envs)
+        ),
+        observation_fingerprints=tuple(
+            tuple(values) for values in observation_fingerprints
+        ),
     )
