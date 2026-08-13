@@ -1,0 +1,39 @@
+# Current-source CPU-environment recovery recipe for t4_sphere.
+#
+# The historical RLE1 winner required a materially larger task-specific budget
+# and residual envelope.  Those core settings are retained on top of the
+# current action-rate/action-history additions and must be revalidated on the
+# current source before release use.
+algorithm: residual_rlpd
+num_envs: 2
+eval_num_envs: 2
+demo_num_envs: 2
+total_env_steps: 100000
+random_env_steps: 5000
+demo_episodes: 64
+demo_max_attempts: 640
+demo_ratio: 0.5
+bc_steps: 5000
+batch_size: 512
+replay_capacity: 250000
+updates_per_vector_step: 1
+q_heads: 10
+q_target_subset: 2
+actor_bc_weight: 50.0
+initial_alpha: 0.01
+eval_interval: 10000
+eval_episodes: 40
+checkpoint_interval: 10000
+validation_manifest_seed: 20261450
+residual_scale: 1.0
+reward_safety_penalty: -10.0
+
+reward_components:
+  r_action_rate:
+    weight: 0.10
+    scale: 1.0
+
+features:
+  action_history:
+    k: 3
+

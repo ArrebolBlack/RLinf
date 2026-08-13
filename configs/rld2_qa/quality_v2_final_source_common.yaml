@@ -1,4 +1,6 @@
-# RLD2-QA clean final-source recipe for the eleven non-special exact-14 tasks.
+# Historical RLD2-QA final-source common recipe.  The current CPU task-recipe
+# map reuses it only for the nine ordinary tasks; do not select it directly for
+# a task that has a retained specialization.
 # Run identity, source commits, output paths, task, and seed stay explicit on the
 # launcher CLI and are deliberately forbidden from this frozen recipe.
 algorithm: residual_rlpd

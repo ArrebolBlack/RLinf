@@ -1,0 +1,93 @@
+schema_version: rlinf-dynamic-benchmark-task-recipe-map-v1
+route: cpu_environment_gpu_learner
+baseline_definition: >-
+  The baseline is the exact per-task recipe map below: ordinary tasks use the
+  common recipe, while every retained task specialization uses its own recipe.
+  A single uniform recipe is not the baseline.
+
+execution_profile:
+  host_training:
+    profile: J32W2
+    jobs_per_eight_gpu_host: 32
+    environments_per_job: 2
+    camera_observations: false
+    physics_renderer: classic_mujoco_cpu
+    learner: one_gpu_per_job_shared
+    task_only_manifest: true
+    persistent_evaluation: true
+    linux_process_start_method: forkserver
+    demo_replay_cache: explicit_identity_bound_path
+  isolated_training_reference:
+    profile: J1W32
+    environments_per_job: 32
+    camera_observations: false
+    purpose: isolated_throughput_reference_not_whole_host_default
+  planner_data_generation:
+    profile: two_numa_local_W16_jobs
+    jobs_per_node: 2
+    workers_per_job: 16
+    camera_observations: true
+    renderer: osmesa_cpu
+    gpu_visible_devices: none
+    task_only_manifest: true
+
+ordinary_recipe: quality_v2_final_source_common.yaml
+specialized_tasks:
+  - t1_so3
+  - t2_se3
+  - t3_phase
+  - t3_full
+  - t4_sphere
+
+tasks:
+  p0_grasp:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t1_belt:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t1_xyz:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t1_so3:
+    recipe: quality_v2_cpu_task_t1_so3_a4_core.yaml
+    role: historical_winner_core_transfer
+    evidence: RLOPT-SO3_A4_39_of_40_success_0_safety
+    current_source_matched_confirmation_required: true
+  t1_occ:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t2_trans:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t2_se3:
+    recipe: quality_v2_final_source_t2_se3.yaml
+    role: historical_winner_retained
+    evidence: RLOPT-SE3_D1_40_of_40_success_0_safety
+    current_source_matched_confirmation_required: true
+  t3_phase:
+    recipe: quality_v2_final_source_t3_phase.yaml
+    role: retained_current_task_specialization
+    current_source_matched_confirmation_required: true
+  t3_full:
+    recipe: quality_v2_final_source_t3_full.yaml
+    role: retained_current_task_specialization
+    current_source_matched_confirmation_required: true
+  t4_sphere:
+    recipe: quality_v2_cpu_task_t4_sphere_w50_rs1_100k.yaml
+    role: historical_winner_core_transfer
+    evidence: RLE1_w50_rs1_100k_best_190_of_200_success_10_safety
+    current_source_matched_confirmation_required: true
+  t4_sphere_tabletop:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t4_slider:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t4_can:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+  t5_replan:
+    recipe: quality_v2_final_source_common.yaml
+    role: ordinary
+
