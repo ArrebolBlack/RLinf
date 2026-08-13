@@ -123,8 +123,10 @@ def _array_digest(value: Any) -> str:
     return digest.hexdigest()
 
 
-def _observation_digest(observation: Any) -> str:
-    payload: dict[str, Any] = {
+def _observation_payload(observation: Any) -> dict[str, Any]:
+    """Return a compact, field-addressable observation fingerprint payload."""
+
+    return {
         "identity": {
             "episode_id": observation.episode_id,
             "task_id": observation.task_id,
@@ -156,7 +158,127 @@ def _observation_digest(observation: Any) -> str:
             for event in observation.events_since_last_observation
         ],
     }
-    return _json_sha256(payload)
+
+
+def _observation_digest(observation: Any) -> str:
+    return _json_sha256(_observation_payload(observation))
+
+
+def _command_payload(command: Any) -> dict[str, Any]:
+    return {
+        "mode": getattr(command.mode, "value", command.mode),
+        "policy_step": int(command.policy_step),
+        "values": np.asarray(command.values, dtype=np.float64).tolist(),
+    }
+
+
+def _first_sequence_mismatch(
+    expected: Sequence[Any],
+    actual: Sequence[Any],
+) -> dict[str, Any] | None:
+    """Describe the first unequal item without weakening exact equality."""
+
+    expected_values = tuple(expected)
+    actual_values = tuple(actual)
+    shared_length = min(len(expected_values), len(actual_values))
+    mismatch_index = next(
+        (
+            index
+            for index in range(shared_length)
+            if expected_values[index] != actual_values[index]
+        ),
+        None,
+    )
+    if mismatch_index is None:
+        if len(expected_values) == len(actual_values):
+            return None
+        mismatch_index = shared_length
+    return {
+        "sequence_index": mismatch_index,
+        "expected_length": len(expected_values),
+        "actual_length": len(actual_values),
+        "expected_item": (
+            expected_values[mismatch_index]
+            if mismatch_index < len(expected_values)
+            else None
+        ),
+        "actual_item": (
+            actual_values[mismatch_index]
+            if mismatch_index < len(actual_values)
+            else None
+        ),
+        "expected_sequence_sha256": _json_sha256(expected_values),
+        "actual_sequence_sha256": _json_sha256(actual_values),
+    }
+
+
+def _first_divergence(
+    *,
+    fresh_backend_distinct: bool,
+    backend_identity_exact: bool,
+    observation_mismatch: Mapping[str, Any] | None,
+    review_mismatch: Mapping[str, Any] | None,
+    outcome_mismatch: Mapping[str, Any] | None,
+    terminal_ledger_mismatch: Mapping[str, Any] | None,
+    terminal_ledger_exact_once: bool,
+    commands: Sequence[Any],
+) -> dict[str, Any] | None:
+    """Locate the earliest strict-replay failure and bind its action context."""
+
+    if not fresh_backend_distinct:
+        return {"channel": "fresh_backend_distinct", "control_step": None}
+    if not backend_identity_exact:
+        return {"channel": "backend_identity", "control_step": None}
+
+    candidates: list[tuple[int, int, str, Mapping[str, Any]]] = []
+    for priority, (channel, mismatch, outcome_offset) in enumerate(
+        (
+            ("observation", observation_mismatch, 0),
+            ("review", review_mismatch, 0),
+            ("outcome", outcome_mismatch, 1),
+        )
+    ):
+        if mismatch is not None:
+            candidates.append(
+                (
+                    int(mismatch["sequence_index"]) + outcome_offset,
+                    priority,
+                    channel,
+                    mismatch,
+                )
+            )
+    if candidates:
+        control_step, _, channel, mismatch = min(candidates)
+        preceding_action = None
+        if control_step > 0 and control_step - 1 < len(commands):
+            preceding_action = _command_payload(commands[control_step - 1])
+        return {
+            "channel": channel,
+            "control_step": control_step,
+            "transition_action": preceding_action,
+            "mismatch": dict(mismatch),
+        }
+    if terminal_ledger_mismatch is not None:
+        return {
+            "channel": "terminal_ledger",
+            "control_step": None,
+            "transition_action": (_command_payload(commands[-1]) if commands else None),
+            "mismatch": dict(terminal_ledger_mismatch),
+        }
+    if not terminal_ledger_exact_once:
+        return {
+            "channel": "terminal_ledger_exact_once",
+            "control_step": None,
+            "transition_action": (_command_payload(commands[-1]) if commands else None),
+        }
+    return None
+
+
+def _write_json_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
+        stream.write("\n")
 
 
 def _readonly_copy(value: Any) -> np.ndarray:
@@ -360,11 +482,9 @@ def _replay(
         replay_observation, replay_review = _state_and_review_observation(
             replay_raw_observation
         )
+        replay_observations = [replay_observation]
         observation_digests = [_observation_digest(replay_observation)]
         actual_review_digests = [_review_digest(replay_review)]
-        expected_observation_digests = [
-            _observation_digest(value) for value in observations
-        ]
         replay_outcomes: list[tuple[bool, bool, bool, str | None]] = []
         for command in commands:
             replay_command = _make_command(
@@ -376,6 +496,7 @@ def _replay(
             replay_observation, replay_review = _state_and_review_observation(
                 result.observation
             )
+            replay_observations.append(replay_observation)
             observation_digests.append(_observation_digest(replay_observation))
             actual_review_digests.append(_review_digest(replay_review))
             replay_outcomes.append(
@@ -403,10 +524,39 @@ def _replay(
         except Exception as exc:
             exact_once_error = {"error_type": type(exc).__name__, "error": str(exc)}
         terminal_ledger_exact_once = exact_once_error is None
-        observation_tape_exact = observation_digests == expected_observation_digests
+        expected_observation_payloads = [
+            _observation_payload(value) for value in observations
+        ]
+        replay_observation_payloads = [
+            _observation_payload(value) for value in replay_observations
+        ]
+        observation_mismatch = _first_sequence_mismatch(
+            expected_observation_payloads,
+            replay_observation_payloads,
+        )
+        review_mismatch = _first_sequence_mismatch(
+            review_digests,
+            actual_review_digests,
+        )
+        outcome_mismatch = _first_sequence_mismatch(outcomes, replay_outcomes)
+        terminal_ledger_mismatch = _first_sequence_mismatch(
+            expected_ledger,
+            replay_ledger,
+        )
+        observation_tape_exact = observation_mismatch is None
         review_tape_exact = tuple(actual_review_digests) == review_digests
-        outcomes_exact = tuple(replay_outcomes) == outcomes
-        terminal_ledger_exact = replay_ledger == expected_ledger
+        outcomes_exact = outcome_mismatch is None
+        terminal_ledger_exact = terminal_ledger_mismatch is None
+        first_divergence = _first_divergence(
+            fresh_backend_distinct=fresh_backend_distinct,
+            backend_identity_exact=backend_identity_exact,
+            observation_mismatch=observation_mismatch,
+            review_mismatch=review_mismatch,
+            outcome_mismatch=outcome_mismatch,
+            terminal_ledger_mismatch=terminal_ledger_mismatch,
+            terminal_ledger_exact_once=terminal_ledger_exact_once,
+            commands=commands,
+        )
         return {
             "mode": "strict_fresh_backend",
             "passed": bool(
@@ -430,6 +580,7 @@ def _replay(
             "replay_provenance": replay_provenance,
             "exact_once_negative_witnesses": list(exact_once_witnesses),
             "exact_once_error": exact_once_error,
+            "first_divergence": first_divergence,
             "replay_observation_sha256": _json_sha256(observation_digests),
             "replay_review_sha256": _json_sha256(actual_review_digests),
             "replay_ledger_sha256": _json_sha256(replay_ledger),
@@ -545,6 +696,13 @@ def main() -> None:
         raise ValueError("--tape-output must use the .npz suffix")
     if tape_output.exists() or visual_gif.exists():
         raise FileExistsError("strict evidence output paths must be new")
+    replay_failure_output = args.output.with_name(
+        f"{args.output.stem}.strict-replay-failure.json"
+    )
+    if replay_failure_output.exists():
+        raise FileExistsError(
+            f"refusing to overwrite strict replay failure evidence: {replay_failure_output}"
+        )
 
     # All host/source/export checks complete before any CUDA backend exists.
     manifest = load_frozen_manifest(
@@ -689,22 +847,58 @@ def main() -> None:
             terminal_ledger=terminal_ledger,
         )
         if replay.get("passed") is not True:
+            action_tape = [_command_payload(command) for command in commands]
+            failure_payload = {
+                "schema_version": "gpu-planner-t1-xyz-strict-replay-failure-v1",
+                "status": "blocked_strict_fresh_replay",
+                "evidence_passed": False,
+                "qualification_completed": 0,
+                "review_candidate": False,
+                "countable_result_written": False,
+                "task_id": TASK_ID,
+                "phase": args.phase,
+                "manifest": {
+                    "candidate_index": row["candidate_index"],
+                    "episode_id": row["request"]["episode_id"],
+                    "manifest_index": row["manifest_index"],
+                    "manifest_sha256": manifest.manifest_sha256,
+                    "source_identity_sha256": manifest.source_identity_sha256,
+                },
+                "reset_request": expected_request,
+                "source_gate": {
+                    "passed": True,
+                    "repositories_exact": True,
+                    "source_identity_sha256": manifest.source_identity_sha256,
+                    "repositories": repositories,
+                },
+                "export": export_identity,
+                "provenance": provenance,
+                "primary": {
+                    "action_count": len(action_tape),
+                    "action_tape_sha256": _json_sha256(action_tape),
+                    "observation_tape_sha256": _json_sha256(
+                        [_observation_digest(value) for value in observations]
+                    ),
+                    "review_tape_sha256": _json_sha256(
+                        [_review_digest(value) for value in reviews]
+                    ),
+                    "outcomes_sha256": _json_sha256(outcomes),
+                    "terminal_ledger_sha256": _json_sha256(terminal_payload),
+                },
+                "replay": replay,
+            }
+            _write_json_exclusive(replay_failure_output, failure_payload)
             raise RuntimeError(
-                f"strict fresh replay failed: {json.dumps(replay, sort_keys=True)}"
+                "strict fresh replay failed; fail-closed evidence written to "
+                f"{replay_failure_output.resolve()}: "
+                f"{json.dumps(replay, sort_keys=True)}"
             )
 
         tape_output = tape_output.resolve()
         visual_gif = visual_gif.resolve()
         _write_tape_npz(tape_output, observations, commands)
         _write_visual_gif(visual_gif, reviews)
-        action_tape = [
-            {
-                "mode": getattr(command.mode, "value", command.mode),
-                "policy_step": int(command.policy_step),
-                "values": np.asarray(command.values, dtype=np.float64).tolist(),
-            }
-            for command in commands
-        ]
+        action_tape = [_command_payload(command) for command in commands]
         trajectory_tape = [_observation_digest(value) for value in observations]
         evidence_export = {
             "passed": True,

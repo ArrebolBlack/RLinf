@@ -296,6 +296,132 @@ def test_fresh_replay_rejects_backend_source_identity_mismatch(
     assert passed["passed"] is True
 
 
+def test_fresh_replay_records_first_observation_divergence(
+    monkeypatch: Any,
+) -> None:
+    api = types.ModuleType("se3_wam.benchmark.api")
+
+    class _ActionCommand:
+        def __init__(self, *, mode: Any, values: Any, policy_step: int) -> None:
+            self.mode = mode
+            self.values = values
+            self.policy_step = policy_step
+
+    api.ActionCommand = _ActionCommand
+    monkeypatch.setitem(sys.modules, "se3_wam", types.ModuleType("se3_wam"))
+    monkeypatch.setitem(
+        sys.modules,
+        "se3_wam.benchmark",
+        types.ModuleType("se3_wam.benchmark"),
+    )
+    monkeypatch.setitem(sys.modules, "se3_wam.benchmark.api", api)
+
+    gpu_backend = types.ModuleType("rlinf.envs.dynamic_benchmark.gpu_backend")
+    gpu_backend.assert_terminal_ledger_exact_once = lambda backend, rows: (
+        "second_consumption_rejected",
+    )
+    rlinf = types.ModuleType("rlinf")
+    rlinf.__path__ = []
+    envs = types.ModuleType("rlinf.envs")
+    envs.__path__ = []
+    dynamic = types.ModuleType("rlinf.envs.dynamic_benchmark")
+    dynamic.__path__ = []
+    monkeypatch.setitem(sys.modules, "rlinf", rlinf)
+    monkeypatch.setitem(sys.modules, "rlinf.envs", envs)
+    monkeypatch.setitem(sys.modules, "rlinf.envs.dynamic_benchmark", dynamic)
+    monkeypatch.setitem(
+        sys.modules,
+        "rlinf.envs.dynamic_benchmark.gpu_backend",
+        gpu_backend,
+    )
+
+    provenance = SimpleNamespace(
+        backend_id="mjwarp_gpu_v1",
+        git_commit="a" * 40,
+        git_tree="b" * 40,
+    )
+
+    class _DivergentReplay:
+        last_terminal_ledger = _terminal_ledger()
+
+        def __init__(self) -> None:
+            self.provenance = provenance
+
+        def reset(self, requests: Any) -> tuple[Any, ...]:
+            assert len(tuple(requests)) == 1
+            return (_observation(0),)
+
+        def policy_steps(self) -> np.ndarray:
+            return np.asarray([0], dtype=np.int64)
+
+        def step(self, commands: Any) -> tuple[Any, ...]:
+            assert len(tuple(commands)) == 1
+            return (
+                SimpleNamespace(
+                    observation=_observation(2),
+                    terminated=True,
+                    truncated=False,
+                    success=True,
+                    termination_reason="success",
+                ),
+            )
+
+        def close(self) -> None:
+            pass
+
+    primary = SimpleNamespace(
+        provenance=provenance,
+        new_replay_backend=lambda: _DivergentReplay(),
+    )
+    request = SimpleNamespace(action_mode=_ActionMode.E7)
+    command = SimpleNamespace(
+        mode=_ActionMode.E7,
+        policy_step=0,
+        values=np.arange(7, dtype=np.float64),
+    )
+    state_0, review_0 = E0._state_and_review_observation(_observation(0))
+    state_1, review_1 = E0._state_and_review_observation(_observation(1))
+
+    replay = E0._replay(
+        backend=primary,
+        request=request,
+        observations=(state_0, state_1),
+        review_digests=(
+            E0._review_digest(review_0),
+            E0._review_digest(review_1),
+        ),
+        commands=(command,),
+        outcomes=((True, False, True, "success"),),
+        terminal_ledger=_terminal_ledger(),
+    )
+
+    assert replay["passed"] is False
+    assert replay["observation_tape_exact"] is False
+    assert replay["first_divergence"]["channel"] == "observation"
+    assert replay["first_divergence"]["control_step"] == 1
+    assert replay["first_divergence"]["mismatch"]["sequence_index"] == 1
+    assert replay["first_divergence"]["transition_action"] == {
+        "mode": "E7",
+        "policy_step": 0,
+        "values": [float(value) for value in range(7)],
+    }
+
+
+def test_strict_replay_failure_evidence_is_exclusive(tmp_path: Path) -> None:
+    path = tmp_path / "result.strict-replay-failure.json"
+    payload = {
+        "status": "blocked_strict_fresh_replay",
+        "evidence_passed": False,
+        "qualification_completed": 0,
+    }
+
+    E0._write_json_exclusive(path, payload)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+    with pytest.raises(FileExistsError):
+        E0._write_json_exclusive(path, payload)
+
+
 def _repositories() -> dict[str, dict[str, str]]:
     return {
         "research": {"commit": "1" * 40, "tree": "2" * 40},
