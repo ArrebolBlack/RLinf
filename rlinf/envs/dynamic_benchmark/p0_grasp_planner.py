@@ -29,10 +29,25 @@ GPU_NATIVE_BACKEND_ID = "mjwarp_gpu_v1"
 E7_ACTION_WIDTH = 7
 PHYSICS_STEPS_PER_CONTROL = 25
 _VISUAL_COMPONENT_PREFIXES = ("rgb/", "depth_m/", "segmentation/")
+_CAPTURE_PLANNER_TAPE_SCHEMAS = MappingProxyType(
+    {
+        "p0_grasp": P0_GRASP_PLANNER_TAPE_SCHEMA_VERSION,
+        "t1_so3": "se3-wam-t1-so3-planner-tape-v2",
+    }
+)
 
 
 class P0GraspPlannerError(RuntimeError):
     """Raised when the causal Planner/tape contract cannot be proven."""
+
+
+def _tape_schema_version(task_id: str) -> str:
+    try:
+        return _CAPTURE_PLANNER_TAPE_SCHEMAS[task_id]
+    except KeyError as exc:
+        raise P0GraspPlannerError(
+            f"unsupported capture Planner task_id: {task_id!r}"
+        ) from exc
 
 
 def _enum_value(value: Any) -> Any:
@@ -249,10 +264,11 @@ class PlannerTapeIdentity:
     physics_steps_per_control: int = PHYSICS_STEPS_PER_CONTROL
 
     def __post_init__(self) -> None:
-        if self.task_id != "p0_grasp" or self.backend_id != GPU_NATIVE_BACKEND_ID:
-            raise P0GraspPlannerError("Planner tape requires p0_grasp/mjwarp_gpu_v1")
+        _tape_schema_version(self.task_id)
+        if self.backend_id != GPU_NATIVE_BACKEND_ID:
+            raise P0GraspPlannerError("Planner tape requires mjwarp_gpu_v1")
         if self.num_envs != 1:
-            raise P0GraspPlannerError("P0 E0 Planner tape requires B=1")
+            raise P0GraspPlannerError("capture E0 Planner tape requires B=1")
         _require_digest("manifest_sha256", self.manifest_sha256)
         _require_digest("backend_identity_sha256", self.backend_identity_sha256)
         if len(self.episode_ids) != 1 or not self.episode_ids[0]:
@@ -299,8 +315,12 @@ class PlannerTapeEntry:
     def __post_init__(self) -> None:
         for name in ("lane", "physics_step", "control_step", "policy_step"):
             _nonnegative_int(name, getattr(self, name))
-        if self.lane != 0 or self.task_id != "p0_grasp" or not self.episode_id:
-            raise P0GraspPlannerError("P0 E0 tape entry identity is invalid")
+        if (
+            self.lane != 0
+            or self.task_id not in _CAPTURE_PLANNER_TAPE_SCHEMAS
+            or not self.episode_id
+        ):
+            raise P0GraspPlannerError("capture E0 tape entry identity is invalid")
         if self.control_step != self.policy_step:
             raise P0GraspPlannerError("observation control/policy clocks disagree")
         if self.physics_step != PHYSICS_STEPS_PER_CONTROL * self.control_step:
@@ -442,10 +462,11 @@ class ActionTrajectoryTape:
         if (
             entry.policy_step != expected_step
             or entry.episode_id != self._identity.episode_ids[0]
+            or entry.task_id != self._identity.task_id
             or any(value.done_after for value in self._entries)
         ):
             raise P0GraspPlannerError(
-                "P0 E0 tape order/identity/terminal state differs"
+                "capture E0 tape order/identity/terminal state differs"
             )
         self._entries.append(entry)
 
@@ -475,7 +496,7 @@ class ActionTrajectoryTape:
 
     def as_dict(self, *, include_sha256: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "schema_version": P0_GRASP_PLANNER_TAPE_SCHEMA_VERSION,
+            "schema_version": _tape_schema_version(self._identity.task_id),
             "identity": self._identity.as_dict(),
             "reset_health": _jsonable(self._reset_health),
             "entries": [entry.as_dict() for entry in self._entries],
@@ -488,7 +509,7 @@ class ActionTrajectoryTape:
 
     def action_dict(self) -> dict[str, Any]:
         payload = {
-            "schema_version": P0_GRASP_PLANNER_TAPE_SCHEMA_VERSION,
+            "schema_version": _tape_schema_version(self._identity.task_id),
             "identity": self._identity.as_dict(),
             "entries": [
                 {
@@ -508,32 +529,40 @@ class ActionTrajectoryTape:
         return payload
 
 
-def _validate_backend(backend: Any) -> None:
+def _validate_backend(backend: Any, *, task_id: str = "p0_grasp") -> None:
+    _tape_schema_version(task_id)
     backend_id = getattr(backend, "backend_id", None)
     if backend_id is None:
         backend_id = getattr(getattr(backend, "provenance", None), "backend_id", None)
     if backend_id != GPU_NATIVE_BACKEND_ID:
-        raise P0GraspPlannerError("P0 Planner requires backend=mjwarp_gpu_v1")
+        raise P0GraspPlannerError("capture Planner requires backend=mjwarp_gpu_v1")
     device = getattr(backend, "device", None)
     if getattr(device, "type", None) != "cuda" and not str(device).startswith("cuda"):
-        raise P0GraspPlannerError("P0 Planner requires a CUDA data plane")
-    if getattr(backend, "task_id", None) != "p0_grasp":
-        raise P0GraspPlannerError("P0 Planner control is restricted to p0_grasp")
+        raise P0GraspPlannerError("capture Planner requires a CUDA data plane")
+    if getattr(backend, "task_id", None) != task_id:
+        raise P0GraspPlannerError(f"capture Planner control is restricted to {task_id}")
     if getattr(backend, "num_envs", None) != 1:
-        raise P0GraspPlannerError("P0 Planner E0 requires num_envs=1")
+        raise P0GraspPlannerError("capture Planner E0 requires num_envs=1")
     if getattr(backend, "observation_track", None) != "state":
-        raise P0GraspPlannerError("P0 Planner E0 requires the frozen STATE track")
+        raise P0GraspPlannerError("capture Planner E0 requires the frozen STATE track")
     if getattr(backend, "render_observations", None) is not True:
-        raise P0GraspPlannerError("P0 Planner E0 requires independent GPU rendering")
+        raise P0GraspPlannerError(
+            "capture Planner E0 requires independent GPU rendering"
+        )
 
 
-def _tape_identity_from_reset(backend: Any, reset: Any) -> PlannerTapeIdentity:
-    _validate_backend(backend)
+def _tape_identity_from_reset(
+    backend: Any,
+    reset: Any,
+    *,
+    task_id: str = "p0_grasp",
+) -> PlannerTapeIdentity:
+    _validate_backend(backend, task_id=task_id)
     stable_identity = getattr(backend, "stable_identity", None)
     if not isinstance(stable_identity, Mapping):
         raise P0GraspPlannerError("GPU backend does not expose a stable run identity")
     return PlannerTapeIdentity(
-        task_id="p0_grasp",
+        task_id=task_id,
         backend_id=GPU_NATIVE_BACKEND_ID,
         num_envs=1,
         manifest_sha256=reset.manifest_sha256,
@@ -546,14 +575,19 @@ def _tape_identity_from_reset(backend: Any, reset: Any) -> PlannerTapeIdentity:
     )
 
 
-def _command_from_planner(planner: Any, observation: Any) -> np.ndarray:
+def _command_from_planner(
+    planner: Any,
+    observation: Any,
+    *,
+    task_id: str = "p0_grasp",
+) -> np.ndarray:
     command = planner.act(observation)
     from se3_wam.benchmark.api import ActionCommand
     from se3_wam.benchmark.contracts import ActionMode
 
     if type(command) is not ActionCommand or command.mode is not ActionMode.E7:
         raise P0GraspPlannerError(
-            "online P0 Planner must emit the exact E7 ActionCommand"
+            f"online {task_id} Planner must emit the exact E7 ActionCommand"
         )
     if command.policy_step != observation.policy_step:
         raise P0GraspPlannerError(
@@ -561,9 +595,13 @@ def _command_from_planner(planner: Any, observation: Any) -> np.ndarray:
         )
     values = np.asarray(command.values, dtype=np.float32)
     if values.shape != (E7_ACTION_WIDTH,) or not np.all(np.isfinite(values)):
-        raise P0GraspPlannerError("online P0 Planner action must be a finite E7 vector")
+        raise P0GraspPlannerError(
+            f"online {task_id} Planner action must be a finite E7 vector"
+        )
     if np.any(values < -1.0) or np.any(values > 1.0):
-        raise P0GraspPlannerError("online P0 Planner action must lie in [-1, 1]")
+        raise P0GraspPlannerError(
+            f"online {task_id} Planner action must lie in [-1, 1]"
+        )
     return np.array(values, dtype=np.float32, copy=True)
 
 
@@ -580,12 +618,23 @@ def _read_done(value: Any) -> bool:
 class CurrentStatePlannerAdapter:
     """Run one CPU Planner decision per current GPU STATE observation."""
 
-    def __init__(self, backend: Any, planner: Any) -> None:
-        _validate_backend(backend)
+    def __init__(
+        self,
+        backend: Any,
+        planner: Any,
+        *,
+        task_id: str = "p0_grasp",
+        diagnostics: Any = planner_step_diagnostics,
+    ) -> None:
+        _validate_backend(backend, task_id=task_id)
         if not callable(getattr(planner, "act", None)):
-            raise TypeError("P0 Planner must expose act(observation)")
+            raise TypeError(f"{task_id} Planner must expose act(observation)")
+        if not callable(diagnostics):
+            raise TypeError("Planner diagnostics must be callable")
         self._backend = backend
         self._planner = planner
+        self._task_id = task_id
+        self._diagnostics = diagnostics
         self._tape: ActionTrajectoryTape | None = None
         self._scene_frames: list[np.ndarray] = []
         self._wrist_frames: list[np.ndarray] = []
@@ -618,7 +667,11 @@ class CurrentStatePlannerAdapter:
         if reset_health["physics_step"] != 0:
             raise P0GraspPlannerError("GPU reset did not start at physics step zero")
         self._tape = ActionTrajectoryTape(
-            _tape_identity_from_reset(self._backend, reset),
+            _tape_identity_from_reset(
+                self._backend,
+                reset,
+                task_id=self._task_id,
+            ),
             reset_health=reset_health,
         )
         self._scene_frames = []
@@ -636,7 +689,7 @@ class CurrentStatePlannerAdapter:
         observation = observations[0]
         expected_step = len(tape.entries)
         if (
-            observation.task_id != "p0_grasp"
+            observation.task_id != self._task_id
             or observation.episode_id != tape.identity.episode_ids[0]
             or observation.physics_step != PHYSICS_STEPS_PER_CONTROL * expected_step
             or observation.control_step != expected_step
@@ -646,7 +699,11 @@ class CurrentStatePlannerAdapter:
                 "current observation identity/clock differs from the tape"
             )
         components = observation_components(observation)
-        values = _command_from_planner(self._planner, observation)
+        values = _command_from_planner(
+            self._planner,
+            observation,
+            task_id=self._task_id,
+        )
         try:
             torch = importlib.import_module("torch")
             device_action = torch.as_tensor(
@@ -687,7 +744,7 @@ class CurrentStatePlannerAdapter:
                 ),
                 observation_component_sha256=components,
                 action=tuple(float(value) for value in values),
-                diagnostics=planner_step_diagnostics(observation, self._planner),
+                diagnostics=self._diagnostics(observation, self._planner),
                 health_after=health,
                 done_after=done,
             )
@@ -702,7 +759,7 @@ class CurrentStatePlannerAdapter:
                 break
         else:
             raise P0GraspPlannerError(
-                "P0 Planner did not reach natural termination at the fixed horizon"
+                f"{self._task_id} Planner did not reach natural termination at the fixed horizon"
             )
         natural_steps = len(self.tape.entries)
         self.tape.finalize(natural_steps)
@@ -714,7 +771,7 @@ class CurrentStatePlannerAdapter:
             len(rows) != 1
             or rows[0].lane != 0
             or rows[0].episode_id != self.tape.identity.episode_ids[0]
-            or rows[0].task_id != "p0_grasp"
+            or rows[0].task_id != self._task_id
             or rows[0].control_step != natural_steps
             or rows[0].policy_step != natural_steps
             or not PHYSICS_STEPS_PER_CONTROL * (natural_steps - 1)
@@ -751,18 +808,22 @@ def replay_action_trajectory(
 ) -> ReplayReceipt:
     """Replay one complete tape on a fresh backend without calling a Planner."""
 
-    _validate_backend(backend)
     if not isinstance(tape, ActionTrajectoryTape) or not tape.complete:
         raise P0GraspPlannerError(
             "replay requires one complete natural-termination tape"
         )
+    _validate_backend(backend, task_id=tape.identity.task_id)
     preview = tuple(request.episode_id for request in backend.next_requests())
     if preview != tape.identity.episode_ids:
         raise P0GraspPlannerError(
             "replay backend is not at the recorded manifest cursor"
         )
     reset = backend.reset()
-    actual = _tape_identity_from_reset(backend, reset)
+    actual = _tape_identity_from_reset(
+        backend,
+        reset,
+        task_id=tape.identity.task_id,
+    )
     expected = replace(actual, horizon_steps=tape.identity.horizon_steps)
     if expected != tape.identity:
         raise P0GraspPlannerError(
@@ -829,7 +890,7 @@ def replay_action_trajectory(
         len(rows) != 1
         or rows[0].lane != 0
         or rows[0].episode_id != tape.identity.episode_ids[0]
-        or rows[0].task_id != "p0_grasp"
+        or rows[0].task_id != tape.identity.task_id
         or rows[0].control_step != tape.identity.horizon_steps
         or rows[0].policy_step != tape.identity.horizon_steps
         or not PHYSICS_STEPS_PER_CONTROL * (tape.identity.horizon_steps - 1)

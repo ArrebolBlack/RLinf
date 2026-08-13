@@ -85,7 +85,8 @@ _CAPTURE_STATE_ENV_CAPABILITIES = MappingProxyType(
 # family; the task id is validated separately by the public contract.
 _P0_STATE_CONTRACT_CAPABILITIES = _CAPTURE_STATE_CONTRACT_CAPABILITIES
 _P0_STATE_ENV_CAPABILITIES = _CAPTURE_STATE_ENV_CAPABILITIES
-_T1_CAPTURE_TASK_IDS = frozenset({"t1_belt", "t1_occ"})
+_T1_CAPTURE_TASK_IDS = frozenset({"t1_belt", "t1_occ", "t1_so3"})
+_T1_RUNTIME_FEATURE_TASK_IDS = frozenset({"t1_belt", "t1_occ"})
 _T4_TASK_IDS = frozenset({"t4_sphere"})
 
 
@@ -874,13 +875,13 @@ class GpuNativeTensorBackendEnv:
             raise ValueError(
                 "runtime_manifest and runtime_manifest_sha256 must be supplied together"
             )
-        if task_id in _T1_CAPTURE_TASK_IDS and runtime_manifest is None:
+        if task_id in _T1_RUNTIME_FEATURE_TASK_IDS and runtime_manifest is None:
             raise ValueError(
                 "T1 capture tensor admission requires a pinned surface-velocity runtime manifest"
             )
-        if task_id not in _T1_CAPTURE_TASK_IDS and runtime_manifest is not None:
+        if task_id not in _T1_RUNTIME_FEATURE_TASK_IDS and runtime_manifest is not None:
             raise ValueError(
-                "runtime feature evidence is only accepted for the T1 capture tensor seam"
+                "runtime feature evidence is only accepted for the T1 surface-velocity tensor seam"
             )
         if (
             isinstance(image_size, bool)
@@ -952,9 +953,11 @@ class GpuNativeTensorBackendEnv:
                 "PyTorch CUDA is unavailable; CPU fallback is forbidden"
             )
         runtime_evidence = ()
-        if task_id in _T1_CAPTURE_TASK_IDS:
+        if task_id in _T1_RUNTIME_FEATURE_TASK_IDS:
             try:
-                from se3_wam.benchmark.gpu_native.tasks import load_runtime_feature_evidence
+                from se3_wam.benchmark.gpu_native.tasks import (
+                    load_runtime_feature_evidence,
+                )
 
                 runtime_evidence = (
                     load_runtime_feature_evidence(
