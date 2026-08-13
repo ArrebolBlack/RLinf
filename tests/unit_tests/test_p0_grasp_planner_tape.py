@@ -198,6 +198,7 @@ class _Backend:
     def __init__(self) -> None:
         self.step = 0
         self.terminal_calls = 0
+        self.review_steps: list[int] = []
 
     def next_requests(self) -> tuple[Any, ...]:
         return (SimpleNamespace(episode_id="episode-0"),)
@@ -205,6 +206,7 @@ class _Backend:
     def reset(self) -> Any:
         self.step = 0
         self.terminal_calls = 0
+        self.review_steps = []
         return SimpleNamespace(
             episode_ids=("episode-0",),
             manifest_sha256=_sha("manifest"),
@@ -222,6 +224,7 @@ class _Backend:
         self, lanes: tuple[int, ...]
     ) -> tuple[dict[str, np.ndarray], ...]:
         assert lanes == (0,)
+        self.review_steps.append(self.step)
         return (_frame(self.step),)
 
     def materialize_teacher_observations(
@@ -313,6 +316,7 @@ def test_online_adapter_and_fresh_replay_share_causal_state_not_planner(
     assert adapter.tape.complete
     assert len(adapter.scene_frames) == 3
     assert online.terminal_calls == 1
+    assert online.review_steps == [0, 1, 2]
 
     fresh = _Backend()
     replay = _MODULE.replay_action_trajectory(fresh, adapter.tape)
@@ -320,3 +324,4 @@ def test_online_adapter_and_fresh_replay_share_causal_state_not_planner(
     assert len(replay.steps) == 2
     assert replay.terminal_rows[0].episode_id == online_rows[0].episode_id
     assert fresh.terminal_calls == 1
+    assert fresh.review_steps == online.review_steps
