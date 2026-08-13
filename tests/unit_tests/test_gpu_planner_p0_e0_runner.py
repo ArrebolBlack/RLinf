@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,3 +67,54 @@ def test_checksum_verifier_rejects_an_unlisted_bundle_artifact(tmp_path: Path) -
 
 def test_runner_uses_current_task_quality_schema() -> None:
     assert _MODULE.TASK_QUALITY_SCHEMA_VERSION == "db0-episode-task-quality-v2"
+
+
+def test_runner_emits_development_export_source_contract() -> None:
+    entry = SimpleNamespace(
+        policy_step=0,
+        action=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        observation_fingerprint_sha256="1" * 64,
+        health_after={"physics_step": 25},
+    )
+    tape = SimpleNamespace(
+        entries=(entry,),
+        sha256="3" * 64,
+        as_dict=lambda: {"complete": True},
+    )
+    terminal = {
+        "episode_id": "episode-0",
+        "task_id": "p0_grasp",
+        "terminated": True,
+        "truncated": False,
+        "success": True,
+        "termination_reason": "success",
+        "task_quality": None,
+    }
+    replay = SimpleNamespace(
+        passed=True,
+        backend_identity_sha256="4" * 64,
+        steps=(),
+    )
+
+    action, trajectory, replay_payload = _MODULE._review_contract_payloads(
+        tape=tape,
+        terminal=terminal,
+        replay=replay,
+        terminal_observation_fingerprint="2" * 64,
+        online_teacher_audits=2,
+        online_transport_checks=1,
+        replay_teacher_audits=2,
+        replay_transport_checks=1,
+    )
+
+    expected_digest = "0266f17513a1845e570adb97e304703a61ee583d3b3cf53cc5191e135c3de866"
+    assert _MODULE.SOURCE_EVALUATION_PHASE == "engineering_e0"
+    assert action["action_tape_sha256"] == expected_digest
+    assert trajectory["action_tape_sha256"] == expected_digest
+    assert trajectory["observation_fingerprints"] == ["1" * 64, "2" * 64]
+    assert trajectory["results"][0]["observation_fingerprint_sha256"] == "2" * 64
+    assert trajectory["terminal"] == terminal
+    assert replay_payload["action_count"] == 1
+    assert replay_payload["action_tape_sha256"] == expected_digest
+    assert replay_payload["observation_fingerprints"] == ["1" * 64, "2" * 64]
+    assert replay_payload["terminal_quality_summary_sha256"] is None
