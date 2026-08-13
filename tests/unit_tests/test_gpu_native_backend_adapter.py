@@ -591,7 +591,9 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
     teachers: list[_Teacher] = []
     teacher_factory = types.ModuleType("se3_wam.benchmark.teacher_factory")
 
-    def _make_teacher(task_id: str, *, request: _FakeRequest) -> tuple[Any, dict[str, Any]]:
+    def _make_teacher(
+        task_id: str, *, request: _FakeRequest
+    ) -> tuple[Any, dict[str, Any]]:
         assert task_id == "t4_slider"
         teacher_requests.append(request.episode_id)
         teacher = _Teacher(request)
@@ -599,7 +601,9 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
         return teacher, {"teacher_type": "fake"}
 
     teacher_factory.make_privileged_teacher = _make_teacher
-    monkeypatch.setitem(sys.modules, "se3_wam.benchmark.teacher_factory", teacher_factory)
+    monkeypatch.setitem(
+        sys.modules, "se3_wam.benchmark.teacher_factory", teacher_factory
+    )
     fake_se3_wam.factory.ActionCommand = _ActionCommand
     fake_se3_wam.factory.ActionMode = _ActionMode
     sys.modules["se3_wam.benchmark.api"].ActionCommand = _ActionCommand
@@ -610,6 +614,10 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
         episode_id: str
         task_id: str
         policy_step: int
+
+        @property
+        def fingerprint_sha256(self) -> str:
+            return f"{self.episode_id}-{self.policy_step}"
 
     @dataclass(frozen=True)
     class _FakeResult:
@@ -625,6 +633,7 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
             self.provenance = SimpleNamespace(device_platform="cuda")
             self._active = np.ones(self.num_envs, dtype=np.bool_)
             self._clock = 0
+            self._ledger_consumed: set[int] = set()
 
         def next_request(self) -> _FakeRequest:
             return _FakeRequest(episode_id=f"planner-{self._clock}")
@@ -633,6 +642,7 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
             self._requests = tuple(requests)
             self._clock = 0
             self._active[:] = True
+            self._ledger_consumed.clear()
             return tuple(
                 _FakeObservation(request.episode_id, "t4_slider", 0)
                 for request in self._requests
@@ -665,12 +675,29 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
             lanes: tuple[int, ...],
             episode_ids: tuple[str, ...],
         ) -> Any:
+            for lane in lanes:
+                if lane in self._ledger_consumed:
+                    raise RuntimeError(f"terminal ledger lane {lane} already consumed")
+                self._ledger_consumed.add(lane)
             return SimpleNamespace(
                 rows=tuple(
-                    SimpleNamespace(lane=lane, episode_id=episode_id)
+                    SimpleNamespace(
+                        lane=lane,
+                        episode_id=episode_id,
+                        task_id="t4_slider",
+                    )
                     for lane, episode_id in zip(lanes, episode_ids, strict=True)
                 )
             )
+
+        def observation_tape(self, lane: int) -> tuple[_FakeObservation, ...]:
+            return tuple(
+                _FakeObservation(self._requests[lane].episode_id, "t4_slider", step)
+                for step in range(self._clock + 1)
+            )
+
+        def new_replay_backend(self) -> _PlannerBackend:
+            return type(self)(num_envs=self.num_envs)
 
         def mark_done(self, done_mask: Any) -> None:
             self._active &= ~np.asarray(done_mask, dtype=np.bool_)
@@ -693,6 +720,13 @@ def test_planner_adapter_uses_current_observation_and_per_reset_teacher(
     assert second[0] is None and second[1].terminated
     assert adapter.replay is False
     assert [len(tape) for tape in adapter.action_tapes] == [1, 2]
+    assert adapter.observation_fingerprints == (
+        ("planner-0-0", "planner-0-1", "planner-0-2"),
+        ("planner-0-0", "planner-0-1", "planner-0-2"),
+    )
     assert teacher_requests == [request.episode_id for request in requests]
     assert all(teacher.calls > 0 for teacher in teachers)
+    witnesses = adapter.assert_terminal_ledger_exact_once()
+    assert len(witnesses) == 2
+    assert all("already consumed" in witness for witness in witnesses)
     adapter.close()
