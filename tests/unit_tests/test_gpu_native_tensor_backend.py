@@ -48,6 +48,7 @@ GpuNativeTensorBackendEnv = _MODULE.GpuNativeTensorBackendEnv
 GpuNativeTensorBackendUnavailableError = _MODULE.GpuNativeTensorBackendUnavailableError
 GpuNativeTensorTerminalRow = _MODULE.GpuNativeTensorTerminalRow
 _require_single_uuid_visibility = _MODULE._require_single_uuid_visibility
+_torch_device_identity = _MODULE._torch_device_identity
 _zero_copy_torch_view = _MODULE._zero_copy_torch_view
 
 _GPU_UUID = "GPU-803b6f88-a884-134a-d92d-cdc532e22e14"
@@ -62,6 +63,39 @@ _EXPORT_DIGESTS = {
     "config_sha256": "4" * 64,
     "manifest_sha256": "5" * 64,
 }
+
+
+def test_torch_device_identity_accepts_trusted_singleton_for_torch_23() -> None:
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_properties=lambda _device: SimpleNamespace()
+        )
+    )
+
+    assert _torch_device_identity(
+        torch,
+        _Device("cuda:0"),
+        trusted_gpu_uuid=_GPU_UUID,
+        trusted_pci_bus_id=_PCI_BUS_ID,
+    ) == (_GPU_UUID, _PCI_BUS_ID)
+
+
+def test_torch_device_identity_rejects_missing_trusted_singleton() -> None:
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_properties=lambda _device: SimpleNamespace()
+        )
+    )
+
+    with pytest.raises(
+        GpuNativeTensorBackendUnavailableError,
+        match="lack trusted UUID/PCI identity",
+    ):
+        _torch_device_identity(
+            torch,
+            _Device("cuda:0"),
+            trusted_pci_bus_id=_PCI_BUS_ID,
+        )
 
 
 @dataclass(frozen=True)

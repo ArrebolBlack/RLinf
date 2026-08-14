@@ -390,6 +390,7 @@ def _torch_device_identity(
     torch: Any,
     device: Any,
     *,
+    trusted_gpu_uuid: str | None = None,
     trusted_pci_bus_id: str | None = None,
 ) -> tuple[str, str]:
     properties = torch.cuda.get_device_properties(device)
@@ -397,7 +398,13 @@ def _torch_device_identity(
         # PyTorch 2.12 exposes ``_CUuuid`` as the RFC-4122 payload without
         # NVIDIA's ``GPU-`` namespace prefix.  Only that exact unprefixed form
         # is accepted; arbitrary strings are never promoted into UUIDs.
-        uuid = _canonical_torch_gpu_uuid(str(properties.uuid))
+        try:
+            uuid = _canonical_torch_gpu_uuid(str(properties.uuid))
+        except (AttributeError, TypeError, ValueError):
+            # PyTorch 2.3 does not publish UUID/PCI fields.  Singleton UUID
+            # CUDA visibility plus the independently matched Warp and NVML
+            # identities still binds logical cuda:0 to one physical GPU.
+            uuid = _canonical_gpu_uuid(trusted_gpu_uuid)
         try:
             pci_bus_id = _canonical_pci_bus_id(
                 f"{int(properties.pci_domain_id):08x}:"
@@ -621,6 +628,7 @@ def _observe_device_identity(
     torch_uuid, torch_pci = _torch_device_identity(
         torch,
         device,
+        trusted_gpu_uuid=nvml_uuid,
         trusted_pci_bus_id=nvml_pci,
     )
     warp_uuid, warp_pci, warp_alias, warp_ordinal = _warp_device_identity(
