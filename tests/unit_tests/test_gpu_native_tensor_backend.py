@@ -1002,6 +1002,19 @@ def test_t1_so3_capture_admission_does_not_claim_surface_runtime_inputs() -> Non
     assert capabilities["device_terminal_mask"] is True
 
 
+def test_t1_xyz_capture_admission_exposes_tensor_terminal_without_runtime_input() -> None:
+    assert "t1_xyz" in _MODULE._T1_CAPTURE_TASK_IDS
+    assert "t1_xyz" not in _MODULE._T1_RUNTIME_FEATURE_TASK_IDS
+    capabilities = _MODULE._p0_expected_capabilities(
+        task_id="t1_xyz",
+        visual=True,
+        device_tensor_step=True,
+    )
+    assert capabilities["rgb"] is True
+    assert capabilities["device_tensor_step"] is True
+    assert capabilities["device_terminal_mask"] is True
+
+
 def test_generated_manifest_projects_only_observation_track_to_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

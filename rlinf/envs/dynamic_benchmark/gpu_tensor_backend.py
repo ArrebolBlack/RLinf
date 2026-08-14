@@ -85,7 +85,7 @@ _CAPTURE_STATE_ENV_CAPABILITIES = MappingProxyType(
 # family; the task id is validated separately by the public contract.
 _P0_STATE_CONTRACT_CAPABILITIES = _CAPTURE_STATE_CONTRACT_CAPABILITIES
 _P0_STATE_ENV_CAPABILITIES = _CAPTURE_STATE_ENV_CAPABILITIES
-_T1_CAPTURE_TASK_IDS = frozenset({"t1_belt", "t1_occ", "t1_so3"})
+_T1_CAPTURE_TASK_IDS = frozenset({"t1_belt", "t1_occ", "t1_so3", "t1_xyz"})
 _T1_RUNTIME_FEATURE_TASK_IDS = frozenset({"t1_belt", "t1_occ"})
 _T4_TASK_IDS = frozenset({"t4_sphere"})
 
