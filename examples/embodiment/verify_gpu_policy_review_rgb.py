@@ -132,8 +132,19 @@ def main() -> None:
         observation_track="state",
     )
     try:
+        executed_requests = backend.next_requests()
+        if len(executed_requests) != 1:
+            raise RuntimeError("RGB B=1 must execute exactly one reset request")
+        executed_request = executed_requests[0]
+        expected_executed_identity = request_identity(request)
+        expected_executed_identity["episode_id"] = (
+            f"{request.episode_id}-cycle00000000"
+        )
+        expected_executed_identity["observation_track"] = "state"
+        if request_identity(executed_request) != expected_executed_identity:
+            raise RuntimeError("manifest cursor changed the sealed reset payload")
         reset = backend.reset()
-        if reset.episode_ids != (request.episode_id,):
+        if reset.episode_ids != (executed_request.episode_id,):
             raise RuntimeError("CUDA reset changed the sealed episode identity")
         evidence = backend.materialize_policy_review_rgb_evidence((0,))
         receipt = _thaw(evidence.receipt)
@@ -167,7 +178,8 @@ def main() -> None:
             "status": "passed_same_cuda_visual_source",
             "task_id": TASK_ID,
             "manifest_index": int(row["manifest_index"]),
-            "reset_request": request_identity(request),
+            "sealed_reset_request": request_identity(request),
+            "reset_request": request_identity(executed_request),
             "reset_manifest_sha256": reset_manifest_sha256,
             "source_identity_sha256": manifest.source_identity_sha256,
             "repositories": repositories,
