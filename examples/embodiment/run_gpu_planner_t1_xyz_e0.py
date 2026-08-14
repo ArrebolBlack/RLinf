@@ -868,6 +868,19 @@ def _replay(
                     result.termination_reason,
                 )
             )
+            if (result.terminated or result.truncated) and command_index + 1 < len(
+                commands
+            ):
+                replay_stop = {
+                    "reason": "natural_terminal_before_action_tape_end",
+                    "command_index": command_index,
+                    "policy_step": replay_policy_step,
+                    "submitted_action_count": len(replay_action_payloads),
+                    "expected_action_count": len(commands),
+                    "unexecuted_action_count": len(commands)
+                    - len(replay_action_payloads),
+                }
+                break
         terminal_grace: dict[str, Any] = {
             "schema_version": "gpu-planner-terminal-grid-grace-v1",
             "mode": "zero_order_hold_last_primary_action_v1",
@@ -886,11 +899,74 @@ def _replay(
         }
         expected_final_outcome = outcomes[-1] if outcomes else None
         replay_final_outcome = replay_outcomes[-1] if replay_outcomes else None
+        expected_action_payloads = [_command_payload(command) for command in commands]
+        action_prefix_exact = bool(
+            replay_action_payloads
+            == expected_action_payloads[: len(replay_action_payloads)]
+        )
         prefix_outcomes_exact = bool(
             len(outcomes) == len(replay_outcomes)
             and tuple(replay_outcomes[:-1]) == tuple(outcomes[:-1])
         )
         pre_grace_margin = _task_quality_margin_diagnostic(replay_backend)
+        unexecuted_action_count = len(commands) - len(replay_action_payloads)
+        terminal_early_attempted = bool(
+            replay_stop is not None
+            and replay_stop.get("reason") == "natural_terminal_before_action_tape_end"
+        )
+        terminal_early_admissible = bool(
+            terminal_early_attempted
+            and action_prefix_exact
+            and unexecuted_action_count == 1
+            and len(replay_outcomes) == len(replay_action_payloads)
+            and tuple(replay_outcomes[:-1])
+            == tuple(outcomes[: max(0, len(replay_outcomes) - 1)])
+            and len(replay_outcomes) <= len(outcomes)
+            and outcomes[len(replay_outcomes) - 1] == (False, False, False, None)
+            and expected_final_outcome == (True, False, True, "success")
+            and replay_final_outcome == expected_final_outcome
+            and pre_grace_margin.get("available") is True
+            and pre_grace_margin.get("stage_index") == 5
+            and pre_grace_margin.get("success") is True
+            and pre_grace_margin.get("terminated") is True
+            and pre_grace_margin.get("truncated") is False
+        )
+        terminal_early: dict[str, Any] = {
+            "schema_version": "gpu-planner-terminal-grid-early-v1",
+            "mode": "natural_success_before_primary_tape_end_v1",
+            "max_unexecuted_control_steps": _TERMINAL_GRACE_MAX_CONTROL_STEPS,
+            "attempted": terminal_early_attempted,
+            "accepted": terminal_early_admissible,
+            "reason": (
+                "semantic_terminal_reached_one_step_early"
+                if terminal_early_admissible
+                else "not_required_or_not_admissible"
+            ),
+            "executed_action_prefix_exact": (
+                action_prefix_exact if terminal_early_attempted else False
+            ),
+            "executed_control_steps": (
+                len(replay_action_payloads) if terminal_early_attempted else 0
+            ),
+            "unexecuted_control_steps": (
+                max(0, unexecuted_action_count) if terminal_early_attempted else 0
+            ),
+            "unexecuted_action_payload_sha256": (
+                _json_sha256(expected_action_payloads[len(replay_action_payloads) :])
+                if terminal_early_admissible
+                else None
+            ),
+            "stage_index": (
+                pre_grace_margin.get("stage_index")
+                if terminal_early_attempted
+                else None
+            ),
+            "outcome": (
+                None
+                if not terminal_early_attempted or replay_final_outcome is None
+                else list(replay_final_outcome)
+            ),
+        }
         terminal_grace_admissible = bool(
             commands
             and replay_stop is None
@@ -1020,18 +1096,40 @@ def _replay(
             actual_review_digests,
         )
         review_tape_exact = review_mismatch is None
-        expected_action_payloads = [_command_payload(command) for command in commands]
         action_tape_exact = replay_action_payloads == expected_action_payloads
+        semantic_action_identity_exact = bool(
+            action_tape_exact or terminal_early["accepted"] is True
+        )
         outcomes_exact = outcome_mismatch is None
         semantic_outcomes_exact = bool(
-            outcomes_exact or terminal_grace["accepted"] is True
+            outcomes_exact
+            or terminal_grace["accepted"] is True
+            or terminal_early["accepted"] is True
         )
         terminal_ledger_exact = terminal_ledger_mismatch is None
-        observation_comparison = _compare_observation_sequences(
-            observations,
-            replay_observations,
+        terminal_early_accepted = terminal_early["accepted"] is True
+        semantic_expected_observations = (
+            observations[: len(replay_observations) - 1]
+            if terminal_early_accepted
+            else observations
         )
-        review_comparison = _compare_review_sequences(reviews, replay_reviews)
+        semantic_actual_observations = (
+            replay_observations[:-1] if terminal_early_accepted else replay_observations
+        )
+        semantic_expected_reviews = (
+            reviews[: len(replay_reviews) - 1] if terminal_early_accepted else reviews
+        )
+        semantic_actual_reviews = (
+            replay_reviews[:-1] if terminal_early_accepted else replay_reviews
+        )
+        observation_comparison = _compare_observation_sequences(
+            semantic_expected_observations,
+            semantic_actual_observations,
+        )
+        review_comparison = _compare_review_sequences(
+            semantic_expected_reviews,
+            semantic_actual_reviews,
+        )
         terminal_ledger_semantic_exact = _terminal_ledger_semantics(
             expected_ledger
         ) == _terminal_ledger_semantics(replay_ledger)
@@ -1039,7 +1137,7 @@ def _replay(
             fresh_backend_distinct=fresh_backend_distinct,
             backend_identity_exact=backend_identity_exact,
             reset_identity_exact=reset_identity_exact,
-            action_tape_exact=action_tape_exact,
+            action_tape_exact=semantic_action_identity_exact,
             observation_semantic_mismatch=observation_comparison[
                 "first_semantic_mismatch"
             ],
@@ -1047,7 +1145,7 @@ def _replay(
             outcome_mismatch=(None if semantic_outcomes_exact else outcome_mismatch),
             terminal_ledger_semantic_exact=terminal_ledger_semantic_exact,
             terminal_ledger_exact_once=terminal_ledger_exact_once,
-            replay_stop=replay_stop,
+            replay_stop=(None if terminal_early_accepted else replay_stop),
             commands=commands,
         )
         return {
@@ -1056,7 +1154,7 @@ def _replay(
                 fresh_backend_distinct
                 and backend_identity_exact
                 and reset_identity_exact
-                and action_tape_exact
+                and semantic_action_identity_exact
                 and observation_comparison["semantic_structure_exact"]
                 and review_comparison["semantic_structure_exact"]
                 and semantic_outcomes_exact
@@ -1067,6 +1165,7 @@ def _replay(
             "backend_identity_exact": backend_identity_exact,
             "source_identity_exact": backend_identity_exact,
             "reset_identity_exact": reset_identity_exact,
+            "semantic_action_identity_exact": semantic_action_identity_exact,
             "action_tape_exact": action_tape_exact,
             "observation_semantic_structure_exact": observation_comparison[
                 "semantic_structure_exact"
@@ -1097,6 +1196,7 @@ def _replay(
             "exact_once_error": exact_once_error,
             "replay_stop": replay_stop,
             "terminal_grace": terminal_grace,
+            "terminal_early": terminal_early,
             "first_divergence": first_divergence,
             "replay_observation_sha256": _json_sha256(observation_digests),
             "replay_review_sha256": _json_sha256(actual_review_digests),

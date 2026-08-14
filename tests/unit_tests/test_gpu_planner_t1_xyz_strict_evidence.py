@@ -845,12 +845,12 @@ def test_fresh_replay_early_terminal_writes_semantic_blocker(monkeypatch: Any) -
 
     class _EarlyTerminalReplay:
         frozen_requests = (request,)
-        last_terminal_ledger = _terminal_ledger()
 
         def __init__(self) -> None:
             self.provenance = provenance
             self.step_count = 0
             self.closed = False
+            self.last_terminal_ledger = None
 
         def reset(self, requests: Any) -> tuple[Any, ...]:
             assert tuple(requests) == (request,)
@@ -863,9 +863,14 @@ def test_fresh_replay_early_terminal_writes_semantic_blocker(monkeypatch: Any) -
             assert len(tuple(commands)) == 1
             if self.step_count == 0:
                 self.step_count = 1
+                self.last_terminal_ledger = _terminal_ledger()
                 return (
                     SimpleNamespace(
-                        observation=_observation(1),
+                        observation=replace(
+                            _numeric_drift_observation(1),
+                            physics_step=24,
+                            time_s=0.048,
+                        ),
                         terminated=True,
                         truncated=False,
                         success=True,
@@ -873,6 +878,30 @@ def test_fresh_replay_early_terminal_writes_semantic_blocker(monkeypatch: Any) -
                     ),
                 )
             return (None,)
+
+        def materialize_task_quality_audit(self) -> dict[str, np.ndarray]:
+            return {
+                "physics_step": np.asarray([25], dtype=np.int64),
+                "stage_index": np.asarray([5], dtype=np.int32),
+                "bilateral_steps": np.asarray([10], dtype=np.int32),
+                "max_bilateral_steps": np.asarray([10], dtype=np.int32),
+                "success": np.asarray([1], dtype=np.int32),
+                "terminated": np.asarray([1], dtype=np.int32),
+                "truncated": np.asarray([0], dtype=np.int32),
+                "event_mask": np.asarray([0], dtype=np.int32),
+                "event_physics_step": np.full(11, -1, dtype=np.int64),
+                "quality_physics_sample_count": np.asarray([25], dtype=np.int64),
+                "quality_has_post_hold_sample": np.asarray([1], dtype=np.int32),
+                "quality_maximum_lift_clearance_m": np.asarray(
+                    [0.09], dtype=np.float32
+                ),
+                "quality_maximum_axis_error_rad": np.asarray([0.02], dtype=np.float32),
+                "quality_error": np.asarray([0], dtype=np.int32),
+                "quality_has_bilateral_hold_margin": np.asarray([1], dtype=np.int32),
+                "quality_bilateral_hold_downstream_margin_m": np.asarray(
+                    [0.4], dtype=np.float32
+                ),
+            }
 
         def close(self) -> None:
             self.closed = True
@@ -908,20 +937,71 @@ def test_fresh_replay_early_terminal_writes_semantic_blocker(monkeypatch: Any) -
     )
 
     assert replay_backend.closed is True
-    assert replay["passed"] is False
-    assert replay["action_tape_exact"] is True
+    assert replay["passed"] is True
+    assert replay_backend.step_count == 1
+    assert replay["action_tape_exact"] is False
+    assert replay["semantic_action_identity_exact"] is True
     assert replay["outcomes_exact"] is False
+    assert replay["semantic_outcomes_exact"] is True
+    assert replay["observation_tape_exact"] is False
+    assert replay["review_tape_exact"] is False
+    assert replay["observation_semantic_structure_exact"] is True
+    assert replay["review_semantic_structure_exact"] is True
     assert replay["replay_stop"] == {
-        "reason": "backend_returned_none_after_terminal",
-        "command_index": 1,
-        "policy_step": 1,
-        "submitted_action_count": 2,
+        "reason": "natural_terminal_before_action_tape_end",
+        "command_index": 0,
+        "policy_step": 0,
+        "submitted_action_count": 1,
         "expected_action_count": 2,
+        "unexecuted_action_count": 1,
     }
-    assert replay["first_divergence"]["channel"] == (
-        "replay_terminated_before_action_tape_end"
+    assert replay["first_divergence"] is None
+    assert replay["terminal_early"] == {
+        "schema_version": "gpu-planner-terminal-grid-early-v1",
+        "mode": "natural_success_before_primary_tape_end_v1",
+        "max_unexecuted_control_steps": 1,
+        "attempted": True,
+        "accepted": True,
+        "reason": "semantic_terminal_reached_one_step_early",
+        "executed_action_prefix_exact": True,
+        "executed_control_steps": 1,
+        "unexecuted_control_steps": 1,
+        "unexecuted_action_payload_sha256": E0._json_sha256(
+            [E0._command_payload(commands[1])]
+        ),
+        "stage_index": 5,
+        "outcome": [True, False, True, "success"],
+    }
+
+    unbounded_backend = _EarlyTerminalReplay()
+    unbounded_commands = commands + (
+        SimpleNamespace(
+            mode=_ActionMode.E7,
+            policy_step=2,
+            values=np.zeros(7, dtype=np.float64),
+        ),
     )
-    assert replay["first_divergence"]["control_step"] == 1
+    unbounded = E0._replay(
+        backend=SimpleNamespace(
+            provenance=provenance,
+            new_replay_backend=lambda: unbounded_backend,
+        ),
+        request=request,
+        observations=tuple(value[0] for value in observations_and_reviews)
+        + (observations_and_reviews[-1][0],),
+        reviews=tuple(value[1] for value in observations_and_reviews)
+        + (observations_and_reviews[-1][1],),
+        commands=unbounded_commands,
+        outcomes=(
+            (False, False, False, None),
+            (False, False, False, None),
+            (True, False, True, "success"),
+        ),
+        terminal_ledger=_terminal_ledger(),
+    )
+    assert unbounded["passed"] is False
+    assert unbounded["terminal_early"]["attempted"] is True
+    assert unbounded["terminal_early"]["accepted"] is False
 
 
 def test_semantic_replay_failure_evidence_is_exclusive(tmp_path: Path) -> None:
@@ -1170,6 +1250,7 @@ def _strict_result(
             "fresh_backend_distinct": True,
             "backend_identity_exact": True,
             "reset_identity_exact": True,
+            "semantic_action_identity_exact": True,
             "action_tape_exact": True,
             "observation_semantic_structure_exact": True,
             "observation_event_sequence_exact": True,
@@ -1207,6 +1288,20 @@ def _strict_result(
                 "outcome": None,
                 "observation_sha256": None,
                 "review_sha256": None,
+            },
+            "terminal_early": {
+                "schema_version": "gpu-planner-terminal-grid-early-v1",
+                "mode": "natural_success_before_primary_tape_end_v1",
+                "max_unexecuted_control_steps": 1,
+                "attempted": False,
+                "accepted": False,
+                "reason": "not_required_or_not_admissible",
+                "executed_action_prefix_exact": False,
+                "executed_control_steps": 0,
+                "unexecuted_control_steps": 0,
+                "unexecuted_action_payload_sha256": None,
+                "stage_index": None,
+                "outcome": None,
             },
         },
         "terminal_ledger": terminal_ledger,
@@ -1293,6 +1388,60 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
         row=row,
     )
 
+    bounded_early_terminal = copy.deepcopy(valid)
+    bounded_early_terminal["control_steps"] = 2
+    bounded_early_terminal["physics_steps"] = 50
+    bounded_early_terminal["terminal_ledger"][0].update(
+        {"physics_step": 50, "control_step": 2, "policy_step": 2}
+    )
+    bounded_early_terminal["action_tape"].append(
+        {
+            "mode": "E7",
+            "policy_step": 1,
+            "values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    bounded_early_terminal["trajectory_tape"].append(
+        STRICT.payload_sha256({"row": 0, "step": 2})
+    )
+    bounded_early_terminal["evidence_export"]["action_tape_sha256"] = (
+        STRICT.payload_sha256(bounded_early_terminal["action_tape"])
+    )
+    bounded_early_terminal["evidence_export"]["trajectory_tape_sha256"] = (
+        STRICT.payload_sha256(bounded_early_terminal["trajectory_tape"])
+    )
+    bounded_early_terminal["replay"]["action_tape_exact"] = False
+    bounded_early_terminal["replay"]["outcomes_exact"] = False
+    bounded_early_terminal["replay"]["replay_stop"] = {
+        "reason": "natural_terminal_before_action_tape_end",
+        "command_index": 0,
+        "policy_step": 0,
+        "submitted_action_count": 1,
+        "expected_action_count": 2,
+        "unexecuted_action_count": 1,
+    }
+    bounded_early_terminal["replay"]["terminal_early"] = {
+        "schema_version": "gpu-planner-terminal-grid-early-v1",
+        "mode": "natural_success_before_primary_tape_end_v1",
+        "max_unexecuted_control_steps": 1,
+        "attempted": True,
+        "accepted": True,
+        "reason": "semantic_terminal_reached_one_step_early",
+        "executed_action_prefix_exact": True,
+        "executed_control_steps": 1,
+        "unexecuted_control_steps": 1,
+        "unexecuted_action_payload_sha256": STRICT.payload_sha256(
+            bounded_early_terminal["action_tape"][1:]
+        ),
+        "stage_index": 5,
+        "outcome": [True, False, True, "success"],
+    }
+    STRICT.validate_result_for_row(
+        bounded_early_terminal,
+        manifest=manifest,
+        row=row,
+    )
+
     invalid_rows = []
     replay_audit = copy.deepcopy(valid)
     replay_audit["replay"]["mode"] = "audit"
@@ -1302,6 +1451,7 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
         "backend_identity_exact",
         "source_identity_exact",
         "reset_identity_exact",
+        "semantic_action_identity_exact",
         "action_tape_exact",
         "observation_semantic_structure_exact",
         "review_semantic_structure_exact",
@@ -1321,6 +1471,17 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     unbounded_terminal_grid = copy.deepcopy(bounded_terminal_grid)
     unbounded_terminal_grid["replay"]["terminal_grace"]["physics_steps"] = 26
     invalid_rows.append(unbounded_terminal_grid)
+    unbounded_early_terminal = copy.deepcopy(bounded_early_terminal)
+    unbounded_early_terminal["replay"]["terminal_early"]["unexecuted_control_steps"] = 2
+    invalid_rows.append(unbounded_early_terminal)
+    forged_early_stop_index = copy.deepcopy(bounded_early_terminal)
+    forged_early_stop_index["replay"]["replay_stop"]["command_index"] = 1
+    invalid_rows.append(forged_early_stop_index)
+    forged_early_suffix = copy.deepcopy(bounded_early_terminal)
+    forged_early_suffix["replay"]["terminal_early"][
+        "unexecuted_action_payload_sha256"
+    ] = "e" * 64
+    invalid_rows.append(forged_early_suffix)
     forged_unused_terminal_grid = copy.deepcopy(valid)
     forged_unused_terminal_grid["replay"]["terminal_grace"]["control_steps"] = 1
     invalid_rows.append(forged_unused_terminal_grid)

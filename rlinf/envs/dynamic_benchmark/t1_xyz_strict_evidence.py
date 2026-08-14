@@ -577,7 +577,7 @@ def validate_result_for_row(
         "backend_identity_exact",
         "source_identity_exact",
         "reset_identity_exact",
-        "action_tape_exact",
+        "semantic_action_identity_exact",
         "observation_semantic_structure_exact",
         "review_semantic_structure_exact",
         "semantic_outcomes_exact",
@@ -676,6 +676,7 @@ def validate_result_for_row(
         "observation_event_sequence_exact",
         "observation_tape_exact",
         "review_tape_exact",
+        "action_tape_exact",
         "outcomes_exact",
         "terminal_ledger_exact",
     ):
@@ -691,41 +692,99 @@ def validate_result_for_row(
         or type(terminal_grace.get("accepted")) is not bool
     ):
         raise RuntimeError("row result terminal-grid grace receipt is invalid")
-    if replay.get("outcomes_exact") is True:
-        if (
-            terminal_grace.get("attempted") is not False
-            or terminal_grace.get("accepted") is not False
-            or terminal_grace.get("reason") != "not_required_or_not_admissible"
-            or terminal_grace.get("held_action_values_exact") is not False
-            or terminal_grace.get("control_steps") != 0
-            or terminal_grace.get("physics_steps") != 0
-            or terminal_grace.get("stage_index_before") is not None
-            or terminal_grace.get("stage_index_after") is not None
-            or terminal_grace.get("outcome") is not None
-            or terminal_grace.get("observation_sha256") is not None
-            or terminal_grace.get("review_sha256") is not None
-        ):
-            raise RuntimeError("exact replay must not consume terminal-grid grace")
-    elif (
-        terminal_grace.get("attempted") is not True
-        or terminal_grace.get("accepted") is not True
-        or terminal_grace.get("reason") != "semantic_terminal_reached"
-        or terminal_grace.get("held_action_values_exact") is not True
-        or terminal_grace.get("control_steps") != 1
-        or isinstance(terminal_grace.get("physics_steps"), bool)
-        or not isinstance(terminal_grace.get("physics_steps"), int)
-        or not 1
+    terminal_early = replay.get("terminal_early")
+    if (
+        not isinstance(terminal_early, Mapping)
+        or terminal_early.get("schema_version") != "gpu-planner-terminal-grid-early-v1"
+        or terminal_early.get("mode") != "natural_success_before_primary_tape_end_v1"
+        or terminal_early.get("max_unexecuted_control_steps") != 1
+        or type(terminal_early.get("attempted")) is not bool
+        or type(terminal_early.get("accepted")) is not bool
+    ):
+        raise RuntimeError("row result early terminal-grid receipt is invalid")
+
+    grace_unused = bool(
+        terminal_grace.get("attempted") is False
+        and terminal_grace.get("accepted") is False
+        and terminal_grace.get("reason") == "not_required_or_not_admissible"
+        and terminal_grace.get("held_action_values_exact") is False
+        and terminal_grace.get("control_steps") == 0
+        and terminal_grace.get("physics_steps") == 0
+        and terminal_grace.get("stage_index_before") is None
+        and terminal_grace.get("stage_index_after") is None
+        and terminal_grace.get("outcome") is None
+        and terminal_grace.get("observation_sha256") is None
+        and terminal_grace.get("review_sha256") is None
+    )
+    early_unused = bool(
+        terminal_early.get("attempted") is False
+        and terminal_early.get("accepted") is False
+        and terminal_early.get("reason") == "not_required_or_not_admissible"
+        and terminal_early.get("executed_action_prefix_exact") is False
+        and terminal_early.get("executed_control_steps") == 0
+        and terminal_early.get("unexecuted_control_steps") == 0
+        and terminal_early.get("unexecuted_action_payload_sha256") is None
+        and terminal_early.get("stage_index") is None
+        and terminal_early.get("outcome") is None
+    )
+    grace_accepted = bool(
+        terminal_grace.get("attempted") is True
+        and terminal_grace.get("accepted") is True
+        and terminal_grace.get("reason") == "semantic_terminal_reached"
+        and terminal_grace.get("held_action_values_exact") is True
+        and terminal_grace.get("control_steps") == 1
+        and not isinstance(terminal_grace.get("physics_steps"), bool)
+        and isinstance(terminal_grace.get("physics_steps"), int)
+        and 1
         <= terminal_grace["physics_steps"]
         <= EXECUTION_CONTRACT["physics_steps_per_control"]
-        or terminal_grace.get("stage_index_before") != 4
-        or terminal_grace.get("stage_index_after") != 5
-        or terminal_grace.get("outcome") != [True, False, True, "success"]
-        or not _is_sha256(terminal_grace.get("observation_sha256"))
-        or not _is_sha256(terminal_grace.get("review_sha256"))
-    ):
-        raise RuntimeError(
-            "non-exact replay lacks a bounded successful terminal-grid grace"
-        )
+        and terminal_grace.get("stage_index_before") == 4
+        and terminal_grace.get("stage_index_after") == 5
+        and terminal_grace.get("outcome") == [True, False, True, "success"]
+        and _is_sha256(terminal_grace.get("observation_sha256"))
+        and _is_sha256(terminal_grace.get("review_sha256"))
+    )
+    replay_stop = replay.get("replay_stop")
+    early_executed_steps = terminal_early.get("executed_control_steps")
+    early_accepted = bool(
+        terminal_early.get("attempted") is True
+        and terminal_early.get("accepted") is True
+        and terminal_early.get("reason") == "semantic_terminal_reached_one_step_early"
+        and terminal_early.get("executed_action_prefix_exact") is True
+        and not isinstance(early_executed_steps, bool)
+        and isinstance(early_executed_steps, int)
+        and early_executed_steps >= 1
+        and terminal_early.get("unexecuted_control_steps") == 1
+        and _is_sha256(terminal_early.get("unexecuted_action_payload_sha256"))
+        and terminal_early.get("stage_index") == 5
+        and terminal_early.get("outcome") == [True, False, True, "success"]
+        and isinstance(replay_stop, Mapping)
+        and replay_stop.get("reason") == "natural_terminal_before_action_tape_end"
+        and replay_stop.get("command_index") == early_executed_steps - 1
+        and replay_stop.get("policy_step") == early_executed_steps - 1
+        and replay_stop.get("submitted_action_count") == early_executed_steps
+        and replay_stop.get("expected_action_count") == early_executed_steps + 1
+        and replay_stop.get("unexecuted_action_count") == 1
+    )
+    if replay.get("outcomes_exact") is True:
+        if (
+            not grace_unused
+            or not early_unused
+            or replay.get("action_tape_exact") is not True
+        ):
+            raise RuntimeError("exact replay must not consume terminal-grid handling")
+    elif grace_accepted:
+        if not early_unused or replay.get("action_tape_exact") is not True:
+            raise RuntimeError("late terminal-grid replay receipt is inconsistent")
+    elif early_accepted:
+        if (
+            not grace_unused
+            or replay.get("action_tape_exact") is not False
+            or replay.get("semantic_action_identity_exact") is not True
+        ):
+            raise RuntimeError("early terminal-grid replay receipt is inconsistent")
+    else:
+        raise RuntimeError("non-exact replay lacks bounded terminal-grid evidence")
     ledger = result.get("terminal_ledger")
     if (
         not isinstance(ledger, list)
@@ -839,6 +898,14 @@ def validate_result_for_row(
             )
         ):
             raise RuntimeError("row result action tape contains an invalid E7 action")
+    if early_accepted and (
+        early_executed_steps != control_steps - 1
+        or terminal_early.get("unexecuted_action_payload_sha256")
+        != payload_sha256(action_tape[early_executed_steps:])
+    ):
+        raise RuntimeError(
+            "early terminal-grid receipt is not bound to the primary action suffix"
+        )
     for index, digest in enumerate(trajectory_tape):
         _require_sha256(digest, f"trajectory_tape[{index}]")
     if (
