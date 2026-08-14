@@ -150,6 +150,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-candidate-manifest-sha256", required=True)
     parser.add_argument("--expected-quality-v2-thresholds-sha256", required=True)
     parser.add_argument("--auditor-commit", required=True)
+    parser.add_argument(
+        "--qv4-disabled-nonblocking",
+        action="store_true",
+        help=(
+            "Audit a release that intentionally did not export Qv4. The winner "
+            "must remain successful and label-valid, with null Qv4 validation and "
+            "behavior-cloning eligibility disabled; Qv2 remains fully audited."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -3063,6 +3072,42 @@ def _audit_attempt_tape(
         raise ValueError("attempt eligibility does not recompute")
 
 
+def _audit_winner_release_eligibility(
+    audit: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    *,
+    qv4_disabled_nonblocking: bool,
+) -> None:
+    if not qv4_disabled_nonblocking:
+        if not audit.get("eligible_for_behavior_cloning"):
+            raise ValueError("winner episode is not behavior-cloning eligible")
+        return
+
+    metrics = metadata.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("Qv4-disabled winner has no metrics mapping")
+    if metadata.get("quality_v4_validation") is not None:
+        raise ValueError("Qv4-disabled winner unexpectedly contains Qv4 validation")
+    if audit.get("eligible_for_behavior_cloning") is not False:
+        raise ValueError("Qv4-disabled winner unexpectedly claims audit BC eligibility")
+    if (
+        metrics.get("eligible_for_behavior_cloning") is not False
+        or metrics.get("success") is not True
+        or metrics.get("label_valid") is not True
+        or metrics.get("termination_reason") != "success"
+        or not math.isclose(
+            _finite_number(
+                metrics.get("trajectory_completion"),
+                "Qv4-disabled winner trajectory completion",
+            ),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("Qv4-disabled winner release eligibility mismatch")
+
+
 def _audit_winner_episode(
     root: Path,
     winner: Mapping[str, Any],
@@ -3070,6 +3115,8 @@ def _audit_winner_episode(
     reset: Mapping[str, Any],
     card: Mapping[str, Any],
     planner_dominance: Mapping[str, Any] | None,
+    *,
+    qv4_disabled_nonblocking: bool,
 ) -> None:
     from se3_wam.benchmark.dataset import audit_episode
 
@@ -3080,9 +3127,12 @@ def _audit_winner_episode(
     audit = audit_episode(episode_dir)
     if audit.get("episode_id") != attempt["episode_id"] or not audit.get("success"):
         raise ValueError("winner episode audit identity or success mismatch")
-    if not audit.get("eligible_for_behavior_cloning"):
-        raise ValueError("winner episode is not behavior-cloning eligible")
     metadata = json.loads((episode_dir / "episode.json").read_text(encoding="utf-8"))
+    _audit_winner_release_eligibility(
+        audit,
+        metadata,
+        qv4_disabled_nonblocking=qv4_disabled_nonblocking,
+    )
     if metadata != {key: winner[key] for key in metadata}:
         raise ValueError("winner manifest does not reproduce the episode record")
     request = metadata.get("request")
@@ -3367,6 +3417,7 @@ def _audit_dataset(
     expected_checksums_sha256: str,
     expected_candidate_sha256: str,
     expected_quality_v2_thresholds_sha256: str,
+    qv4_disabled_nonblocking: bool = False,
 ) -> dict[str, Any]:
     if not root.is_dir():
         raise FileNotFoundError(root)
@@ -3776,6 +3827,7 @@ def _audit_dataset(
             reset,
             card,
             planner_dominance,
+            qv4_disabled_nonblocking=qv4_disabled_nonblocking,
         )
         accepted += 1
     if consumed_skip_events != set(skip_events):
@@ -3808,6 +3860,11 @@ def _audit_dataset(
         "quality_v2_threshold_identity": expected_threshold_identity,
         "quality_v2_calibration_wave_receipt_identity": (calibration_receipt_identity),
         "quality_v4_full_exports": quality_v4_full_exports,
+        "quality_v4_policy": (
+            "nonblocking_not_exported"
+            if qv4_disabled_nonblocking
+            else "behavior_cloning_required"
+        ),
         "accepted_count": accepted,
         "attempted_reset_count": len(reset_results),
         "candidate_attempt_count": len(attempt_rows),
@@ -3862,6 +3919,11 @@ def main() -> None:
         "candidate_manifest_sha256": expected_candidate,
         "quality_v2_thresholds_sha256": expected_quality_v2_thresholds,
         "auditor_commit": auditor_commit,
+        "quality_v4_policy": (
+            "nonblocking_not_exported"
+            if args.qv4_disabled_nonblocking
+            else "behavior_cloning_required"
+        ),
         "started_unix_s": started,
     }
     try:
@@ -3871,6 +3933,7 @@ def main() -> None:
             expected_checksums_sha256=expected_checksums,
             expected_candidate_sha256=expected_candidate,
             expected_quality_v2_thresholds_sha256=expected_quality_v2_thresholds,
+            qv4_disabled_nonblocking=args.qv4_disabled_nonblocking,
         )
         report.update(
             status="passed",
