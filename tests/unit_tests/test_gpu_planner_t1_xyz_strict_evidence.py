@@ -90,13 +90,9 @@ def test_task_quality_margin_diagnostic_serializes_lane_zero() -> None:
                 "quality_maximum_lift_clearance_m": np.asarray(
                     [0.049], dtype=np.float32
                 ),
-                "quality_maximum_axis_error_rad": np.asarray(
-                    [0.02], dtype=np.float32
-                ),
+                "quality_maximum_axis_error_rad": np.asarray([0.02], dtype=np.float32),
                 "quality_error": np.asarray([0], dtype=np.int32),
-                "quality_has_bilateral_hold_margin": np.asarray(
-                    [1], dtype=np.int32
-                ),
+                "quality_has_bilateral_hold_margin": np.asarray([1], dtype=np.int32),
                 "quality_bilateral_hold_downstream_margin_m": np.asarray(
                     [0.3], dtype=np.float32
                 ),
@@ -598,6 +594,202 @@ def test_fresh_replay_reports_numeric_drift_without_blocking(monkeypatch: Any) -
     assert replay["review_numeric_drift"]["blocking"] is False
 
 
+def test_fresh_replay_accepts_one_bounded_terminal_grid_hold(monkeypatch: Any) -> None:
+    api = types.ModuleType("se3_wam.benchmark.api")
+
+    class _ActionCommand:
+        def __init__(self, *, mode: Any, values: Any, policy_step: int) -> None:
+            self.mode = mode
+            self.values = values
+            self.policy_step = policy_step
+
+    api.ActionCommand = _ActionCommand
+    monkeypatch.setitem(sys.modules, "se3_wam", types.ModuleType("se3_wam"))
+    monkeypatch.setitem(
+        sys.modules, "se3_wam.benchmark", types.ModuleType("se3_wam.benchmark")
+    )
+    monkeypatch.setitem(sys.modules, "se3_wam.benchmark.api", api)
+
+    gpu_backend = types.ModuleType("rlinf.envs.dynamic_benchmark.gpu_backend")
+    gpu_backend.assert_terminal_ledger_exact_once = lambda backend, rows: (
+        "second_consumption_rejected",
+    )
+    rlinf = types.ModuleType("rlinf")
+    rlinf.__path__ = []
+    envs = types.ModuleType("rlinf.envs")
+    envs.__path__ = []
+    dynamic = types.ModuleType("rlinf.envs.dynamic_benchmark")
+    dynamic.__path__ = []
+    monkeypatch.setitem(sys.modules, "rlinf", rlinf)
+    monkeypatch.setitem(sys.modules, "rlinf.envs", envs)
+    monkeypatch.setitem(sys.modules, "rlinf.envs.dynamic_benchmark", dynamic)
+    monkeypatch.setitem(
+        sys.modules,
+        "rlinf.envs.dynamic_benchmark.gpu_backend",
+        gpu_backend,
+    )
+
+    request = _request()
+    provenance = SimpleNamespace(
+        backend_id="mjwarp_gpu_v1",
+        device_name="NVIDIA A100-SXM4-80GB",
+        device_ordinal=0,
+        device_platform="cuda",
+        git_commit="1" * 40,
+        git_tree="2" * 40,
+        implementation_version="test",
+        physical_device_identity_source="warp_cuda_driver",
+        physical_device_pci_bus_id="00000000:01:00.0",
+        physical_device_uuid="GPU-test",
+        precision="float32",
+        runtime_versions={},
+    )
+
+    def _quality_audit(*, terminal: bool, stage_index: int) -> dict[str, np.ndarray]:
+        physics_step = 26 if terminal else 25
+        return {
+            "physics_step": np.asarray([physics_step], dtype=np.int64),
+            "stage_index": np.asarray([stage_index], dtype=np.int32),
+            "bilateral_steps": np.asarray([10], dtype=np.int32),
+            "max_bilateral_steps": np.asarray([10], dtype=np.int32),
+            "success": np.asarray([int(terminal)], dtype=np.int32),
+            "terminated": np.asarray([int(terminal)], dtype=np.int32),
+            "truncated": np.asarray([0], dtype=np.int32),
+            "event_mask": np.asarray([0], dtype=np.int32),
+            "event_physics_step": np.full(11, -1, dtype=np.int64),
+            "quality_physics_sample_count": np.asarray([physics_step], dtype=np.int64),
+            "quality_has_post_hold_sample": np.asarray([1], dtype=np.int32),
+            "quality_maximum_lift_clearance_m": np.asarray([0.09], dtype=np.float32),
+            "quality_maximum_axis_error_rad": np.asarray([0.02], dtype=np.float32),
+            "quality_error": np.asarray([0], dtype=np.int32),
+            "quality_has_bilateral_hold_margin": np.asarray([1], dtype=np.int32),
+            "quality_bilateral_hold_downstream_margin_m": np.asarray(
+                [0.4], dtype=np.float32
+            ),
+        }
+
+    class _OneStepLateReplay:
+        frozen_requests = (request,)
+
+        def __init__(self, *, stage_index: int = 4) -> None:
+            self.provenance = provenance
+            self.step_count = 0
+            self.stage_index = stage_index
+            self.last_terminal_ledger = None
+
+        def reset(self, requests: Any) -> tuple[Any, ...]:
+            assert tuple(requests) == (request,)
+            return (_observation(0),)
+
+        def policy_steps(self) -> np.ndarray:
+            return np.asarray([self.step_count], dtype=np.int64)
+
+        def step(self, commands: Any) -> tuple[Any, ...]:
+            (command,) = tuple(commands)
+            assert np.array_equal(command.values, np.zeros(7, dtype=np.float64))
+            self.step_count += 1
+            if self.step_count == 1:
+                return (
+                    SimpleNamespace(
+                        observation=_observation(1),
+                        terminated=False,
+                        truncated=False,
+                        success=False,
+                        termination_reason=None,
+                    ),
+                )
+            if self.stage_index == 4:
+                self.last_terminal_ledger = _terminal_ledger()
+                return (
+                    SimpleNamespace(
+                        observation=_observation(2),
+                        terminated=True,
+                        truncated=False,
+                        success=True,
+                        termination_reason="success",
+                    ),
+                )
+            raise AssertionError("terminal grace must not run outside stage 4")
+
+        def materialize_task_quality_audit(self) -> dict[str, np.ndarray]:
+            terminal = self.last_terminal_ledger is not None
+            return _quality_audit(
+                terminal=terminal,
+                stage_index=5 if terminal else self.stage_index,
+            )
+
+        def close(self) -> None:
+            pass
+
+    command = SimpleNamespace(
+        mode=_ActionMode.E7,
+        policy_step=0,
+        values=np.zeros(7, dtype=np.float64),
+    )
+    state_0, review_0 = E0._state_and_review_observation(_observation(0))
+    state_1, review_1 = E0._state_and_review_observation(_observation(1))
+    replay_backend = _OneStepLateReplay()
+    primary = SimpleNamespace(
+        provenance=provenance,
+        new_replay_backend=lambda: replay_backend,
+    )
+
+    replay = E0._replay(
+        backend=primary,
+        request=request,
+        observations=(state_0, state_1),
+        reviews=(review_0, review_1),
+        commands=(command,),
+        outcomes=((True, False, True, "success"),),
+        terminal_ledger=_terminal_ledger(),
+    )
+
+    assert replay["passed"] is True
+    assert replay["action_tape_exact"] is True
+    assert replay["outcomes_exact"] is False
+    assert replay["semantic_outcomes_exact"] is True
+    assert replay["terminal_ledger_semantic_exact"] is True
+    assert replay["terminal_ledger_exact_once"] is True
+    assert replay["first_divergence"] is None
+    assert replay["terminal_grace"] == {
+        "schema_version": "gpu-planner-terminal-grid-grace-v1",
+        "mode": "zero_order_hold_last_primary_action_v1",
+        "max_control_steps": 1,
+        "attempted": True,
+        "accepted": True,
+        "reason": "semantic_terminal_reached",
+        "held_action_values_exact": True,
+        "control_steps": 1,
+        "physics_steps": 1,
+        "stage_index_before": 4,
+        "stage_index_after": 5,
+        "outcome": [True, False, True, "success"],
+        "observation_sha256": E0._observation_digest(
+            E0._state_and_review_observation(_observation(2))[0]
+        ),
+        "review_sha256": E0._review_digest(
+            E0._state_and_review_observation(_observation(2))[1]
+        ),
+    }
+
+    stage_two_backend = _OneStepLateReplay(stage_index=2)
+    stage_two = E0._replay(
+        backend=SimpleNamespace(
+            provenance=provenance,
+            new_replay_backend=lambda: stage_two_backend,
+        ),
+        request=request,
+        observations=(state_0, state_1),
+        reviews=(review_0, review_1),
+        commands=(command,),
+        outcomes=((True, False, True, "success"),),
+        terminal_ledger=_terminal_ledger(),
+    )
+    assert stage_two["passed"] is False
+    assert stage_two_backend.step_count == 1
+    assert stage_two["terminal_grace"]["attempted"] is False
+
+
 def test_fresh_replay_early_terminal_writes_semantic_blocker(monkeypatch: Any) -> None:
     api = types.ModuleType("se3_wam.benchmark.api")
 
@@ -1000,6 +1192,22 @@ def _strict_result(
             "replay_observation_sha256": STRICT.payload_sha256(trajectory_tape),
             "replay_review_sha256": STRICT.payload_sha256(["review-0", "review-1"]),
             "replay_ledger_sha256": STRICT.payload_sha256(terminal_ledger),
+            "terminal_grace": {
+                "schema_version": "gpu-planner-terminal-grid-grace-v1",
+                "mode": "zero_order_hold_last_primary_action_v1",
+                "max_control_steps": 1,
+                "attempted": False,
+                "accepted": False,
+                "reason": "not_required_or_not_admissible",
+                "held_action_values_exact": False,
+                "control_steps": 0,
+                "physics_steps": 0,
+                "stage_index_before": None,
+                "stage_index_after": None,
+                "outcome": None,
+                "observation_sha256": None,
+                "review_sha256": None,
+            },
         },
         "terminal_ledger": terminal_ledger,
         "action_tape": action_tape,
@@ -1061,6 +1269,30 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     valid = _strict_result(manifest, 0)
     STRICT.validate_result_for_row(valid, manifest=manifest, row=row)
 
+    bounded_terminal_grid = copy.deepcopy(valid)
+    bounded_terminal_grid["replay"]["outcomes_exact"] = False
+    bounded_terminal_grid["replay"]["terminal_grace"] = {
+        "schema_version": "gpu-planner-terminal-grid-grace-v1",
+        "mode": "zero_order_hold_last_primary_action_v1",
+        "max_control_steps": 1,
+        "attempted": True,
+        "accepted": True,
+        "reason": "semantic_terminal_reached",
+        "held_action_values_exact": True,
+        "control_steps": 1,
+        "physics_steps": 1,
+        "stage_index_before": 4,
+        "stage_index_after": 5,
+        "outcome": [True, False, True, "success"],
+        "observation_sha256": "c" * 64,
+        "review_sha256": "d" * 64,
+    }
+    STRICT.validate_result_for_row(
+        bounded_terminal_grid,
+        manifest=manifest,
+        row=row,
+    )
+
     invalid_rows = []
     replay_audit = copy.deepcopy(valid)
     replay_audit["replay"]["mode"] = "audit"
@@ -1086,6 +1318,12 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     blocking_event_drift = copy.deepcopy(valid)
     blocking_event_drift["replay"]["observation_event_drift"]["blocking"] = True
     invalid_rows.append(blocking_event_drift)
+    unbounded_terminal_grid = copy.deepcopy(bounded_terminal_grid)
+    unbounded_terminal_grid["replay"]["terminal_grace"]["physics_steps"] = 26
+    invalid_rows.append(unbounded_terminal_grid)
+    forged_unused_terminal_grid = copy.deepcopy(valid)
+    forged_unused_terminal_grid["replay"]["terminal_grace"]["control_steps"] = 1
+    invalid_rows.append(forged_unused_terminal_grid)
     wrong_quality = copy.deepcopy(valid)
     wrong_quality["quality"]["schema_version"] = "db0-episode-task-quality-v1"
     invalid_rows.append(wrong_quality)

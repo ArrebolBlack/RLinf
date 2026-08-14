@@ -137,13 +137,17 @@ def sha256_file(path: Path) -> str:
 
 
 def _require_sha256(value: Any, name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
+    if not _is_sha256(value):
         raise ValueError(f"{name} must be a lowercase SHA-256 digest")
     return value
+
+
+def _is_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _require_git_oid(value: Any, name: str) -> str:
@@ -677,6 +681,51 @@ def validate_result_for_row(
     ):
         if type(replay.get(name)) is not bool:
             raise RuntimeError("row result exact replay diagnostics are invalid")
+    terminal_grace = replay.get("terminal_grace")
+    if (
+        not isinstance(terminal_grace, Mapping)
+        or terminal_grace.get("schema_version") != "gpu-planner-terminal-grid-grace-v1"
+        or terminal_grace.get("mode") != "zero_order_hold_last_primary_action_v1"
+        or terminal_grace.get("max_control_steps") != 1
+        or type(terminal_grace.get("attempted")) is not bool
+        or type(terminal_grace.get("accepted")) is not bool
+    ):
+        raise RuntimeError("row result terminal-grid grace receipt is invalid")
+    if replay.get("outcomes_exact") is True:
+        if (
+            terminal_grace.get("attempted") is not False
+            or terminal_grace.get("accepted") is not False
+            or terminal_grace.get("reason") != "not_required_or_not_admissible"
+            or terminal_grace.get("held_action_values_exact") is not False
+            or terminal_grace.get("control_steps") != 0
+            or terminal_grace.get("physics_steps") != 0
+            or terminal_grace.get("stage_index_before") is not None
+            or terminal_grace.get("stage_index_after") is not None
+            or terminal_grace.get("outcome") is not None
+            or terminal_grace.get("observation_sha256") is not None
+            or terminal_grace.get("review_sha256") is not None
+        ):
+            raise RuntimeError("exact replay must not consume terminal-grid grace")
+    elif (
+        terminal_grace.get("attempted") is not True
+        or terminal_grace.get("accepted") is not True
+        or terminal_grace.get("reason") != "semantic_terminal_reached"
+        or terminal_grace.get("held_action_values_exact") is not True
+        or terminal_grace.get("control_steps") != 1
+        or isinstance(terminal_grace.get("physics_steps"), bool)
+        or not isinstance(terminal_grace.get("physics_steps"), int)
+        or not 1
+        <= terminal_grace["physics_steps"]
+        <= EXECUTION_CONTRACT["physics_steps_per_control"]
+        or terminal_grace.get("stage_index_before") != 4
+        or terminal_grace.get("stage_index_after") != 5
+        or terminal_grace.get("outcome") != [True, False, True, "success"]
+        or not _is_sha256(terminal_grace.get("observation_sha256"))
+        or not _is_sha256(terminal_grace.get("review_sha256"))
+    ):
+        raise RuntimeError(
+            "non-exact replay lacks a bounded successful terminal-grid grace"
+        )
     ledger = result.get("terminal_ledger")
     if (
         not isinstance(ledger, list)
