@@ -128,6 +128,7 @@ def main() -> None:
         render_observations=True,
         manifest_requests=(request,),
         manifest_sha256=reset_manifest_sha256,
+        split=getattr(request.split, "value", request.split),
         observation_track="state",
     )
     try:
