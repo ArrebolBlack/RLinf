@@ -774,6 +774,20 @@ class GpuNativeVisualPolicyObservation:
 
 
 @dataclass(frozen=True)
+class GpuNativePolicyReviewRGBEvidence:
+    """One atomic GPU policy-RGB view and its directly derived review frames."""
+
+    policy_rgb: Mapping[str, Any]
+    review_rgb: tuple[Mapping[str, Any], ...]
+    receipt: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "policy_rgb", MappingProxyType(dict(self.policy_rgb)))
+        object.__setattr__(self, "review_rgb", tuple(self.review_rgb))
+        object.__setattr__(self, "receipt", _freeze_identity(dict(self.receipt)))
+
+
+@dataclass(frozen=True)
 class GpuNativePrivilegedRewardState:
     """Minimal simulator-state view reserved for reward computation."""
 
@@ -825,7 +839,7 @@ class GpuNativeTensorBackendEnv:
         expected_se3_source_commit: str,
         expected_se3_source_tree: str,
         device_ordinal: int = 0,
-        image_size: int = 64,
+        image_size: int = 224,
         render_observations: bool | None = None,
         split: str = "train",
         manifest_seed: int = 20261050,
@@ -1296,6 +1310,7 @@ class GpuNativeTensorBackendEnv:
                 "consumer": "rl",
                 "observation_track": self._observation_track.value,
                 "render_observations": effective_render_observations,
+                "image_size": image_size,
                 "batch_size": num_envs,
                 "backend_id": _GPU_NATIVE_BACKEND_ID,
                 "api_version": _GPU_NATIVE_API_VERSION,
@@ -1541,21 +1556,10 @@ class GpuNativeTensorBackendEnv:
                 "GPU policy source observation differs from the frozen P0 layout"
             )
         visual = self._env.device_visual_observation()
-        rgb = {}
+        rgb = self._policy_rgb_views(visual)
         depth_m = {}
         segmentation = {}
         for camera in ("agentview", "robot0_eye_in_hand"):
-            rgb[camera] = self._view(
-                visual.rgb[camera],
-                f"policy_rgb_{camera}",
-                expected_shape=(
-                    self._num_envs,
-                    self._image_size,
-                    self._image_size,
-                    3,
-                ),
-                expected_dtype=self._torch.float32,
-            )
             depth_m[camera] = self._view(
                 visual.depth_m[camera],
                 f"policy_depth_{camera}",
@@ -1586,6 +1590,172 @@ class GpuNativeTensorBackendEnv:
             rgb=rgb,
             depth_m=depth_m,
             segmentation=segmentation,
+        )
+
+    def _policy_rgb_views(self, visual: Any) -> Mapping[str, Any]:
+        """Return the exact zero-copy RGB tensor views used by visual policies."""
+
+        rgb = {}
+        for camera in ("agentview", "robot0_eye_in_hand"):
+            rgb[camera] = self._view(
+                visual.rgb[camera],
+                f"policy_rgb_{camera}",
+                expected_shape=(
+                    self._num_envs,
+                    self._image_size,
+                    self._image_size,
+                    3,
+                ),
+                expected_dtype=self._torch.float32,
+            )
+        return MappingProxyType(rgb)
+
+    def _review_lanes(
+        self,
+        lanes: tuple[int, ...] | None,
+        *,
+        require_policy_resolution: bool,
+    ) -> tuple[int, ...]:
+        if self._closed:
+            raise GpuNativeTensorBackendUnavailableError("GPU tensor backend is closed")
+        if not self._render_observations:
+            raise GpuNativeTensorBackendUnavailableError(
+                "review RGB requires render_observations=True"
+            )
+        if self._steps_since_reset is None:
+            raise GpuNativeTensorBackendUnavailableError(
+                "review RGB materialization requires a reset cohort"
+            )
+        if require_policy_resolution and self._image_size < 224:
+            raise GpuNativeTensorBackendUnavailableError(
+                "policy/review RGB evidence requires at least 224x224"
+            )
+        selected = tuple(range(self._num_envs)) if lanes is None else lanes
+        if not isinstance(selected, tuple):
+            raise TypeError("review RGB lanes must be an immutable tuple")
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("review RGB lanes must be non-empty and unique")
+        if any(
+            isinstance(lane, bool)
+            or not isinstance(lane, int)
+            or not 0 <= lane < self._num_envs
+            for lane in selected
+        ):
+            raise ValueError("review RGB lane is outside the active cohort")
+        return selected
+
+    @staticmethod
+    def _review_frames_from_policy_rgb(
+        tensors: Mapping[str, Any],
+        selected: tuple[int, ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        numpy = importlib.import_module("numpy")
+        host = {
+            camera: tensor.detach().cpu().numpy() for camera, tensor in tensors.items()
+        }
+        frames = []
+        for lane in selected:
+            row = {}
+            for camera, values in host.items():
+                frame = numpy.asarray(values[lane], dtype=numpy.float32)
+                if not numpy.all(numpy.isfinite(frame)):
+                    raise GpuNativeTensorBackendUnavailableError(
+                        f"GPU review RGB is non-finite for {camera} lane {lane}"
+                    )
+                encoded = numpy.rint(numpy.clip(frame, 0.0, 1.0) * 255.0).astype(
+                    numpy.uint8
+                )
+                encoded.setflags(write=False)
+                row[camera] = encoded
+            frames.append(MappingProxyType(row))
+        return tuple(frames)
+
+    def materialize_policy_review_rgb_evidence(
+        self,
+        lanes: tuple[int, ...] | None = None,
+    ) -> GpuNativePolicyReviewRGBEvidence:
+        """Atomically bind review frames to the raw CUDA tensors a policy consumes.
+
+        Exactly one ``device_visual_observation`` packet is requested. Its Warp
+        RGB arrays become the policy's zero-copy Torch views, and the host review
+        frames are encoded directly from those same views. CPU rendering is not
+        consulted or available on this path.
+        """
+
+        selected = self._review_lanes(lanes, require_policy_resolution=True)
+        visual = self._env.device_visual_observation()
+        tensors = self._policy_rgb_views(visual)
+        frames = self._review_frames_from_policy_rgb(tensors, selected)
+        materializer = getattr(self._env, "materialize_planner_observations", None)
+        if not callable(materializer):
+            raise GpuNativeTensorBackendUnavailableError(
+                "SE3-WAM GPU backend lacks the review materialization seam"
+            )
+        materialized = tuple(materializer(selected))
+        if len(materialized) != len(selected):
+            raise GpuNativeTensorBackendUnavailableError(
+                "SE3-WAM review materialization returned the wrong lane count"
+            )
+        numpy = importlib.import_module("numpy")
+        for lane_index, (policy_frame, observation) in enumerate(
+            zip(frames, materialized, strict=True)
+        ):
+            for camera in ("agentview", "robot0_eye_in_hand"):
+                review_frame = numpy.asarray(observation.rgb[camera], dtype=numpy.uint8)
+                if review_frame.shape != policy_frame[camera].shape or not numpy.array_equal(
+                    review_frame, policy_frame[camera]
+                ):
+                    raise GpuNativeTensorBackendUnavailableError(
+                        "SE3-WAM review materialization differs from the policy RGB tensor "
+                        f"for lane {selected[lane_index]} camera {camera}"
+                    )
+        tensor_pointers = {}
+        for camera, tensor in tensors.items():
+            pointer = tensor.data_ptr()
+            if (
+                isinstance(pointer, bool)
+                or not isinstance(pointer, int)
+                or pointer <= 0
+                or tensor.device != self._device
+            ):
+                raise GpuNativeTensorBackendUnavailableError(
+                    f"policy RGB tensor for {camera} is not resident on the pinned CUDA device"
+                )
+            tensor_pointers[camera] = pointer
+        frame_sha256 = tuple(
+            MappingProxyType(
+                {
+                    camera: hashlib.sha256(frame[camera].tobytes(order="C")).hexdigest()
+                    for camera in ("agentview", "robot0_eye_in_hand")
+                }
+            )
+            for frame in frames
+        )
+        receipt = {
+            "schema_version": "rlinf-gpu-policy-review-rgb-source-v1",
+            "backend_id": _GPU_NATIVE_BACKEND_ID,
+            "device_platform": "cuda",
+            "expected_gpu_uuid": self._expected_gpu_uuid,
+            "device_ordinal": self._device_ordinal,
+            "image_height": self._image_size,
+            "image_width": self._image_size,
+            "cameras": ("agentview", "robot0_eye_in_hand"),
+            "lanes": selected,
+            "generation": self._active_generation,
+            "control_steps_since_reset": self._steps_since_reset,
+            "policy_tensor_data_ptr": tensor_pointers,
+            "review_frame_uint8_sha256": frame_sha256,
+            "device_visual_observation_calls": 1,
+            "zero_copy_policy_tensor_view": True,
+            "review_derived_directly_from_policy_tensor": True,
+            "se3_review_materialization_matches_policy_tensor": True,
+            "se3_review_materialization": "materialize_planner_observations",
+            "cpu_renderer_fallback": False,
+        }
+        return GpuNativePolicyReviewRGBEvidence(
+            policy_rgb=tensors,
+            review_rgb=frames,
+            receipt=receipt,
         )
 
     def privileged_reward_state(
@@ -1643,63 +1813,10 @@ class GpuNativeTensorBackendEnv:
         frozen policy observation track.
         """
 
-        if self._closed:
-            raise GpuNativeTensorBackendUnavailableError("GPU tensor backend is closed")
-        if not self._render_observations:
-            raise GpuNativeTensorBackendUnavailableError(
-                "review RGB requires render_observations=True"
-            )
-        if self._steps_since_reset is None:
-            raise GpuNativeTensorBackendUnavailableError(
-                "review RGB materialization requires a reset cohort"
-            )
-        selected = tuple(range(self._num_envs)) if lanes is None else lanes
-        if not isinstance(selected, tuple):
-            raise TypeError("review RGB lanes must be an immutable tuple")
-        if not selected or len(set(selected)) != len(selected):
-            raise ValueError("review RGB lanes must be non-empty and unique")
-        if any(
-            isinstance(lane, bool)
-            or not isinstance(lane, int)
-            or not 0 <= lane < self._num_envs
-            for lane in selected
-        ):
-            raise ValueError("review RGB lane is outside the active cohort")
-
-        numpy = importlib.import_module("numpy")
+        selected = self._review_lanes(lanes, require_policy_resolution=False)
         visual = self._env.device_visual_observation()
-        tensors = {}
-        for camera in ("agentview", "robot0_eye_in_hand"):
-            tensors[camera] = self._view(
-                visual.rgb[camera],
-                f"review_rgb_{camera}",
-                expected_shape=(
-                    self._num_envs,
-                    self._image_size,
-                    self._image_size,
-                    3,
-                ),
-                expected_dtype=self._torch.float32,
-            )
-        host = {
-            camera: tensor.detach().cpu().numpy() for camera, tensor in tensors.items()
-        }
-        frames = []
-        for lane in selected:
-            row = {}
-            for camera, values in host.items():
-                frame = numpy.asarray(values[lane], dtype=numpy.float32)
-                if not numpy.all(numpy.isfinite(frame)):
-                    raise GpuNativeTensorBackendUnavailableError(
-                        f"GPU review RGB is non-finite for {camera} lane {lane}"
-                    )
-                encoded = numpy.rint(numpy.clip(frame, 0.0, 1.0) * 255.0).astype(
-                    numpy.uint8
-                )
-                encoded.setflags(write=False)
-                row[camera] = encoded
-            frames.append(MappingProxyType(row))
-        return tuple(frames)
+        tensors = self._policy_rgb_views(visual)
+        return self._review_frames_from_policy_rgb(tensors, selected)
 
     def materialize_health_audit(self) -> Mapping[str, Any]:
         """Fail closed on overflow or controller/driver guards at a cohort boundary."""

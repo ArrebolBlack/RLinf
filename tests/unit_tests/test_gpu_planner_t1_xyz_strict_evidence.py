@@ -57,6 +57,10 @@ def test_result_runners_expose_only_frozen_manifest_strict_evidence() -> None:
     assert "--episodes" not in d32_options
 
 
+def test_e0_review_rgb_defaults_to_policy_resolution() -> None:
+    assert E0._parser().get_default("image_size") == 224
+
+
 def test_frozen_execution_uses_state_e7_and_canonical_evaluator() -> None:
     assert STRICT.EXECUTION_CONTRACT["observation_track"] == "state"
     assert STRICT.EXECUTION_CONTRACT["action_mode"] == "E7"

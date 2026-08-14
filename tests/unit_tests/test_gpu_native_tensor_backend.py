@@ -874,6 +874,104 @@ def test_review_rgb_materializes_selected_gpu_frames_as_uint8() -> None:
     ]
 
 
+def test_policy_review_rgb_evidence_uses_one_gpu_packet_and_policy_tensor() -> None:
+    class _PolicyTensor:
+        def __init__(self, value: Any, pointer: int, device: Any) -> None:
+            self.value = value
+            self._pointer = pointer
+            self.device = device
+
+        def data_ptr(self) -> int:
+            return self._pointer
+
+        def detach(self) -> _PolicyTensor:
+            return self
+
+        def cpu(self) -> _PolicyTensor:
+            return self
+
+        def numpy(self) -> Any:
+            return self.value
+
+    rgb = {
+        "agentview": object(),
+        "robot0_eye_in_hand": object(),
+    }
+    device = object()
+    values = {
+        rgb["agentview"]: _PolicyTensor(
+            np.full((1, 224, 224, 3), 0.5, dtype=np.float32), 1001, device
+        ),
+        rgb["robot0_eye_in_hand"]: _PolicyTensor(
+            np.full((1, 224, 224, 3), 0.25, dtype=np.float32), 1002, device
+        ),
+    }
+    calls = 0
+
+    def device_visual_observation() -> Any:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(rgb=rgb)
+
+    backend = object.__new__(GpuNativeTensorBackendEnv)
+    backend._closed = False  # noqa: SLF001
+    backend._render_observations = True  # noqa: SLF001
+    backend._steps_since_reset = 7  # noqa: SLF001
+    backend._active_generation = 3  # noqa: SLF001
+    backend._num_envs = 1  # noqa: SLF001
+    backend._image_size = 224  # noqa: SLF001
+    backend._expected_gpu_uuid = _GPU_UUID  # noqa: SLF001
+    backend._device_ordinal = 0  # noqa: SLF001
+    backend._device = device  # noqa: SLF001
+    backend._torch = SimpleNamespace(float32=object())  # noqa: SLF001
+    backend._env = SimpleNamespace(  # noqa: SLF001
+        device_visual_observation=device_visual_observation,
+        materialize_planner_observations=lambda lanes: (
+            SimpleNamespace(
+                rgb={
+                    "agentview": np.full((224, 224, 3), 128, dtype=np.uint8),
+                    "robot0_eye_in_hand": np.full(
+                        (224, 224, 3), 64, dtype=np.uint8
+                    ),
+                }
+            ),
+        ),
+    )
+    backend._view = lambda value, name, **kwargs: values[value]  # noqa: SLF001
+
+    evidence = backend.materialize_policy_review_rgb_evidence((0,))
+
+    assert calls == 1
+    assert evidence.policy_rgb["agentview"] is values[rgb["agentview"]]
+    assert evidence.review_rgb[0]["agentview"].shape == (224, 224, 3)
+    assert evidence.review_rgb[0]["agentview"][0, 0].tolist() == [128, 128, 128]
+    assert evidence.receipt["backend_id"] == "mjwarp_gpu_v1"
+    assert evidence.receipt["device_platform"] == "cuda"
+    assert evidence.receipt["image_height"] == 224
+    assert evidence.receipt["image_width"] == 224
+    assert evidence.receipt["policy_tensor_data_ptr"]["agentview"] == 1001
+    assert evidence.receipt["device_visual_observation_calls"] == 1
+    assert evidence.receipt["zero_copy_policy_tensor_view"] is True
+    assert evidence.receipt["review_derived_directly_from_policy_tensor"] is True
+    assert evidence.receipt["se3_review_materialization_matches_policy_tensor"] is True
+    assert evidence.receipt["cpu_renderer_fallback"] is False
+
+
+def test_policy_review_rgb_evidence_rejects_sub_policy_resolution() -> None:
+    backend = object.__new__(GpuNativeTensorBackendEnv)
+    backend._closed = False  # noqa: SLF001
+    backend._render_observations = True  # noqa: SLF001
+    backend._steps_since_reset = 0  # noqa: SLF001
+    backend._num_envs = 1  # noqa: SLF001
+    backend._image_size = 64  # noqa: SLF001
+
+    with pytest.raises(
+        GpuNativeTensorBackendUnavailableError,
+        match="at least 224x224",
+    ):
+        backend.materialize_policy_review_rgb_evidence((0,))
+
+
 def test_t4_admission_requires_owner_frozen_manifest_before_runtime_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

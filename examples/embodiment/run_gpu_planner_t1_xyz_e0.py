@@ -93,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rlinf-source-root", type=Path, required=True)
     parser.add_argument("--dynamic-source-root", type=Path, required=True)
     parser.add_argument("--device-ordinal", type=int, default=0)
-    parser.add_argument("--image-size", type=int, default=64)
+    parser.add_argument("--image-size", type=int, default=224)
     return parser
 
 
@@ -1133,8 +1133,8 @@ def _task_quality_margin_diagnostic(backend: Any) -> dict[str, Any]:
 
 def main() -> None:
     args = _parser().parse_args()
-    if args.image_size < 64:
-        raise ValueError("--image-size must be at least 64")
+    if args.image_size < 224:
+        raise ValueError("--image-size must be at least 224 for policy/review RGB evidence")
     if args.device_ordinal < 0:
         raise ValueError("--device-ordinal must be nonnegative")
     if not args.expected_gpu_uuid.strip():

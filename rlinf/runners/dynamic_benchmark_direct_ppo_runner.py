@@ -24,15 +24,16 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Normal
 
 from rlinf.algorithms.advantages import compute_gae_advantages_and_returns
+from rlinf.algorithms.direct_ppo_visual_actor_critic import (
+    DirectPPOVisualActorCritic,
+)
 from rlinf.algorithms.losses import compute_ppo_actor_loss, compute_ppo_critic_loss
 from rlinf.data.direct_ppo_rollout_buffer import (
     DirectPPORollout,
@@ -41,14 +42,10 @@ from rlinf.data.direct_ppo_rollout_buffer import (
 )
 from rlinf.envs.dynamic_benchmark.direct_ppo_reward import (
     DirectPPOReward,
-    DirectPPORewardViolation,
 )
 from rlinf.envs.dynamic_benchmark.gpu_tensor_backend import (
     GpuNativeTensorBackendEnv,
     GpuNativeVisualPolicyObservation,
-)
-from rlinf.algorithms.direct_ppo_visual_actor_critic import (
-    DirectPPOVisualActorCritic,
 )
 
 
@@ -63,7 +60,7 @@ class DirectPPORunConfig:
     ppo_epochs: int
     encoder_batch_size: int
     manifest_name: str
-    image_size: int = 64
+    image_size: int = 224
     checkpoint_every_cohorts: int = 10
 
     def __post_init__(self) -> None:
@@ -81,6 +78,8 @@ class DirectPPORunConfig:
                 raise ValueError(f"{name} must be positive")
         if not self.name or not self.manifest_name:
             raise ValueError("Direct PPO run names must be non-empty")
+        if self.image_size < 224:
+            raise ValueError("Direct PPO visual policy requires image_size >= 224")
 
 
 @dataclass(frozen=True)
