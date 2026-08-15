@@ -16,12 +16,12 @@ from typing import Callable, Optional
 
 import torch
 
+from rlinf.algorithms.masked_ops import masked_mean, masked_mean_ratio
 from rlinf.algorithms.registry import register_policy_loss
 from rlinf.algorithms.utils import huber_loss
 from rlinf.utils.metric_utils import (
     compute_critic_explained_variance_stats,
 )
-from rlinf.algorithms.masked_ops import masked_mean, masked_mean_ratio
 
 
 def compute_decoupled_ppo_actor_loss(

@@ -16,9 +16,9 @@ from typing import Optional
 
 import torch
 
+from rlinf.algorithms.masked_ops import masked_mean
 from rlinf.algorithms.registry import register_advantage
 from rlinf.algorithms.utils import kl_penalty, safe_normalize
-from rlinf.algorithms.masked_ops import masked_mean
 
 
 @register_advantage("gae")

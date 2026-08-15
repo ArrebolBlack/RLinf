@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -297,86 +296,3 @@ def test_commit_requires_pending_row_and_validates_boolean_dtype() -> None:
 def test_field_phase_is_validated() -> None:
     with pytest.raises(ValueError, match="phase"):
         DeviceFieldSpec(shape=(), dtype="float32", phase="later")
-
-
-def test_tensor_ppo_rollout_uses_two_phase_order_without_host_materialization() -> None:
-    script = (
-        Path(__file__).parents[2]
-        / "examples"
-        / "embodiment"
-        / "train_dynamic_benchmark_tensor_ppo_smoke.py"
-    )
-    tree = ast.parse(script.read_text(encoding="utf-8"))
-    rollout_loop = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.For)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "_step"
-        and "cohort_horizon_steps" in ast.unparse(node.iter)
-    )
-    calls = [node for node in ast.walk(rollout_loop) if isinstance(node, ast.Call)]
-
-    def method_calls(name: str) -> list[ast.Call]:
-        return [
-            call
-            for call in calls
-            if isinstance(call.func, ast.Attribute) and call.func.attr == name
-        ]
-
-    begin = method_calls("begin_step")
-    environment_step = [
-        call
-        for call in method_calls("step")
-        if isinstance(call.func.value, ast.Name) and call.func.value.id == "env"
-    ]
-    commit = method_calls("commit_step")
-    assert len(begin) == len(environment_step) == len(commit) == 1
-    assert begin[0].lineno < environment_step[0].lineno < commit[0].lineno
-
-    forbidden = {"clone", "cpu", "numpy", "item", "tolist"}
-    assert not [
-        call
-        for call in calls
-        if isinstance(call.func, ast.Attribute) and call.func.attr in forbidden
-    ]
-
-
-def test_tensor_ppo_checkpoint_captures_exact_cross_process_resume_state() -> None:
-    script = (
-        Path(__file__).parents[2]
-        / "examples"
-        / "embodiment"
-        / "train_dynamic_benchmark_tensor_ppo_smoke.py"
-    )
-    source = script.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    main = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "main"
-    )
-    calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
-
-    manifest_restore = next(
-        call
-        for call in calls
-        if isinstance(call.func, ast.Attribute)
-        and call.func.attr == "load_manifest_state_dict"
-    )
-    initial_reset = min(
-        call.lineno
-        for call in calls
-        if isinstance(call.func, ast.Attribute)
-        and call.func.attr == "reset"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "env"
-    )
-    assert manifest_restore.lineno < initial_reset
-    assert 'parser.add_argument("--resume-from", type=Path)' in source
-    assert '"schema_version": "rlinf-gpuenv0-tensor-ppo-smoke-v0.2"' in source
-    assert '"rng_state": _capture_rng_state()' in source
-    assert '"manifest_cursor": dict(env.manifest_state_dict())' in source
-    assert '"parameter_sha256": parameter_sha256_end' in source
-    assert '_restore_rng_state(restored["rng_state"])' in source
-    assert "_atomic_torch_save(checkpoint_path, checkpoint_payload)" in source

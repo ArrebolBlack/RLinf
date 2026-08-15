@@ -17,6 +17,7 @@ import torch
 
 from rlinf.config import SupportedModel
 from rlinf.envs import SupportedEnvType
+from rlinf.envs.plugins import get_env_plugin
 
 
 def prepare_actions_for_maniskill(
@@ -333,7 +334,22 @@ def prepare_actions(
             raw_chunk_actions = raw_chunk_actions.float()
         raw_chunk_actions = raw_chunk_actions.numpy()
 
-    env_type = SupportedEnvType(env_type)
+    try:
+        env_type = SupportedEnvType(env_type)
+    except ValueError:
+        plugin = get_env_plugin(env_type)
+        if plugin.prepare_actions is None:
+            return raw_chunk_actions
+        return plugin.prepare_actions(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+            num_action_chunks=num_action_chunks,
+            action_dim=action_dim,
+            action_scale=action_scale,
+            policy=policy,
+            wm_env_type=wm_env_type,
+            env_cfg=env_cfg,
+        )
     if env_type == SupportedEnvType.LIBERO:
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
@@ -411,8 +427,6 @@ def prepare_actions(
             action_dim=action_dim,
             model_type=model_type,
         )
-    elif env_type == SupportedEnvType.DYNAMIC_BENCHMARK:
-        chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.ROBOVERSE:
         chunk_actions = prepare_actions_for_roboverse(
             raw_chunk_actions=raw_chunk_actions,

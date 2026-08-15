@@ -19,6 +19,12 @@ to RLinf.
 
       Add a new RL environment and wire it into the env registry.
 
+   .. grid-item-card:: External Environment Plugin
+      :link: environment_plugins
+      :link-type: doc
+
+      Distribute an environment independently through a Python entry point.
+
    .. grid-item-card:: New Model with FSDP
       :link: new_model_fsdp
       :link-type: doc
@@ -54,6 +60,7 @@ to RLinf.
 
    Extending Overview <overview>
    New Environment <new_env>
+   External Environment Plugin <environment_plugins>
    New Model with FSDP <new_model_fsdp>
    New Model with Megatron <new_model_megatron>
    New SFT Model <new_model_sft>

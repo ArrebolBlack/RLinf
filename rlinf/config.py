@@ -17,7 +17,7 @@ import importlib.util
 import logging
 import os
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +25,7 @@ from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
+from rlinf.envs.plugins import get_env_plugin, resolve_builtin_env_type
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
     HybridComponentPlacement,
@@ -1084,12 +1085,12 @@ def validate_embodied_cfg(cfg):
             cfg.runner.get("overlap_env_bootstrap", False)
         ) and not cfg.env.get("train", {}).get("enable_offload", False)
         train_env_type = (
-            SupportedEnvType(cfg.env.train.env_type)
+            resolve_builtin_env_type(cfg.env.train.env_type, SupportedEnvType)
             if cfg.env.get("train", None) is not None
             else None
         )
         eval_env_type = (
-            SupportedEnvType(cfg.env.eval.env_type)
+            resolve_builtin_env_type(cfg.env.eval.env_type, SupportedEnvType)
             if cfg.env.get("eval", None) is not None
             else None
         )
@@ -1130,36 +1131,18 @@ def validate_embodied_cfg(cfg):
                 assert cfg.env.train.base_config_name == "r1pro_behavior", (
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
-        elif (
-            train_env_type == SupportedEnvType.DYNAMIC_BENCHMARK
-            or eval_env_type == SupportedEnvType.DYNAMIC_BENCHMARK
-        ):
-            dynamic_env_cfgs = [
-                env_cfg
-                for env_cfg in (cfg.env.get("train", None), cfg.env.get("eval", None))
-                if env_cfg is not None
-                and SupportedEnvType(env_cfg.env_type)
-                == SupportedEnvType.DYNAMIC_BENCHMARK
-            ]
-            for env_cfg in dynamic_env_cfgs:
-                assert env_cfg.get("task_id", None), (
-                    "Dynamic Benchmark requires env.train/eval.task_id"
-                )
-                assert env_cfg.get("split", None) in {
-                    "train",
-                    "validation",
-                    "test_id",
-                    "test_ood",
-                }, "Dynamic Benchmark split is invalid"
-                assert int(env_cfg.get("image_size", 64)) >= 64, (
-                    "Dynamic Benchmark image_size must be at least 64"
-                )
-            assert int(model_cfg.action_dim) == 7, (
-                "Dynamic Benchmark currently requires the E7 action contract"
-            )
-            assert int(model_cfg.obs_dim) > 0, (
-                "Set actor.model.obs_dim from probe_dynamic_benchmark.py"
-            )
+        external_env_cfgs: dict[str, list[Any]] = {}
+        for env_cfg in (cfg.env.get("train", None), cfg.env.get("eval", None)):
+            if env_cfg is None:
+                continue
+            try:
+                SupportedEnvType(env_cfg.env_type)
+            except ValueError:
+                external_env_cfgs.setdefault(str(env_cfg.env_type), []).append(env_cfg)
+        for env_name, env_cfgs in external_env_cfgs.items():
+            validator = get_env_plugin(env_name).validate_config
+            if validator is not None:
+                validator(cfg, model_cfg, tuple(env_cfgs))
     return cfg
 
 
