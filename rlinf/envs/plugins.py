@@ -80,7 +80,9 @@ def get_env_plugin(name: str) -> EnvPlugin:
         raise ValueError("external environment type must be a non-empty string")
     matches = _matching_entry_points(name)
     if not matches:
-        raise ValueError(f"environment type {name!r} is not built in or installed as a plugin")
+        raise ValueError(
+            f"environment type {name!r} is not built in or installed as a plugin"
+        )
     if len(matches) != 1:
         providers = sorted(f"{item.value} ({item.dist})" for item in matches)
         raise ValueError(
@@ -105,4 +107,9 @@ def resolve_builtin_env_type(name: str, supported_type: type) -> Any | None:
         return None
 
 
-__all__ = ["ENV_PLUGIN_GROUP", "EnvPlugin", "get_env_plugin", "resolve_builtin_env_type"]
+__all__ = [
+    "ENV_PLUGIN_GROUP",
+    "EnvPlugin",
+    "get_env_plugin",
+    "resolve_builtin_env_type",
+]

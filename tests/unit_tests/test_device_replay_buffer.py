@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -322,3 +323,18 @@ def test_replay_hot_methods_forbid_host_materialization_and_cpu_sampling_rng() -
     assert "torch.Generator(device=device)" in source
     assert "self._torch.multinomial(" in source
     assert "self._torch.randint(" in source
+
+
+def test_public_replay_entrypoint_does_not_initialize_storage_stack() -> None:
+    code = (
+        "import sys; import rlinf.data as data; "
+        "assert data.DeviceReplayBuffer.__name__ == 'DeviceReplayBuffer'; "
+        "assert 'rlinf.data.storage' not in sys.modules"
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
