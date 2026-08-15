@@ -1163,7 +1163,13 @@ def _strict_result(
         if success
         else None
     )
-    action_tape = [{"mode": "E7", "policy_step": 0, "values": [0.0] * 7}]
+    action_tape = [
+        {
+            "mode": "E7",
+            "policy_step": 0,
+            "values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    ]
     trajectory_tape = [
         STRICT.payload_sha256({"row": index, "step": step}) for step in range(2)
     ]
@@ -1186,6 +1192,18 @@ def _strict_result(
         "physical_device_uuid": "GPU-test",
         "runtime_versions": {},
     }
+    planner_audit = {
+        "schema_version": "se3-wam-conveyor-planner-audit-v2",
+        "terminal_phase": "done",
+        "regrasp_attempts": 0,
+    }
+    teacher_preparation = {"effective_close_retry_steps": None}
+    one_shot_acquisition_gate = STRICT.build_one_shot_acquisition_gate(
+        action_tape,
+        success=success,
+        planner_audit=planner_audit,
+        teacher_preparation=teacher_preparation,
+    )
     terminal_ledger = [
         {
             "episode_id": episode_id,
@@ -1307,6 +1325,9 @@ def _strict_result(
         "terminal_ledger": terminal_ledger,
         "action_tape": action_tape,
         "trajectory_tape": trajectory_tape,
+        "teacher_preparation": teacher_preparation,
+        "planner_audit": planner_audit,
+        "one_shot_acquisition_gate": one_shot_acquisition_gate,
         "evidence_export": {
             "passed": True,
             "action_tape_sha256": STRICT.payload_sha256(action_tape),
@@ -1354,6 +1375,62 @@ def test_manifest_rejects_hybrid_observation_contract(tmp_path: Path) -> None:
             expected_phase="e0",
             verify_exports=False,
         )
+
+
+def test_one_shot_acquisition_gate_rejects_reopen_and_second_close() -> None:
+    def action(policy_step: int, gripper: float) -> dict[str, Any]:
+        return {
+            "mode": "E7",
+            "policy_step": policy_step,
+            "values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper],
+        }
+
+    planner_audit = {
+        "schema_version": "se3-wam-conveyor-planner-audit-v2",
+        "regrasp_attempts": 1,
+    }
+    receipt = STRICT.build_one_shot_acquisition_gate(
+        [action(0, -1.0), action(1, 1.0), action(2, -1.0), action(3, 1.0)],
+        success=True,
+        planner_audit=planner_audit,
+        teacher_preparation={"effective_close_retry_steps": 8},
+    )
+
+    assert receipt["passed"] is False
+    assert receipt["success_on_first_acquisition"] is False
+    assert receipt["retry_disabled"] is False
+    assert receipt["planner_regrasp_attempts"] == 1
+    assert receipt["gripper_close_epoch_count"] == 2
+    assert receipt["first_close_policy_step"] == 1
+    assert receipt["subsequent_close_policy_steps"] == [3]
+    assert receipt["reopened_after_first_close"] is True
+    assert receipt["reopen_policy_steps"] == [2]
+
+
+def test_one_shot_acquisition_gate_accepts_single_close_without_reopen() -> None:
+    action_tape = [
+        {
+            "mode": "E7",
+            "policy_step": step,
+            "values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper],
+        }
+        for step, gripper in enumerate((-1.0, -1.0, 1.0, 1.0))
+    ]
+    receipt = STRICT.build_one_shot_acquisition_gate(
+        action_tape,
+        success=True,
+        planner_audit={
+            "schema_version": "se3-wam-conveyor-planner-audit-v2",
+            "regrasp_attempts": 0,
+        },
+        teacher_preparation={"effective_close_retry_steps": None},
+    )
+
+    assert receipt["passed"] is True
+    assert receipt["success_on_first_acquisition"] is True
+    assert receipt["gripper_close_epoch_count"] == 1
+    assert receipt["first_close_policy_step"] == 2
+    assert receipt["reopened_after_first_close"] is False
 
 
 def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
@@ -1526,6 +1603,15 @@ def test_row_validator_rejects_nonblocking_identity_and_evidence_gates(
     incomplete_export = copy.deepcopy(valid)
     incomplete_export["evidence_export"]["passed"] = False
     invalid_rows.append(incomplete_export)
+    missing_planner_audit = copy.deepcopy(valid)
+    missing_planner_audit.pop("planner_audit")
+    invalid_rows.append(missing_planner_audit)
+    missing_teacher_preparation = copy.deepcopy(valid)
+    missing_teacher_preparation.pop("teacher_preparation")
+    invalid_rows.append(missing_teacher_preparation)
+    forged_one_shot_receipt = copy.deepcopy(valid)
+    forged_one_shot_receipt["planner_audit"]["regrasp_attempts"] = 1
+    invalid_rows.append(forged_one_shot_receipt)
 
     for invalid in invalid_rows:
         with pytest.raises((RuntimeError, ValueError)):

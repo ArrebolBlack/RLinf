@@ -10,7 +10,9 @@ The result path accepts only a sealed E0/D32 manifest row.  It validates the
 complete export-bound ResetRequest and the clean five-repository source tuple
 before constructing CUDA, plans from the current observation at every control
 step, and emits a countable result only after semantic fresh-backend replay,
-quality-v2, exact-once terminal ledger, and evidence-file gates all pass.
+quality-v2, exact-once terminal ledger, one-shot acquisition, and evidence-file
+gates all pass.  A retry-assisted success is exported only as fail-closed
+diagnostic evidence and is never written as a review candidate.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ QUALITY_EVALUATOR_ID = _STRICT.QUALITY_EVALUATOR_ID
 QUALITY_SCHEMA_VERSION = _STRICT.QUALITY_SCHEMA_VERSION
 RESULT_SCHEMA_VERSION = _STRICT.RESULT_SCHEMA_VERSION
 TASK_ID = _STRICT.TASK_ID
+build_one_shot_acquisition_gate = _STRICT.build_one_shot_acquisition_gate
 load_frozen_manifest = _STRICT.load_frozen_manifest
 preflight_export_request = _STRICT.preflight_export_request
 request_identity = _STRICT.request_identity
@@ -1369,9 +1372,17 @@ def main() -> None:
     replay_failure_output = args.output.with_name(
         f"{args.output.stem}.semantic-replay-failure.json"
     )
+    acquisition_failure_output = args.output.with_name(
+        f"{args.output.stem}.first-acquisition-failure.json"
+    )
     if replay_failure_output.exists():
         raise FileExistsError(
             f"refusing to overwrite semantic replay failure evidence: {replay_failure_output}"
+        )
+    if acquisition_failure_output.exists():
+        raise FileExistsError(
+            "refusing to overwrite first-acquisition failure evidence: "
+            f"{acquisition_failure_output}"
         )
 
     # All host/source/export checks complete before any CUDA backend exists.
@@ -1503,6 +1514,20 @@ def main() -> None:
             terminal_payload[0],
             episode_id=str(request.episode_id),
         )
+        action_tape = [_command_payload(command) for command in commands]
+        planner_audit_snapshot = getattr(teacher, "planner_audit_snapshot", None)
+        if not callable(planner_audit_snapshot):
+            raise RuntimeError("t1_xyz Planner lacks its required audit snapshot")
+        planner_audit = planner_audit_snapshot()
+        if not isinstance(planner_audit, Mapping):
+            raise RuntimeError("t1_xyz Planner audit snapshot is not a mapping")
+        planner_audit = dict(planner_audit)
+        one_shot_acquisition_gate = build_one_shot_acquisition_gate(
+            action_tape,
+            success=bool(result.success),
+            planner_audit=planner_audit,
+            teacher_preparation=preparation,
+        )
         primary_task_quality_margin = _task_quality_margin_diagnostic(backend)
         primary_exact_once = assert_terminal_ledger_exact_once(
             backend,
@@ -1518,7 +1543,6 @@ def main() -> None:
             terminal_ledger=terminal_ledger,
         )
         if replay.get("passed") is not True:
-            action_tape = [_command_payload(command) for command in commands]
             failure_payload = {
                 "schema_version": "gpu-planner-t1-xyz-semantic-replay-failure-v1",
                 "status": "blocked_semantic_fresh_replay",
@@ -1558,6 +1582,9 @@ def main() -> None:
                     "terminal_ledger": terminal_payload,
                     "task_quality_margin_diagnostic": primary_task_quality_margin,
                 },
+                "teacher_preparation": preparation,
+                "planner_audit": planner_audit,
+                "one_shot_acquisition_gate": one_shot_acquisition_gate,
                 "task_quality_thresholds": {
                     "bilateral_contact_hold_s": float(
                         task_config["capture"]["bilateral_contact_hold_s"]
@@ -1578,7 +1605,6 @@ def main() -> None:
         visual_gif = visual_gif.resolve()
         _write_tape_npz(tape_output, observations, commands)
         _write_visual_gif(visual_gif, reviews)
-        action_tape = [_command_payload(command) for command in commands]
         trajectory_tape = [_observation_digest(value) for value in observations]
         evidence_export = {
             "passed": True,
@@ -1589,6 +1615,49 @@ def main() -> None:
             "visual_file": str(visual_gif),
             "visual_sha256": _file_sha256(visual_gif),
         }
+        if one_shot_acquisition_gate["passed"] is not True:
+            failure_payload = {
+                "schema_version": "gpu-planner-t1-xyz-first-acquisition-failure-v1",
+                "status": "blocked_first_acquisition",
+                "evidence_passed": False,
+                "qualification_completed": 0,
+                "review_candidate": False,
+                "countable_result_written": False,
+                "task_id": TASK_ID,
+                "phase": args.phase,
+                "manifest": {
+                    "candidate_index": row["candidate_index"],
+                    "episode_id": row["request"]["episode_id"],
+                    "manifest_index": row["manifest_index"],
+                    "manifest_sha256": manifest.manifest_sha256,
+                    "source_identity_sha256": manifest.source_identity_sha256,
+                },
+                "reset_request": expected_request,
+                "source_gate": {
+                    "passed": True,
+                    "repositories_exact": True,
+                    "source_identity_sha256": manifest.source_identity_sha256,
+                    "repositories": repositories,
+                },
+                "export": export_identity,
+                "provenance": provenance,
+                "success": bool(result.success),
+                "termination_reason": result.termination_reason,
+                "terminal_ledger": terminal_payload,
+                "replay": replay,
+                "action_tape": action_tape,
+                "trajectory_tape": trajectory_tape,
+                "evidence_export": evidence_export,
+                "teacher_preparation": preparation,
+                "planner_audit": planner_audit,
+                "one_shot_acquisition_gate": one_shot_acquisition_gate,
+            }
+            _write_json_exclusive(acquisition_failure_output, failure_payload)
+            raise RuntimeError(
+                "trajectory violated the one-shot acquisition contract; "
+                "fail-closed evidence written to "
+                f"{acquisition_failure_output.resolve()}"
+            )
         payload = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "status": "completed_review_evidence",
@@ -1640,6 +1709,8 @@ def main() -> None:
             "trajectory_tape": trajectory_tape,
             "evidence_export": evidence_export,
             "teacher_preparation": preparation,
+            "planner_audit": planner_audit,
+            "one_shot_acquisition_gate": one_shot_acquisition_gate,
             "planner_latency_s": {
                 "count": len(latencies_s),
                 "max": max(latencies_s),

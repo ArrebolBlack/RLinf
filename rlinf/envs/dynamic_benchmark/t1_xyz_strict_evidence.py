@@ -8,7 +8,10 @@
 The helpers in this module are deliberately host-only.  They validate a sealed
 manifest, every export, the complete ``ResetRequest``, and the checked-out
 source tuple before a result runner is allowed to construct a CUDA backend.
-They do not reserve resources or create an environment.
+Completed review evidence also proves that a successful trajectory used one
+gripper-close epoch and zero Planner regrasp attempts.  Failed task outcomes
+may still be preserved as evidence, but a retry-assisted success fails closed.
+These helpers do not reserve resources or create an environment.
 """
 
 from __future__ import annotations
@@ -28,8 +31,9 @@ BACKEND_ID = "mjwarp_gpu_v1"
 QUALITY_SCHEMA_VERSION = "db0-episode-task-quality-v2"
 QUALITY_EVALUATOR_ID = BACKEND_ID
 MANIFEST_SCHEMA_VERSION = "gpuplan0-t1-xyz-review-evidence-manifest-v3"
-RESULT_SCHEMA_VERSION = "gpu-planner-t1-xyz-review-evidence-result-v3"
+RESULT_SCHEMA_VERSION = "gpu-planner-t1-xyz-review-evidence-result-v4"
 D32_SUMMARY_SCHEMA_VERSION = "gpu-planner-t1-xyz-d32-strict-summary-v2"
+ONE_SHOT_ACQUISITION_SCHEMA_VERSION = "gpu-planner-t1-xyz-one-shot-acquisition-gate-v1"
 
 CANONICAL_REQUEST_FIELDS = (
     "action_mode",
@@ -68,6 +72,7 @@ EXECUTION_CONTRACT = {
     "fresh_replay_gate": "semantic_identity_outcome_quality_v1",
     "horizon_control_steps": 160,
     "observation_track": "state",
+    "one_shot_acquisition_required": True,
     "physics_hz": 500,
     "physics_steps_per_control": 25,
     "planner_observation_source": "current_observation_each_control_step",
@@ -134,6 +139,99 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def build_one_shot_acquisition_gate(
+    action_tape: Sequence[Mapping[str, Any]],
+    *,
+    success: bool,
+    planner_audit: Mapping[str, Any],
+    teacher_preparation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind task success to one close epoch and zero Planner regrasp attempts."""
+
+    if type(success) is not bool:
+        raise TypeError("one-shot acquisition success must be a bool")
+    if not isinstance(planner_audit, Mapping):
+        raise TypeError("one-shot acquisition requires a Planner audit mapping")
+    if not isinstance(teacher_preparation, Mapping):
+        raise TypeError("one-shot acquisition requires a teacher preparation mapping")
+
+    close_policy_steps: list[int] = []
+    reopen_policy_steps: list[int] = []
+    last_decisive_state: str | None = None
+    first_close_seen = False
+    for index, action in enumerate(action_tape):
+        if not isinstance(action, Mapping):
+            raise TypeError(f"action_tape[{index}] must be a mapping")
+        policy_step = action.get("policy_step")
+        values = action.get("values")
+        if (
+            isinstance(policy_step, bool)
+            or not isinstance(policy_step, int)
+            or policy_step != index
+            or not isinstance(values, Sequence)
+            or isinstance(values, (str, bytes))
+            or len(values) != 7
+        ):
+            raise ValueError("one-shot acquisition requires ordered E7 actions")
+        gripper = values[6]
+        if (
+            isinstance(gripper, bool)
+            or not isinstance(gripper, (int, float))
+            or not math.isfinite(gripper)
+        ):
+            raise ValueError("one-shot acquisition gripper actions must be finite")
+        decisive_state = None
+        if gripper >= 0.5:
+            decisive_state = "close"
+        elif gripper <= -0.5:
+            decisive_state = "open"
+        if decisive_state == "close" and last_decisive_state != "close":
+            close_policy_steps.append(policy_step)
+            first_close_seen = True
+        elif decisive_state == "open" and first_close_seen:
+            reopen_policy_steps.append(policy_step)
+        if decisive_state is not None:
+            last_decisive_state = decisive_state
+
+    audit_schema = planner_audit.get("schema_version")
+    regrasp_attempts = planner_audit.get("regrasp_attempts")
+    planner_audit_valid = bool(
+        audit_schema == "se3-wam-conveyor-planner-audit-v2"
+        and not isinstance(regrasp_attempts, bool)
+        and isinstance(regrasp_attempts, int)
+        and regrasp_attempts >= 0
+    )
+    retry_disabled = bool(
+        "effective_close_retry_steps" in teacher_preparation
+        and teacher_preparation.get("effective_close_retry_steps") is None
+    )
+    passed = bool(
+        retry_disabled
+        and planner_audit_valid
+        and regrasp_attempts == 0
+        and len(close_policy_steps) == 1
+        and not reopen_policy_steps
+    )
+    return {
+        "schema_version": ONE_SHOT_ACQUISITION_SCHEMA_VERSION,
+        "required": True,
+        "passed": passed,
+        "terminal_success": success,
+        "success_on_first_acquisition": bool(success and passed),
+        "retry_disabled": retry_disabled,
+        "planner_audit_valid": planner_audit_valid,
+        "planner_audit_schema_version": audit_schema,
+        "planner_regrasp_attempts": regrasp_attempts,
+        "gripper_close_epoch_count": len(close_policy_steps),
+        "first_close_policy_step": (
+            close_policy_steps[0] if close_policy_steps else None
+        ),
+        "subsequent_close_policy_steps": close_policy_steps[1:],
+        "reopened_after_first_close": bool(reopen_policy_steps),
+        "reopen_policy_steps": reopen_policy_steps,
+    }
 
 
 def _require_sha256(value: Any, name: str) -> str:
@@ -898,6 +996,25 @@ def validate_result_for_row(
             )
         ):
             raise RuntimeError("row result action tape contains an invalid E7 action")
+    planner_audit = result.get("planner_audit")
+    teacher_preparation = result.get("teacher_preparation")
+    one_shot_gate = result.get("one_shot_acquisition_gate")
+    if (
+        not isinstance(planner_audit, Mapping)
+        or not isinstance(teacher_preparation, Mapping)
+        or not isinstance(one_shot_gate, Mapping)
+    ):
+        raise RuntimeError("row result lacks the one-shot acquisition evidence")
+    expected_one_shot_gate = build_one_shot_acquisition_gate(
+        action_tape,
+        success=success,
+        planner_audit=planner_audit,
+        teacher_preparation=teacher_preparation,
+    )
+    if dict(one_shot_gate) != expected_one_shot_gate:
+        raise RuntimeError("row result one-shot acquisition receipt is inconsistent")
+    if one_shot_gate.get("passed") is not True:
+        raise RuntimeError("row result did not succeed on its first acquisition")
     if early_accepted and (
         early_executed_steps != control_steps - 1
         or terminal_early.get("unexecuted_action_payload_sha256")
@@ -1056,12 +1173,14 @@ __all__ = [
     "EXECUTION_CONTRACT",
     "FAILURE_TERMINATION_REASONS",
     "MANIFEST_SCHEMA_VERSION",
+    "ONE_SHOT_ACQUISITION_SCHEMA_VERSION",
     "QUALITY_EVALUATOR_ID",
     "QUALITY_SCHEMA_VERSION",
     "RESULT_SCHEMA_VERSION",
     "SOURCE_REPOSITORIES",
     "TASK_ID",
     "T1XYZFrozenManifest",
+    "build_one_shot_acquisition_gate",
     "canonical_json_bytes",
     "load_frozen_manifest",
     "payload_sha256",
