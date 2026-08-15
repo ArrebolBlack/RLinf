@@ -21,6 +21,15 @@ rollout buffer without initializing the Ray-backed storage stack.
 from __future__ import annotations
 
 import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rlinf.data import schema, storage
+    from rlinf.data.device_replay_buffer import (
+        DeviceReplayBatch,
+        DeviceReplayBuffer,
+        DeviceReplayContractError,
+    )
 
 __all__ = [
     "schema",
@@ -34,7 +43,11 @@ __all__ = [
 def __getattr__(name: str):
     if name in {"schema", "storage"}:
         value = importlib.import_module(f"rlinf.data.{name}")
-    elif name in {"DeviceReplayBatch", "DeviceReplayBuffer", "DeviceReplayContractError"}:
+    elif name in {
+        "DeviceReplayBatch",
+        "DeviceReplayBuffer",
+        "DeviceReplayContractError",
+    }:
         module = importlib.import_module("rlinf.data.device_replay_buffer")
         value = getattr(module, name)
     else:

@@ -46,17 +46,23 @@ def _clear_plugin_cache() -> Iterator[None]:
     get_env_plugin.cache_clear()
 
 
-def test_external_environment_plugin_resolves_class(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_external_environment_plugin_resolves_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plugin = EnvPlugin(env_cls=_ExternalEnv)
     entry_point = _EntryPoint("external", "tests:create_plugin", lambda: plugin)
-    monkeypatch.setattr(env_plugins, "_matching_entry_points", lambda name: (entry_point,))
+    monkeypatch.setattr(
+        env_plugins, "_matching_entry_points", lambda name: (entry_point,)
+    )
 
     assert get_env_plugin("external") is plugin
     assert get_env_cls("external") is _ExternalEnv
     assert resolve_builtin_env_type("external", SupportedEnvType) is None
 
 
-def test_builtin_environment_does_not_load_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_builtin_environment_does_not_load_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def _unexpected_lookup(name: str) -> tuple[object, ...]:
         raise AssertionError(f"unexpected plugin lookup for {name}")
 
@@ -71,9 +77,15 @@ def test_builtin_environment_does_not_load_plugin(monkeypatch: pytest.MonkeyPatc
 def test_external_environment_requires_unique_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = _EntryPoint("external", "first:create", lambda: EnvPlugin(_ExternalEnv), "one")
-    second = _EntryPoint("external", "second:create", lambda: EnvPlugin(_ExternalEnv), "two")
-    monkeypatch.setattr(env_plugins, "_matching_entry_points", lambda name: (first, second))
+    first = _EntryPoint(
+        "external", "first:create", lambda: EnvPlugin(_ExternalEnv), "one"
+    )
+    second = _EntryPoint(
+        "external", "second:create", lambda: EnvPlugin(_ExternalEnv), "two"
+    )
+    monkeypatch.setattr(
+        env_plugins, "_matching_entry_points", lambda name: (first, second)
+    )
 
     with pytest.raises(ValueError, match="multiple plugin providers"):
         get_env_plugin("external")
@@ -81,7 +93,9 @@ def test_external_environment_requires_unique_provider(
 
 def test_environment_plugin_validates_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     entry_point = _EntryPoint("external", "tests:invalid", lambda: object())
-    monkeypatch.setattr(env_plugins, "_matching_entry_points", lambda name: (entry_point,))
+    monkeypatch.setattr(
+        env_plugins, "_matching_entry_points", lambda name: (entry_point,)
+    )
 
     with pytest.raises(TypeError, match="must return"):
         get_env_plugin("external")

@@ -44,7 +44,10 @@ class DeviceFieldSpec:
     phase: str = "begin"
 
     def __post_init__(self) -> None:
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in self.shape):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in self.shape
+        ):
             raise ValueError("device field dimensions must be positive integers")
         if self.dtype is None:
             raise ValueError("device field dtype must not be None")
@@ -120,9 +123,13 @@ class DeviceTransitionBuffer:
                 for value in shape
             ):
                 raise ValueError(f"{name} must contain positive integer dimensions")
-        torch = importlib.import_module("torch") if torch_module is None else torch_module
+        torch = (
+            importlib.import_module("torch") if torch_module is None else torch_module
+        )
         if str(device).lower().split(":", 1)[0] != "cuda":
-            raise DeviceTransitionContractError("device transition storage requires CUDA")
+            raise DeviceTransitionContractError(
+                "device transition storage requires CUDA"
+            )
         specs = {} if extra_fields is None else dict(extra_fields)
         reserved = {
             "observation",
@@ -169,7 +176,9 @@ class DeviceTransitionBuffer:
         self._observation = torch.empty(
             (*prefix, *observation_shape), dtype=observation_dtype, device=device
         )
-        self._action = torch.empty((*prefix, *action_shape), dtype=action_dtype, device=device)
+        self._action = torch.empty(
+            (*prefix, *action_shape), dtype=action_dtype, device=device
+        )
         self._reward = torch.empty(prefix, dtype=reward_dtype, device=device)
         self._next_observation = torch.empty(
             (*prefix, *observation_shape), dtype=observation_dtype, device=device
@@ -183,7 +192,9 @@ class DeviceTransitionBuffer:
             dtype=terminal_reason_dtype,
             device=device,
         )
-        self._physics_step = torch.empty(prefix, dtype=physics_step_dtype, device=device)
+        self._physics_step = torch.empty(
+            prefix, dtype=physics_step_dtype, device=device
+        )
         self._valid = torch.empty(prefix, dtype=torch.bool, device=device)
         self._extras = {
             name: torch.empty((*prefix, *spec.shape), dtype=spec.dtype, device=device)
@@ -278,7 +289,9 @@ class DeviceTransitionBuffer:
         """
 
         if self._pending:
-            raise DeviceTransitionContractError("a device transition is already pending")
+            raise DeviceTransitionContractError(
+                "a device transition is already pending"
+            )
         if self.full:
             raise DeviceTransitionContractError("device transition buffer is full")
         self._require_tensor(
@@ -323,7 +336,9 @@ class DeviceTransitionBuffer:
         """Complete the pending row with post-step tensors on the same GPU."""
 
         if not self._pending:
-            raise DeviceTransitionContractError("no pending device transition to commit")
+            raise DeviceTransitionContractError(
+                "no pending device transition to commit"
+            )
         vector_observation_shape = (self._num_envs, *self._observation_shape)
         vector_shape = (self._num_envs,)
         self._require_tensor(
