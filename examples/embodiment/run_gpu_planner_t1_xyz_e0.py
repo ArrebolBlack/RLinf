@@ -1234,29 +1234,43 @@ def _write_visual_gif(path: Path, reviews: Sequence[Mapping[str, Any]]) -> None:
 def _write_tape_npz(
     path: Path,
     observations: Sequence[Any],
+    raw_observations: Sequence[Any],
     commands: Sequence[Any],
+    step_results: Sequence[Any],
 ) -> None:
     if path.exists():
         raise FileExistsError(f"refusing to overwrite {path}")
-    if not observations or len(observations) != len(commands) + 1:
+    if (
+        not observations
+        or len(observations) != len(commands) + 1
+        or len(raw_observations) != len(observations)
+        or len(step_results) != len(commands)
+    ):
         raise ValueError(
-            "trajectory tape must contain one more observation than actions"
+            "trajectory tape must align Planner, raw observation, action, and result rows"
         )
+    if any(
+        result.observation.fingerprint_sha256
+        != raw_observations[index + 1].fingerprint_sha256
+        for index, result in enumerate(step_results)
+    ):
+        raise ValueError("raw observation tape differs from the GPU step results")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "episode_id": np.asarray([value.episode_id for value in observations]),
-        "task_id": np.asarray([value.task_id for value in observations]),
+        "schema_version": np.asarray("gpu-planner-t1-xyz-raw-tape-v1"),
+        "episode_id": np.asarray([value.episode_id for value in raw_observations]),
+        "task_id": np.asarray([value.task_id for value in raw_observations]),
         "physics_step": np.asarray(
-            [value.physics_step for value in observations], dtype=np.int64
+            [value.physics_step for value in raw_observations], dtype=np.int64
         ),
         "control_step": np.asarray(
-            [value.control_step for value in observations], dtype=np.int64
+            [value.control_step for value in raw_observations], dtype=np.int64
         ),
         "policy_step": np.asarray(
-            [value.policy_step for value in observations], dtype=np.int64
+            [value.policy_step for value in raw_observations], dtype=np.int64
         ),
         "time_s": np.asarray(
-            [value.time_s for value in observations], dtype=np.float64
+            [value.time_s for value in raw_observations], dtype=np.float64
         ),
         "action_values": np.stack(
             [np.asarray(value.values, dtype=np.float64) for value in commands]
@@ -1267,12 +1281,54 @@ def _write_tape_npz(
         "observation_digest": np.asarray(
             [_observation_digest(value) for value in observations]
         ),
+        "raw_observation_fingerprint_sha256": np.asarray(
+            [value.fingerprint_sha256 for value in raw_observations]
+        ),
+        "events_since_last_observation_json": np.asarray(
+            [
+                json.dumps(
+                    [
+                        {
+                            "name": event.name,
+                            "physics_step": int(event.physics_step),
+                            "time_s": float(event.time_s),
+                        }
+                        for event in value.events_since_last_observation
+                    ],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                for value in raw_observations
+            ]
+        ),
+        "step_result_terminated": np.asarray(
+            [value.terminated for value in step_results], dtype=np.bool_
+        ),
+        "step_result_truncated": np.asarray(
+            [value.truncated for value in step_results], dtype=np.bool_
+        ),
+        "step_result_success": np.asarray(
+            [value.success for value in step_results], dtype=np.bool_
+        ),
+        "step_result_active_stage_progress": np.asarray(
+            [value.active_stage_progress for value in step_results], dtype=np.float64
+        ),
+        "step_result_termination_reason": np.asarray(
+            [value.termination_reason or "" for value in step_results]
+        ),
+        "step_result_observation_fingerprint_sha256": np.asarray(
+            [value.observation.fingerprint_sha256 for value in step_results]
+        ),
     }
     for group_name in ("rgb", "depth_m", "segmentation", "proprio", "privileged"):
-        keys = sorted(getattr(observations[0], group_name))
+        keys = sorted(getattr(raw_observations[0], group_name))
         for key in keys:
             payload[f"{group_name}/{key}"] = np.stack(
-                [np.asarray(getattr(value, group_name)[key]) for value in observations]
+                [
+                    np.asarray(getattr(value, group_name)[key])
+                    for value in raw_observations
+                ]
             )
     np.savez_compressed(path, **payload)
 
@@ -1475,8 +1531,10 @@ def main() -> None:
             raise RuntimeError("CUDA reset changed the sealed row identity")
         observation, review = _state_and_review_observation(raw_observations[0])
         observations = [observation]
+        raw_trajectory_observations = [raw_observations[0]]
         reviews = [review]
         commands: list[Any] = []
+        step_results: list[Any] = []
         outcomes: list[tuple[bool, bool, bool, str | None]] = []
         latencies_s: list[float] = []
         result = None
@@ -1493,6 +1551,8 @@ def main() -> None:
             observation, review = _state_and_review_observation(result.observation)
             commands.append(command)
             observations.append(observation)
+            raw_trajectory_observations.append(result.observation)
+            step_results.append(result)
             reviews.append(review)
             outcomes.append(
                 (
@@ -1603,9 +1663,44 @@ def main() -> None:
 
         tape_output = tape_output.resolve()
         visual_gif = visual_gif.resolve()
-        _write_tape_npz(tape_output, observations, commands)
+        _write_tape_npz(
+            tape_output,
+            observations,
+            raw_trajectory_observations,
+            commands,
+            step_results,
+        )
         _write_visual_gif(visual_gif, reviews)
         trajectory_tape = [_observation_digest(value) for value in observations]
+        raw_visual_alignment = {
+            camera: {
+                "frame_count": len(raw_trajectory_observations),
+                "resolution": list(np.asarray(reviews[0][camera]).shape[:2]),
+                "review_frames_equal_raw_gpu_rgb": all(
+                    np.array_equal(
+                        np.asarray(raw.rgb[camera]), np.asarray(review_row[camera])
+                    )
+                    for raw, review_row in zip(
+                        raw_trajectory_observations, reviews, strict=True
+                    )
+                ),
+                "raw_rgb_tape_sha256": _json_sha256(
+                    [
+                        _array_digest(raw.rgb[camera])
+                        for raw in raw_trajectory_observations
+                    ]
+                ),
+            }
+            for camera in _REVIEW_CAMERAS
+        }
+        if any(
+            row["review_frames_equal_raw_gpu_rgb"] is not True
+            or row["resolution"] != [args.image_size, args.image_size]
+            for row in raw_visual_alignment.values()
+        ):
+            raise RuntimeError(
+                "raw GPU policy observation and review materialization diverged"
+            )
         evidence_export = {
             "passed": True,
             "action_tape_sha256": _json_sha256(action_tape),
@@ -1614,6 +1709,7 @@ def main() -> None:
             "tape_file_sha256": _file_sha256(tape_output),
             "visual_file": str(visual_gif),
             "visual_sha256": _file_sha256(visual_gif),
+            "raw_visual_alignment": raw_visual_alignment,
         }
         if one_shot_acquisition_gate["passed"] is not True:
             failure_payload = {
